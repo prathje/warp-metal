@@ -419,6 +419,119 @@ class TestMetalLaunch(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet)
 
+    def test_math_builtins_match_cpu(self):
+        # Each unary math op tested against CPU. A handful of these (e.g.
+        # ``round``, transcendentals like ``sin`` for large args) may differ
+        # from CPU at the ulp level if MSL and the CPU LLVM math library
+        # diverge in their rounding policy — we use a tight ``assert_allclose``
+        # rather than ``assert_array_equal`` so those don't fail spuriously.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k_sqrt(a: wp.array(dtype=wp.float32), c: wp.array(dtype=wp.float32)):
+                tid = wp.tid(); c[tid] = wp.sqrt(a[tid])
+            @wp.kernel
+            def k_abs(a: wp.array(dtype=wp.float32), c: wp.array(dtype=wp.float32)):
+                tid = wp.tid(); c[tid] = wp.abs(a[tid])
+            @wp.kernel
+            def k_floor(a: wp.array(dtype=wp.float32), c: wp.array(dtype=wp.float32)):
+                tid = wp.tid(); c[tid] = wp.floor(a[tid])
+            @wp.kernel
+            def k_ceil(a: wp.array(dtype=wp.float32), c: wp.array(dtype=wp.float32)):
+                tid = wp.tid(); c[tid] = wp.ceil(a[tid])
+            @wp.kernel
+            def k_exp(a: wp.array(dtype=wp.float32), c: wp.array(dtype=wp.float32)):
+                tid = wp.tid(); c[tid] = wp.exp(a[tid])
+            @wp.kernel
+            def k_log(a: wp.array(dtype=wp.float32), c: wp.array(dtype=wp.float32)):
+                tid = wp.tid(); c[tid] = wp.log(a[tid])
+            @wp.kernel
+            def k_sin(a: wp.array(dtype=wp.float32), c: wp.array(dtype=wp.float32)):
+                tid = wp.tid(); c[tid] = wp.sin(a[tid])
+            @wp.kernel
+            def k_cos(a: wp.array(dtype=wp.float32), c: wp.array(dtype=wp.float32)):
+                tid = wp.tid(); c[tid] = wp.cos(a[tid])
+            @wp.kernel
+            def k_tanh(a: wp.array(dtype=wp.float32), c: wp.array(dtype=wp.float32)):
+                tid = wp.tid(); c[tid] = wp.tanh(a[tid])
+
+            rng = np.random.default_rng(2026)
+            N = 257
+            cases = [
+                (k_sqrt, lambda: np.abs(rng.standard_normal(N).astype(np.float32)) + 1e-3),
+                (k_abs,  lambda: rng.standard_normal(N).astype(np.float32)),
+                (k_floor,lambda: rng.uniform(-10, 10, size=N).astype(np.float32)),
+                (k_ceil, lambda: rng.uniform(-10, 10, size=N).astype(np.float32)),
+                (k_exp,  lambda: rng.uniform(-3, 3, size=N).astype(np.float32)),
+                (k_log,  lambda: np.abs(rng.standard_normal(N).astype(np.float32)) + 1e-3),
+                (k_sin,  lambda: rng.uniform(-3.14, 3.14, size=N).astype(np.float32)),
+                (k_cos,  lambda: rng.uniform(-3.14, 3.14, size=N).astype(np.float32)),
+                (k_tanh, lambda: rng.standard_normal(N).astype(np.float32)),
+            ]
+            for kf, gen in cases:
+                an = gen()
+                c_cpu = wp.zeros(N, dtype=wp.float32, device='cpu')
+                c_m = wp.zeros(N, dtype=wp.float32, device='metal:0')
+                wp.launch(kf, dim=N,
+                          inputs=[wp.array(an, dtype=wp.float32, device='cpu')],
+                          outputs=[c_cpu], device='cpu')
+                wp.launch(kf, dim=N,
+                          inputs=[wp.array(an, dtype=wp.float32, device='metal:0')],
+                          outputs=[c_m], device='metal:0')
+                np.testing.assert_allclose(
+                    c_m.numpy(), c_cpu.numpy(),
+                    rtol=1e-5, atol=1e-6,
+                    err_msg=f'{kf.adj.fun_name} CPU/Metal disagreement',
+                )
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_math_min_max_matches_cpu(self):
+        # Binary builtins ``wp.min`` and ``wp.max`` map to ``metal::min`` /
+        # ``metal::max``; output is bit-exact for finite inputs because both
+        # CPU and Metal pick element-wise without any floating-point math.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def kmin(a: wp.array(dtype=wp.float32), b: wp.array(dtype=wp.float32),
+                     c: wp.array(dtype=wp.float32)):
+                tid = wp.tid(); c[tid] = wp.min(a[tid], b[tid])
+
+            @wp.kernel
+            def kmax(a: wp.array(dtype=wp.float32), b: wp.array(dtype=wp.float32),
+                     c: wp.array(dtype=wp.float32)):
+                tid = wp.tid(); c[tid] = wp.max(a[tid], b[tid])
+
+            rng = np.random.default_rng(99)
+            N = 512
+            an = rng.standard_normal(N).astype(np.float32)
+            bn = rng.standard_normal(N).astype(np.float32)
+            for kf in (kmin, kmax):
+                c_cpu = wp.zeros(N, dtype=wp.float32, device='cpu')
+                c_m = wp.zeros(N, dtype=wp.float32, device='metal:0')
+                wp.launch(kf, dim=N,
+                          inputs=[wp.array(an, dtype=wp.float32, device='cpu'),
+                                  wp.array(bn, dtype=wp.float32, device='cpu')],
+                          outputs=[c_cpu], device='cpu')
+                wp.launch(kf, dim=N,
+                          inputs=[wp.array(an, dtype=wp.float32, device='metal:0'),
+                                  wp.array(bn, dtype=wp.float32, device='metal:0')],
+                          outputs=[c_m], device='metal:0')
+                np.testing.assert_array_equal(
+                    c_cpu.numpy(), c_m.numpy(),
+                    err_msg=f'{kf.adj.fun_name} mismatch',
+                )
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
     def test_rejects_adjoint_launch(self):
         snippet = textwrap.dedent(
             """
