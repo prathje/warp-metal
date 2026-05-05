@@ -3802,17 +3802,24 @@ class Device:
             ``domain``, ``bus``, and ``device`` are all hexadecimal values. ``None`` for CPU devices.
     """
 
-    def __init__(self, runtime, alias, ordinal=-1, is_primary=False, context=None):
+    def __init__(self, runtime, alias, ordinal=-1, is_primary=False, context=None, kind=None):
         self.runtime = runtime
         self.alias = alias
         self.ordinal = ordinal
         self.is_primary = is_primary
 
+        # Infer device kind from ordinal for backwards compatibility with callers
+        # that don't pass ``kind`` (CPU = -1, CUDA = >= 0). The Metal backend always
+        # passes ``kind="metal"`` explicitly.
+        if kind is None:
+            kind = "cpu" if ordinal == -1 else "cuda"
+        self.kind = kind
+
         # context can be None to avoid acquiring primary contexts until the device is used
         self._context = context
 
-        # if the device context is not primary, it cannot be None
-        if ordinal != -1 and not is_primary:
+        # if the device context is not primary, it cannot be None (CUDA only)
+        if self.kind == "cuda" and ordinal != -1 and not is_primary:
             assert context is not None
 
         # streams will be created when context is acquired
@@ -3824,7 +3831,7 @@ class Device:
 
         self.context_guard = ContextGuard(self)
 
-        if self.ordinal == -1:
+        if self.kind == "cpu":
             # CPU device
             self.name = platform.processor() or "CPU"
             self.arch = 0
@@ -3845,7 +3852,7 @@ class Device:
             self.default_allocator = CpuDefaultAllocator(self)
             self.pinned_allocator = CpuPinnedAllocator(self)
 
-        elif ordinal >= 0 and ordinal < runtime.core.wp_cuda_device_get_count():
+        elif self.kind == "cuda" and ordinal >= 0 and ordinal < runtime.core.wp_cuda_device_get_count():
             # CUDA device
             self.name = runtime.core.wp_cuda_device_get_name(ordinal).decode()
             self.arch = runtime.core.wp_cuda_device_get_arch(ordinal)
@@ -3907,6 +3914,42 @@ class Device:
                 self.context, ptr, src, srcsize, reps
             )
 
+        elif self.kind == "metal":
+            # Metal device (experimental — discovery only at this stage; no allocator
+            # or kernel launch wired up yet). The MLX runtime substrate is imported
+            # lazily so that builds without ``mlx`` installed still succeed.
+            try:
+                import mlx.core as mx  # noqa: PLC0415
+            except ImportError as e:
+                raise RuntimeError(
+                    "wp.config.enable_metal=True but the 'mlx' package is not "
+                    "importable. Install it with `uv pip install mlx` (or "
+                    "`pip install mlx`) on macOS / Apple Silicon."
+                ) from e
+
+            if not mx.metal.is_available():
+                raise RuntimeError("Metal is not available on this system. The MLX runtime reports no Metal device.")
+
+            self.name = f"Apple Metal GPU {ordinal}"
+            self.arch = 0  # MSL/Metal version not yet exposed
+            self.sm_count = 0
+            self.max_shared_memory_per_block = 0
+            # Apple Silicon has unified memory between CPU and GPU
+            self.is_uva = True
+            self.is_mempool_supported = False
+            self.is_mempool_enabled = False
+            self.is_ipc_supported = False
+            self.is_cubin_supported = False
+            self.uuid = None
+            self.pci_bus_id = None
+
+            # Allocator and per-device dispatch are not implemented yet —
+            # they will be added in step 3b. Accessing them raises a clear error.
+            self.default_allocator = None
+            self.pinned_allocator = None
+            self.memset = None
+            self.memtile = None
+
         else:
             raise RuntimeError(f"Invalid device ordinal ({ordinal})'")
 
@@ -3943,12 +3986,17 @@ class Device:
     @property
     def is_cpu(self) -> bool:
         """A boolean indicating whether the device is a CPU device."""
-        return self.ordinal < 0
+        return self.kind == "cpu"
 
     @property
     def is_cuda(self) -> bool:
         """A boolean indicating whether the device is a CUDA device."""
-        return self.ordinal >= 0
+        return self.kind == "cuda"
+
+    @property
+    def is_metal(self) -> bool:
+        """A boolean indicating whether the device is a Metal device (Apple Silicon)."""
+        return self.kind == "metal"
 
     @property
     def is_capturing(self) -> bool:
@@ -5911,6 +5959,15 @@ class Runtime:
                 # count known non-primary contexts on each physical device so we can
                 # give them reasonable aliases (e.g., "cuda:0.0", "cuda:0.1")
                 self.cuda_custom_context_count = [0] * cuda_device_count
+
+        # register Metal device(s) when explicitly enabled. Gated behind a config
+        # flag so the experimental backend can't affect users who don't opt in.
+        self.metal_devices = []
+        if warp.config.enable_metal:
+            metal_device = Device(self, "metal:0", ordinal=0, kind="metal")
+            self.metal_devices.append(metal_device)
+            self.device_map["metal:0"] = metal_device
+            self.device_map["metal"] = metal_device
 
         # set default device
         if cuda_device_count > 0:

@@ -179,6 +179,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
     from warp.tests.test_linear_solvers import TestLinearSolvers
     from warp.tests.test_lvalue import TestLValue
     from warp.tests.test_math import TestMath
+    from warp.tests.test_metal_device import TestMetalDevice, TestMetalDisabled
     from warp.tests.test_module_contamination import TestModuleContamination
     from warp.tests.test_module_hashing import TestModuleHashing
     from warp.tests.test_module_parallel_load import TestModuleParallelLoad
@@ -316,6 +317,8 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
         TestMath,
         TestMempool,
         TestMesh,
+        TestMetalDevice,
+        TestMetalDisabled,
         TestMeshQueryAABBMethods,
         TestMeshQueryPoint,
         TestMeshQueryRay,

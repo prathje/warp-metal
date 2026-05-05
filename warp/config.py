@@ -223,6 +223,19 @@ Only affects systems with CUDA driver versions below 12.3.
 enable_mempools_at_init: bool = True
 """Enable CUDA memory pools during device initialization when supported."""
 
+enable_metal: bool = False
+"""Enable the experimental Metal backend on macOS (Apple Silicon).
+
+When ``True``, Warp registers a ``"metal:0"`` device backed by Apple's Metal API
+via the `MLX <https://github.com/ml-explore/mlx>`_ runtime. Requires ``mlx`` to
+be importable; raises ``RuntimeError`` at :func:`warp.init` time if it is not.
+
+This setting must be assigned before :func:`warp.init` is called (or before the
+first import-driven device enumeration). The Metal backend is incomplete and
+intended for inference-only workloads — autograd, graph capture, and most of
+the kernel-builtin surface are not yet wired up.
+"""
+
 track_memory: bool = False
 """Enable tracking of memory allocations at initialization.
 
