@@ -22,6 +22,11 @@ pointer to the offending statement):
   ``sqrt``, ``abs``, ``min``, ``max``, ``floor``, ``ceil``, ``exp``,
   ``log``, ``sin``, ``cos``, ``tanh``, etc. — translated to MSL's
   ``metal::`` namespace.
+- ``for i in range(...)`` loops, both static (Warp unrolls them, so this
+  is a no-op) and dynamic (a structural pre-pass rewrites Warp's
+  ``goto``-based loop into a real MSL ``for``).
+- ``wp::assign(dst, src)`` (in-place mutation, used by the loop body for
+  accumulator updates).
 """
 
 from __future__ import annotations
@@ -187,8 +192,23 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"wp::mul\s*\(\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)"), r"(\1 * \2)"),
     (re.compile(r"wp::div\s*\(\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)"), r"(\1 / \2)"),
     (re.compile(r"wp::mod\s*\(\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)"), r"(\1 % \2)"),
-    # Strip wp::float32(x) / wp::int32(x) etc. casts
-    (re.compile(r"wp::(float32|float16|int32|uint32|int64|uint64)\s*\(\s*([^()]+?)\s*\)"), r"\2"),
+    # ``wp::assign(target, value)`` — used by Warp to model in-place mutation
+    # of a local (e.g. accumulator updates inside a loop). Translate to a
+    # plain assignment statement.
+    (
+        re.compile(r"wp::assign\s*\(\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)\s*;"),
+        r"\1 = \2;",
+    ),
+    # Strip Warp scalar-type cast wrappers ``wp::T(x)``. Includes the unsuffixed
+    # Python-style names ``wp::float``, ``wp::int``, etc. that Warp emits for
+    # ``float(x)`` / ``int(x)`` constructor calls in user code.
+    (
+        re.compile(
+            r"wp::(float|float16|float32|int|int8|int16|int32|int64|"
+            r"uint|uint8|uint16|uint32|uint64|bool)\s*\(\s*([^()]+?)\s*\)"
+        ),
+        r"\2",
+    ),
 ]
 
 # Append math-builtin renames after the operator/cast rules. Each generates a
@@ -252,6 +272,94 @@ def _strip_comments_and_directives(line: str) -> str | None:
     return line
 
 
+# ---- Dynamic for-loop structural translation -------------------------------
+#
+# Warp's IR lowers ``for i in range(n):`` (with ``n`` not a compile-time
+# constant) to a ``goto``-based loop. Static ranges are fully unrolled and
+# need no rewrite — they appear as straight-line code. The dynamic pattern is
+# always:
+#
+#     var_X = wp::range(var_N);
+#     start_for_K:;
+#         if (iter_cmp(var_X) == 0) goto end_for_K;
+#         var_Y = wp::iter_next(var_X);
+#         ... body ...
+#         goto start_for_K;
+#     end_for_K:;
+#
+# We rewrite the opener to ``for (int var_Y = 0; var_Y < var_N; ++var_Y) {``,
+# the trailing ``goto`` to nothing, and the end label to ``}``. The MSL
+# compiler does support ``goto`` so a more literal lowering would also work,
+# but a real ``for`` produces cleaner emitted code that's easy to read in
+# debug builds and removes the need to declare a ``range_t`` type.
+_RANGE_PAT = re.compile(r"^\s*var_(\w+)\s*=\s*wp::range\s*\(\s*var_(\w+)\s*\)\s*;\s*$")
+_START_LABEL_PAT = re.compile(r"^\s*start_for_(\d+)\s*:\s*;\s*$")
+_ITER_CMP_PAT = re.compile(r"^\s*if\s*\(\s*iter_cmp\s*\(\s*var_(\w+)\s*\)\s*==\s*0\s*\)\s*goto\s+end_for_(\d+)\s*;\s*$")
+_ITER_NEXT_PAT = re.compile(r"^\s*var_(\w+)\s*=\s*wp::iter_next\s*\(\s*var_(\w+)\s*\)\s*;\s*$")
+_END_LABEL_PAT = re.compile(r"^\s*end_for_(\d+)\s*:\s*;\s*$")
+_GOTO_START_PAT = re.compile(r"^\s*goto\s+start_for_(\d+)\s*;\s*$")
+
+
+def _preprocess_for_loops(lines: list[str]) -> tuple[list[str], set[str]]:
+    """Rewrite dynamic-range goto-loops as MSL ``for`` loops.
+
+    Returns ``(processed_lines, vars_to_skip_decl)`` — the second value lists
+    Warp local labels whose top-level declaration must be suppressed (the
+    range-iterator object, which doesn't exist in our MSL output, and the
+    induction variable, which is declared by the ``for`` statement instead).
+    """
+    processed: list[str] = []
+    skip: set[str] = set()
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+
+        # Try to match the canonical 4-line for-loop opener.
+        if i + 3 < len(lines):
+            m_range = _RANGE_PAT.match(line)
+            m_start = _START_LABEL_PAT.match(lines[i + 1])
+            m_cmp = _ITER_CMP_PAT.match(lines[i + 2])
+            m_next = _ITER_NEXT_PAT.match(lines[i + 3])
+            if (
+                m_range
+                and m_start
+                and m_cmp
+                and m_next
+                and m_range.group(1) == m_cmp.group(1) == m_next.group(2)
+                and m_start.group(1) == m_cmp.group(2)
+            ):
+                range_var_label = m_range.group(1)
+                range_arg_label = m_range.group(2)
+                iter_var_label = m_next.group(1)
+                processed.append(
+                    f"for (int var_{iter_var_label} = 0; "
+                    f"var_{iter_var_label} < var_{range_arg_label}; "
+                    f"++var_{iter_var_label}) {{"
+                )
+                # Range-iterator local doesn't exist in MSL output; iter var
+                # is declared inline by the ``for``.
+                skip.add(range_var_label)
+                skip.add(iter_var_label)
+                i += 4
+                continue
+
+        if _GOTO_START_PAT.match(line):
+            # Implicit in the for loop — drop.
+            i += 1
+            continue
+
+        if _END_LABEL_PAT.match(line):
+            processed.append("}")
+            i += 1
+            continue
+
+        processed.append(line)
+        i += 1
+
+    return processed, skip
+
+
 def generate_msl_kernel(kernel) -> MetalKernelArtifact:
     """Build an MSL artifact for a Warp ``Kernel`` object.
 
@@ -267,13 +375,20 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
     if not getattr(adj, "blocks", None):
         adj.build(builder=None, default_builder_options={"enable_backward": False})
 
+    # Preprocess: rewrite dynamic-range goto-loops into ``for`` loops. Static
+    # ranges are pre-unrolled by Warp and pass through untouched. Returns a
+    # transformed line list plus a set of Warp local labels whose top-level
+    # declaration should be suppressed (the iter-state object and the
+    # induction variable, which the generated ``for`` declares inline).
+    forward_lines, vars_to_skip_decl = _preprocess_for_loops(adj.blocks[0].body_forward)
+
     # Classify each array arg as input or output by scanning the IR strings.
     # MLX inputs are ``const device T*`` (read-only) — verified empirically —
     # so any array that is written through must become an MLX output. We can't
     # rely on ``arg.is_write`` here because it is only populated when
     # ``verify_autograd_array_access`` is enabled.
     written_arg_names: set[str] = set()
-    for raw in adj.blocks[0].body_forward:
+    for raw in forward_lines:
         # Pattern: wp::array_store(var_<argname>, ...)
         m = re.match(r"\s*wp::array_store\s*\(\s*var_([A-Za-z_]\w*)", raw)
         if m:
@@ -308,7 +423,7 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
     # Warp local labels are integers (``var_0``, ``var_1``); arg labels start
     # with a letter (``var_a``). Both are valid ``\w+`` so use that.
     address_pattern = re.compile(r"\s*var_(\w+)\s*=\s*wp::address\s*\(\s*var_(\w+)\s*,\s*var_(\w+)\s*\)\s*;\s*$")
-    for raw in adj.blocks[0].body_forward:
+    for raw in forward_lines:
         m = address_pattern.match(raw)
         if m:
             local_label, arr_arg, idx_label = m.group(1), m.group(2), m.group(3)
@@ -324,6 +439,15 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
             # This local was a pointer into an array arg; we'll inline its
             # uses below, so it doesn't need a declaration.
             continue
+        if var.label in vars_to_skip_decl:
+            # Iterator-state or induction-variable for a translated for-loop;
+            # declared inline by the generated ``for`` statement.
+            continue
+        # Skip ranges that would otherwise hit ``_msl_var_type`` (which doesn't
+        # know about ``wp::range_t``). The for-loop translation should already
+        # have added these to ``vars_to_skip_decl``, but guard defensively.
+        if var.ctype() == "wp::range_t":
+            continue
         ctype = var.ctype()
         msl_type = _msl_var_type(ctype)
         if var.constant is None:
@@ -332,7 +456,7 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
             body_lines.append(f"    const {msl_type} var_{var.label} = {_msl_constant_str(var.constant)};")
 
     # --- Forward statements --------------------------------------------
-    for raw in adj.blocks[0].body_forward:
+    for raw in forward_lines:
         line = _strip_comments_and_directives(raw)
         if line is None:
             continue

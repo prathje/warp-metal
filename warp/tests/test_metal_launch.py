@@ -532,6 +532,76 @@ class TestMetalLaunch(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet)
 
+    def test_static_range_for_loop_matches_cpu(self):
+        # Static ``range(N)`` is unrolled by Warp into straight-line code, so
+        # this exercises the unrolled IR plus the ``wp::float()`` constructor
+        # cast that surfaces on the accumulator initializer.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(a: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
+                tid = wp.tid()
+                s = float(0.0)
+                for i in range(8):
+                    s = s + a[tid * 8 + i]
+                out[tid] = s
+
+            N = 64
+            rng = np.random.default_rng(13)
+            an = rng.standard_normal(N * 8).astype(np.float32)
+            out_cpu = wp.zeros(N, dtype=wp.float32, device='cpu')
+            out_m = wp.zeros(N, dtype=wp.float32, device='metal:0')
+            wp.launch(k, dim=N,
+                      inputs=[wp.array(an, dtype=wp.float32, device='cpu')],
+                      outputs=[out_cpu], device='cpu')
+            wp.launch(k, dim=N,
+                      inputs=[wp.array(an, dtype=wp.float32, device='metal:0')],
+                      outputs=[out_m], device='metal:0')
+            np.testing.assert_array_equal(out_cpu.numpy(), out_m.numpy())
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_dynamic_range_for_loop_matches_cpu(self):
+        # ``range(n)`` with non-constant ``n`` lowers to a goto-loop in the IR;
+        # our preprocessor rewrites it as a real MSL ``for``. Tests several
+        # inner sizes to catch off-by-ones in the iteration bound.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(a: wp.array(dtype=wp.float32), n: wp.int32, out: wp.array(dtype=wp.float32)):
+                tid = wp.tid()
+                s = float(0.0)
+                for i in range(n):
+                    s = s + a[tid * n + i]
+                out[tid] = s
+
+            rng = np.random.default_rng(99)
+            for inner in (1, 5, 8, 17):
+                N = 32
+                an = rng.standard_normal(N * inner).astype(np.float32)
+                out_cpu = wp.zeros(N, dtype=wp.float32, device='cpu')
+                out_m = wp.zeros(N, dtype=wp.float32, device='metal:0')
+                wp.launch(k, dim=N,
+                          inputs=[wp.array(an, dtype=wp.float32, device='cpu'), inner],
+                          outputs=[out_cpu], device='cpu')
+                wp.launch(k, dim=N,
+                          inputs=[wp.array(an, dtype=wp.float32, device='metal:0'), inner],
+                          outputs=[out_m], device='metal:0')
+                np.testing.assert_array_equal(
+                    out_cpu.numpy(), out_m.numpy(),
+                    err_msg=f'inner={inner} mismatch'
+                )
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
     def test_rejects_adjoint_launch(self):
         snippet = textwrap.dedent(
             """
