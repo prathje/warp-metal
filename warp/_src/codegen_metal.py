@@ -71,9 +71,10 @@ pointer to the offending statement):
   ``wp.atomic_min``, ``wp.atomic_max`` — translated to MSL's
   ``atomic_fetch_*_explicit`` with relaxed ordering. The launcher sets
   ``mx.fast.metal_kernel(atomic_outputs=True)`` for kernels that use any
-  atomic op, which makes *all* outputs of that kernel ``device atomic<T>*``;
-  mixed atomic / non-atomic writes to outputs in the same kernel are
-  rejected at codegen time.
+  atomic op, which makes *all* outputs of that kernel ``device atomic<T>*``.
+  Kernels that mix ``wp.atomic_*`` with plain ``arr[i] = val`` writes on
+  *different* outputs are supported by translating each regular scalar
+  store to ``atomic_store_explicit`` when the kernel is in atomic mode.
 - Vec types ``wp.vec2``/``wp.vec3``/``wp.vec4`` (and the corresponding
   int/uint variants) — native ``floatN`` / ``intN`` etc. in MSL.
   Constructor maps to ``floatN(...)``, ``[i]`` indexing maps to MSL
@@ -1021,21 +1022,16 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
             atomic_arg_names.add(m.group(1))
 
     # MLX's ``atomic_outputs`` flag is per-kernel, not per-output: when set,
-    # *every* output is typed ``device atomic<T>*``, which means a regular
-    # ``arr[idx] = val`` store on a non-atomic output would no longer compile
-    # (the LHS isn't an lvalue of the right type). Reject the mixed case
-    # rather than silently miscompiling.
+    # *every* output is typed ``device atomic<T>*``. We can still support
+    # kernels that mix ``wp.atomic_*`` and plain ``arr[i] = val`` writes on
+    # *different* outputs by translating the regular-store half into
+    # ``atomic_store_explicit`` — one atomic op per scalar element written.
+    # Reads from atomic-typed outputs are not yet supported (not seen in the
+    # mujoco_warp recon for the affected kernels), and writes through a
+    # field of an ``atomic<T>*`` element type aren't representable in MSL,
+    # so non-scalar output dtypes still go through the same per-component
+    # expansion they always did.
     has_atomic = bool(atomic_arg_names)
-    if has_atomic:
-        non_atomic_outputs = written_arg_names - atomic_arg_names
-        if non_atomic_outputs:
-            raise MetalCodegenError(
-                f"Kernel {adj.fun_name!r} mixes atomic and non-atomic writes to outputs "
-                f"({sorted(non_atomic_outputs)} written via ``arr[idx] = ...``, "
-                f"{sorted(atomic_arg_names)} written via ``wp.atomic_*``). MLX makes "
-                f"all outputs of a kernel atomic together; mixed kernels are not yet "
-                f"supported. Split into two launches."
-            )
 
     input_args: list = []
     output_args: list = []
@@ -1456,6 +1452,18 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
             if len(parts) >= 2:
                 indices = parts[:-1]
                 value = parts[-1]
+                # When the kernel uses ``wp.atomic_*`` on any output, MLX
+                # makes ALL outputs ``device atomic<T>*`` and a plain
+                # ``arr[idx] = val`` won't compile — wrap each scalar
+                # write in ``atomic_store_explicit`` instead.
+                output_arg_names = {a.label for a in output_args}
+                use_atomic_store = has_atomic and arr in output_arg_names
+
+                def _emit_scalar_write(idx_expr: str, rhs: str) -> str:
+                    if use_atomic_store:
+                        return f"{indent}atomic_store_explicit(&{arr}[{idx_expr}], {rhs}, memory_order_relaxed);"
+                    return f"{indent}{arr}[{idx_expr}] = {rhs};"
+
                 if arr in vec_arr_info:
                     vec_n, _ = vec_arr_info[arr]
                     if len(indices) == 1:
@@ -1463,7 +1471,7 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
                     else:
                         elem_idx = f"({_flat_index_expr(arr, indices)})"
                     for k in range(vec_n):
-                        body_lines.append(_finalize(f"{indent}{arr}[{elem_idx} * {vec_n} + {k}] = {value}[{k}];"))
+                        body_lines.append(_finalize(_emit_scalar_write(f"{elem_idx} * {vec_n} + {k}", f"{value}[{k}]")))
                     continue
                 if arr in mat_arr_info:
                     rows, cols, _ = mat_arr_info[arr]
@@ -1477,7 +1485,12 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
                     for r in range(rows):
                         for c in range(cols):
                             body_lines.append(
-                                _finalize(f"{indent}{arr}[{elem_idx} * {stride} + {r * cols + c}] = {value}[{c}][{r}];")
+                                _finalize(
+                                    _emit_scalar_write(
+                                        f"{elem_idx} * {stride} + {r * cols + c}",
+                                        f"{value}[{c}][{r}]",
+                                    )
+                                )
                             )
                     continue
                 if arr in struct_arr_info:
@@ -1501,21 +1514,24 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
                         src = _per_field_local(val_struct_label, fname)
                         off = finfo.offset
                         if finfo.kind == _STRUCT_FIELD_KIND_SCALAR:
-                            body_lines.append(_finalize(f"{indent}{arr}[{base} + {off}] = {src};"))
+                            body_lines.append(_finalize(_emit_scalar_write(f"{base} + {off}", src)))
                         elif finfo.kind == _STRUCT_FIELD_KIND_VEC:
                             for k in range(finfo.size):
-                                body_lines.append(_finalize(f"{indent}{arr}[{base} + {off} + {k}] = {src}[{k}];"))
+                                body_lines.append(_finalize(_emit_scalar_write(f"{base} + {off} + {k}", f"{src}[{k}]")))
                         elif finfo.kind == _STRUCT_FIELD_KIND_MAT:
                             for r in range(finfo.rows):
                                 for c in range(finfo.cols):
                                     body_lines.append(
                                         _finalize(
-                                            f"{indent}{arr}[{base} + {off + r * finfo.cols + c}] = {src}[{c}][{r}];"
+                                            _emit_scalar_write(
+                                                f"{base} + {off + r * finfo.cols + c}",
+                                                f"{src}[{c}][{r}]",
+                                            )
                                         )
                                     )
                     continue
                 flat_idx = _flat_index_expr(arr, indices)
-                body_lines.append(_finalize(f"{indent}{arr}[{flat_idx}] = {value};"))
+                body_lines.append(_finalize(_emit_scalar_write(flat_idx, value)))
                 continue
         translated = _translate_intrinsics(line.strip())
         body_lines.append(f"    {_finalize(translated)}")
