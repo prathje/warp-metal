@@ -68,18 +68,23 @@ pointer to the offending statement):
   mixed atomic / non-atomic writes to outputs in the same kernel are
   rejected at codegen time.
 - Vec types ``wp.vec2``/``wp.vec3``/``wp.vec4`` (and the corresponding
-  int/uint variants) for sizes ``N`` in ``{2, 3, 4}`` where MSL has a
-  native ``floatN`` / ``intN`` etc. type. The constructor
-  (``wp.vec3(x, y, z)``) maps to ``floatN(...)``, ``[i]`` indexing maps
-  to MSL subscript, and ``wp.dot``/``wp.cross``/``wp.normalize``/
-  ``wp.length`` are added to the math whitelist as ``metal::*``. Reads
-  and writes of ``wp.array(dtype=wp.vec3)`` are expanded into per-
-  component scalar accesses (``a[i*3+0]``, ``a[i*3+1]``, ``a[i*3+2]``)
-  to avoid the address-space mismatches that ``packed_floatN`` pointer
-  casts hit in MLX-generated kernel wrappers. Multi-dim arrays of vec
-  types (``wp.array2d(dtype=wp.vec3)`` etc.) are also supported via
-  the same expansion combined with ``_flat_index_expr`` for the user-
-  visible dims.
+  int/uint variants) — native ``floatN`` / ``intN`` etc. in MSL.
+  Constructor maps to ``floatN(...)``, ``[i]`` indexing maps to MSL
+  subscript, and ``wp.dot``/``wp.cross``/``wp.normalize``/``wp.length``
+  are added to the math whitelist as ``metal::*``. Reads and writes of
+  ``wp.array(dtype=wp.vec3)`` are expanded into per-component scalar
+  accesses (``a[i*3+0]``, ``a[i*3+1]``, ``a[i*3+2]``) to avoid
+  ``packed_floatN`` cast issues. Multi-dim arrays of vec types
+  (``wp.array2d(dtype=wp.vec3)`` etc.) work via the same expansion plus
+  ``_flat_index_expr`` for the user-visible dims.
+- Larger vec types (``wp.vec5``, ``wp.spatial_vector`` = vec6,
+  ``wp.vec8``, ...) — MSL has no native ``floatN`` for N > 4, so the
+  codegen emits a custom ``wp_vec<N>_<scalar>`` struct in the kernel
+  header with ``+/-/*//`` operator overloads and a
+  ``wp_vec<N>_<scalar>_make(v0, v1, ...)`` factory. ``wp.spatial_top``
+  and ``wp.spatial_bottom`` translate to header helpers. Arrays and
+  struct fields of these types use the same per-component flat-buffer
+  expansion as native vec arrays.
 - Matrix types ``wp.mat22``/``wp.mat33``/``wp.mat44`` (and the
   corresponding int variants) for ``RxC`` with ``R, C`` in ``{2, 3, 4}``
   where MSL has a native ``floatRxC`` type. ``wp.transpose`` and
@@ -158,14 +163,48 @@ _WP_VEC_T_PAT = re.compile(r"wp::vec_t\s*<\s*(\d+)\s*,\s*wp::(\w+)\s*>")
 _WP_MAT_T_PAT = re.compile(r"wp::mat_t\s*<\s*(\d+)\s*,\s*(\d+)\s*,\s*wp::(\w+)\s*>")
 
 
+_MSL_VEC_NATIVE_N = (2, 3, 4)
+
+
+def _msl_vec_name(n: int, msl_scalar: str) -> str:
+    """Return the MSL type name for ``vec_t<N, T>`` given the MSL scalar prefix.
+
+    Native ``floatN`` etc. for N in {2, 3, 4}; ``wp_vecN_<scalar>`` otherwise.
+    """
+    if n in _MSL_VEC_NATIVE_N:
+        return f"{msl_scalar}{n}"
+    return f"wp_vec{n}_{msl_scalar}"
+
+
+def _msl_vec_ctor(n: int, msl_scalar: str) -> str:
+    """Return the constructor / factory expression name for ``vec_t<N, T>``.
+
+    For native sizes this matches the type name (``float3(a, b, c)``). For
+    big sizes we use a free factory function ``wp_vecN_<scalar>_make`` —
+    MSL doesn't let us declare a variadic struct constructor cleanly.
+    """
+    if n in _MSL_VEC_NATIVE_N:
+        return f"{msl_scalar}{n}"
+    return f"wp_vec{n}_{msl_scalar}_make"
+
+
 def _vec_t_to_msl(n: int, scalar_ctype: str) -> str:
-    """Translate ``wp::vec_t<N, wp::TYPE>`` to its MSL name (e.g. ``float3``)."""
-    if n not in _MSL_VEC_SUPPORTED_N:
-        raise MetalCodegenError(f"MSL codegen does not yet support vec{n} (only sizes 2, 3, 4 have native MSL types)")
+    """Translate ``wp::vec_t<N, wp::TYPE>`` to its MSL name.
+
+    For N in {2, 3, 4} this returns the native MSL type (``floatN`` etc.).
+    For larger N (vec5, vec6 = ``spatial_vector``, vec8) it returns a name
+    like ``wp_vec6_float`` for which the codegen emits a custom struct
+    declaration in the kernel header.
+    """
+    if n < 2:
+        raise MetalCodegenError(f"MSL codegen: vec_t<{n}, ...> not supported (need N >= 2)")
     full_ctype = f"wp::{scalar_ctype}"
     if full_ctype not in _MSL_VEC_SCALAR_PREFIX:
         raise MetalCodegenError(f"MSL codegen does not yet support vec_t element type {full_ctype!r}")
-    return f"{_MSL_VEC_SCALAR_PREFIX[full_ctype]}{n}"
+    msl_scalar = _MSL_VEC_SCALAR_PREFIX[full_ctype]
+    if n in _MSL_VEC_NATIVE_N:
+        return f"{msl_scalar}{n}"
+    return f"wp_vec{n}_{msl_scalar}"
 
 
 def _mat_t_to_msl(rows: int, cols: int, scalar_ctype: str) -> str:
@@ -210,6 +249,126 @@ def _translate_vec_t_in(text: str) -> str:
 #  - Reads from row-major array storage build columns by gathering strided
 #    elements; writes scatter back the same way (handled in
 #    ``generate_msl_kernel`` alongside vec arrays).
+
+
+# ---------------------------------------------------------------------------
+# Custom big-vec struct emission (vec5, vec6 = spatial_vector, vec8, ...)
+# ---------------------------------------------------------------------------
+#
+# MSL has no native ``floatN`` for N > 4. We emit a small custom struct per
+# ``(N, scalar)`` combination used by the kernel, with operator overloads so
+# the existing ``wp::add(a, b) -> (a + b)`` translations Just Work for the
+# resulting MSL types.
+_BIG_VEC_NAME_PAT = re.compile(r"\bwp_vec(\d+)_(\w+)\b")
+# Stripped scalar -> MSL scalar prefix lookup. Goes from "float" / "int" etc.
+# back to the same name (it's a no-op convenience map for clarity).
+_MSL_PREFIX_TO_SAME = {prefix: prefix for prefix in _MSL_VEC_SCALAR_PREFIX.values()}
+
+
+def _emit_big_vec_struct(name: str, n: int, msl_scalar: str) -> str:
+    """Emit the MSL declaration for a custom big-vec struct.
+
+    The struct has a plain N-element scalar array as its only data member,
+    plus operator overloads (+, -, * by scalar, /, [] for read+write, ==).
+    Each unrolled component-wise operation is generated explicitly so the
+    MSL compiler can vectorise without trusting an MSL ``for`` loop with a
+    runtime bound.
+    """
+    body_lines: list[str] = []
+    body_lines.append(f"struct {name} {{")
+    body_lines.append(f"    {msl_scalar} c[{n}];")
+    body_lines.append(f"    inline thread {msl_scalar}& operator[](int i) thread {{ return c[i]; }}")
+    body_lines.append(f"    inline {msl_scalar} operator[](int i) const thread {{ return c[i]; }}")
+    body_lines.append("};")
+    # Variadic-arg constructor: ``wp_vec6_float(v0, v1, ..., v5)`` so the
+    # existing IR ``wp::vec_t<6, ...>(...)`` (with the braces stripped) maps
+    # directly. We can't define a templated constructor on the struct in a
+    # forward-portable way, so emit a free factory function with the same
+    # name as the type — MSL allows ``wp_vec6_float(args...)`` to dispatch
+    # to a function of that name when no constructor matches.
+    args = ", ".join(f"{msl_scalar} v{i}" for i in range(n))
+    body_lines.append(f"inline {name} {name}_make({args}) {{")
+    body_lines.append(f"    {name} r;")
+    for i in range(n):
+        body_lines.append(f"    r.c[{i}] = v{i};")
+    body_lines.append("    return r;")
+    body_lines.append("}")
+    # Operator overloads. Component-wise unrolled for clarity and so MSL's
+    # auto-vectoriser sees independent statements.
+    for op in ("+", "-", "*", "/"):
+        body_lines.append(f"inline {name} operator{op}({name} a, {name} b) {{")
+        body_lines.append(f"    {name} r;")
+        for i in range(n):
+            body_lines.append(f"    r.c[{i}] = a.c[{i}] {op} b.c[{i}];")
+        body_lines.append("    return r;")
+        body_lines.append("}")
+    return "\n".join(body_lines)
+
+
+def _emit_spatial_helpers() -> str:
+    """Helpers that decompose a ``wp_vec6_float`` into its top/bottom vec3.
+
+    Mujoco-warp uses ``wp.spatial_top`` / ``wp.spatial_bottom`` extensively
+    on ``spatial_vector`` (= ``vec_t<6, float32>``).
+    """
+    return (
+        "inline float3 wp_spatial_top(wp_vec6_float v) { "
+        "return float3(v.c[0], v.c[1], v.c[2]); }\n"
+        "inline float3 wp_spatial_bottom(wp_vec6_float v) { "
+        "return float3(v.c[3], v.c[4], v.c[5]); }"
+    )
+
+
+def _build_kernel_header(source: str) -> str:
+    """Scan ``source`` for ``wp_vecN_<scalar>`` struct names and emit a
+    header block defining each unique one (plus spatial helpers if vec6
+    structs are present).
+    """
+    seen: set[tuple[int, str]] = set()
+    for m in _BIG_VEC_NAME_PAT.finditer(source):
+        n = int(m.group(1))
+        scalar = m.group(2)
+        if scalar not in _MSL_PREFIX_TO_SAME:
+            continue
+        if n in _MSL_VEC_NATIVE_N:
+            # Shouldn't happen — native sizes use the ``floatN`` form, not
+            # the custom name — but guard defensively.
+            continue
+        seen.add((n, scalar))
+    if not seen:
+        return ""
+    parts: list[str] = []
+    for n, scalar in sorted(seen):
+        parts.append(_emit_big_vec_struct(f"wp_vec{n}_{scalar}", n, scalar))
+    if (6, "float") in seen:
+        parts.append(_emit_spatial_helpers())
+    return "\n".join(parts) + "\n"
+
+
+def _rewrite_vec_t_brace_constructor(text: str) -> str:
+    """Rewrite ``wp::vec_t<N, wp::T>({v0, v1, ...})`` (the brace-init form
+    Warp's IR uses for vec5+) into a plain function-call constructor.
+
+    For native sizes (N in {2,3,4}) the result is ``floatN(v0, v1, ...)``;
+    for big sizes it's ``wp_vecN_<scalar>_make(v0, v1, ...)`` (a free
+    function we emit in the header — MSL doesn't let us define a variadic
+    struct constructor as cleanly).
+    """
+    pat = re.compile(r"wp::vec_t<\s*(\d+)\s*,\s*wp::(\w+)\s*>\s*\(\s*\{([^{}]*)\}\s*\)")
+
+    def repl(m: re.Match[str]) -> str:
+        n = int(m.group(1))
+        scalar_ctype = m.group(2)
+        args_str = m.group(3).strip()
+        full_ctype = f"wp::{scalar_ctype}"
+        if full_ctype not in _MSL_VEC_SCALAR_PREFIX or n < 2:
+            return m.group(0)
+        msl_scalar = _MSL_VEC_SCALAR_PREFIX[full_ctype]
+        if n in _MSL_VEC_NATIVE_N:
+            return f"{msl_scalar}{n}({args_str})"
+        return f"wp_vec{n}_{msl_scalar}_make({args_str})"
+
+    return pat.sub(repl, text)
 
 
 def _rewrite_mat_t_constructor(text: str) -> str:
@@ -396,6 +555,12 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     # ``var_n = wp::copy(var_loaded)``). For scalar / pointer types the copy
     # is just plain assignment.
     (re.compile(r"wp::copy\s*\(\s*([^()]+?)\s*\)"), r"\1"),
+    # ``wp::spatial_top(v)`` / ``wp::spatial_bottom(v)`` — extract the upper
+    # / lower vec3 of a ``spatial_vector`` (vec_t<6, float32>). The named
+    # helpers are emitted in the kernel header alongside the wp_vec6_float
+    # struct itself.
+    (re.compile(r"\bwp::spatial_top\b"), "wp_spatial_top"),
+    (re.compile(r"\bwp::spatial_bottom\b"), "wp_spatial_bottom"),
     # ``wp::extract(mat, i, j)`` (3-arg, matrix form) — must come BEFORE the
     # 2-arg vec form below, otherwise the non-greedy ``[^()]+?`` for the
     # second arg would swallow ``i, j`` together. MSL matrices are
@@ -569,6 +734,11 @@ class MetalKernelArtifact:
     # The launcher constructs ``mx.array(value.shape, dtype=int32)`` for each
     # of these and appends them to the MLX inputs list, in order.
     output_shape_inputs: list[str] = field(default_factory=list)
+    # MSL declarations to inject before the kernel function body — used for
+    # custom big-vec structs (vec5, vec6 = spatial_vector, vec8) that don't
+    # have native MSL ``floatN`` equivalents. Empty for kernels that only
+    # use native types.
+    header: str = ""
 
 
 def _strip_comments_and_directives(line: str) -> str | None:
@@ -916,13 +1086,13 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
                 # vec component is the innermost MLX dim, not part of the
                 # element index).
                 vec_n, msl_scalar = vec_arr_info[arr_arg]
-                msl_vec_type = f"{msl_scalar}{vec_n}"
+                msl_vec_ctor = _msl_vec_ctor(vec_n, msl_scalar)
                 if len(index_var_names) == 1:
                     elem_idx = index_var_names[0]
                 else:
                     elem_idx = f"({_flat_index_expr(arr_arg, index_var_names)})"
                 comps = [f"{arr_arg}[{elem_idx} * {vec_n} + {k}]" for k in range(vec_n)]
-                subscript_map[local_label] = f"{msl_vec_type}({', '.join(comps)})"
+                subscript_map[local_label] = f"{msl_vec_ctor}({', '.join(comps)})"
             elif arr_arg in mat_arr_info:
                 # Mat-typed array: each *element* is ``rows*cols`` consecutive
                 # row-major-stored scalars. Build the column-major MSL
@@ -1011,7 +1181,8 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
             subscript_map[field_local] = f"{arr_name}[{base}]"
         elif field_info.kind == _STRUCT_FIELD_KIND_VEC:
             comps = [f"{arr_name}[({base}) + {k}]" for k in range(field_info.size)]
-            subscript_map[field_local] = f"{field_info.msl_type}({', '.join(comps)})"
+            ctor = field_info.msl_type if field_info.size in _MSL_VEC_NATIVE_N else f"{field_info.msl_type}_make"
+            subscript_map[field_local] = f"{ctor}({', '.join(comps)})"
         elif field_info.kind == _STRUCT_FIELD_KIND_MAT:
             rows, cols = field_info.rows, field_info.cols
             msl_vec = field_info.msl_type.split("x")[0]  # e.g. "float3" from "float3x3"
@@ -1068,12 +1239,17 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
         # Re-run intrinsic translation in case ``wp::load(var_1)`` became
         # ``wp::load(arr[idx])``.
         translated = _translate_intrinsics(translated)
-        # Rewrite ``wp::mat_t<R, C, ...>(...)`` constructor calls first — the
-        # row-major flat args need reordering into column form. After that,
-        # any remaining ``wp::vec_t<N, ...>`` and ``wp::mat_t<R, C, ...>``
-        # bare type references are renamed (e.g. variable declarations,
-        # dangling type names).
+        # Rewrite ``wp::mat_t<R, C, ...>(...)`` constructor calls first —
+        # the row-major flat args need reordering into column form.
+        # Likewise, ``wp::vec_t<N, ...>({v0, v1, ...})`` (the brace form
+        # Warp uses for vec5+) needs the braces stripped and the type
+        # renamed before the bare-type translator below sees it.
         translated = _rewrite_mat_t_constructor(translated)
+        translated = _rewrite_vec_t_brace_constructor(translated)
+        # Bare ``wp::vec_t<N, ...>`` and ``wp::mat_t<R, C, ...>`` type
+        # references (in declarations etc.) get renamed to the MSL native
+        # type for native sizes, or our custom ``wp_vecN_<scalar>`` for big
+        # sizes.
         translated = _translate_vec_t_in(translated)
         # Rename ``var_<argname>`` -> ``<argname>`` so the body matches the
         # MLX-generated function signature (which uses the names from
@@ -1237,6 +1413,8 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
     base_input_names = [a.label for a in input_args]
     extra_input_names = [f"{name}_shape" for name in output_shape_inputs]
 
+    header = _build_kernel_header(source)
+
     return MetalKernelArtifact(
         name=adj.fun_name,
         source=source,
@@ -1246,6 +1424,7 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
         output_args=output_args,
         atomic_outputs=has_atomic,
         output_shape_inputs=output_shape_inputs,
+        header=header,
     )
 
 
@@ -1290,10 +1469,8 @@ def _vec_dtype_info(arg) -> tuple[int, str] | None:
     scalar_cls = getattr(dtype, "_wp_scalar_type_", None)
     if n is None or scalar_cls is None:
         return None
-    if n not in _MSL_VEC_SUPPORTED_N:
-        raise MetalCodegenError(
-            f"MSL codegen does not yet support arrays of vec{n} (only sizes 2, 3, 4 have native MSL types)"
-        )
+    if n < 2:
+        raise MetalCodegenError(f"MSL codegen does not support vec{n} (need N >= 2)")
     scalar_ctype = f"wp::{scalar_cls.__name__}"
     if scalar_ctype not in _MSL_VEC_SCALAR_PREFIX:
         raise MetalCodegenError(f"MSL codegen does not yet support arrays of vec_t with element type {scalar_ctype!r}")
@@ -1377,9 +1554,10 @@ def _classify_struct_field(fname: str, ftype) -> tuple[str, int, str, int, int]:
         n = int(ftype._length_)
         scalar_cls = ftype._wp_scalar_type_
         scalar_ctype = f"wp::{scalar_cls.__name__}"
-        if n not in _MSL_VEC_SUPPORTED_N or scalar_ctype not in _MSL_VEC_SCALAR_PREFIX:
+        if n < 2 or scalar_ctype not in _MSL_VEC_SCALAR_PREFIX:
             raise MetalCodegenError(f"MSL codegen does not support vec field {fname!r} of {ftype!r} in a struct")
-        return _STRUCT_FIELD_KIND_VEC, n, f"{_MSL_VEC_SCALAR_PREFIX[scalar_ctype]}{n}", 0, 0
+        msl_scalar = _MSL_VEC_SCALAR_PREFIX[scalar_ctype]
+        return _STRUCT_FIELD_KIND_VEC, n, _msl_vec_name(n, msl_scalar), 0, 0
     # mat_t
     if getattr(ftype, "_wp_generic_type_str_", None) == "mat_t":
         rows, cols = int(ftype._shape_[0]), int(ftype._shape_[1])
@@ -1532,6 +1710,7 @@ def _get_or_build_metal_kernel(kernel):
             output_names=artifact.output_names,
             source=artifact.source,
             atomic_outputs=artifact.atomic_outputs,
+            header=artifact.header,
         )
         kernel._metal_artifact = artifact
         kernel._metal_mlx_kernel = mlx_kernel

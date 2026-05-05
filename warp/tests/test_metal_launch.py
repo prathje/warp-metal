@@ -1580,6 +1580,87 @@ class TestMetalLaunch(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet)
 
+    def test_spatial_vector_round_trip_matches_cpu(self):
+        # ``wp.spatial_vector`` is ``vec_t<6, float32>`` — sized beyond MSL's
+        # native ``floatN`` (N <= 4). Codegen emits a custom ``wp_vec6_float``
+        # struct in the kernel ``header`` parameter with ``+/-/*//``
+        # operator overloads and ``wp_spatial_top`` / ``wp_spatial_bottom``
+        # helpers. Verifies all three patterns (construct / add / top+bottom)
+        # produce bit-exact CPU vs Metal output.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def construct(a: wp.array(dtype=wp.vec3),
+                          b: wp.array(dtype=wp.vec3),
+                          out: wp.array(dtype=wp.spatial_vector)):
+                tid = wp.tid()
+                out[tid] = wp.spatial_vector(a[tid][0], a[tid][1], a[tid][2],
+                                             b[tid][0], b[tid][1], b[tid][2])
+
+            @wp.kernel
+            def add(a: wp.array(dtype=wp.spatial_vector),
+                    b: wp.array(dtype=wp.spatial_vector),
+                    c: wp.array(dtype=wp.spatial_vector)):
+                tid = wp.tid()
+                c[tid] = a[tid] + b[tid]
+
+            @wp.kernel
+            def top_bottom(s: wp.array(dtype=wp.spatial_vector),
+                           top: wp.array(dtype=wp.vec3),
+                           bottom: wp.array(dtype=wp.vec3)):
+                tid = wp.tid()
+                top[tid] = wp.spatial_top(s[tid])
+                bottom[tid] = wp.spatial_bottom(s[tid])
+
+            N = 32
+            rng = np.random.default_rng(0)
+            an = rng.standard_normal((N, 3)).astype(np.float32)
+            bn = rng.standard_normal((N, 3)).astype(np.float32)
+            sn2 = rng.standard_normal((N, 6)).astype(np.float32)
+
+            for dev in ('cpu', 'metal:0'):
+                a3 = wp.array(an, dtype=wp.vec3, device=dev)
+                b3 = wp.array(bn, dtype=wp.vec3, device=dev)
+                sv = wp.zeros(N, dtype=wp.spatial_vector, device=dev)
+                wp.launch(construct, dim=N, inputs=[a3, b3], outputs=[sv], device=dev)
+                if dev == 'cpu':
+                    cpu_sv = sv.numpy()
+                else:
+                    np.testing.assert_array_equal(sv.numpy(), cpu_sv)
+
+                sv2 = wp.array(sn2, dtype=wp.spatial_vector, device=dev)
+                sum_arr = wp.zeros(N, dtype=wp.spatial_vector, device=dev)
+                wp.launch(add, dim=N,
+                          inputs=[wp.array(cpu_sv, dtype=wp.spatial_vector, device=dev), sv2],
+                          outputs=[sum_arr], device=dev)
+                if dev == 'cpu':
+                    cpu_sum = sum_arr.numpy()
+                else:
+                    np.testing.assert_array_equal(sum_arr.numpy(), cpu_sum)
+
+                top_arr = wp.zeros(N, dtype=wp.vec3, device=dev)
+                bot_arr = wp.zeros(N, dtype=wp.vec3, device=dev)
+                wp.launch(top_bottom, dim=N, inputs=[sv],
+                          outputs=[top_arr, bot_arr], device=dev)
+                if dev == 'cpu':
+                    cpu_top = top_arr.numpy()
+                    cpu_bot = bot_arr.numpy()
+                else:
+                    np.testing.assert_array_equal(top_arr.numpy(), cpu_top)
+                    np.testing.assert_array_equal(bot_arr.numpy(), cpu_bot)
+            # Sanity: the construct kernel's output equals concat of (an, bn).
+            np.testing.assert_array_equal(cpu_sv,
+                                          np.concatenate([an, bn], axis=1))
+            # Sanity: top is the first 3 components, bottom is the last 3.
+            np.testing.assert_array_equal(cpu_top, an)
+            np.testing.assert_array_equal(cpu_bot, bn)
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=60)
+
     def test_rejects_adjoint_launch(self):
         snippet = textwrap.dedent(
             """
