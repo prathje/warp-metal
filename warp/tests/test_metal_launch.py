@@ -1141,6 +1141,167 @@ class TestMetalLaunch(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet)
 
+    def test_mat33_add_matches_cpu(self):
+        # Element-wise mat33 add. Bit-exact (single fp32 add per component,
+        # no reordering).
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(a: wp.array(dtype=wp.mat33),
+                  b: wp.array(dtype=wp.mat33),
+                  c: wp.array(dtype=wp.mat33)):
+                tid = wp.tid()
+                c[tid] = a[tid] + b[tid]
+
+            N = 64
+            rng = np.random.default_rng(0)
+            an = rng.standard_normal((N, 3, 3)).astype(np.float32)
+            bn = rng.standard_normal((N, 3, 3)).astype(np.float32)
+            c_cpu = wp.zeros(N, dtype=wp.mat33, device='cpu')
+            c_m = wp.zeros(N, dtype=wp.mat33, device='metal:0')
+            wp.launch(k, dim=N,
+                      inputs=[wp.array(an, dtype=wp.mat33, device='cpu'),
+                              wp.array(bn, dtype=wp.mat33, device='cpu')],
+                      outputs=[c_cpu], device='cpu')
+            wp.launch(k, dim=N,
+                      inputs=[wp.array(an, dtype=wp.mat33, device='metal:0'),
+                              wp.array(bn, dtype=wp.mat33, device='metal:0')],
+                      outputs=[c_m], device='metal:0')
+            np.testing.assert_array_equal(c_cpu.numpy(), c_m.numpy())
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_mat33_extract_2d_index_matches_cpu(self):
+        # ``m[i, j]`` -> 3-arg ``wp::extract`` -> MSL ``m[j][i]`` (column-then-
+        # row). Computes the trace, which uses three diagonal extracts.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(a: wp.array(dtype=wp.mat33), out: wp.array(dtype=wp.float32)):
+                tid = wp.tid()
+                m = a[tid]
+                out[tid] = m[0, 0] + m[1, 1] + m[2, 2]
+
+            N = 32
+            rng = np.random.default_rng(11)
+            an = rng.standard_normal((N, 3, 3)).astype(np.float32)
+            out_cpu = wp.zeros(N, dtype=wp.float32, device='cpu')
+            out_m = wp.zeros(N, dtype=wp.float32, device='metal:0')
+            wp.launch(k, dim=N,
+                      inputs=[wp.array(an, dtype=wp.mat33, device='cpu')],
+                      outputs=[out_cpu], device='cpu')
+            wp.launch(k, dim=N,
+                      inputs=[wp.array(an, dtype=wp.mat33, device='metal:0')],
+                      outputs=[out_m], device='metal:0')
+            np.testing.assert_array_equal(out_cpu.numpy(), out_m.numpy())
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_mat33_transpose_matches_cpu(self):
+        # ``wp.transpose`` -> ``metal::transpose``. Verifies the row/col
+        # convention end-to-end: store a row-major matrix, transpose it on
+        # the GPU, copy back to row-major storage; the result should match
+        # ``np.transpose`` of the input array.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(a: wp.array(dtype=wp.mat33), out: wp.array(dtype=wp.mat33)):
+                tid = wp.tid()
+                out[tid] = wp.transpose(a[tid])
+
+            N = 32
+            rng = np.random.default_rng(7)
+            an = rng.standard_normal((N, 3, 3)).astype(np.float32)
+            out_cpu = wp.zeros(N, dtype=wp.mat33, device='cpu')
+            out_m = wp.zeros(N, dtype=wp.mat33, device='metal:0')
+            wp.launch(k, dim=N,
+                      inputs=[wp.array(an, dtype=wp.mat33, device='cpu')],
+                      outputs=[out_cpu], device='cpu')
+            wp.launch(k, dim=N,
+                      inputs=[wp.array(an, dtype=wp.mat33, device='metal:0')],
+                      outputs=[out_m], device='metal:0')
+            np.testing.assert_array_equal(out_cpu.numpy(), out_m.numpy())
+            # Sanity: the result really is the transpose of the input.
+            np.testing.assert_array_equal(out_cpu.numpy(), np.transpose(an, (0, 2, 1)))
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_mat33_vec3_mul_matches_cpu(self):
+        # M*v: depends on the row-major-storage / column-major-MSL convention
+        # being correct. Float-summation-order tolerance because Metal/CPU
+        # may schedule the dot products differently.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(m: wp.array(dtype=wp.mat33),
+                  v: wp.array(dtype=wp.vec3),
+                  out: wp.array(dtype=wp.vec3)):
+                tid = wp.tid()
+                out[tid] = m[tid] * v[tid]
+
+            N = 32
+            rng = np.random.default_rng(99)
+            mn = rng.standard_normal((N, 3, 3)).astype(np.float32)
+            vn = rng.standard_normal((N, 3)).astype(np.float32)
+            out_cpu = wp.zeros(N, dtype=wp.vec3, device='cpu')
+            out_m = wp.zeros(N, dtype=wp.vec3, device='metal:0')
+            wp.launch(k, dim=N,
+                      inputs=[wp.array(mn, dtype=wp.mat33, device='cpu'),
+                              wp.array(vn, dtype=wp.vec3, device='cpu')],
+                      outputs=[out_cpu], device='cpu')
+            wp.launch(k, dim=N,
+                      inputs=[wp.array(mn, dtype=wp.mat33, device='metal:0'),
+                              wp.array(vn, dtype=wp.vec3, device='metal:0')],
+                      outputs=[out_m], device='metal:0')
+            np.testing.assert_allclose(out_cpu.numpy(), out_m.numpy(), rtol=1e-4, atol=1e-6)
+            # Sanity: result equals NumPy ``M @ v`` row-by-row.
+            ref = np.einsum('nij,nj->ni', mn, vn)
+            np.testing.assert_allclose(out_cpu.numpy(), ref, rtol=1e-4, atol=1e-5)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_mat33_identity_constructor_matches_cpu(self):
+        # Constructor with row-major flat args has to be reordered into
+        # column form for MSL to read correctly.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(out: wp.array(dtype=wp.mat33)):
+                tid = wp.tid()
+                out[tid] = wp.mat33(1.0, 0.0, 0.0,
+                                    0.0, 1.0, 0.0,
+                                    0.0, 0.0, 1.0)
+
+            N = 16
+            out_cpu = wp.zeros(N, dtype=wp.mat33, device='cpu')
+            out_m = wp.zeros(N, dtype=wp.mat33, device='metal:0')
+            wp.launch(k, dim=N, outputs=[out_cpu], device='cpu')
+            wp.launch(k, dim=N, outputs=[out_m], device='metal:0')
+            np.testing.assert_array_equal(out_cpu.numpy(), out_m.numpy())
+            np.testing.assert_array_equal(out_m.numpy()[0], np.eye(3, dtype=np.float32))
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
     def test_rejects_adjoint_launch(self):
         snippet = textwrap.dedent(
             """

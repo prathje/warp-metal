@@ -51,6 +51,16 @@ pointer to the offending statement):
   to avoid the address-space mismatches that ``packed_floatN`` pointer
   casts hit in MLX-generated kernel wrappers. Multi-dim arrays of vec
   types are not yet supported.
+- Matrix types ``wp.mat22``/``wp.mat33``/``wp.mat44`` (and the
+  corresponding int variants) for ``RxC`` with ``R, C`` in ``{2, 3, 4}``
+  where MSL has a native ``floatRxC`` type. ``wp.transpose`` and
+  ``wp.determinant`` route to ``metal::*``. ``wp.mat33(...)`` row-major
+  flat constructor is reordered into ``floatRxC(floatR(...), ...)``
+  column form. ``wp::extract(m, i, j)`` becomes ``m[j][i]`` to match
+  MSL's column-major indexing. Reads/writes of ``wp.array(dtype=wp.mat33)``
+  scatter/gather between row-major user storage and the column-major
+  MSL representation. Multi-dim arrays of mat types are not yet
+  supported.
 """
 
 from __future__ import annotations
@@ -114,6 +124,8 @@ _MSL_VEC_SUPPORTED_N = (2, 3, 4)
 # Pattern that matches ``wp::vec_t<N, wp::TYPE>`` — used both to translate
 # variable ctypes (declarations) and constructor expressions inside the body.
 _WP_VEC_T_PAT = re.compile(r"wp::vec_t\s*<\s*(\d+)\s*,\s*wp::(\w+)\s*>")
+# Pattern that matches ``wp::mat_t<R, C, wp::TYPE>``.
+_WP_MAT_T_PAT = re.compile(r"wp::mat_t\s*<\s*(\d+)\s*,\s*(\d+)\s*,\s*wp::(\w+)\s*>")
 
 
 def _vec_t_to_msl(n: int, scalar_ctype: str) -> str:
@@ -126,9 +138,79 @@ def _vec_t_to_msl(n: int, scalar_ctype: str) -> str:
     return f"{_MSL_VEC_SCALAR_PREFIX[full_ctype]}{n}"
 
 
+def _mat_t_to_msl(rows: int, cols: int, scalar_ctype: str) -> str:
+    """Translate ``wp::mat_t<R, C, wp::TYPE>`` to its MSL name (e.g. ``float3x3``)."""
+    if rows not in _MSL_VEC_SUPPORTED_N or cols not in _MSL_VEC_SUPPORTED_N:
+        raise MetalCodegenError(
+            f"MSL codegen does not yet support mat{rows}x{cols} (only sizes 2, 3, 4 per dim have native MSL types)"
+        )
+    full_ctype = f"wp::{scalar_ctype}"
+    if full_ctype not in _MSL_VEC_SCALAR_PREFIX:
+        raise MetalCodegenError(f"MSL codegen does not yet support mat_t element type {full_ctype!r}")
+    return f"{_MSL_VEC_SCALAR_PREFIX[full_ctype]}{rows}x{cols}"
+
+
 def _translate_vec_t_in(text: str) -> str:
-    """Replace every ``wp::vec_t<N, wp::TYPE>`` occurrence in ``text``."""
-    return _WP_VEC_T_PAT.sub(lambda m: _vec_t_to_msl(int(m.group(1)), m.group(2)), text)
+    """Replace every ``wp::vec_t<N, ...>`` and ``wp::mat_t<R, C, ...>`` reference
+    in ``text`` with the MSL native type name (``float3``, ``float3x3``, etc.).
+    Constructor calls are rewritten elsewhere (see ``_rewrite_mat_t_constructor``)
+    because the row-major-to-column-major arg reorder differs from the simple
+    name substitution this function does.
+    """
+    text = _WP_VEC_T_PAT.sub(lambda m: _vec_t_to_msl(int(m.group(1)), m.group(2)), text)
+    text = _WP_MAT_T_PAT.sub(lambda m: _mat_t_to_msl(int(m.group(1)), int(m.group(2)), m.group(3)), text)
+    return text
+
+
+# ---------------------------------------------------------------------------
+# Matrix constructor and storage layout
+# ---------------------------------------------------------------------------
+#
+# MSL matrices are column-major: ``m[col][row]`` (so ``mat[0]`` is the first
+# column as a vector). Warp stores matrices row-major in array buffers and
+# the IR's ``wp::mat_t<R, C, T>(v00, v01, v02, v10, ...)`` constructor takes
+# row-major flat args.
+#
+# Convention: keep the *logical* matrix the same on both sides. MSL column
+# ``k`` corresponds to logical column ``k``. So ``m * v``, ``m1 * m2``, and
+# ``transpose(m)`` all work with native MSL operators. The trade-off:
+#  - The constructor must reorder row-major args into column form
+#    (handled by ``_rewrite_mat_t_constructor``).
+#  - ``wp::extract(m, i, j)`` (row i, col j) becomes ``m[j][i]`` in MSL.
+#  - Reads from row-major array storage build columns by gathering strided
+#    elements; writes scatter back the same way (handled in
+#    ``generate_msl_kernel`` alongside vec arrays).
+
+
+def _rewrite_mat_t_constructor(text: str) -> str:
+    """Rewrite ``wp::mat_t<R, C, wp::T>(v00, v01, ..., v(R-1)(C-1))`` (row-major
+    flat) into ``floatRxC(floatR(v00, v10, ...), floatR(v01, v11, ...), ...)``.
+
+    Constructors with the wrong arg count or unsupported types are left
+    untouched; the unsupported-intrinsic guard catches them downstream.
+    """
+    pat = re.compile(r"wp::mat_t<\s*(\d+)\s*,\s*(\d+)\s*,\s*wp::(\w+)\s*>\s*\(([^()]*)\)")
+
+    def repl(m: re.Match[str]) -> str:
+        rows, cols = int(m.group(1)), int(m.group(2))
+        scalar = m.group(3)
+        args_str = m.group(4)
+        args = [a.strip() for a in args_str.split(",") if a.strip()]
+        if len(args) != rows * cols:
+            return m.group(0)
+        full_ctype = f"wp::{scalar}"
+        if full_ctype not in _MSL_VEC_SCALAR_PREFIX or rows not in _MSL_VEC_SUPPORTED_N:
+            return m.group(0)
+        msl_scalar = _MSL_VEC_SCALAR_PREFIX[full_ctype]
+        msl_vec = f"{msl_scalar}{rows}"
+        msl_mat = f"{msl_scalar}{rows}x{cols}"
+        col_strs: list[str] = []
+        for c in range(cols):
+            col_components = [args[r * cols + c] for r in range(rows)]
+            col_strs.append(f"{msl_vec}({', '.join(col_components)})")
+        return f"{msl_mat}({', '.join(col_strs)})"
+
+    return pat.sub(repl, text)
 
 
 # Pointer ctypes have a ``*`` suffix; address-space qualifier in MSL is
@@ -137,7 +219,7 @@ _POINTER_ADDRESS_SPACE = "device"
 
 
 def _msl_scalar_type(ctype: str) -> str:
-    """Translate a Warp scalar/vector ctype string to its MSL equivalent.
+    """Translate a Warp scalar / vector / matrix ctype string to its MSL equivalent.
 
     Raises ``MetalCodegenError`` for types MSL cannot represent natively
     (notably ``wp::float64`` — Apple Silicon GPUs have no double-precision
@@ -145,10 +227,15 @@ def _msl_scalar_type(ctype: str) -> str:
     """
     if ctype == "wp::float64":
         raise MetalCodegenError("MSL has no native float64; double-precision kernels cannot be lowered to Metal")
+    stripped = ctype.strip()
     # ``wp::vec_t<N, wp::TYPE>`` -> ``floatN`` / ``intN`` / etc.
-    m = _WP_VEC_T_PAT.fullmatch(ctype.strip())
+    m = _WP_VEC_T_PAT.fullmatch(stripped)
     if m:
         return _vec_t_to_msl(int(m.group(1)), m.group(2))
+    # ``wp::mat_t<R, C, wp::TYPE>`` -> ``floatRxC`` / ``intRxC`` / etc.
+    m = _WP_MAT_T_PAT.fullmatch(stripped)
+    if m:
+        return _mat_t_to_msl(int(m.group(1)), int(m.group(2)), m.group(3))
     if ctype not in _SCALAR_CTYPE_TO_MSL:
         raise MetalCodegenError(f"MSL codegen: unsupported scalar ctype {ctype!r}")
     return _SCALAR_CTYPE_TO_MSL[ctype]
@@ -231,6 +318,9 @@ _MATH_BUILTIN_NAMES: tuple[str, ...] = (
     "normalize",
     "length",
     "distance",
+    # Matrix ops (defined on MSL floatRxC etc.).
+    "transpose",
+    "determinant",
 )
 
 
@@ -274,6 +364,14 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     # ``var_n = wp::copy(var_loaded)``). For scalar / pointer types the copy
     # is just plain assignment.
     (re.compile(r"wp::copy\s*\(\s*([^()]+?)\s*\)"), r"\1"),
+    # ``wp::extract(mat, i, j)`` (3-arg, matrix form) — must come BEFORE the
+    # 2-arg vec form below, otherwise the non-greedy ``[^()]+?`` for the
+    # second arg would swallow ``i, j`` together. MSL matrices are
+    # column-major (``m[col][row]``), so the row/col arg order is reversed.
+    (
+        re.compile(r"wp::extract\s*\(\s*([^,()]+?)\s*,\s*([^,()]+?)\s*,\s*([^,()]+?)\s*\)"),
+        r"\1[\3][\2]",
+    ),
     # ``wp::extract(vec, idx)`` returns the i-th component. MSL vector types
     # support the C-style ``[i]`` subscript directly.
     (re.compile(r"wp::extract\s*\(\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)"), r"\1[\2]"),
@@ -693,12 +791,18 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
     # ``floatN(arr[i*N+0], arr[i*N+1], ...)`` instead of any cast trick.
     arg_label_set = {a.label for a in adj.args}
     arg_by_label = {a.label: a for a in adj.args}
-    # Map argname -> (vec_size, msl_scalar) for each vec-typed array arg.
+    # Map argname -> (vec_size, msl_scalar) for each vec-typed array arg, and
+    # argname -> (rows, cols, msl_scalar) for each mat-typed array arg.
     vec_arr_info: dict[str, tuple[int, str]] = {}
+    mat_arr_info: dict[str, tuple[int, int, str]] = {}
     for arg in adj.args:
-        info = _vec_dtype_info(arg)
-        if info is not None:
-            vec_arr_info[arg.label] = info
+        v_info = _vec_dtype_info(arg)
+        if v_info is not None:
+            vec_arr_info[arg.label] = v_info
+            continue
+        m_info = _mat_dtype_info(arg)
+        if m_info is not None:
+            mat_arr_info[arg.label] = m_info
 
     subscript_map: dict[str, str] = {}  # local label -> "arr[flat_idx]" string
     for raw in forward_lines:
@@ -724,6 +828,27 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
                 idx = index_var_names[0]
                 comps = [f"{arr_arg}[{idx} * {vec_n} + {k}]" for k in range(vec_n)]
                 subscript_map[local_label] = f"{msl_vec_type}({', '.join(comps)})"
+            elif arr_arg in mat_arr_info:
+                # Mat-typed: only 1-D arrays of mat are currently supported.
+                # Read row-major flat (rows*cols floats per element) and build
+                # an MSL ``floatRxC`` whose column k = (M[0][k], M[1][k], ...).
+                arg_var = arg_by_label[arr_arg]
+                arr_ndim = getattr(arg_var.type, "ndim", 1) or 1
+                if arr_ndim != 1 or len(index_var_names) != 1:
+                    raise MetalCodegenError(
+                        f"MSL codegen does not yet support multi-dim arrays of mat types "
+                        f"(kernel {adj.fun_name!r} arg {arr_arg!r})"
+                    )
+                rows, cols, msl_scalar = mat_arr_info[arr_arg]
+                stride = rows * cols
+                msl_vec_type = f"{msl_scalar}{rows}"
+                msl_mat_type = f"{msl_scalar}{rows}x{cols}"
+                idx = index_var_names[0]
+                col_strs: list[str] = []
+                for c in range(cols):
+                    col_components = [f"{arr_arg}[{idx} * {stride} + {r * cols + c}]" for r in range(rows)]
+                    col_strs.append(f"{msl_vec_type}({', '.join(col_components)})")
+                subscript_map[local_label] = f"{msl_mat_type}({', '.join(col_strs)})"
             else:
                 subscript_map[local_label] = f"{arr_arg}[{_flat_index_expr(arr_arg, index_var_names)}]"
 
@@ -758,9 +883,12 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
         # Re-run intrinsic translation in case ``wp::load(var_1)`` became
         # ``wp::load(arr[idx])``.
         translated = _translate_intrinsics(translated)
-        # Rewrite any remaining ``wp::vec_t<N, wp::TYPE>`` as the MSL native
-        # type (``float3`` etc.). This catches constructor calls like
-        # ``var_4 = wp::vec_t<3, wp::float32>(a, b, c);`` -> ``var_4 = float3(a, b, c);``.
+        # Rewrite ``wp::mat_t<R, C, ...>(...)`` constructor calls first — the
+        # row-major flat args need reordering into column form. After that,
+        # any remaining ``wp::vec_t<N, ...>`` and ``wp::mat_t<R, C, ...>``
+        # bare type references are renamed (e.g. variable declarations,
+        # dangling type names).
+        translated = _rewrite_mat_t_constructor(translated)
         translated = _translate_vec_t_in(translated)
         # Rename ``var_<argname>`` -> ``<argname>`` so the body matches the
         # MLX-generated function signature (which uses the names from
@@ -821,6 +949,25 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
                     idx = indices[0]
                     for k in range(vec_n):
                         body_lines.append(_finalize(f"{indent}{arr}[{idx} * {vec_n} + {k}] = {value}[{k}];"))
+                    continue
+                if arr in mat_arr_info:
+                    arg_var = arg_by_label[arr]
+                    arr_ndim = getattr(arg_var.type, "ndim", 1) or 1
+                    if arr_ndim != 1 or len(indices) != 1:
+                        raise MetalCodegenError(
+                            f"MSL codegen does not yet support stores into multi-dim arrays of mat types "
+                            f"(kernel {adj.fun_name!r} arg {arr!r})"
+                        )
+                    rows, cols, _ = mat_arr_info[arr]
+                    stride = rows * cols
+                    idx = indices[0]
+                    # Scatter to row-major storage: data[i*RC + r*C + c] =
+                    # logical M[r][c] = MSL ``value[c][r]`` (column, then row).
+                    for r in range(rows):
+                        for c in range(cols):
+                            body_lines.append(
+                                _finalize(f"{indent}{arr}[{idx} * {stride} + {r * cols + c}] = {value}[{c}][{r}];")
+                            )
                     continue
                 flat_idx = _flat_index_expr(arr, indices)
                 body_lines.append(_finalize(f"{indent}{arr}[{flat_idx}] = {value};"))
@@ -897,6 +1044,33 @@ def _vec_dtype_info(arg) -> tuple[int, str] | None:
     return n, _MSL_VEC_SCALAR_PREFIX[scalar_ctype]
 
 
+def _mat_dtype_info(arg) -> tuple[int, int, str] | None:
+    """If ``arg`` is a ``wp.array`` whose element type is a Warp mat_t, return
+    ``(rows, cols, msl_scalar_type)``. Otherwise return ``None``.
+    """
+    if not _is_array_arg(arg):
+        return None
+    dtype = getattr(arg.type, "dtype", None)
+    if dtype is None:
+        return None
+    if getattr(dtype, "_wp_generic_type_str_", None) != "mat_t":
+        return None
+    shape = getattr(dtype, "_shape_", None)
+    scalar_cls = getattr(dtype, "_wp_scalar_type_", None)
+    if shape is None or len(shape) != 2 or scalar_cls is None:
+        return None
+    rows, cols = int(shape[0]), int(shape[1])
+    if rows not in _MSL_VEC_SUPPORTED_N or cols not in _MSL_VEC_SUPPORTED_N:
+        raise MetalCodegenError(
+            f"MSL codegen does not yet support arrays of mat{rows}x{cols} "
+            f"(only sizes 2, 3, 4 per dim have native MSL types)"
+        )
+    scalar_ctype = f"wp::{scalar_cls.__name__}"
+    if scalar_ctype not in _MSL_VEC_SCALAR_PREFIX:
+        raise MetalCodegenError(f"MSL codegen does not yet support arrays of mat_t with element type {scalar_ctype!r}")
+    return rows, cols, _MSL_VEC_SCALAR_PREFIX[scalar_ctype]
+
+
 # ---------------------------------------------------------------------------
 # Launch path (step 3d)
 # ---------------------------------------------------------------------------
@@ -942,13 +1116,23 @@ def _array_view_dtype_and_shape(value):
     storage is ``value.size * vec_size`` scalars, exposed to MLX as a flat
     ``(*value.shape, vec_size)`` of the inner scalar dtype. The kernel-side
     body computes per-component indices itself.
+
+    For mat-typed arrays (``wp.array(dtype=wp.mat33)`` etc.), the storage is
+    ``value.size * rows * cols`` scalars in row-major layout, exposed as
+    ``(*value.shape, rows * cols)`` of the inner scalar dtype.
     """
     dtype = value.dtype
-    if getattr(dtype, "_wp_generic_type_str_", None) == "vec_t":
+    kind = getattr(dtype, "_wp_generic_type_str_", None)
+    if kind == "vec_t":
         n = dtype._length_
         scalar_cls = dtype._wp_scalar_type_
         mx_dtype = _wp_dtype_to_mx_dtype(scalar_cls)
         return mx_dtype, (*value.shape, n)
+    if kind == "mat_t":
+        rows, cols = dtype._shape_
+        scalar_cls = dtype._wp_scalar_type_
+        mx_dtype = _wp_dtype_to_mx_dtype(scalar_cls)
+        return mx_dtype, (*value.shape, rows * cols)
     return _wp_dtype_to_mx_dtype(dtype), value.shape
 
 
