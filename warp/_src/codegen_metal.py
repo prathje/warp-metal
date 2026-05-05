@@ -36,6 +36,14 @@ pointer to the offending statement):
   ``log``, ``sin``, ``cos``, ``tanh``, ``clamp``, etc. — translated to
   MSL's ``metal::`` namespace.
 - ``wp.where(cond, a, b)`` -> ``((cond) ? (a) : (b))`` (C-style ternary).
+- Read-only field access on ``wp.array(dtype=SomeStruct)`` for POD structs
+  whose fields are scalars / vec / mat with 4-byte scalar width (float32 /
+  int32 / uint32 / float16 / etc.). No MSL ``struct`` is emitted; instead
+  each field read expands to direct flat-buffer accesses at the field's
+  offset. Currently NOT supported: local struct construction
+  (``q = SomeStruct()``), struct-typed kernel args, stores of struct
+  values into arrays, struct fields of mixed scalar widths or nested
+  structs / array fields.
 - ``for i in range(...)`` loops, both static (Warp unrolls them, so this
   is a no-op) and dynamic (a structural pre-pass rewrites Warp's
   ``goto``-based loop into a real MSL ``for``).
@@ -814,10 +822,12 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
     # ``floatN(arr[i*N+0], arr[i*N+1], ...)`` instead of any cast trick.
     arg_label_set = {a.label for a in adj.args}
     arg_by_label = {a.label: a for a in adj.args}
-    # Map argname -> (vec_size, msl_scalar) for each vec-typed array arg, and
-    # argname -> (rows, cols, msl_scalar) for each mat-typed array arg.
+    # Map argname -> (vec_size, msl_scalar) for each vec-typed array arg,
+    # argname -> (rows, cols, msl_scalar) for each mat-typed array arg, and
+    # argname -> _StructLayout for each struct-typed array arg.
     vec_arr_info: dict[str, tuple[int, str]] = {}
     mat_arr_info: dict[str, tuple[int, int, str]] = {}
+    struct_arr_info: dict[str, _StructLayout] = {}
     for arg in adj.args:
         v_info = _vec_dtype_info(arg)
         if v_info is not None:
@@ -826,6 +836,10 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
         m_info = _mat_dtype_info(arg)
         if m_info is not None:
             mat_arr_info[arg.label] = m_info
+            continue
+        s_info = _struct_dtype_info(arg)
+        if s_info is not None:
+            struct_arr_info[arg.label] = s_info
 
     subscript_map: dict[str, str] = {}  # local label -> "arr[flat_idx]" string
     # Locals that resolve to ``<arr>_shape`` (the MLX-supplied shape array).
@@ -861,6 +875,11 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
                 subscript_map[target_label] = subscript_map[source_label]
                 shape_aliases.add(target_label)
 
+    # Track ``var_X = wp::address(var_struct_arr, var_idx);`` so the struct
+    # field-pointer pass below can resolve ``var_X->field`` back to the
+    # array+index pair.
+    struct_refs: dict[str, tuple[str, str]] = {}  # local_label -> (arr_name, elem_idx_expr)
+
     for raw in forward_lines:
         m = _ADDRESS_MULTI_PAT.match(raw)
         if m:
@@ -870,6 +889,16 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
                 continue
             indices = re.findall(r"var_(\w+)", m.group("rest"))
             index_var_names = [f"var_{i}" for i in indices]
+            if arr_arg in struct_arr_info:
+                # Don't put a scalar subscript in ``subscript_map`` — the
+                # struct pointer itself isn't directly used; only its
+                # ``->field`` accesses (handled in the next pass).
+                if len(index_var_names) == 1:
+                    elem_idx_expr = index_var_names[0]
+                else:
+                    elem_idx_expr = f"({_flat_index_expr(arr_arg, index_var_names)})"
+                struct_refs[local_label] = (arr_arg, elem_idx_expr)
+                continue
             if arr_arg in vec_arr_info:
                 # Vec-typed array: each *element* is ``vec_n`` consecutive
                 # scalars. Compute the linear element index from the user-
@@ -906,12 +935,52 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
             else:
                 subscript_map[local_label] = f"{arr_arg}[{_flat_index_expr(arr_arg, index_var_names)}]"
 
+    # Struct field pointer pass: ``var_Y = &(var_X->field);`` where
+    # ``var_X`` is a struct-array reference recorded above. The field-ptr
+    # local goes into ``subscript_map`` with the appropriate scalar / vec /
+    # mat constructor; the trailing ``wp::load(var_Y)`` is then translated
+    # to that expression by the existing load rule + subscript inlining.
+    struct_field_addr_pat = re.compile(r"^\s*var_(\w+)\s*=\s*&\s*\(\s*var_(\w+)\s*->\s*(\w+)\s*\)\s*;\s*$")
+    for raw in forward_lines:
+        m = struct_field_addr_pat.match(raw)
+        if not m:
+            continue
+        field_local = m.group(1)
+        struct_local = m.group(2)
+        field_name = m.group(3)
+        if struct_local not in struct_refs:
+            continue
+        arr_name, elem_idx_expr = struct_refs[struct_local]
+        layout = struct_arr_info[arr_name]
+        field_info = layout.fields.get(field_name)
+        if field_info is None:
+            raise MetalCodegenError(f"Kernel {adj.fun_name!r}: struct {layout.name!r} has no field {field_name!r}")
+        base = f"{elem_idx_expr} * {layout.scalars_per_elem} + {field_info.offset}"
+        if field_info.kind == _STRUCT_FIELD_KIND_SCALAR:
+            subscript_map[field_local] = f"{arr_name}[{base}]"
+        elif field_info.kind == _STRUCT_FIELD_KIND_VEC:
+            comps = [f"{arr_name}[({base}) + {k}]" for k in range(field_info.size)]
+            subscript_map[field_local] = f"{field_info.msl_type}({', '.join(comps)})"
+        elif field_info.kind == _STRUCT_FIELD_KIND_MAT:
+            rows, cols = field_info.rows, field_info.cols
+            msl_vec = f"{field_info.msl_type.split('x')[0]}"  # e.g. "float3" from "float3x3"
+            col_strs: list[str] = []
+            for c in range(cols):
+                col_components = [f"{arr_name}[({base}) + {r * cols + c}]" for r in range(rows)]
+                col_strs.append(f"{msl_vec}({', '.join(col_components)})")
+            subscript_map[field_local] = f"{field_info.msl_type}({', '.join(col_strs)})"
+
     # --- Local variable declarations -----------------------------------
     body_lines: list[str] = []
     for var in adj.variables:
         if var.label in subscript_map:
             # This local was a pointer into an array arg; we'll inline its
             # uses below, so it doesn't need a declaration.
+            continue
+        if var.label in struct_refs:
+            # Struct-array pointer local — its ``->field`` accesses go
+            # through ``subscript_map`` and the struct-pointer itself is
+            # never used in code we emit.
             continue
         if var.label in vars_to_skip_decl:
             # Iterator-state or induction-variable for a translated for-loop;
@@ -965,6 +1034,11 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
             continue
         m_load = load_pat.match(raw)
         if m_load and m_load.group(2) in shape_aliases:
+            continue
+        # Struct field pointer line — the field expression is in
+        # ``subscript_map`` and gets inlined when the field-ptr local is
+        # referenced via ``wp::load``.
+        if struct_field_addr_pat.match(raw):
             continue
         # ``builtin_tid2d(var_X, var_Y);`` / ``builtin_tid3d(...)`` —
         # arity-specific structural rewrite (the patterns table only handles
@@ -1134,6 +1208,115 @@ def _mat_dtype_info(arg) -> tuple[int, int, str] | None:
 
 
 # ---------------------------------------------------------------------------
+# Struct (``@wp.struct``) layout
+# ---------------------------------------------------------------------------
+#
+# We don't emit MSL ``struct`` declarations. Every read of a struct field on
+# an element of a ``wp.array(dtype=SomeStruct)`` is expanded into direct
+# scalar/vec/mat accesses on the underlying flat buffer. This avoids the
+# address-space-cast issues that pointer-cast approaches hit and is
+# structurally similar to how vec/mat arrays already work.
+#
+# Currently supported: read-only field access on ``wp.array(dtype=SomeStruct)``
+# for POD structs whose fields are scalars / vec / mat. The supported scalar
+# field width is 4 bytes (``float32``, ``int32``, ``uint32``); mixed-width
+# fields, nested structs, and array fields would need different handling and
+# are rejected with a clear error.
+#
+# Currently NOT supported: local struct construction (``q = SomeStruct()``),
+# struct-typed kernel args (``def k(s: SomeStruct, ...)``), stores of struct
+# values into arrays. Those raise ``MetalCodegenError``.
+
+_STRUCT_FIELD_KIND_SCALAR = "scalar"
+_STRUCT_FIELD_KIND_VEC = "vec"
+_STRUCT_FIELD_KIND_MAT = "mat"
+
+
+@dataclass
+class _StructFieldInfo:
+    name: str
+    offset: int  # offset within the struct, in scalars (4-byte units)
+    size: int  # number of scalars
+    kind: str  # one of ``_STRUCT_FIELD_KIND_*``
+    msl_type: str  # MSL name (``float`` / ``float3`` / ``float3x3`` etc.)
+    rows: int = 0
+    cols: int = 0
+
+
+@dataclass
+class _StructLayout:
+    name: str  # mangled name from Warp's struct (``Particle_4b7eabdf``)
+    fields: dict[str, _StructFieldInfo] = field(default_factory=dict)
+    scalars_per_elem: int = 0
+
+
+def _classify_struct_field(fname: str, ftype) -> tuple[str, int, str, int, int]:
+    """Return ``(kind, size_in_scalars, msl_type, rows, cols)`` for a field type."""
+    # vec_t
+    if getattr(ftype, "_wp_generic_type_str_", None) == "vec_t":
+        n = int(ftype._length_)
+        scalar_cls = ftype._wp_scalar_type_
+        scalar_ctype = f"wp::{scalar_cls.__name__}"
+        if n not in _MSL_VEC_SUPPORTED_N or scalar_ctype not in _MSL_VEC_SCALAR_PREFIX:
+            raise MetalCodegenError(f"MSL codegen does not support vec field {fname!r} of {ftype!r} in a struct")
+        return _STRUCT_FIELD_KIND_VEC, n, f"{_MSL_VEC_SCALAR_PREFIX[scalar_ctype]}{n}", 0, 0
+    # mat_t
+    if getattr(ftype, "_wp_generic_type_str_", None) == "mat_t":
+        rows, cols = int(ftype._shape_[0]), int(ftype._shape_[1])
+        scalar_cls = ftype._wp_scalar_type_
+        scalar_ctype = f"wp::{scalar_cls.__name__}"
+        if (
+            rows not in _MSL_VEC_SUPPORTED_N
+            or cols not in _MSL_VEC_SUPPORTED_N
+            or scalar_ctype not in _MSL_VEC_SCALAR_PREFIX
+        ):
+            raise MetalCodegenError(f"MSL codegen does not support mat field {fname!r} of {ftype!r} in a struct")
+        msl_scalar = _MSL_VEC_SCALAR_PREFIX[scalar_ctype]
+        return _STRUCT_FIELD_KIND_MAT, rows * cols, f"{msl_scalar}{rows}x{cols}", rows, cols
+    # Scalar
+    name = getattr(ftype, "__name__", None)
+    if name is None:
+        raise MetalCodegenError(f"MSL codegen: struct field {fname!r} has unsupported type {ftype!r}")
+    scalar_ctype = f"wp::{name}"
+    if scalar_ctype == "wp::float64":
+        raise MetalCodegenError(f"MSL codegen: struct field {fname!r} is float64 — MSL has no fp64")
+    if scalar_ctype not in _SCALAR_CTYPE_TO_MSL:
+        raise MetalCodegenError(
+            f"MSL codegen does not yet support struct field {fname!r} of type {ftype!r} "
+            f"(no MSL scalar mapping for {scalar_ctype})"
+        )
+    return _STRUCT_FIELD_KIND_SCALAR, 1, _SCALAR_CTYPE_TO_MSL[scalar_ctype], 0, 0
+
+
+def _struct_layout_for(struct_cls) -> _StructLayout:
+    """Build a ``_StructLayout`` for a Warp ``Struct`` instance."""
+    layout = _StructLayout(name=getattr(struct_cls, "key", "anonymous_struct"))
+    offset = 0
+    for fname, fvar in getattr(struct_cls, "vars", {}).items():
+        kind, size, msl_type, rows, cols = _classify_struct_field(fname, fvar.type)
+        layout.fields[fname] = _StructFieldInfo(
+            name=fname, offset=offset, size=size, kind=kind, msl_type=msl_type, rows=rows, cols=cols
+        )
+        offset += size
+    layout.scalars_per_elem = offset
+    return layout
+
+
+def _struct_dtype_info(arg) -> _StructLayout | None:
+    """If ``arg`` is a ``wp.array`` whose element type is a Warp ``Struct``,
+    return a layout describing its field offsets. Otherwise return ``None``.
+    """
+    from warp._src.codegen import Struct  # noqa: PLC0415
+
+    if not _is_array_arg(arg):
+        return None
+    dtype = getattr(arg.type, "dtype", None)
+    if not isinstance(dtype, Struct):
+        return None
+    return _struct_layout_for(dtype)
+
+
+# ---------------------------------------------------------------------------
 # Launch path (step 3d)
 # ---------------------------------------------------------------------------
 #
@@ -1182,7 +1365,16 @@ def _array_view_dtype_and_shape(value):
     For mat-typed arrays (``wp.array(dtype=wp.mat33)`` etc.), the storage is
     ``value.size * rows * cols`` scalars in row-major layout, exposed as
     ``(*value.shape, rows * cols)`` of the inner scalar dtype.
+
+    For struct-typed arrays (``wp.array(dtype=SomeStruct)``), the storage is
+    ``value.size * scalars_per_elem`` scalars exposed as float32 (matches
+    Warp's tight C packing for the supported all-4-byte-field POD structs).
+    The kernel-side body computes per-field offsets itself.
     """
+    import mlx.core as mx  # noqa: PLC0415
+
+    from warp._src.codegen import Struct  # noqa: PLC0415
+
     dtype = value.dtype
     kind = getattr(dtype, "_wp_generic_type_str_", None)
     if kind == "vec_t":
@@ -1195,6 +1387,9 @@ def _array_view_dtype_and_shape(value):
         scalar_cls = dtype._wp_scalar_type_
         mx_dtype = _wp_dtype_to_mx_dtype(scalar_cls)
         return mx_dtype, (*value.shape, rows * cols)
+    if isinstance(dtype, Struct):
+        layout = _struct_layout_for(dtype)
+        return mx.float32, (*value.shape, layout.scalars_per_elem)
     return _wp_dtype_to_mx_dtype(dtype), value.shape
 
 
