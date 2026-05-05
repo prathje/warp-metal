@@ -11827,6 +11827,19 @@ def launch(
             "and cannot be launched with wp.launch()."
         )
 
+    # Metal short-circuit: route the Metal device through the experimental MLX
+    # backend, bypassing Warp's CUDA/CPU compilation pipeline (which would
+    # try to emit CUDA/C++ for a kernel we want to lower to MSL instead).
+    if device.is_metal:
+        if adjoint:
+            raise RuntimeError("Metal backend does not yet support adjoint launches")
+        if record_cmd:
+            raise RuntimeError("Metal backend does not yet support record_cmd launches")
+        from warp._src.codegen_metal import launch_metal_kernel  # noqa: PLC0415
+
+        launch_metal_kernel(kernel, dim, inputs, outputs, device)
+        return
+
     dim, total_dim_size = _normalize_launch_dim(dim)
 
     if total_dim_size > 0:
