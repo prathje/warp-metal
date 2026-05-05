@@ -92,6 +92,17 @@ pointer to the offending statement):
   and ``wp.spatial_bottom`` translate to header helpers. Arrays and
   struct fields of these types use the same per-component flat-buffer
   expansion as native vec arrays.
+- ``wp.quat_t<T>`` (and ``wp.quat`` — alias for ``quat_t<float32>``).
+  Normalised to ``wp.vec_t<4, T>`` at codegen entry so all the vec4
+  paths cover quat. Quat-specific operations (``quat_inverse``,
+  ``quat_rotate``, etc.) would still need their own translations.
+- Trivial intrinsics surfaced by the mujoco_warp recon: ``wp.unot``
+  (``!``), ``wp.bit_and/or/xor``, ``wp.lshift/rshift``, ``wp.floordiv``
+  (C-style truncation toward zero — diverges from Python ``//`` for
+  mixed-sign integers), ``wp.length_sq`` (translates to
+  ``metal::dot(v, v)``), and the in-place compound forms
+  ``wp.add_inplace``/``sub_inplace``/``mul_inplace``/``div_inplace``/
+  ``assign_inplace``.
 - Matrix types ``wp.mat22``/``wp.mat33``/``wp.mat44`` (and the
   corresponding int variants) for ``RxC`` with ``R, C`` in ``{2, 3, 4}``
   where MSL has a native ``floatRxC`` type. ``wp.transpose`` and
@@ -168,6 +179,22 @@ _MSL_VEC_SUPPORTED_N = (2, 3, 4)
 _WP_VEC_T_PAT = re.compile(r"wp::vec_t\s*<\s*(\d+)\s*,\s*wp::(\w+)\s*>")
 # Pattern that matches ``wp::mat_t<R, C, wp::TYPE>``.
 _WP_MAT_T_PAT = re.compile(r"wp::mat_t\s*<\s*(\d+)\s*,\s*(\d+)\s*,\s*wp::(\w+)\s*>")
+# Pattern that matches ``wp::quat_t<wp::TYPE>``. We treat quaternions as
+# 4-element vec_t with float32 components — Warp lays them out the same
+# way and our vec/mat machinery covers all the array, constructor, and
+# extract patterns we currently see in mujoco_warp's hot path. Quat-
+# specific operations (``wp.quat_inverse``, ``wp.quat_rotate``, etc.) would
+# need their own translations later.
+_WP_QUAT_T_PAT = re.compile(r"wp::quat_t\s*<\s*wp::(\w+)\s*>")
+
+
+def _normalize_quat_t(text: str) -> str:
+    """Rewrite every ``wp::quat_t<wp::T>`` reference as ``wp::vec_t<4, wp::T>``.
+
+    Run before any other vec/mat handling so the existing 4-element vec
+    paths cover quat seamlessly.
+    """
+    return _WP_QUAT_T_PAT.sub(lambda m: f"wp::vec_t<4, wp::{m.group(1)}>", text)
 
 
 _MSL_VEC_NATIVE_N = (2, 3, 4)
@@ -441,6 +468,9 @@ def _msl_scalar_type(ctype: str) -> str:
     if ctype == "wp::float64":
         raise MetalCodegenError("MSL has no native float64; double-precision kernels cannot be lowered to Metal")
     stripped = ctype.strip()
+    # ``wp::quat_t<wp::TYPE>`` is laid out as a 4-element vec_t; rewrite
+    # so the vec_t/mat_t handling below covers it.
+    stripped = _normalize_quat_t(stripped)
     # ``wp::vec_t<N, wp::TYPE>`` -> ``floatN`` / ``intN`` / etc.
     m = _WP_VEC_T_PAT.fullmatch(stripped)
     if m:
@@ -570,6 +600,25 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     # Unary negation: ``wp::neg(X)`` -> ``(-X)``. Works for scalar / vec / mat
     # because MSL's ``operator-`` is defined on all of those.
     (re.compile(r"wp::neg\s*\(\s*([^()]+?)\s*\)"), r"(-\1)"),
+    # Boolean not: ``wp::unot(X)`` -> ``(!X)``.
+    (re.compile(r"wp::unot\s*\(\s*([^()]+?)\s*\)"), r"(!\1)"),
+    # Bitwise ops. Only ``bit_and`` actually shows up in the mujoco_warp
+    # inventory but the others are cheap to add as a set.
+    (re.compile(r"wp::bit_and\s*\(\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)"), r"(\1 & \2)"),
+    (re.compile(r"wp::bit_or\s*\(\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)"), r"(\1 | \2)"),
+    (re.compile(r"wp::bit_xor\s*\(\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)"), r"(\1 ^ \2)"),
+    (re.compile(r"wp::lshift\s*\(\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)"), r"(\1 << \2)"),
+    (re.compile(r"wp::rshift\s*\(\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)"), r"(\1 >> \2)"),
+    # Floor division: ``wp::floordiv(X, Y)`` -> ``(X / Y)``. C-style truncation
+    # toward zero, NOT Python ``//`` floor toward -inf — diverges for mixed-
+    # sign integer operands (e.g. ``-7 / 2`` is ``-3`` here vs ``-4`` in
+    # Python). Mujoco_warp uses this for non-negative array indexing in
+    # practice so the divergence is unlikely to surface.
+    (re.compile(r"wp::floordiv\s*\(\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)"), r"(\1 / \2)"),
+    # ``wp::length_sq(V)`` is the squared length of a vector. MSL has no
+    # native ``length_squared``, so we translate to the dot of the vector
+    # with itself — works for native ``floatN`` types.
+    (re.compile(r"wp::length_sq\s*\(\s*([^()]+?)\s*\)"), r"metal::dot(\1, \1)"),
     # ``wp::assign(target, value)`` — used by Warp to model in-place mutation
     # of a local (e.g. accumulator updates inside a loop). Translate to a
     # plain assignment statement.
@@ -1294,6 +1343,10 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
         # Re-run intrinsic translation in case ``wp::load(var_1)`` became
         # ``wp::load(arr[idx])``.
         translated = _translate_intrinsics(translated)
+        # Normalize ``wp::quat_t<wp::T>`` to ``wp::vec_t<4, wp::T>`` so the
+        # existing vec_t machinery (constructor rewrite, type translation,
+        # array dtype detection) handles quat as a 4-element vec.
+        translated = _normalize_quat_t(translated)
         # Rewrite ``wp::mat_t<R, C, ...>(...)`` constructor calls first —
         # the row-major flat args need reordering into column form.
         # Likewise, ``wp::vec_t<N, ...>({v0, v1, ...})`` (the brace form
@@ -1343,19 +1396,33 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
         # ``wp::store(addr_var, value);`` — write through a field pointer.
         # We translate by looking up the LHS expression we recorded in
         # ``subscript_map`` for ``addr_var``.
-        m_store = re.match(
-            r"^(?P<indent>\s*)wp::store\s*\(\s*var_(?P<addr>\w+)\s*,\s*(?P<val>[^()]+?)\s*\)\s*;\s*$",
-            raw,
+        # ``wp::store`` and the in-place compound forms (``add_inplace``,
+        # ``sub_inplace``, ``mul_inplace``, ``assign_inplace``) all write
+        # through a field pointer. Translate via the LHS expression
+        # recorded in ``subscript_map`` for the address.
+        store_op_map = {
+            "store": "=",
+            "assign_inplace": "=",
+            "add_inplace": "+=",
+            "sub_inplace": "-=",
+            "mul_inplace": "*=",
+            "div_inplace": "/=",
+        }
+        store_pat = re.compile(
+            r"^(?P<indent>\s*)wp::(?P<op>store|assign_inplace|add_inplace|sub_inplace|"
+            r"mul_inplace|div_inplace)\s*\(\s*var_(?P<addr>\w+)\s*,\s*(?P<val>[^()]+?)\s*\)\s*;\s*$"
         )
+        m_store = store_pat.match(raw)
         if m_store:
             addr = m_store.group("addr")
             value = m_store.group("val")
             indent = m_store.group("indent")
+            op = store_op_map[m_store.group("op")]
             if addr in subscript_map:
                 lhs = subscript_map[addr]
-                body_lines.append(_finalize(f"{indent}{lhs} = {value};"))
+                body_lines.append(_finalize(f"{indent}{lhs} {op} {value};"))
                 continue
-            # Stray wp::store — pass through; the unsupported-intrinsic
+            # Stray store — pass through; the unsupported-intrinsic
             # guard will catch it.
         # ``builtin_tid2d(var_X, var_Y);`` / ``builtin_tid3d(...)`` —
         # arity-specific structural rewrite (the patterns table only handles
@@ -1518,7 +1585,7 @@ def _vec_dtype_info(arg) -> tuple[int, str] | None:
     dtype = getattr(arg.type, "dtype", None)
     if dtype is None:
         return None
-    if getattr(dtype, "_wp_generic_type_str_", None) != "vec_t":
+    if getattr(dtype, "_wp_generic_type_str_", None) not in ("vec_t", "quat_t"):
         return None
     n = getattr(dtype, "_length_", None)
     scalar_cls = getattr(dtype, "_wp_scalar_type_", None)
@@ -1604,8 +1671,8 @@ class _StructLayout:
 
 def _classify_struct_field(fname: str, ftype) -> tuple[str, int, str, int, int]:
     """Return ``(kind, size_in_scalars, msl_type, rows, cols)`` for a field type."""
-    # vec_t
-    if getattr(ftype, "_wp_generic_type_str_", None) == "vec_t":
+    # vec_t (and quat_t — laid out identically to vec4)
+    if getattr(ftype, "_wp_generic_type_str_", None) in ("vec_t", "quat_t"):
         n = int(ftype._length_)
         scalar_cls = ftype._wp_scalar_type_
         scalar_ctype = f"wp::{scalar_cls.__name__}"
@@ -1698,6 +1765,7 @@ def _wp_dtype_to_mx_dtype(wp_dtype):
         wpt.uint16: mx.uint16,
         wpt.int64: mx.int64,
         wpt.uint64: mx.uint64,
+        wpt.bool: mx.bool_,
     }
     if wp_dtype is wpt.float64:
         raise MetalCodegenError("MSL/MLX has no native float64; use float32 for Metal kernels")
@@ -1730,7 +1798,7 @@ def _array_view_dtype_and_shape(value):
 
     dtype = value.dtype
     kind = getattr(dtype, "_wp_generic_type_str_", None)
-    if kind == "vec_t":
+    if kind in ("vec_t", "quat_t"):
         n = dtype._length_
         scalar_cls = dtype._wp_scalar_type_
         mx_dtype = _wp_dtype_to_mx_dtype(scalar_cls)

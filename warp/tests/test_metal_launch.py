@@ -1744,6 +1744,123 @@ class TestMetalLaunch(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet)
 
+    def test_unot_floordiv_bit_and_length_sq_match_cpu(self):
+        # Trivial intrinsics that surfaced as gaps in the mujoco_warp recon.
+        # Each is a one-line regex add; this test bundles them.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k_unot(a: wp.array(dtype=wp.bool), out: wp.array(dtype=wp.bool)):
+                tid = wp.tid()
+                out[tid] = not a[tid]
+
+            @wp.kernel
+            def k_floordiv(a: wp.array(dtype=wp.int32),
+                           b: wp.array(dtype=wp.int32),
+                           out: wp.array(dtype=wp.int32)):
+                tid = wp.tid()
+                out[tid] = a[tid] // b[tid]
+
+            @wp.kernel
+            def k_bit_and(a: wp.array(dtype=wp.int32),
+                          b: wp.array(dtype=wp.int32),
+                          out: wp.array(dtype=wp.int32)):
+                tid = wp.tid()
+                out[tid] = a[tid] & b[tid]
+
+            @wp.kernel
+            def k_length_sq(v: wp.array(dtype=wp.vec3),
+                            out: wp.array(dtype=wp.float32)):
+                tid = wp.tid()
+                out[tid] = wp.length_sq(v[tid])
+
+            N = 32
+            rng = np.random.default_rng(0)
+            # Generate ALL inputs up front so CPU and Metal see identical data.
+            unot_in = rng.integers(0, 2, N).astype(bool)
+            fd_a = rng.integers(1, 100, N, dtype=np.int32)
+            fd_b = rng.integers(1, 5, N, dtype=np.int32)
+            band_a = rng.integers(0, 0xFFFF, N, dtype=np.int32)
+            band_b = rng.integers(0, 0xFFFF, N, dtype=np.int32)
+            vn = rng.standard_normal((N, 3)).astype(np.float32)
+
+            for dev in ('cpu', 'metal:0'):
+                a = wp.array(unot_in, dtype=wp.bool, device=dev)
+                out = wp.zeros(N, dtype=wp.bool, device=dev)
+                wp.launch(k_unot, dim=N, inputs=[a], outputs=[out], device=dev)
+                if dev == 'cpu':
+                    cpu_unot = out.numpy()
+                else:
+                    np.testing.assert_array_equal(out.numpy(), cpu_unot)
+
+            for dev in ('cpu', 'metal:0'):
+                a = wp.array(fd_a, dtype=wp.int32, device=dev)
+                b = wp.array(fd_b, dtype=wp.int32, device=dev)
+                out = wp.zeros(N, dtype=wp.int32, device=dev)
+                wp.launch(k_floordiv, dim=N, inputs=[a, b], outputs=[out], device=dev)
+                if dev == 'cpu':
+                    cpu_fd = out.numpy()
+                else:
+                    np.testing.assert_array_equal(out.numpy(), cpu_fd)
+
+            for dev in ('cpu', 'metal:0'):
+                a = wp.array(band_a, dtype=wp.int32, device=dev)
+                b = wp.array(band_b, dtype=wp.int32, device=dev)
+                out = wp.zeros(N, dtype=wp.int32, device=dev)
+                wp.launch(k_bit_and, dim=N, inputs=[a, b], outputs=[out], device=dev)
+                if dev == 'cpu':
+                    cpu_band = out.numpy()
+                else:
+                    np.testing.assert_array_equal(out.numpy(), cpu_band)
+
+            for dev in ('cpu', 'metal:0'):
+                v = wp.array(vn, dtype=wp.vec3, device=dev)
+                out = wp.zeros(N, dtype=wp.float32, device=dev)
+                wp.launch(k_length_sq, dim=N, inputs=[v], outputs=[out], device=dev)
+                if dev == 'cpu':
+                    cpu_l2 = out.numpy()
+                else:
+                    np.testing.assert_allclose(out.numpy(), cpu_l2, rtol=1e-5)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_quat_array_round_trip_matches_cpu(self):
+        # ``wp.quat`` is laid out as a 4-component vec_t; the codegen
+        # normalises ``wp::quat_t<wp::T>`` to ``wp::vec_t<4, wp::T>`` so
+        # quat constructor / extract / array reads all reuse the vec4 path.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(out: wp.array(dtype=wp.quat)):
+                tid = wp.tid()
+                out[tid] = wp.quat(1.0, 2.0, 3.0, float(tid))
+
+            N = 16
+            for dev in ('cpu', 'metal:0'):
+                out = wp.zeros(N, dtype=wp.quat, device=dev)
+                wp.launch(k, dim=N, outputs=[out], device=dev)
+                if dev == 'cpu':
+                    cpu_out = out.numpy()
+                else:
+                    np.testing.assert_array_equal(out.numpy(), cpu_out)
+            # Sanity: the float-view layout is (1.0, 2.0, 3.0, tid) per element.
+            expected = np.zeros((N, 4), dtype=np.float32)
+            expected[:, 0] = 1.0
+            expected[:, 1] = 2.0
+            expected[:, 2] = 3.0
+            expected[:, 3] = np.arange(N, dtype=np.float32)
+            np.testing.assert_array_equal(cpu_out, expected)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
     def test_rejects_adjoint_launch(self):
         snippet = textwrap.dedent(
             """
