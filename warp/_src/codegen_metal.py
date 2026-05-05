@@ -49,10 +49,16 @@ pointer to the offending statement):
   addresses route through the same ``subscript_map`` mechanism, and
   ``wp::store(addr, val)`` becomes ``<lhs_expr> = val``. Storing a struct
   local into a struct array scatters the fields per-component.
-- Currently NOT supported: struct-typed kernel args
-  (``def k(s: SomeStruct, ...)``), reading a struct *value* out of an
-  array as a local (``m = arr[tid]; m.field``), nested structs, array
-  fields, mixed scalar widths within a struct.
+- Struct-typed kernel args (``def k(s: SomeStruct, ...)``). The launcher
+  serialises the ``StructInstance`` to bytes (via the ``_ctype`` member)
+  and passes it as a 1-D float32 mx.array; the kernel body reads each
+  field at its compile-time-known scalar offset (same machinery as
+  struct-array field reads, with the array index pinned to 0).
+- Currently NOT supported: reading a struct *value* out of an array as
+  a local (``m = arr[tid]; m.field`` — workaround: use
+  ``arr[tid].field`` directly), nested structs, array fields, mixed
+  scalar widths within a struct (e.g. int + float together — would need
+  per-field ``as_type`` bit-casts on the float-viewed buffer).
 - ``for i in range(...)`` loops, both static (Warp unrolls them, so this
   is a no-op) and dynamic (a structural pre-pass rewrites Warp's
   ``goto``-based loop into a real MSL ``for``).
@@ -1146,17 +1152,16 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
         if isinstance(var.type, _Struct):
             struct_local_layouts[var.label] = _struct_layout_for(var.type)
             struct_local_is_arg[var.label] = False
+    # Struct-typed kernel args: the launcher serialises the struct instance
+    # into a flat scalar buffer (see ``_array_view_dtype_and_shape`` for
+    # arrays; struct args use the same per-field layout). The kernel sees
+    # ``device const float* <argname>`` plus our auto-generated
+    # ``<argname>_shape``, and field accesses translate to direct subscripts
+    # at the field's scalar offset.
+    struct_arg_layouts: dict[str, _StructLayout] = {}
     for arg in adj.args:
         if isinstance(arg.type, _Struct):
-            # Struct-typed kernel args are not yet supported (we'd need MLX
-            # to flatten the struct into a buffer of scalar fields, which is
-            # a separate launcher change).
-            raise MetalCodegenError(
-                f"Kernel {adj.fun_name!r} arg {arg.label!r}: "
-                "struct-typed kernel arguments are not yet supported on Metal "
-                "(use a wp.array(dtype=Struct) instead, or pass the fields as "
-                "separate args)"
-            )
+            struct_arg_layouts[arg.label] = _struct_layout_for(arg.type)
 
     def _per_field_local(struct_label: str, field_name: str) -> str:
         # Double underscore separates struct label from field name to avoid
@@ -1180,12 +1185,42 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
 
         if accessor == ".":
             # Struct-local field: alias to the per-field MSL local.
-            if struct_local not in struct_local_layouts:
+            if struct_local in struct_local_layouts:
+                layout = struct_local_layouts[struct_local]
+                if field_name not in layout.fields:
+                    raise MetalCodegenError(
+                        f"Kernel {adj.fun_name!r}: struct {layout.name!r} has no field {field_name!r}"
+                    )
+                subscript_map[field_local] = _per_field_local(struct_local, field_name)
                 continue
-            layout = struct_local_layouts[struct_local]
-            if field_name not in layout.fields:
-                raise MetalCodegenError(f"Kernel {adj.fun_name!r}: struct {layout.name!r} has no field {field_name!r}")
-            subscript_map[field_local] = _per_field_local(struct_local, field_name)
+            # Struct-arg field: the launcher serialises the struct into a
+            # flat scalar buffer of length ``scalars_per_elem``; field
+            # accesses are direct subscripts at the field's offset.
+            if struct_local in struct_arg_layouts:
+                layout = struct_arg_layouts[struct_local]
+                field_info = layout.fields.get(field_name)
+                if field_info is None:
+                    raise MetalCodegenError(
+                        f"Kernel {adj.fun_name!r}: struct arg {struct_local!r} has no field {field_name!r}"
+                    )
+                base = str(field_info.offset)
+                if field_info.kind == _STRUCT_FIELD_KIND_SCALAR:
+                    subscript_map[field_local] = f"{struct_local}[{base}]"
+                elif field_info.kind == _STRUCT_FIELD_KIND_VEC:
+                    comps = [f"{struct_local}[{base} + {k}]" for k in range(field_info.size)]
+                    ctor = (
+                        field_info.msl_type if field_info.size in _MSL_VEC_NATIVE_N else f"{field_info.msl_type}_make"
+                    )
+                    subscript_map[field_local] = f"{ctor}({', '.join(comps)})"
+                elif field_info.kind == _STRUCT_FIELD_KIND_MAT:
+                    rows, cols = field_info.rows, field_info.cols
+                    msl_vec = field_info.msl_type.split("x")[0]
+                    col_strs: list[str] = []
+                    for c in range(cols):
+                        col_components = [f"{struct_local}[{base} + {r * cols + c}]" for r in range(rows)]
+                        col_strs.append(f"{msl_vec}({', '.join(col_components)})")
+                    subscript_map[field_local] = f"{field_info.msl_type}({', '.join(col_strs)})"
+                continue
             continue
 
         # accessor == "->": struct-array field, build a flat-buffer expression.
@@ -1757,6 +1792,7 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device):
     import mlx.core as mx  # noqa: PLC0415
     import numpy as np  # noqa: PLC0415
 
+    from warp._src.codegen import Struct  # noqa: PLC0415
     from warp._src.context import _metal_get_buffer, runtime  # noqa: PLC0415
 
     artifact, mlx_kernel = _get_or_build_metal_kernel(kernel)
@@ -1795,6 +1831,30 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device):
             # ``view`` reinterprets bytes (no copy); ``reshape`` flattens / shapes for MLX.
             typed = mx_buf.view(mx_dtype).reshape(view_shape)
             mlx_inputs.append(typed)
+        elif isinstance(arg_var.type, Struct):
+            # Struct-typed arg: serialise the user's ``StructInstance`` into
+            # a flat scalar buffer the kernel can index. The struct's
+            # ``_ctype`` member is a ``ctypes.Structure`` populated by the
+            # field setters Warp generates, so ``bytes(...)`` gives us the
+            # right tight-packed layout. We view it as ``mx.float32`` —
+            # consistent with how struct *arrays* expose their storage.
+            layout = _struct_layout_for(arg_var.type)
+            ctype_inst = getattr(value, "_ctype", None)
+            if ctype_inst is None:
+                raise RuntimeError(
+                    f"Kernel '{kernel.key}' arg '{input_name}' is a struct but the "
+                    f"Python value lacks a ``_ctype`` member; pass a real "
+                    f"``StructInstance`` (e.g. one constructed via ``MyStruct()``)"
+                )
+            raw = bytes(ctype_inst)
+            np_buf = np.frombuffer(raw, dtype=np.float32).copy()
+            if np_buf.size != layout.scalars_per_elem:
+                raise RuntimeError(
+                    f"Kernel '{kernel.key}' arg '{input_name}': struct "
+                    f"serialisation produced {np_buf.size} float32s but the "
+                    f"computed layout expects {layout.scalars_per_elem}"
+                )
+            mlx_inputs.append(mx.array(np_buf, dtype=mx.float32))
         else:
             # Scalar input — convert to a 0-D mx.array literal.
             mx_dtype = _wp_dtype_to_mx_dtype(arg_var.type)
