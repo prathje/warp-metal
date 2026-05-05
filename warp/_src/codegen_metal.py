@@ -27,7 +27,8 @@ pointer to the offending statement):
   ``_ArrayAnnotation`` instance rather than a ``warp._src.types.array``,
   but both expose ``ndim`` / ``dtype`` so the codegen treats them
   uniformly.
-- Scalar arithmetic intrinsics: ``add``, ``sub``, ``mul``, ``div``, ``mod``
+- Scalar / vec / mat arithmetic intrinsics: ``add``, ``sub``, ``mul``,
+  ``div``, ``mod``, ``neg`` (unary)
 - ``if`` / ``else`` blocks and the comparison operators ``<``, ``<=``,
   ``==``, ``!=``, ``>=``, ``>`` (Warp's IR pre-emits these in plain C/MSL
   syntax, so they pass through the regex-based translator unchanged).
@@ -306,16 +307,22 @@ def _emit_big_vec_struct(name: str, n: int, msl_scalar: str) -> str:
 
 
 def _emit_spatial_helpers() -> str:
-    """Helpers that decompose a ``wp_vec6_float`` into its top/bottom vec3.
+    """Helpers specific to ``spatial_vector`` (``vec_t<6, float32>``).
 
-    Mujoco-warp uses ``wp.spatial_top`` / ``wp.spatial_bottom`` extensively
-    on ``spatial_vector`` (= ``vec_t<6, float32>``).
+    - ``wp_spatial_top`` / ``wp_spatial_bottom`` decompose into the upper /
+      lower vec3.
+    - A ``(float3, float3)`` overload of ``wp_vec6_float_make`` mirrors
+      Warp's ``wp.spatial_vector(top_vec3, bottom_vec3)`` two-arg
+      constructor (used wherever a kernel composes a spatial_vector from
+      two vec3s rather than 6 scalars).
     """
     return (
         "inline float3 wp_spatial_top(wp_vec6_float v) { "
         "return float3(v.c[0], v.c[1], v.c[2]); }\n"
         "inline float3 wp_spatial_bottom(wp_vec6_float v) { "
-        "return float3(v.c[3], v.c[4], v.c[5]); }"
+        "return float3(v.c[3], v.c[4], v.c[5]); }\n"
+        "inline wp_vec6_float wp_vec6_float_make(float3 a, float3 b) { "
+        "return wp_vec6_float_make(a[0], a[1], a[2], b[0], b[1], b[2]); }"
     )
 
 
@@ -346,20 +353,31 @@ def _build_kernel_header(source: str) -> str:
 
 
 def _rewrite_vec_t_brace_constructor(text: str) -> str:
-    """Rewrite ``wp::vec_t<N, wp::T>({v0, v1, ...})`` (the brace-init form
-    Warp's IR uses for vec5+) into a plain function-call constructor.
+    """Rewrite ``wp::vec_t<N, wp::T>(args)`` constructor calls (any arg shape)
+    to the corresponding MSL form.
 
-    For native sizes (N in {2,3,4}) the result is ``floatN(v0, v1, ...)``;
-    for big sizes it's ``wp_vecN_<scalar>_make(v0, v1, ...)`` (a free
-    function we emit in the header — MSL doesn't let us define a variadic
-    struct constructor as cleanly).
+    Args may come in either of two shapes:
+      - ``({v0, v1, ...})`` — the brace-init form Warp uses for vec5+ when
+        constructing from N scalars.
+      - ``(args...)`` — a plain comma-separated list, used for vec_t<N,T>
+        ``= float3(scalar)`` (single-arg broadcast), ``spatial_vector(vec3,
+        vec3)`` (the canonical 2-arg overload), and the standard
+        N-arg form for vec2/3/4.
+
+    For native sizes (N in {2,3,4}) the result is ``floatN(args)`` — MSL's
+    native vector type provides all the overloads. For big sizes it's
+    ``wp_vecN_<scalar>_make(args)`` — the helper functions we emit in the
+    header carry the same overload set we need.
     """
-    pat = re.compile(r"wp::vec_t<\s*(\d+)\s*,\s*wp::(\w+)\s*>\s*\(\s*\{([^{}]*)\}\s*\)")
+    pat = re.compile(r"wp::vec_t<\s*(\d+)\s*,\s*wp::(\w+)\s*>\s*\(([^()]*)\)")
 
     def repl(m: re.Match[str]) -> str:
         n = int(m.group(1))
         scalar_ctype = m.group(2)
         args_str = m.group(3).strip()
+        # Strip the outer ``{}`` if present.
+        if args_str.startswith("{") and args_str.endswith("}"):
+            args_str = args_str[1:-1].strip()
         full_ctype = f"wp::{scalar_ctype}"
         if full_ctype not in _MSL_VEC_SCALAR_PREFIX or n < 2:
             return m.group(0)
@@ -543,6 +561,9 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"wp::mul\s*\(\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)"), r"(\1 * \2)"),
     (re.compile(r"wp::div\s*\(\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)"), r"(\1 / \2)"),
     (re.compile(r"wp::mod\s*\(\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)"), r"(\1 % \2)"),
+    # Unary negation: ``wp::neg(X)`` -> ``(-X)``. Works for scalar / vec / mat
+    # because MSL's ``operator-`` is defined on all of those.
+    (re.compile(r"wp::neg\s*\(\s*([^()]+?)\s*\)"), r"(-\1)"),
     # ``wp::assign(target, value)`` — used by Warp to model in-place mutation
     # of a local (e.g. accumulator updates inside a loop). Translate to a
     # plain assignment statement.
@@ -999,7 +1020,6 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
     # mismatches in MLX-generated wrappers. So we emit per-component reads
     # ``floatN(arr[i*N+0], arr[i*N+1], ...)`` instead of any cast trick.
     arg_label_set = {a.label for a in adj.args}
-    arg_by_label = {a.label: a for a in adj.args}
     # Map argname -> (vec_size, msl_scalar) for each vec-typed array arg,
     # argname -> (rows, cols, msl_scalar) for each mat-typed array arg, and
     # argname -> _StructLayout for each struct-typed array arg.

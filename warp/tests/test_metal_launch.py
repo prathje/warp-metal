@@ -1661,6 +1661,47 @@ class TestMetalLaunch(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet, timeout=60)
 
+    def test_neg_and_spatial_two_arg_constructor_match_cpu(self):
+        # Mirrors the real mujoco_warp kernel ``_cacc_world``: a ``spatial_
+        # vector`` is constructed from a vec3 and the negation of another
+        # vec3. Exercises three patterns at once: ``wp::neg`` on a vec, the
+        # 2-arg ``spatial_vector(vec3, vec3)`` constructor, and a 2-D
+        # ``wp.array2d[wp.spatial_vector]`` write.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(gravity: wp.array(dtype=wp.vec3),
+                  out: wp.array2d(dtype=wp.spatial_vector)):
+                worldid = wp.tid()
+                out[worldid, 0] = wp.spatial_vector(
+                    wp.vec3(0.0),
+                    -gravity[worldid % gravity.shape[0]],
+                )
+
+            nworld, nbody = 4, 5
+            rng = np.random.default_rng(0)
+            gn = rng.standard_normal((nworld, 3)).astype(np.float32)
+
+            for dev in ('cpu', 'metal:0'):
+                g = wp.array(gn, dtype=wp.vec3, device=dev)
+                ca = wp.zeros((nworld, nbody), dtype=wp.spatial_vector, device=dev)
+                wp.launch(k, dim=nworld, inputs=[g], outputs=[ca], device=dev)
+                if dev == 'cpu':
+                    cpu_out = ca.numpy()
+                else:
+                    np.testing.assert_array_equal(ca.numpy(), cpu_out)
+            # Sanity: the kernel zeros the upper vec3 and stores -gravity
+            # into the lower vec3 of column 0; remaining columns stay zero.
+            expected = np.zeros((nworld, nbody, 6), dtype=np.float32)
+            expected[:, 0, 3:] = -gn
+            np.testing.assert_array_equal(cpu_out, expected)
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=60)
+
     def test_rejects_adjoint_launch(self):
         snippet = textwrap.dedent(
             """
