@@ -18,6 +18,10 @@ pointer to the offending statement):
 - ``if`` / ``else`` blocks and the comparison operators ``<``, ``<=``,
   ``==``, ``!=``, ``>=``, ``>`` (Warp's IR pre-emits these in plain C/MSL
   syntax, so they pass through the regex-based translator unchanged).
+- A whitelist of math builtins listed in ``_MATH_BUILTIN_NAMES`` —
+  ``sqrt``, ``abs``, ``min``, ``max``, ``floor``, ``ceil``, ``exp``,
+  ``log``, ``sin``, ``cos``, ``tanh``, etc. — translated to MSL's
+  ``metal::`` namespace.
 """
 
 from __future__ import annotations
@@ -113,6 +117,48 @@ def _msl_constant_str(value) -> str:
 # Intrinsic translation
 # ---------------------------------------------------------------------------
 
+# Math builtins that translate by simple namespace rename: ``wp::sqrt(x)`` →
+# ``metal::sqrt(x)``. Argument structure is preserved verbatim. Listed
+# explicitly (rather than via a wildcard ``wp::(\w+)`` pattern) so that
+# unsupported builtins still raise a clear ``MetalCodegenError`` instead of
+# silently passing through and erroring at MSL compile time.
+_MATH_BUILTIN_NAMES: tuple[str, ...] = (
+    # Unary
+    "abs",
+    "sqrt",
+    "rsqrt",
+    "floor",
+    "ceil",
+    "round",
+    "rint",
+    "trunc",
+    "sign",
+    "exp",
+    "exp2",
+    "log",
+    "log2",
+    "log10",
+    "sin",
+    "cos",
+    "tan",
+    "asin",
+    "acos",
+    "atan",
+    "sinh",
+    "cosh",
+    "tanh",
+    "isfinite",
+    "isnan",
+    "isinf",
+    # Binary
+    "min",
+    "max",
+    "atan2",
+    "pow",
+    "copysign",
+)
+
+
 # Patterns are applied in order. Each entry is (regex, replacement). Captures
 # can be back-referenced with \1, \2, etc.
 _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
@@ -144,6 +190,13 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     # Strip wp::float32(x) / wp::int32(x) etc. casts
     (re.compile(r"wp::(float32|float16|int32|uint32|int64|uint64)\s*\(\s*([^()]+?)\s*\)"), r"\2"),
 ]
+
+# Append math-builtin renames after the operator/cast rules. Each generates a
+# simple ``wp::name`` -> ``metal::name`` substitution; the argument list is
+# left intact for MSL to resolve via overload.
+for _name in _MATH_BUILTIN_NAMES:
+    _INTRINSIC_PATTERNS.append((re.compile(rf"\bwp::{_name}\b"), f"metal::{_name}"))
+del _name
 
 
 def _translate_intrinsics(line: str) -> str:
