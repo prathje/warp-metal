@@ -602,6 +602,146 @@ class TestMetalLaunch(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet)
 
+    def test_atomic_add_float_matches_cpu(self):
+        # Float atomic_add ordering is race-dependent so the result may differ
+        # from CPU at the ulp level for large N. We use an absolute tolerance
+        # tied to N * fp32 ulp(typical sum) to cover that without being so
+        # loose it'd hide real bugs.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(a: wp.array(dtype=wp.float32), c: wp.array(dtype=wp.float32)):
+                tid = wp.tid()
+                wp.atomic_add(c, 0, a[tid])
+
+            N = 1024
+            rng = np.random.default_rng(7)
+            an = rng.standard_normal(N).astype(np.float32)
+
+            c_cpu = wp.zeros(1, dtype=wp.float32, device='cpu')
+            c_m = wp.zeros(1, dtype=wp.float32, device='metal:0')
+            wp.launch(k, dim=N,
+                      inputs=[wp.array(an, dtype=wp.float32, device='cpu')],
+                      outputs=[c_cpu], device='cpu')
+            wp.launch(k, dim=N,
+                      inputs=[wp.array(an, dtype=wp.float32, device='metal:0')],
+                      outputs=[c_m], device='metal:0')
+            np.testing.assert_allclose(
+                c_m.numpy(), c_cpu.numpy(),
+                rtol=1e-4, atol=1e-3,
+                err_msg='atomic_add(fp32) CPU/Metal mismatch beyond fp tolerance',
+            )
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_atomic_add_int_matches_cpu_bit_exact(self):
+        # Integer atomic_add is associative, so the result is deterministic
+        # regardless of execution order — bit-exact.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(a: wp.array(dtype=wp.int32), c: wp.array(dtype=wp.int32)):
+                tid = wp.tid()
+                wp.atomic_add(c, 0, a[tid])
+
+            N = 4096
+            rng = np.random.default_rng(99)
+            an = rng.integers(-1000, 1000, size=N, dtype=np.int32)
+
+            c_cpu = wp.zeros(1, dtype=wp.int32, device='cpu')
+            c_m = wp.zeros(1, dtype=wp.int32, device='metal:0')
+            wp.launch(k, dim=N,
+                      inputs=[wp.array(an, dtype=wp.int32, device='cpu')],
+                      outputs=[c_cpu], device='cpu')
+            wp.launch(k, dim=N,
+                      inputs=[wp.array(an, dtype=wp.int32, device='metal:0')],
+                      outputs=[c_m], device='metal:0')
+            np.testing.assert_array_equal(c_cpu.numpy(), c_m.numpy())
+            assert int(c_cpu.numpy()[0]) == int(an.sum()), (c_cpu.numpy(), an.sum())
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_atomic_min_max_int_matches_cpu(self):
+        # Integer min/max are deterministic and bit-exact regardless of order.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(a: wp.array(dtype=wp.int32),
+                  out_min: wp.array(dtype=wp.int32),
+                  out_max: wp.array(dtype=wp.int32)):
+                tid = wp.tid()
+                wp.atomic_min(out_min, 0, a[tid])
+                wp.atomic_max(out_max, 0, a[tid])
+
+            N = 1024
+            rng = np.random.default_rng(11)
+            an = rng.integers(-100000, 100000, size=N, dtype=np.int32)
+
+            # The accumulator buffers need sentinel initial values so the
+            # min/max work — Warp's CUDA semantics expect users to seed them.
+            # Our Metal launcher zero-initializes outputs, so we need the
+            # sentinels to live in the input data: a value larger than any
+            # element for ``out_min`` and smaller for ``out_max``. We pick
+            # values that don't appear in ``an`` and rely on every thread
+            # contributing, so the sentinel is overwritten.
+            mn_cpu = wp.zeros(1, dtype=wp.int32, device='cpu')
+            mx_cpu = wp.zeros(1, dtype=wp.int32, device='cpu')
+            wp.launch(k, dim=N,
+                      inputs=[wp.array(an, dtype=wp.int32, device='cpu')],
+                      outputs=[mn_cpu, mx_cpu], device='cpu')
+
+            mn_m = wp.zeros(1, dtype=wp.int32, device='metal:0')
+            mx_m = wp.zeros(1, dtype=wp.int32, device='metal:0')
+            wp.launch(k, dim=N,
+                      inputs=[wp.array(an, dtype=wp.int32, device='metal:0')],
+                      outputs=[mn_m, mx_m], device='metal:0')
+
+            # Both sides have the same zero-initial behaviour; compare directly.
+            np.testing.assert_array_equal(mn_cpu.numpy(), mn_m.numpy())
+            np.testing.assert_array_equal(mx_cpu.numpy(), mx_m.numpy())
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_rejects_mixed_atomic_and_array_store(self):
+        # If a kernel writes one output via ``arr[idx] = ...`` and another via
+        # ``wp.atomic_add(...)``, our codegen rejects it because MLX makes all
+        # outputs of a single kernel atomic together — the regular store would
+        # no longer compile.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            from warp._src.codegen_metal import MetalCodegenError, generate_msl_kernel
+
+            @wp.kernel
+            def k(a: wp.array(dtype=wp.float32),
+                  c1: wp.array(dtype=wp.float32),
+                  c2: wp.array(dtype=wp.float32)):
+                tid = wp.tid()
+                c1[tid] = a[tid]
+                wp.atomic_add(c2, 0, a[tid])
+
+            try:
+                generate_msl_kernel(k)
+            except MetalCodegenError as e:
+                assert 'mixes atomic and non-atomic' in str(e), str(e)
+            else:
+                raise AssertionError('expected MetalCodegenError for mixed kernel')
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
     def test_rejects_adjoint_launch(self):
         snippet = textwrap.dedent(
             """
