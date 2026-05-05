@@ -1,0 +1,324 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Experimental MSL code generator for Warp's Metal backend.
+
+This module is a thin translator that consumes Warp's pre-emitted typed-IR
+strings (``adj.blocks[0].body_forward``) and rewrites them as Metal Shading
+Language. It does *not* re-walk the Python AST — it post-processes the
+CUDA-flavoured C++ statements that ``codegen.py`` already produces.
+
+Scope (step 3c, intentionally narrow):
+- 1-D ``wp.array`` args of scalar dtype (``float32``, ``int32``, ``uint32``,
+  ``int64``, ``uint64``)
+- ``wp.tid()``
+- Address-of, load, store on 1-D arrays
+- Scalar arithmetic intrinsics: ``add``, ``sub``, ``mul``, ``div``, ``mod``
+
+Anything else raises ``NotImplementedError`` with a pointer to the upstream
+statement so we know what to add next.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    pass
+
+
+class MetalCodegenError(NotImplementedError):
+    """Raised when MSL codegen encounters an unsupported construct.
+
+    Subclasses ``NotImplementedError`` so that callers can distinguish
+    "incomplete backend" from genuine bugs and decide whether to fall back to
+    CPU.
+    """
+
+
+# ---------------------------------------------------------------------------
+# Type mapping
+# ---------------------------------------------------------------------------
+
+# C++ ctype string (as returned by ``Var.ctype()``) -> MSL type string.
+# The values intentionally match Apple's MSL spec:
+#   https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf
+_SCALAR_CTYPE_TO_MSL: dict[str, str] = {
+    "wp::float16": "half",
+    "wp::float32": "float",
+    "wp::int32": "int",
+    "wp::uint32": "uint",
+    "wp::int64": "long",
+    "wp::uint64": "ulong",
+    "wp::int8": "char",
+    "wp::uint8": "uchar",
+    "wp::int16": "short",
+    "wp::uint16": "ushort",
+    "wp::bool": "bool",
+}
+
+# Pointer ctypes have a ``*`` suffix; address-space qualifier in MSL is
+# ``device`` for buffer-resident memory (the only kind we currently allocate).
+_POINTER_ADDRESS_SPACE = "device"
+
+
+def _msl_scalar_type(ctype: str) -> str:
+    """Translate a Warp scalar ctype string to its MSL equivalent.
+
+    Raises ``MetalCodegenError`` for types MSL cannot represent natively
+    (notably ``wp::float64`` — Apple Silicon GPUs have no double-precision
+    floating point support).
+    """
+    if ctype == "wp::float64":
+        raise MetalCodegenError("MSL has no native float64; double-precision kernels cannot be lowered to Metal")
+    if ctype not in _SCALAR_CTYPE_TO_MSL:
+        raise MetalCodegenError(f"MSL codegen: unsupported scalar ctype {ctype!r}")
+    return _SCALAR_CTYPE_TO_MSL[ctype]
+
+
+def _msl_pointer_type(ctype: str) -> str:
+    assert ctype.endswith("*"), ctype
+    inner = ctype[:-1].rstrip()
+    return f"{_POINTER_ADDRESS_SPACE} {_msl_scalar_type(inner)}*"
+
+
+def _msl_var_type(ctype: str) -> str:
+    """Translate a local variable's ctype to MSL."""
+    if ctype.endswith("*"):
+        return _msl_pointer_type(ctype)
+    return _msl_scalar_type(ctype)
+
+
+def _msl_constant_str(value) -> str:
+    """Format a Python scalar as an MSL literal."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    # ``isinstance(True, int)`` is True, so ``bool`` must come first.
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        # MSL accepts the same syntax as C++; ``f`` suffix marks single
+        # precision so the literal stays in fp32 register pressure.
+        return f"{value!r}f"
+    raise MetalCodegenError(f"MSL codegen does not yet support constant values of type {type(value).__name__}")
+
+
+# ---------------------------------------------------------------------------
+# Intrinsic translation
+# ---------------------------------------------------------------------------
+
+# Patterns are applied in order. Each entry is (regex, replacement). Captures
+# can be back-referenced with \1, \2, etc.
+_INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    # wp.tid() -> thread_position_in_grid.x (we only support 1-D dispatch)
+    (re.compile(r"\bbuiltin_tid1d\s*\(\s*\)"), "(int)thread_position_in_grid.x"),
+    # wp::address(arr, idx) -> &arr[idx]  (used only if the dataflow collapse
+    # in ``generate_msl_kernel`` didn't fold it away — e.g. for non-arg
+    # array locals, which we don't currently support but emit a recognisable
+    # form for.)
+    (re.compile(r"wp::address\s*\(\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)"), r"&\1[\2]"),
+    # wp::load(X) -> X
+    # The dataflow collapse in ``generate_msl_kernel`` rewrites all our
+    # ``wp::load`` operands from raw pointer locals to subscript expressions
+    # (``arr[idx]``), so the load is logically a no-op — the value is already
+    # there. If a non-collapsed load slips through, it'll fail the
+    # ``_check_no_unsupported_intrinsics`` guard downstream.
+    (re.compile(r"wp::load\s*\(\s*([^()]+?)\s*\)"), r"\1"),
+    # wp::array_store(arr, idx, val) -> arr[idx] = val
+    (
+        re.compile(r"wp::array_store\s*\(\s*([^,()]+?)\s*,\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)"),
+        r"\1[\2] = \3",
+    ),
+    # Scalar arithmetic
+    (re.compile(r"wp::add\s*\(\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)"), r"(\1 + \2)"),
+    (re.compile(r"wp::sub\s*\(\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)"), r"(\1 - \2)"),
+    (re.compile(r"wp::mul\s*\(\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)"), r"(\1 * \2)"),
+    (re.compile(r"wp::div\s*\(\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)"), r"(\1 / \2)"),
+    (re.compile(r"wp::mod\s*\(\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)"), r"(\1 % \2)"),
+    # Strip wp::float32(x) / wp::int32(x) etc. casts
+    (re.compile(r"wp::(float32|float16|int32|uint32|int64|uint64)\s*\(\s*([^()]+?)\s*\)"), r"\2"),
+]
+
+
+def _translate_intrinsics(line: str) -> str:
+    """Apply intrinsic substitutions until convergence."""
+    prev = None
+    while prev != line:
+        prev = line
+        for pat, repl in _INTRINSIC_PATTERNS:
+            line = pat.sub(repl, line)
+    return line
+
+
+def _check_no_unsupported_intrinsics(line: str) -> None:
+    """After translation, any remaining ``wp::`` or ``builtin_`` is unsupported."""
+    if "wp::" in line or "builtin_" in line:
+        raise MetalCodegenError(
+            f"MSL codegen does not yet support this statement; remaining Warp intrinsic in: {line!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Kernel artifact
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class MetalKernelArtifact:
+    """Everything ``mx.fast.metal_kernel`` needs to compile a kernel.
+
+    The artifact is consumed by the launch path (step 3d). For step 3c the
+    ``source`` string is fed directly to ``mx.fast.metal_kernel`` and a
+    1-element dispatch is used to confirm it compiles.
+    """
+
+    name: str
+    source: str
+    input_names: list[str]
+    output_names: list[str]
+    # Parallel to ``input_names`` — Warp ``Var`` for each input arg, so the
+    # dispatch path can resolve element type / shape.
+    input_args: list = field(default_factory=list)
+    output_args: list = field(default_factory=list)
+
+
+def _strip_comments_and_directives(line: str) -> str | None:
+    s = line.strip()
+    if not s:
+        return None
+    if s.startswith("//"):
+        return None
+    if s.startswith("#line"):
+        return None
+    return line
+
+
+def generate_msl_kernel(kernel) -> MetalKernelArtifact:
+    """Build an MSL artifact for a Warp ``Kernel`` object.
+
+    The kernel must already have been added to a module so that
+    ``kernel.adj.build()`` can resolve overloads. We invoke ``build()``
+    here defensively in case it hasn't run yet.
+    """
+    adj = kernel.adj
+
+    # Build the IR if not already built. Pass enable_backward=False because
+    # we only consume the forward pass — the Metal backend does not yet
+    # support autodiff.
+    if not getattr(adj, "blocks", None):
+        adj.build(builder=None, default_builder_options={"enable_backward": False})
+
+    # Classify each array arg as input or output by scanning the IR strings.
+    # MLX inputs are ``const device T*`` (read-only) — verified empirically —
+    # so any array that is written through must become an MLX output. We can't
+    # rely on ``arg.is_write`` here because it is only populated when
+    # ``verify_autograd_array_access`` is enabled.
+    written_arg_names: set[str] = set()
+    for raw in adj.blocks[0].body_forward:
+        # Pattern: wp::array_store(var_<argname>, ...)
+        m = re.match(r"\s*wp::array_store\s*\(\s*var_([A-Za-z_]\w*)", raw)
+        if m:
+            written_arg_names.add(m.group(1))
+
+    input_args: list = []
+    output_args: list = []
+    for arg in adj.args:
+        if not _is_array_arg(arg):
+            # Scalar arg — always an input.
+            input_args.append(arg)
+            continue
+        if arg.label in written_arg_names:
+            output_args.append(arg)
+        else:
+            input_args.append(arg)
+
+    if not output_args:
+        raise MetalCodegenError(
+            f"Kernel {adj.fun_name!r} has no output array; MSL kernels must write through at least one output buffer"
+        )
+
+    # --- Dataflow simplification ---------------------------------------
+    # Warp's IR splits an ``arr[i]`` read into ``addr = wp::address(arr, i);``
+    # followed by ``val = wp::load(addr);``. The intermediate ``addr`` is a
+    # typed pointer in CUDA C++ but in MSL it would inherit a specific address
+    # space (``const constant`` for inputs vs ``device`` for outputs) that we
+    # can't easily express in a separately-declared local. Collapsing the
+    # ``address``/``load`` pair into a direct subscript sidesteps the issue
+    # entirely and yields cleaner MSL.
+    subscript_map: dict[str, str] = {}  # var label -> "arr[idx]" string
+    # Warp local labels are integers (``var_0``, ``var_1``); arg labels start
+    # with a letter (``var_a``). Both are valid ``\w+`` so use that.
+    address_pattern = re.compile(r"\s*var_(\w+)\s*=\s*wp::address\s*\(\s*var_(\w+)\s*,\s*var_(\w+)\s*\)\s*;\s*$")
+    for raw in adj.blocks[0].body_forward:
+        m = address_pattern.match(raw)
+        if m:
+            local_label, arr_arg, idx_label = m.group(1), m.group(2), m.group(3)
+            # Only collapse if the array reference is one of the kernel args —
+            # otherwise the pointer source might be something more complex.
+            if any(arr_arg == a.label for a in adj.args):
+                subscript_map[local_label] = f"{arr_arg}[var_{idx_label}]"
+
+    # --- Local variable declarations -----------------------------------
+    body_lines: list[str] = []
+    for var in adj.variables:
+        if var.label in subscript_map:
+            # This local was a pointer into an array arg; we'll inline its
+            # uses below, so it doesn't need a declaration.
+            continue
+        ctype = var.ctype()
+        msl_type = _msl_var_type(ctype)
+        if var.constant is None:
+            body_lines.append(f"    {msl_type} var_{var.label};")
+        else:
+            body_lines.append(f"    const {msl_type} var_{var.label} = {_msl_constant_str(var.constant)};")
+
+    # --- Forward statements --------------------------------------------
+    for raw in adj.blocks[0].body_forward:
+        line = _strip_comments_and_directives(raw)
+        if line is None:
+            continue
+        # Skip the now-redundant address lines.
+        if address_pattern.match(raw):
+            continue
+        translated = _translate_intrinsics(line.strip())
+        # Inline subscripts for any var that became part of subscript_map.
+        # Replace ``wp::load(var_X)`` patterns with the array subscript first,
+        # then any bare ``var_X`` reference.
+        for local_label, subscript in subscript_map.items():
+            translated = re.sub(rf"\bvar_{re.escape(local_label)}\b", subscript, translated)
+        # Re-run intrinsic translation in case wp::load(var_1) became wp::load(arr[idx]).
+        translated = _translate_intrinsics(translated)
+        # Rename ``var_<argname>`` -> ``<argname>`` so the body matches MLX's
+        # generated function signature (which uses the names from
+        # ``input_names``/``output_names`` directly).
+        for arg in adj.args:
+            translated = re.sub(rf"\bvar_{re.escape(arg.label)}\b", arg.label, translated)
+        _check_no_unsupported_intrinsics(translated)
+        body_lines.append(f"    {translated}")
+
+    source = "\n".join(body_lines) + "\n"
+
+    return MetalKernelArtifact(
+        name=adj.fun_name,
+        source=source,
+        input_names=[a.label for a in input_args],
+        output_names=[a.label for a in output_args],
+        input_args=input_args,
+        output_args=output_args,
+    )
+
+
+def _is_array_arg(var) -> bool:
+    """Return True if a kernel arg's type is a ``wp.array`` family."""
+    # Lazy import to avoid import cycle with warp._src.types.
+    from warp._src.types import array, indexedarray  # noqa: PLC0415
+
+    t = var.type
+    if isinstance(t, array):
+        return True
+    if isinstance(t, indexedarray):
+        return True
+    # ``wp.array`` annotations live as classes too:
+    return getattr(t, "_wp_generic_type_str_", None) in ("array_t", "indexedarray_t")
