@@ -61,7 +61,9 @@ pointer to the offending statement):
   component scalar accesses (``a[i*3+0]``, ``a[i*3+1]``, ``a[i*3+2]``)
   to avoid the address-space mismatches that ``packed_floatN`` pointer
   casts hit in MLX-generated kernel wrappers. Multi-dim arrays of vec
-  types are not yet supported.
+  types (``wp.array2d(dtype=wp.vec3)`` etc.) are also supported via
+  the same expansion combined with ``_flat_index_expr`` for the user-
+  visible dims.
 - Matrix types ``wp.mat22``/``wp.mat33``/``wp.mat44`` (and the
   corresponding int variants) for ``RxC`` with ``R, C`` in ``{2, 3, 4}``
   where MSL has a native ``floatRxC`` type. ``wp.transpose`` and
@@ -70,8 +72,9 @@ pointer to the offending statement):
   column form. ``wp::extract(m, i, j)`` becomes ``m[j][i]`` to match
   MSL's column-major indexing. Reads/writes of ``wp.array(dtype=wp.mat33)``
   scatter/gather between row-major user storage and the column-major
-  MSL representation. Multi-dim arrays of mat types are not yet
-  supported.
+  MSL representation. Multi-dim arrays of mat types
+  (``wp.array2d(dtype=wp.mat33)`` etc.) are also supported via the same
+  scatter/gather expanded for each user-visible dim.
 """
 
 from __future__ import annotations
@@ -868,38 +871,36 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
             indices = re.findall(r"var_(\w+)", m.group("rest"))
             index_var_names = [f"var_{i}" for i in indices]
             if arr_arg in vec_arr_info:
-                # Vec-typed: only 1-D arrays of vec are currently supported.
-                arg_var = arg_by_label[arr_arg]
-                arr_ndim = getattr(arg_var.type, "ndim", 1) or 1
-                if arr_ndim != 1 or len(index_var_names) != 1:
-                    raise MetalCodegenError(
-                        f"MSL codegen does not yet support multi-dim arrays of vec types "
-                        f"(kernel {adj.fun_name!r} arg {arr_arg!r})"
-                    )
+                # Vec-typed array: each *element* is ``vec_n`` consecutive
+                # scalars. Compute the linear element index from the user-
+                # visible ndim-many indices, then expand each component
+                # access. Works for any ndim because the MLX view shape and
+                # ``_flat_index_expr`` both use the user-visible dims (the
+                # vec component is the innermost MLX dim, not part of the
+                # element index).
                 vec_n, msl_scalar = vec_arr_info[arr_arg]
                 msl_vec_type = f"{msl_scalar}{vec_n}"
-                idx = index_var_names[0]
-                comps = [f"{arr_arg}[{idx} * {vec_n} + {k}]" for k in range(vec_n)]
+                if len(index_var_names) == 1:
+                    elem_idx = index_var_names[0]
+                else:
+                    elem_idx = f"({_flat_index_expr(arr_arg, index_var_names)})"
+                comps = [f"{arr_arg}[{elem_idx} * {vec_n} + {k}]" for k in range(vec_n)]
                 subscript_map[local_label] = f"{msl_vec_type}({', '.join(comps)})"
             elif arr_arg in mat_arr_info:
-                # Mat-typed: only 1-D arrays of mat are currently supported.
-                # Read row-major flat (rows*cols floats per element) and build
-                # an MSL ``floatRxC`` whose column k = (M[0][k], M[1][k], ...).
-                arg_var = arg_by_label[arr_arg]
-                arr_ndim = getattr(arg_var.type, "ndim", 1) or 1
-                if arr_ndim != 1 or len(index_var_names) != 1:
-                    raise MetalCodegenError(
-                        f"MSL codegen does not yet support multi-dim arrays of mat types "
-                        f"(kernel {adj.fun_name!r} arg {arr_arg!r})"
-                    )
+                # Mat-typed array: each *element* is ``rows*cols`` consecutive
+                # row-major-stored scalars. Build the column-major MSL
+                # ``floatRxC`` from those scalars (column k = M[*][k]).
                 rows, cols, msl_scalar = mat_arr_info[arr_arg]
                 stride = rows * cols
                 msl_vec_type = f"{msl_scalar}{rows}"
                 msl_mat_type = f"{msl_scalar}{rows}x{cols}"
-                idx = index_var_names[0]
+                if len(index_var_names) == 1:
+                    elem_idx = index_var_names[0]
+                else:
+                    elem_idx = f"({_flat_index_expr(arr_arg, index_var_names)})"
                 col_strs: list[str] = []
                 for c in range(cols):
-                    col_components = [f"{arr_arg}[{idx} * {stride} + {r * cols + c}]" for r in range(rows)]
+                    col_components = [f"{arr_arg}[{elem_idx} * {stride} + {r * cols + c}]" for r in range(rows)]
                     col_strs.append(f"{msl_vec_type}({', '.join(col_components)})")
                 subscript_map[local_label] = f"{msl_mat_type}({', '.join(col_strs)})"
             else:
@@ -998,35 +999,27 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
                 indices = parts[:-1]
                 value = parts[-1]
                 if arr in vec_arr_info:
-                    arg_var = arg_by_label[arr]
-                    arr_ndim = getattr(arg_var.type, "ndim", 1) or 1
-                    if arr_ndim != 1 or len(indices) != 1:
-                        raise MetalCodegenError(
-                            f"MSL codegen does not yet support stores into multi-dim arrays of vec types "
-                            f"(kernel {adj.fun_name!r} arg {arr!r})"
-                        )
                     vec_n, _ = vec_arr_info[arr]
-                    idx = indices[0]
+                    if len(indices) == 1:
+                        elem_idx = indices[0]
+                    else:
+                        elem_idx = f"({_flat_index_expr(arr, indices)})"
                     for k in range(vec_n):
-                        body_lines.append(_finalize(f"{indent}{arr}[{idx} * {vec_n} + {k}] = {value}[{k}];"))
+                        body_lines.append(_finalize(f"{indent}{arr}[{elem_idx} * {vec_n} + {k}] = {value}[{k}];"))
                     continue
                 if arr in mat_arr_info:
-                    arg_var = arg_by_label[arr]
-                    arr_ndim = getattr(arg_var.type, "ndim", 1) or 1
-                    if arr_ndim != 1 or len(indices) != 1:
-                        raise MetalCodegenError(
-                            f"MSL codegen does not yet support stores into multi-dim arrays of mat types "
-                            f"(kernel {adj.fun_name!r} arg {arr!r})"
-                        )
                     rows, cols, _ = mat_arr_info[arr]
                     stride = rows * cols
-                    idx = indices[0]
+                    if len(indices) == 1:
+                        elem_idx = indices[0]
+                    else:
+                        elem_idx = f"({_flat_index_expr(arr, indices)})"
                     # Scatter to row-major storage: data[i*RC + r*C + c] =
                     # logical M[r][c] = MSL ``value[c][r]`` (column, then row).
                     for r in range(rows):
                         for c in range(cols):
                             body_lines.append(
-                                _finalize(f"{indent}{arr}[{idx} * {stride} + {r * cols + c}] = {value}[{c}][{r}];")
+                                _finalize(f"{indent}{arr}[{elem_idx} * {stride} + {r * cols + c}] = {value}[{c}][{r}];")
                             )
                     continue
                 flat_idx = _flat_index_expr(arr, indices)

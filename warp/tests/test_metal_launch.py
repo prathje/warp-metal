@@ -1433,6 +1433,85 @@ class TestMetalLaunch(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet)
 
+    def test_2d_vec3_array_matches_cpu(self):
+        # ``wp.array2d(dtype=wp.vec3)`` was previously rejected. Lifted: vec
+        # arrays of any ndim work via the same per-component expansion plus
+        # ``_flat_index_expr`` for the user-visible dims.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def add(a: wp.array2d(dtype=wp.vec3),
+                    b: wp.array2d(dtype=wp.vec3),
+                    c: wp.array2d(dtype=wp.vec3)):
+                i, j = wp.tid()
+                c[i, j] = a[i, j] + b[i, j]
+
+            @wp.kernel
+            def dot(a: wp.array2d(dtype=wp.vec3),
+                    b: wp.array2d(dtype=wp.vec3),
+                    c: wp.array2d(dtype=wp.float32)):
+                i, j = wp.tid()
+                c[i, j] = wp.dot(a[i, j], b[i, j])
+
+            H, W = 5, 7
+            rng = np.random.default_rng(0)
+            an = rng.standard_normal((H, W, 3)).astype(np.float32)
+            bn = rng.standard_normal((H, W, 3)).astype(np.float32)
+            for dev in ('cpu', 'metal:0'):
+                a = wp.array(an, dtype=wp.vec3, device=dev)
+                b = wp.array(bn, dtype=wp.vec3, device=dev)
+                c = wp.zeros((H, W), dtype=wp.vec3, device=dev)
+                wp.launch(add, dim=(H, W), inputs=[a, b], outputs=[c], device=dev)
+                if dev == 'cpu':
+                    cpu_add = c.numpy()
+                else:
+                    np.testing.assert_array_equal(c.numpy(), cpu_add)
+            for dev in ('cpu', 'metal:0'):
+                a = wp.array(an, dtype=wp.vec3, device=dev)
+                b = wp.array(bn, dtype=wp.vec3, device=dev)
+                c = wp.zeros((H, W), dtype=wp.float32, device=dev)
+                wp.launch(dot, dim=(H, W), inputs=[a, b], outputs=[c], device=dev)
+                if dev == 'cpu':
+                    cpu_dot = c.numpy()
+                else:
+                    np.testing.assert_allclose(c.numpy(), cpu_dot, rtol=1e-5, atol=1e-6)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_2d_mat33_array_matches_cpu(self):
+        # Same lift for mat33 — multi-dim arrays of mat now work.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(a: wp.array2d(dtype=wp.mat33),
+                  out: wp.array2d(dtype=wp.mat33)):
+                i, j = wp.tid()
+                out[i, j] = wp.transpose(a[i, j])
+
+            H, W = 4, 6
+            rng = np.random.default_rng(11)
+            mn = rng.standard_normal((H, W, 3, 3)).astype(np.float32)
+            for dev in ('cpu', 'metal:0'):
+                a = wp.array(mn, dtype=wp.mat33, device=dev)
+                out = wp.zeros((H, W), dtype=wp.mat33, device=dev)
+                wp.launch(k, dim=(H, W), inputs=[a], outputs=[out], device=dev)
+                if dev == 'cpu':
+                    cpu_out = out.numpy()
+                else:
+                    np.testing.assert_array_equal(out.numpy(), cpu_out)
+            # Sanity: result is the per-cell matrix transpose of the input.
+            np.testing.assert_array_equal(cpu_out, np.transpose(mn, (0, 1, 3, 2)))
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
     def test_rejects_adjoint_launch(self):
         snippet = textwrap.dedent(
             """
