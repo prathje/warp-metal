@@ -1368,6 +1368,71 @@ class TestMetalLaunch(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet)
 
+    def test_where_matches_cpu(self):
+        # ``wp.where(cond, a, b)`` -> C-style ternary in MSL. Bit-exact for
+        # finite inputs (no fp ops, just selection).
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(a: wp.array(dtype=wp.float32),
+                  b: wp.array(dtype=wp.float32),
+                  c: wp.array(dtype=wp.float32)):
+                tid = wp.tid()
+                c[tid] = wp.where(a[tid] > 0.0, a[tid], b[tid])
+
+            N = 1024
+            rng = np.random.default_rng(0)
+            an = rng.standard_normal(N).astype(np.float32)
+            bn = rng.standard_normal(N).astype(np.float32)
+            c_cpu = wp.zeros(N, dtype=wp.float32, device='cpu')
+            c_m = wp.zeros(N, dtype=wp.float32, device='metal:0')
+            wp.launch(k, dim=N,
+                      inputs=[wp.array(an, dtype=wp.float32, device='cpu'),
+                              wp.array(bn, dtype=wp.float32, device='cpu')],
+                      outputs=[c_cpu], device='cpu')
+            wp.launch(k, dim=N,
+                      inputs=[wp.array(an, dtype=wp.float32, device='metal:0'),
+                              wp.array(bn, dtype=wp.float32, device='metal:0')],
+                      outputs=[c_m], device='metal:0')
+            np.testing.assert_array_equal(c_cpu.numpy(), c_m.numpy())
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_clamp_matches_cpu(self):
+        # ``wp.clamp(x, lo, hi)`` -> ``metal::clamp``. Same arg order. The
+        # MSL stdlib clamp is bit-exact when ``lo <= x <= hi`` is preserved
+        # element-wise (no sub-ulp rounding involved).
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(a: wp.array(dtype=wp.float32),
+                  c: wp.array(dtype=wp.float32)):
+                tid = wp.tid()
+                c[tid] = wp.clamp(a[tid], -1.0, 1.0)
+
+            N = 1024
+            rng = np.random.default_rng(11)
+            an = (rng.standard_normal(N) * 5.0).astype(np.float32)
+            c_cpu = wp.zeros(N, dtype=wp.float32, device='cpu')
+            c_m = wp.zeros(N, dtype=wp.float32, device='metal:0')
+            wp.launch(k, dim=N,
+                      inputs=[wp.array(an, dtype=wp.float32, device='cpu')],
+                      outputs=[c_cpu], device='cpu')
+            wp.launch(k, dim=N,
+                      inputs=[wp.array(an, dtype=wp.float32, device='metal:0')],
+                      outputs=[c_m], device='metal:0')
+            np.testing.assert_array_equal(c_cpu.numpy(), c_m.numpy())
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
     def test_rejects_adjoint_launch(self):
         snippet = textwrap.dedent(
             """

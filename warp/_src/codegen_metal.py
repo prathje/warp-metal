@@ -33,8 +33,9 @@ pointer to the offending statement):
   syntax, so they pass through the regex-based translator unchanged).
 - A whitelist of math builtins listed in ``_MATH_BUILTIN_NAMES`` —
   ``sqrt``, ``abs``, ``min``, ``max``, ``floor``, ``ceil``, ``exp``,
-  ``log``, ``sin``, ``cos``, ``tanh``, etc. — translated to MSL's
-  ``metal::`` namespace.
+  ``log``, ``sin``, ``cos``, ``tanh``, ``clamp``, etc. — translated to
+  MSL's ``metal::`` namespace.
+- ``wp.where(cond, a, b)`` -> ``((cond) ? (a) : (b))`` (C-style ternary).
 - ``for i in range(...)`` loops, both static (Warp unrolls them, so this
   is a no-op) and dynamic (a structural pre-pass rewrites Warp's
   ``goto``-based loop into a real MSL ``for``).
@@ -331,6 +332,8 @@ _MATH_BUILTIN_NAMES: tuple[str, ...] = (
     # Matrix ops (defined on MSL floatRxC etc.).
     "transpose",
     "determinant",
+    # Ternary clamp — same name and 3-arg signature in MSL (``metal::clamp(x, lo, hi)``).
+    "clamp",
 )
 
 
@@ -385,6 +388,13 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     # ``wp::extract(vec, idx)`` returns the i-th component. MSL vector types
     # support the C-style ``[i]`` subscript directly.
     (re.compile(r"wp::extract\s*\(\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)"), r"\1[\2]"),
+    # ``wp::where(cond, a, b)`` is a select. MSL has ``select(b, a, cond)``
+    # but the C-style ternary works for both scalar and vector operands and
+    # avoids the surprising arg-order swap.
+    (
+        re.compile(r"wp::where\s*\(\s*([^,()]+?)\s*,\s*([^,()]+?)\s*,\s*([^,()]+?)\s*\)"),
+        r"((\1) ? (\2) : (\3))",
+    ),
     # Atomic ops on array elements. MLX-allocated outputs flagged with
     # ``atomic_outputs=True`` are typed ``device atomic<T>*``, so the
     # ``&arr[idx]`` we form here is already a valid atomic-pointer operand.
