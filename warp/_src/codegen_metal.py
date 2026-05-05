@@ -17,6 +17,16 @@ pointer to the offending statement):
   (``arr[i, j]`` -> ``arr[i * arr_shape[1] + j]``). MLX auto-generates
   ``<inputname>_shape`` for inputs; the launcher appends a synthetic
   ``<outputname>_shape`` argument for each multi-dim output.
+- ``arr.shape[k]`` access inside the kernel body. The IR emits a chain
+  ``var_X = &(var_arg.shape); var_Y = wp::load(var_X);
+  var_Z = wp::extract(var_Y, k);`` with intermediate ``wp::shape_t`` /
+  ``wp::shape_t*`` ctypes. The codegen aliases those locals to the
+  ``<arg>_shape`` array and skips the bookkeeping lines.
+- Both annotation forms: ``wp.array(dtype=...)`` (callable) and
+  ``wp.array2d[float]`` (subscript). The latter produces an
+  ``_ArrayAnnotation`` instance rather than a ``warp._src.types.array``,
+  but both expose ``ndim`` / ``dtype`` so the codegen treats them
+  uniformly.
 - Scalar arithmetic intrinsics: ``add``, ``sub``, ``mul``, ``div``, ``mod``
 - ``if`` / ``else`` blocks and the comparison operators ``<``, ``<=``,
   ``==``, ``!=``, ``>=``, ``>`` (Warp's IR pre-emits these in plain C/MSL
@@ -805,6 +815,39 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
             mat_arr_info[arg.label] = m_info
 
     subscript_map: dict[str, str] = {}  # local label -> "arr[flat_idx]" string
+    # Locals that resolve to ``<arr>_shape`` (the MLX-supplied shape array).
+    # Tracked separately so we can recognise them when emitting / skipping
+    # ``wp::load`` and ``wp::extract`` lines that operate on the shape struct.
+    shape_aliases: set[str] = set()
+
+    # ``arr.shape[k]`` lowers to ``var_X = &(var_arr.shape); var_Y = wp::load(var_X);
+    # var_Z = wp::extract(var_Y, k);``. The intermediate ``var_X`` (``wp::shape_t*``)
+    # and ``var_Y`` (``wp::shape_t``) are types our table doesn't know, so we
+    # alias both to ``<arr>_shape`` and skip their declarations + the
+    # corresponding ``&(...)`` and ``wp::load(...)`` lines. The trailing
+    # ``wp::extract(var_Y, k)`` then translates via the existing 2-arg extract
+    # rule into ``arr_shape[k]``.
+    shape_address_pat = re.compile(r"^\s*var_(\w+)\s*=\s*&\s*\(\s*var_(\w+)\s*\.\s*shape\s*\)\s*;\s*$")
+    load_pat = re.compile(r"^\s*var_(\w+)\s*=\s*wp::load\s*\(\s*var_(\w+)\s*\)\s*;\s*$")
+    for raw in forward_lines:
+        m = shape_address_pat.match(raw)
+        if m:
+            local_label = m.group(1)
+            arr_arg = m.group(2)
+            if arr_arg in arg_label_set:
+                subscript_map[local_label] = f"{arr_arg}_shape"
+                shape_aliases.add(local_label)
+    # Propagate aliases through ``var_Y = wp::load(var_X)`` whose source is
+    # already a shape alias.
+    for raw in forward_lines:
+        m = load_pat.match(raw)
+        if m:
+            target_label = m.group(1)
+            source_label = m.group(2)
+            if source_label in shape_aliases:
+                subscript_map[target_label] = subscript_map[source_label]
+                shape_aliases.add(target_label)
+
     for raw in forward_lines:
         m = _ADDRESS_MULTI_PAT.match(raw)
         if m:
@@ -905,6 +948,13 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
         # Address lines have been folded into ``subscript_map``.
         if _ADDRESS_MULTI_PAT.match(raw):
             continue
+        # ``var_X = &(var_arg.shape);`` and the load that follows are also
+        # collapsed via ``subscript_map``/``shape_aliases``; skip the raw lines.
+        if shape_address_pat.match(raw):
+            continue
+        m_load = load_pat.match(raw)
+        if m_load and m_load.group(2) in shape_aliases:
+            continue
         # ``builtin_tid2d(var_X, var_Y);`` / ``builtin_tid3d(...)`` —
         # arity-specific structural rewrite (the patterns table only handles
         # the 1-D form).
@@ -1003,14 +1053,23 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
 
 
 def _is_array_arg(var) -> bool:
-    """Return True if a kernel arg's type is a ``wp.array`` family."""
+    """Return True if a kernel arg's type is a ``wp.array`` family.
+
+    Handles both annotation forms Warp produces:
+      - ``wp.array(dtype=wp.float32)`` — a callable that returns an instance
+        of ``warp._src.types.array``.
+      - ``wp.array2d[float]`` — the subscript form returning a
+        ``_ArrayAnnotation`` (this is what ``mujoco_warp`` uses throughout,
+        and is missing the ``_wp_generic_type_str_`` marker the older form
+        carries).
+    """
     # Lazy import to avoid import cycle with warp._src.types.
-    from warp._src.types import array, indexedarray  # noqa: PLC0415
+    from warp._src.types import _ArrayAnnotationBase, array, indexedarray  # noqa: PLC0415
 
     t = var.type
-    if isinstance(t, array):
+    if isinstance(t, (array, indexedarray)):
         return True
-    if isinstance(t, indexedarray):
+    if isinstance(t, _ArrayAnnotationBase):
         return True
     # ``wp.array`` annotations live as classes too:
     return getattr(t, "_wp_generic_type_str_", None) in ("array_t", "indexedarray_t")

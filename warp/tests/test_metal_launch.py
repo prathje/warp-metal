@@ -1302,6 +1302,72 @@ class TestMetalLaunch(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet)
 
+    def test_array_shape_access_in_body_matches_cpu(self):
+        # ``arr.shape[k]`` lowers to a goto-free chain of intermediates with
+        # ``wp::shape_t*``/``wp::shape_t`` ctypes the type table doesn't know.
+        # The codegen aliases those locals to MLX's auto-generated
+        # ``<arg>_shape`` (or the synthetic shape input we add for outputs).
+        # mujoco_warp uses this pattern heavily for broadcasting / wrapping.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(src: wp.array2d(dtype=wp.float32),
+                  dst: wp.array2d(dtype=wp.float32)):
+                worldid, i = wp.tid()
+                src_row = worldid % src.shape[0]
+                dst[worldid, i] = src[src_row, i]
+
+            nworld, nq = 8, 12
+            src_n = 4  # broadcast: src has 4 rows, each repeated twice
+            rng = np.random.default_rng(0)
+            src_np = rng.standard_normal((src_n, nq)).astype(np.float32)
+
+            for dev in ('cpu', 'metal:0'):
+                src_arr = wp.array(src_np, dtype=wp.float32, device=dev)
+                dst_arr = wp.zeros((nworld, nq), dtype=wp.float32, device=dev)
+                wp.launch(k, dim=(nworld, nq),
+                          inputs=[src_arr], outputs=[dst_arr], device=dev)
+                if dev == 'cpu':
+                    cpu_out = dst_arr.numpy()
+                else:
+                    np.testing.assert_array_equal(dst_arr.numpy(), cpu_out)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_subscript_array_annotation_form_matches_cpu(self):
+        # mujoco_warp uses the subscript annotation form
+        # ``wp.array2d[float]`` (which produces ``_ArrayAnnotation``) rather
+        # than the callable form ``wp.array2d(dtype=float)``. Both must work.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(src: wp.array2d[float], dst: wp.array2d[float]):
+                i, j = wp.tid()
+                dst[i, j] = src[i, j] * 2.0
+
+            H, W = 8, 5
+            rng = np.random.default_rng(7)
+            an = rng.standard_normal((H, W)).astype(np.float32)
+            for dev in ('cpu', 'metal:0'):
+                src_arr = wp.array(an, dtype=wp.float32, device=dev)
+                dst_arr = wp.zeros((H, W), dtype=wp.float32, device=dev)
+                wp.launch(k, dim=(H, W),
+                          inputs=[src_arr], outputs=[dst_arr], device=dev)
+                if dev == 'cpu':
+                    cpu_out = dst_arr.numpy()
+                else:
+                    np.testing.assert_array_equal(dst_arr.numpy(), cpu_out)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
     def test_rejects_adjoint_launch(self):
         snippet = textwrap.dedent(
             """
