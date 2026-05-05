@@ -1702,6 +1702,48 @@ class TestMetalLaunch(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet, timeout=60)
 
+    def test_struct_typed_kernel_arg_matches_cpu(self):
+        # ``def k(p: Particle, ...)`` was previously rejected. Lifted: the
+        # launcher serialises the user's ``StructInstance`` to a flat
+        # float32 buffer (via ``bytes(p._ctype)``) and passes it as an MLX
+        # input; the kernel body reads each field at its scalar offset.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.struct
+            class Particle:
+                pos: wp.vec3
+                mass: wp.float32
+
+            @wp.kernel
+            def k(p: Particle, out: wp.array(dtype=wp.float32)):
+                tid = wp.tid()
+                out[tid] = p.mass + p.pos[0] + p.pos[1] + p.pos[2] + float(tid)
+
+            N = 16
+            p = Particle()
+            p.pos = wp.vec3(1.0, 2.0, 3.0)
+            p.mass = 10.0
+
+            for dev in ('cpu', 'metal:0'):
+                out = wp.zeros(N, dtype=wp.float32, device=dev)
+                wp.launch(k, dim=N, inputs=[p], outputs=[out], device=dev)
+                if dev == 'cpu':
+                    cpu_out = out.numpy()
+                else:
+                    np.testing.assert_array_equal(out.numpy(), cpu_out)
+            # Sanity: each output element is mass + pos.x + pos.y + pos.z + tid.
+            expected = np.array(
+                [10.0 + 1.0 + 2.0 + 3.0 + i for i in range(N)],
+                dtype=np.float32,
+            )
+            np.testing.assert_array_equal(cpu_out, expected)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
     def test_rejects_adjoint_launch(self):
         snippet = textwrap.dedent(
             """
