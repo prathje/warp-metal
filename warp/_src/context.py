@@ -3462,6 +3462,77 @@ class CudaMempoolAllocator:
         runtime.core.wp_free_device_async(self.device.context, ptr)
 
 
+# Registry that keeps MLX-backed Metal buffers alive while their address is in use.
+# The pointer returned by ``MetalDefaultAllocator.allocate`` is the CPU-mapped address
+# of an ``mx.array``'s underlying unified-memory buffer; we must hold the ``mx.array``
+# reference here, otherwise the buffer is freed once the local goes out of scope and
+# the pointer becomes dangling.
+_metal_buffer_registry: dict[int, Any] = {}
+_metal_buffer_lock = threading.Lock()
+
+
+def _metal_register_buffer(ptr: int, mx_array) -> None:
+    with _metal_buffer_lock:
+        _metal_buffer_registry[ptr] = mx_array
+
+
+def _metal_get_buffer(ptr: int):
+    """Return the MLX array backing the given Metal pointer, or ``None`` if unknown.
+
+    Used by the Metal kernel-dispatch path to recover the ``mx.array`` from a
+    Warp pointer for passing into ``mx.fast.metal_kernel``. Not yet wired up
+    to launch — added now alongside the allocator so the registry has a single
+    documented access pattern.
+    """
+    with _metal_buffer_lock:
+        return _metal_buffer_registry.get(ptr)
+
+
+def _metal_release_buffer(ptr: int) -> None:
+    with _metal_buffer_lock:
+        _metal_buffer_registry.pop(ptr, None)
+
+
+class MetalDefaultAllocator:
+    """Allocator backed by ``mlx.core`` arrays on Apple Silicon.
+
+    Returns a CPU-addressable pointer into MLX's unified-memory buffer so the
+    existing host-side ``wp_memcpy_h2h`` and ``wp_memset_host`` paths in Warp
+    work unchanged on Metal devices. The MLX array reference is held in
+    ``_metal_buffer_registry`` until ``deallocate`` is called.
+    """
+
+    def __init__(self, device):
+        assert device.is_metal
+        self.device = device
+        # Lazy imports — this allocator is only constructed when the user
+        # explicitly enables the Metal backend, so it's safe to require these.
+        import mlx.core as mx  # noqa: PLC0415
+
+        self._mx = mx
+
+    def allocate(self, size_in_bytes: int) -> int:
+        if size_in_bytes <= 0:
+            raise ValueError(f"Cannot allocate {size_in_bytes} bytes on '{self.device}'")
+        # Allocate a flat byte buffer; ``wp.array`` layers shape/dtype on top.
+        buf = self._mx.zeros((size_in_bytes,), dtype=self._mx.uint8)
+        self._mx.eval(buf)
+        # Extract the CPU-addressable pointer from the unified-memory buffer.
+        # ``np.array(buf, copy=False)`` aliases the same storage on Apple
+        # Silicon (verified empirically — writes through this address are
+        # visible to subsequent GPU ops on ``buf``).
+        view = np.array(buf, copy=False)
+        ptr = int(view.__array_interface__["data"][0])
+        if ptr == 0:
+            raise RuntimeError(f"Failed to allocate {size_in_bytes} bytes on '{self.device}'")
+        _metal_register_buffer(ptr, buf)
+        _set_alloc_tag_if_tracking(ptr)
+        return ptr
+
+    def deallocate(self, ptr: int, size_in_bytes: int) -> None:
+        _metal_release_buffer(ptr)
+
+
 class ContextGuard:
     def __init__(self, device):
         self.device = device
@@ -3943,12 +4014,14 @@ class Device:
             self.uuid = None
             self.pci_bus_id = None
 
-            # Allocator and per-device dispatch are not implemented yet —
-            # they will be added in step 3b. Accessing them raises a clear error.
-            self.default_allocator = None
-            self.pinned_allocator = None
-            self.memset = None
-            self.memtile = None
+            # MLX-backed allocator. Pointers returned by this allocator are
+            # CPU-addressable into the same unified-memory buffer that the GPU
+            # reads/writes, so memset/memtile use the host-side dispatch funcs.
+            self.default_allocator = MetalDefaultAllocator(self)
+            # Pinned/unpinned distinction does not apply to unified memory; alias.
+            self.pinned_allocator = self.default_allocator
+            self.memset = runtime.core.wp_memset_host
+            self.memtile = runtime.core.wp_memtile_host
 
         else:
             raise RuntimeError(f"Invalid device ordinal ({ordinal})'")
@@ -4139,7 +4212,17 @@ class Device:
         if self is other:
             return True
         elif isinstance(other, Device):
-            return self.context == other.context
+            # CUDA devices may be represented by multiple Device instances that
+            # share a context (primary + non-primary alias), so context equality
+            # is the right check when both sides are CUDA. For non-CUDA devices,
+            # ``context`` is ``None`` for everything, so context equality would
+            # collapse CPU and Metal into one bucket — fall back to identity,
+            # which is correct because Runtime constructs each non-CUDA device
+            # exactly once and hands it out via ``device_map``.
+            if self.is_cuda and other.is_cuda:
+                return self.context == other.context
+            else:
+                return False
         elif isinstance(other, str):
             if other == "cuda":
                 return self == self.runtime.get_current_cuda_device()
