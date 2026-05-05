@@ -27,6 +27,13 @@ pointer to the offending statement):
   ``goto``-based loop into a real MSL ``for``).
 - ``wp::assign(dst, src)`` (in-place mutation, used by the loop body for
   accumulator updates).
+- Atomic ops on output arrays — ``wp.atomic_add``, ``wp.atomic_sub``,
+  ``wp.atomic_min``, ``wp.atomic_max`` — translated to MSL's
+  ``atomic_fetch_*_explicit`` with relaxed ordering. The launcher sets
+  ``mx.fast.metal_kernel(atomic_outputs=True)`` for kernels that use any
+  atomic op, which makes *all* outputs of that kernel ``device atomic<T>*``;
+  mixed atomic / non-atomic writes to outputs in the same kernel are
+  rejected at codegen time.
 """
 
 from __future__ import annotations
@@ -199,6 +206,27 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         re.compile(r"wp::assign\s*\(\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)\s*;"),
         r"\1 = \2;",
     ),
+    # Atomic ops on array elements. MLX-allocated outputs flagged with
+    # ``atomic_outputs=True`` are typed ``device atomic<T>*``, so the
+    # ``&arr[idx]`` we form here is already a valid atomic-pointer operand.
+    # MSL's ``memory_order_relaxed`` matches CUDA's default atomic ordering,
+    # which is what Warp's IR semantics imply.
+    (
+        re.compile(r"wp::atomic_add\s*\(\s*([^,()]+?)\s*,\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)"),
+        r"atomic_fetch_add_explicit(&\1[\2], \3, memory_order_relaxed)",
+    ),
+    (
+        re.compile(r"wp::atomic_sub\s*\(\s*([^,()]+?)\s*,\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)"),
+        r"atomic_fetch_sub_explicit(&\1[\2], \3, memory_order_relaxed)",
+    ),
+    (
+        re.compile(r"wp::atomic_min\s*\(\s*([^,()]+?)\s*,\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)"),
+        r"atomic_fetch_min_explicit(&\1[\2], \3, memory_order_relaxed)",
+    ),
+    (
+        re.compile(r"wp::atomic_max\s*\(\s*([^,()]+?)\s*,\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)"),
+        r"atomic_fetch_max_explicit(&\1[\2], \3, memory_order_relaxed)",
+    ),
     # Strip Warp scalar-type cast wrappers ``wp::T(x)``. Includes the unsuffixed
     # Python-style names ``wp::float``, ``wp::int``, etc. that Warp emits for
     # ``float(x)`` / ``int(x)`` constructor calls in user code.
@@ -259,6 +287,12 @@ class MetalKernelArtifact:
     # dispatch path can resolve element type / shape.
     input_args: list = field(default_factory=list)
     output_args: list = field(default_factory=list)
+    # ``True`` if any kernel statement uses ``wp::atomic_*`` on an output
+    # array. The launcher passes this through to
+    # ``mx.fast.metal_kernel(atomic_outputs=...)`` so that outputs are typed
+    # ``device atomic<T>*`` in the generated function signature, and the
+    # ``init_value=0.0`` fallback is applied at call time.
+    atomic_outputs: bool = False
 
 
 def _strip_comments_and_directives(line: str) -> str | None:
@@ -388,11 +422,34 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
     # rely on ``arg.is_write`` here because it is only populated when
     # ``verify_autograd_array_access`` is enabled.
     written_arg_names: set[str] = set()
+    atomic_arg_names: set[str] = set()
+    array_store_pat = re.compile(r"\s*wp::array_store\s*\(\s*var_([A-Za-z_]\w*)")
+    atomic_pat = re.compile(r"wp::atomic_(?:add|sub|min|max)\s*\(\s*var_([A-Za-z_]\w*)")
     for raw in forward_lines:
-        # Pattern: wp::array_store(var_<argname>, ...)
-        m = re.match(r"\s*wp::array_store\s*\(\s*var_([A-Za-z_]\w*)", raw)
+        m = array_store_pat.match(raw)
         if m:
             written_arg_names.add(m.group(1))
+        m = atomic_pat.search(raw)
+        if m:
+            written_arg_names.add(m.group(1))
+            atomic_arg_names.add(m.group(1))
+
+    # MLX's ``atomic_outputs`` flag is per-kernel, not per-output: when set,
+    # *every* output is typed ``device atomic<T>*``, which means a regular
+    # ``arr[idx] = val`` store on a non-atomic output would no longer compile
+    # (the LHS isn't an lvalue of the right type). Reject the mixed case
+    # rather than silently miscompiling.
+    has_atomic = bool(atomic_arg_names)
+    if has_atomic:
+        non_atomic_outputs = written_arg_names - atomic_arg_names
+        if non_atomic_outputs:
+            raise MetalCodegenError(
+                f"Kernel {adj.fun_name!r} mixes atomic and non-atomic writes to outputs "
+                f"({sorted(non_atomic_outputs)} written via ``arr[idx] = ...``, "
+                f"{sorted(atomic_arg_names)} written via ``wp.atomic_*``). MLX makes "
+                f"all outputs of a kernel atomic together; mixed kernels are not yet "
+                f"supported. Split into two launches."
+            )
 
     input_args: list = []
     output_args: list = []
@@ -488,6 +545,7 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
         output_names=[a.label for a in output_args],
         input_args=input_args,
         output_args=output_args,
+        atomic_outputs=has_atomic,
     )
 
 
@@ -560,6 +618,7 @@ def _get_or_build_metal_kernel(kernel):
             input_names=artifact.input_names,
             output_names=artifact.output_names,
             source=artifact.source,
+            atomic_outputs=artifact.atomic_outputs,
         )
         kernel._metal_artifact = artifact
         kernel._metal_mlx_kernel = mlx_kernel
@@ -657,12 +716,22 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device):
         return
     threadgroup_size = min(256, total)
 
+    # MLX outputs are uninitialized by default. For atomic-output kernels
+    # we *must* zero-initialize so the first ``atomic_fetch_add`` accumulates
+    # from a defined zero rather than stale buffer contents (verified
+    # empirically in the step-2 atomic probe). Note: this means atomic
+    # kernels always start their accumulators at zero — pre-existing values
+    # in the user's ``wp.array`` are not preserved across the launch. Most
+    # atomic-accumulator usage zeroes the buffer beforehand anyway.
+    init_value = 0.0 if artifact.atomic_outputs else None
+
     out_mx_list = mlx_kernel(
         inputs=mlx_inputs,
         grid=(total, 1, 1),
         threadgroup=(threadgroup_size, 1, 1),
         output_shapes=output_shapes,
         output_dtypes=output_dtypes,
+        init_value=init_value,
     )
     # Force the dispatch to complete so the unified-memory copy below sees
     # the final results rather than queued operations.
