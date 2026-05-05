@@ -950,6 +950,197 @@ class TestMetalLaunch(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet)
 
+    def test_vec3_add_matches_cpu(self):
+        # Element-wise vec3 add. Bit-exact because it's a single fp32 add per
+        # component with no reordering.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(a: wp.array(dtype=wp.vec3),
+                  b: wp.array(dtype=wp.vec3),
+                  c: wp.array(dtype=wp.vec3)):
+                tid = wp.tid()
+                c[tid] = a[tid] + b[tid]
+
+            N = 256
+            rng = np.random.default_rng(0)
+            an = rng.standard_normal((N, 3)).astype(np.float32)
+            bn = rng.standard_normal((N, 3)).astype(np.float32)
+            c_cpu = wp.zeros(N, dtype=wp.vec3, device='cpu')
+            c_m = wp.zeros(N, dtype=wp.vec3, device='metal:0')
+            wp.launch(k, dim=N,
+                      inputs=[wp.array(an, dtype=wp.vec3, device='cpu'),
+                              wp.array(bn, dtype=wp.vec3, device='cpu')],
+                      outputs=[c_cpu], device='cpu')
+            wp.launch(k, dim=N,
+                      inputs=[wp.array(an, dtype=wp.vec3, device='metal:0'),
+                              wp.array(bn, dtype=wp.vec3, device='metal:0')],
+                      outputs=[c_m], device='metal:0')
+            np.testing.assert_array_equal(c_cpu.numpy(), c_m.numpy())
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_vec3_construct_and_index_match_cpu(self):
+        # Round-trip via component construction and component access:
+        # build a vec3 from three scalar arrays, then sum its components.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def construct(x: wp.array(dtype=wp.float32),
+                          y: wp.array(dtype=wp.float32),
+                          z: wp.array(dtype=wp.float32),
+                          out: wp.array(dtype=wp.vec3)):
+                tid = wp.tid()
+                out[tid] = wp.vec3(x[tid], y[tid], z[tid])
+
+            @wp.kernel
+            def index_sum(a: wp.array(dtype=wp.vec3),
+                          out: wp.array(dtype=wp.float32)):
+                tid = wp.tid()
+                v = a[tid]
+                out[tid] = v[0] + v[1] + v[2]
+
+            N = 128
+            rng = np.random.default_rng(7)
+            xn = rng.standard_normal(N).astype(np.float32)
+            yn = rng.standard_normal(N).astype(np.float32)
+            zn = rng.standard_normal(N).astype(np.float32)
+            for dev in ('cpu', 'metal:0'):
+                v_arr = wp.zeros(N, dtype=wp.vec3, device=dev)
+                wp.launch(construct, dim=N,
+                          inputs=[wp.array(xn, dtype=wp.float32, device=dev),
+                                  wp.array(yn, dtype=wp.float32, device=dev),
+                                  wp.array(zn, dtype=wp.float32, device=dev)],
+                          outputs=[v_arr], device=dev)
+                s_arr = wp.zeros(N, dtype=wp.float32, device=dev)
+                wp.launch(index_sum, dim=N, inputs=[v_arr], outputs=[s_arr], device=dev)
+                if dev == 'cpu':
+                    cpu_v = v_arr.numpy()
+                    cpu_s = s_arr.numpy()
+                else:
+                    np.testing.assert_array_equal(v_arr.numpy(), cpu_v)
+                    np.testing.assert_array_equal(s_arr.numpy(), cpu_s)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_vec3_dot_matches_cpu(self):
+        # ``wp.dot`` -> ``metal::dot``. Float-summation order may differ
+        # between Metal and CPU; allow modest fp tolerance.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(a: wp.array(dtype=wp.vec3),
+                  b: wp.array(dtype=wp.vec3),
+                  c: wp.array(dtype=wp.float32)):
+                tid = wp.tid()
+                c[tid] = wp.dot(a[tid], b[tid])
+
+            N = 256
+            rng = np.random.default_rng(11)
+            an = rng.standard_normal((N, 3)).astype(np.float32)
+            bn = rng.standard_normal((N, 3)).astype(np.float32)
+            c_cpu = wp.zeros(N, dtype=wp.float32, device='cpu')
+            c_m = wp.zeros(N, dtype=wp.float32, device='metal:0')
+            wp.launch(k, dim=N,
+                      inputs=[wp.array(an, dtype=wp.vec3, device='cpu'),
+                              wp.array(bn, dtype=wp.vec3, device='cpu')],
+                      outputs=[c_cpu], device='cpu')
+            wp.launch(k, dim=N,
+                      inputs=[wp.array(an, dtype=wp.vec3, device='metal:0'),
+                              wp.array(bn, dtype=wp.vec3, device='metal:0')],
+                      outputs=[c_m], device='metal:0')
+            np.testing.assert_allclose(c_cpu.numpy(), c_m.numpy(), rtol=1e-4, atol=1e-6)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_vec3_cross_normalize_matches_cpu(self):
+        # Composes ``wp.cross`` and ``wp.normalize`` — the latter uses
+        # ``rsqrt``-style ops, so allow ulp-level Metal/CPU divergence.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(a: wp.array(dtype=wp.vec3),
+                  b: wp.array(dtype=wp.vec3),
+                  out: wp.array(dtype=wp.vec3)):
+                tid = wp.tid()
+                out[tid] = wp.normalize(wp.cross(a[tid], b[tid]))
+
+            N = 256
+            rng = np.random.default_rng(2026)
+            an = rng.standard_normal((N, 3)).astype(np.float32)
+            bn = rng.standard_normal((N, 3)).astype(np.float32)
+            out_cpu = wp.zeros(N, dtype=wp.vec3, device='cpu')
+            out_m = wp.zeros(N, dtype=wp.vec3, device='metal:0')
+            wp.launch(k, dim=N,
+                      inputs=[wp.array(an, dtype=wp.vec3, device='cpu'),
+                              wp.array(bn, dtype=wp.vec3, device='cpu')],
+                      outputs=[out_cpu], device='cpu')
+            wp.launch(k, dim=N,
+                      inputs=[wp.array(an, dtype=wp.vec3, device='metal:0'),
+                              wp.array(bn, dtype=wp.vec3, device='metal:0')],
+                      outputs=[out_m], device='metal:0')
+            np.testing.assert_allclose(out_cpu.numpy(), out_m.numpy(), rtol=1e-4, atol=1e-6)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_vec2_and_vec4_match_cpu(self):
+        # Sanity check that vec2 / vec4 also work via the same code path.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k2(a: wp.array(dtype=wp.vec2),
+                   b: wp.array(dtype=wp.vec2),
+                   c: wp.array(dtype=wp.vec2)):
+                tid = wp.tid()
+                c[tid] = a[tid] + b[tid]
+
+            @wp.kernel
+            def k4(a: wp.array(dtype=wp.vec4),
+                   b: wp.array(dtype=wp.vec4),
+                   c: wp.array(dtype=wp.vec4)):
+                tid = wp.tid()
+                c[tid] = a[tid] + b[tid]
+
+            N = 128
+            rng = np.random.default_rng(99)
+            for kf, dim in ((k2, 2), (k4, 4)):
+                vt = wp.vec2 if dim == 2 else wp.vec4
+                an = rng.standard_normal((N, dim)).astype(np.float32)
+                bn = rng.standard_normal((N, dim)).astype(np.float32)
+                c_cpu = wp.zeros(N, dtype=vt, device='cpu')
+                c_m = wp.zeros(N, dtype=vt, device='metal:0')
+                wp.launch(kf, dim=N,
+                          inputs=[wp.array(an, dtype=vt, device='cpu'),
+                                  wp.array(bn, dtype=vt, device='cpu')],
+                          outputs=[c_cpu], device='cpu')
+                wp.launch(kf, dim=N,
+                          inputs=[wp.array(an, dtype=vt, device='metal:0'),
+                                  wp.array(bn, dtype=vt, device='metal:0')],
+                          outputs=[c_m], device='metal:0')
+                np.testing.assert_array_equal(c_cpu.numpy(), c_m.numpy())
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
     def test_rejects_adjoint_launch(self):
         snippet = textwrap.dedent(
             """
