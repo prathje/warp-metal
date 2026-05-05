@@ -1512,6 +1512,82 @@ class TestMetalLaunch(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet)
 
+    def test_struct_array_field_read_matches_cpu(self):
+        # Read-only field access on ``wp.array(dtype=Particle)`` for a POD
+        # struct of ``vec3 + float``. The struct's tight 4-scalar layout is
+        # accessed via per-field offsets on a flat float buffer, with no
+        # MSL ``struct`` declaration emitted.
+        snippet = textwrap.dedent(
+            """
+            import ctypes
+            import warp as wp
+            import numpy as np
+
+            @wp.struct
+            class Particle:
+                pos: wp.vec3
+                mass: wp.float32
+
+            @wp.kernel
+            def read_mass(p: wp.array(dtype=Particle),
+                          out: wp.array(dtype=wp.float32)):
+                tid = wp.tid()
+                out[tid] = p[tid].mass
+
+            @wp.kernel
+            def read_pos(p: wp.array(dtype=Particle),
+                         out: wp.array(dtype=wp.vec3)):
+                tid = wp.tid()
+                out[tid] = p[tid].pos
+
+            @wp.kernel
+            def fill(pos_in: wp.array(dtype=wp.vec3),
+                     mass_in: wp.array(dtype=wp.float32),
+                     p: wp.array(dtype=Particle)):
+                tid = wp.tid()
+                q = Particle()
+                q.pos = pos_in[tid]
+                q.mass = mass_in[tid]
+                p[tid] = q
+
+            N = 32
+            rng = np.random.default_rng(0)
+            pos_np = rng.standard_normal((N, 3)).astype(np.float32)
+            mass_np = rng.standard_normal(N).astype(np.float32)
+
+            # Build the struct array on CPU using Warp's CPU codegen (which
+            # supports local struct construction). We reuse that buffer's
+            # bytes verbatim on Metal — Warp's struct layout is tight 4-byte-
+            # field packing, matching what the Metal codegen reads.
+            pos_cpu = wp.array(pos_np, dtype=wp.vec3, device='cpu')
+            mass_cpu = wp.array(mass_np, dtype=wp.float32, device='cpu')
+            p_cpu = wp.empty(N, dtype=Particle, device='cpu')
+            wp.launch(fill, dim=N, inputs=[pos_cpu, mass_cpu],
+                      outputs=[p_cpu], device='cpu')
+
+            buf = bytes(p_cpu.numpy())
+            p_m = wp.empty(N, dtype=Particle, device='metal:0')
+            ctypes.memmove(p_m.ptr, buf, len(buf))
+
+            # mass field
+            out_cpu = wp.zeros(N, dtype=wp.float32, device='cpu')
+            out_m = wp.zeros(N, dtype=wp.float32, device='metal:0')
+            wp.launch(read_mass, dim=N, inputs=[p_cpu], outputs=[out_cpu], device='cpu')
+            wp.launch(read_mass, dim=N, inputs=[p_m], outputs=[out_m], device='metal:0')
+            np.testing.assert_array_equal(out_cpu.numpy(), out_m.numpy())
+            np.testing.assert_array_equal(out_m.numpy(), mass_np)
+
+            # pos field (vec3)
+            out_cpu = wp.zeros(N, dtype=wp.vec3, device='cpu')
+            out_m = wp.zeros(N, dtype=wp.vec3, device='metal:0')
+            wp.launch(read_pos, dim=N, inputs=[p_cpu], outputs=[out_cpu], device='cpu')
+            wp.launch(read_pos, dim=N, inputs=[p_m], outputs=[out_m], device='metal:0')
+            np.testing.assert_array_equal(out_cpu.numpy(), out_m.numpy())
+            np.testing.assert_array_equal(out_m.numpy(), pos_np)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
     def test_rejects_adjoint_launch(self):
         snippet = textwrap.dedent(
             """
