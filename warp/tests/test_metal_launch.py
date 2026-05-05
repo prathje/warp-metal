@@ -742,6 +742,78 @@ class TestMetalLaunch(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet)
 
+    def test_while_loop_matches_cpu(self):
+        # Triangular sum: ``s = sum(1..n)``. Exercises the structural
+        # ``while``-as-``while(true){}`` rewrite plus mid-body mutation via
+        # ``wp::assign``.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(a: wp.array(dtype=wp.int32), out: wp.array(dtype=wp.int32)):
+                tid = wp.tid()
+                n = a[tid]
+                s = int(0)
+                while n > 0:
+                    s = s + n
+                    n = n - 1
+                out[tid] = s
+
+            N = 32
+            rng = np.random.default_rng(0)
+            an = rng.integers(0, 50, size=N, dtype=np.int32)
+            out_cpu = wp.zeros(N, dtype=wp.int32, device='cpu')
+            out_m = wp.zeros(N, dtype=wp.int32, device='metal:0')
+            wp.launch(k, dim=N,
+                      inputs=[wp.array(an, dtype=wp.int32, device='cpu')],
+                      outputs=[out_cpu], device='cpu')
+            wp.launch(k, dim=N,
+                      inputs=[wp.array(an, dtype=wp.int32, device='metal:0')],
+                      outputs=[out_m], device='metal:0')
+            np.testing.assert_array_equal(out_cpu.numpy(), out_m.numpy())
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_while_loop_with_break_matches_cpu(self):
+        # Linear search returning the first index whose value crosses a
+        # threshold. ``break`` lowers to ``goto end_while_K`` in Warp's IR;
+        # our preprocessor must rewrite that as ``break;`` to be valid MSL.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(a: wp.array(dtype=wp.float32), n: wp.int32,
+                  out: wp.array(dtype=wp.int32)):
+                tid = wp.tid()
+                i = int(0)
+                while i < n:
+                    if a[tid * n + i] > 0.5:
+                        break
+                    i = i + 1
+                out[tid] = i
+
+            N = 64
+            M = 50
+            rng = np.random.default_rng(99)
+            an = rng.uniform(0.0, 1.0, size=N * M).astype(np.float32)
+            out_cpu = wp.zeros(N, dtype=wp.int32, device='cpu')
+            out_m = wp.zeros(N, dtype=wp.int32, device='metal:0')
+            wp.launch(k, dim=N,
+                      inputs=[wp.array(an, dtype=wp.float32, device='cpu'), M],
+                      outputs=[out_cpu], device='cpu')
+            wp.launch(k, dim=N,
+                      inputs=[wp.array(an, dtype=wp.float32, device='metal:0'), M],
+                      outputs=[out_m], device='metal:0')
+            np.testing.assert_array_equal(out_cpu.numpy(), out_m.numpy())
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
     def test_rejects_adjoint_launch(self):
         snippet = textwrap.dedent(
             """
