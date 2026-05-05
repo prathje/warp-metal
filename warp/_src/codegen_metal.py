@@ -322,3 +322,178 @@ def _is_array_arg(var) -> bool:
         return True
     # ``wp.array`` annotations live as classes too:
     return getattr(t, "_wp_generic_type_str_", None) in ("array_t", "indexedarray_t")
+
+
+# ---------------------------------------------------------------------------
+# Launch path (step 3d)
+# ---------------------------------------------------------------------------
+#
+# These imports are deferred to the function bodies so that simply importing
+# this module on a system without MLX (e.g. Linux CI) does not error.
+
+
+def _wp_dtype_to_mx_dtype(wp_dtype):
+    """Translate a Warp scalar dtype to its MLX equivalent.
+
+    Returns the MLX dtype object. Raises ``MetalCodegenError`` for types
+    MSL/MLX cannot represent.
+    """
+    import mlx.core as mx  # noqa: PLC0415
+
+    import warp._src.types as wpt  # noqa: PLC0415
+
+    mapping = {
+        wpt.float32: mx.float32,
+        wpt.float16: mx.float16,
+        wpt.int32: mx.int32,
+        wpt.uint32: mx.uint32,
+        wpt.int8: mx.int8,
+        wpt.uint8: mx.uint8,
+        wpt.int16: mx.int16,
+        wpt.uint16: mx.uint16,
+        wpt.int64: mx.int64,
+        wpt.uint64: mx.uint64,
+    }
+    if wp_dtype is wpt.float64:
+        raise MetalCodegenError("MSL/MLX has no native float64; use float32 for Metal kernels")
+    if wp_dtype not in mapping:
+        raise MetalCodegenError(f"No MLX dtype for Warp dtype {wp_dtype!r}")
+    return mapping[wp_dtype]
+
+
+def _get_or_build_metal_kernel(kernel):
+    """Return ``(artifact, mlx_kernel)`` for a Warp kernel, building+caching on first use.
+
+    The cache lives on the Warp ``Kernel`` object via two attributes;
+    Warp regenerates the underlying ``Adjoint`` if the source changes, so
+    pinning the cache to the kernel instance is safe.
+    """
+    import mlx.core as mx  # noqa: PLC0415
+
+    artifact = getattr(kernel, "_metal_artifact", None)
+    mlx_kernel = getattr(kernel, "_metal_mlx_kernel", None)
+    if artifact is None or mlx_kernel is None:
+        artifact = generate_msl_kernel(kernel)
+        mlx_kernel = mx.fast.metal_kernel(
+            name=artifact.name,
+            input_names=artifact.input_names,
+            output_names=artifact.output_names,
+            source=artifact.source,
+        )
+        kernel._metal_artifact = artifact
+        kernel._metal_mlx_kernel = mlx_kernel
+    return artifact, mlx_kernel
+
+
+def launch_metal_kernel(kernel, dim, inputs, outputs, device):
+    """Dispatch a Warp kernel on a Metal device via MLX.
+
+    This is the Metal-specific equivalent of the CUDA/CPU launch path in
+    ``warp._src.context.launch``. It:
+
+    1. Resolves (or builds and caches) the ``MetalKernelArtifact`` and
+       ``mx.fast.metal_kernel`` for the kernel.
+    2. Translates each Warp argument into an MLX argument:
+       - ``wp.array`` inputs become typed views of the MLX-managed unified
+         buffer that backs the array (zero-copy, via ``mx.array.view``).
+       - Scalar inputs become ``mx.array`` literals.
+    3. Lets MLX allocate fresh output buffers (its API does not accept
+       user-provided outputs), then ``wp_memcpy_h2h``-copies the MLX result
+       into the user's existing ``wp.array`` storage. The copy is between
+       two unified-memory addresses, so it's an ordinary host memcpy.
+    """
+    import mlx.core as mx  # noqa: PLC0415
+    import numpy as np  # noqa: PLC0415
+
+    from warp._src.context import _metal_get_buffer, runtime  # noqa: PLC0415
+
+    artifact, mlx_kernel = _get_or_build_metal_kernel(kernel)
+
+    fwd_args = list(inputs) + list(outputs)
+    if len(fwd_args) != len(kernel.adj.args):
+        raise RuntimeError(
+            f"Error launching kernel '{kernel.key}', passed {len(fwd_args)} arguments "
+            f"but kernel requires {len(kernel.adj.args)}."
+        )
+
+    arg_by_name = {a.label: (i, a) for i, a in enumerate(kernel.adj.args)}
+
+    # ---- Build MLX inputs in artifact.input_names order ----
+    mlx_inputs: list = []
+    for input_name in artifact.input_names:
+        idx, arg_var = arg_by_name[input_name]
+        value = fwd_args[idx]
+        if _is_array_arg(arg_var):
+            if not getattr(value, "device", None) or not value.device.is_metal:
+                raise RuntimeError(
+                    f"Kernel '{kernel.key}' argument '{input_name}' must be a wp.array on a Metal "
+                    f"device; got {getattr(value, 'device', '?')}"
+                )
+            mx_buf = _metal_get_buffer(value.ptr)
+            if mx_buf is None:
+                raise RuntimeError(
+                    f"Kernel '{kernel.key}' argument '{input_name}' has no registered MLX buffer "
+                    f"(ptr={value.ptr}). Was it allocated by Warp's Metal allocator?"
+                )
+            mx_dtype = _wp_dtype_to_mx_dtype(value.dtype)
+            # ``view`` reinterprets bytes (no copy); ``reshape`` flattens / shapes for MLX.
+            typed = mx_buf.view(mx_dtype).reshape(value.shape)
+            mlx_inputs.append(typed)
+        else:
+            # Scalar input — convert to a 0-D mx.array literal.
+            mx_dtype = _wp_dtype_to_mx_dtype(arg_var.type)
+            mlx_inputs.append(mx.array(value, dtype=mx_dtype))
+
+    # ---- Build MLX output specs from user's output wp.arrays ----
+    output_shapes: list = []
+    output_dtypes: list = []
+    output_dest_arrays: list = []
+    for output_name in artifact.output_names:
+        idx, arg_var = arg_by_name[output_name]
+        value = fwd_args[idx]
+        if not _is_array_arg(arg_var):
+            raise RuntimeError(
+                f"Kernel '{kernel.key}' output '{output_name}' is not a wp.array; "
+                f"only array outputs are supported on Metal"
+            )
+        if not getattr(value, "device", None) or not value.device.is_metal:
+            raise RuntimeError(
+                f"Kernel '{kernel.key}' output '{output_name}' must be a wp.array on a Metal "
+                f"device; got {getattr(value, 'device', '?')}"
+            )
+        output_shapes.append(value.shape)
+        output_dtypes.append(_wp_dtype_to_mx_dtype(value.dtype))
+        output_dest_arrays.append(value)
+
+    # ---- Compute grid ----
+    if isinstance(dim, int):
+        total = dim
+    else:
+        total = 1
+        for d in dim:
+            total *= d
+    if total <= 0:
+        return
+    threadgroup_size = min(256, total)
+
+    out_mx_list = mlx_kernel(
+        inputs=mlx_inputs,
+        grid=(total, 1, 1),
+        threadgroup=(threadgroup_size, 1, 1),
+        output_shapes=output_shapes,
+        output_dtypes=output_dtypes,
+    )
+    # Force the dispatch to complete so the unified-memory copy below sees
+    # the final results rather than queued operations.
+    if isinstance(out_mx_list, mx.array):
+        out_mx_list = [out_mx_list]
+    for o in out_mx_list:
+        mx.eval(o)
+
+    # ---- Copy MLX outputs into the user's wp.array buffers ----
+    for o_mx, dest in zip(out_mx_list, output_dest_arrays, strict=True):
+        np_view = np.array(o_mx, copy=False)
+        src_ptr = int(np_view.__array_interface__["data"][0])
+        nbytes = np_view.nbytes
+        if not runtime.core.wp_memcpy_h2h(dest.ptr, src_ptr, nbytes):
+            raise RuntimeError(f"Failed to copy Metal kernel output back into wp.array (kernel '{kernel.key}')")
