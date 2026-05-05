@@ -8,15 +8,16 @@ strings (``adj.blocks[0].body_forward``) and rewrites them as Metal Shading
 Language. It does *not* re-walk the Python AST — it post-processes the
 CUDA-flavoured C++ statements that ``codegen.py`` already produces.
 
-Scope (step 3c, intentionally narrow):
-- 1-D ``wp.array`` args of scalar dtype (``float32``, ``int32``, ``uint32``,
-  ``int64``, ``uint64``)
-- ``wp.tid()``
+Currently supported (anything else raises ``MetalCodegenError`` with a
+pointer to the offending statement):
+- 1-D ``wp.array`` args of scalar dtype (``float16/32``, ``int8/16/32/64``,
+  ``uint8/16/32/64``, ``bool``)
+- ``wp.tid()`` (1-D dispatch)
 - Address-of, load, store on 1-D arrays
 - Scalar arithmetic intrinsics: ``add``, ``sub``, ``mul``, ``div``, ``mod``
-
-Anything else raises ``NotImplementedError`` with a pointer to the upstream
-statement so we know what to add next.
+- ``if`` / ``else`` blocks and the comparison operators ``<``, ``<=``,
+  ``==``, ``!=``, ``>=``, ``>`` (Warp's IR pre-emits these in plain C/MSL
+  syntax, so they pass through the regex-based translator unchanged).
 """
 
 from __future__ import annotations
@@ -56,7 +57,10 @@ _SCALAR_CTYPE_TO_MSL: dict[str, str] = {
     "wp::uint8": "uchar",
     "wp::int16": "short",
     "wp::uint16": "ushort",
+    # Bool is the one IR ctype without a ``wp::`` prefix — Warp emits plain
+    # ``bool`` for boolean locals (e.g. the result of a comparison op).
     "wp::bool": "bool",
+    "bool": "bool",
 }
 
 # Pointer ctypes have a ``*`` suffix; address-space qualifier in MSL is
