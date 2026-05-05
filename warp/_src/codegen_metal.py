@@ -36,14 +36,22 @@ pointer to the offending statement):
   ``log``, ``sin``, ``cos``, ``tanh``, ``clamp``, etc. — translated to
   MSL's ``metal::`` namespace.
 - ``wp.where(cond, a, b)`` -> ``((cond) ? (a) : (b))`` (C-style ternary).
-- Read-only field access on ``wp.array(dtype=SomeStruct)`` for POD structs
+- Field reads/writes on ``wp.array(dtype=SomeStruct)`` for POD structs
   whose fields are scalars / vec / mat with 4-byte scalar width (float32 /
   int32 / uint32 / float16 / etc.). No MSL ``struct`` is emitted; instead
   each field read expands to direct flat-buffer accesses at the field's
-  offset. Currently NOT supported: local struct construction
-  (``q = SomeStruct()``), struct-typed kernel args, stores of struct
-  values into arrays, struct fields of mixed scalar widths or nested
-  structs / array fields.
+  offset.
+- Local struct construction (``q = SomeStruct()``), per-field assignment
+  (``q.pos = ...``), and storing the local into an array
+  (``arr[i] = q``). The struct value is represented as one MSL local per
+  field (``var_<X>__<field>`` with ``T(0)`` zero-init); field-pointer
+  addresses route through the same ``subscript_map`` mechanism, and
+  ``wp::store(addr, val)`` becomes ``<lhs_expr> = val``. Storing a struct
+  local into a struct array scatters the fields per-component.
+- Currently NOT supported: struct-typed kernel args
+  (``def k(s: SomeStruct, ...)``), reading a struct *value* out of an
+  array as a local (``m = arr[tid]; m.field``), nested structs, array
+  fields, mixed scalar widths within a struct.
 - ``for i in range(...)`` loops, both static (Warp unrolls them, so this
   is a no-op) and dynamic (a structural pre-pass rewrites Warp's
   ``goto``-based loop into a real MSL ``for``).
@@ -935,19 +943,62 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
             else:
                 subscript_map[local_label] = f"{arr_arg}[{_flat_index_expr(arr_arg, index_var_names)}]"
 
-    # Struct field pointer pass: ``var_Y = &(var_X->field);`` where
-    # ``var_X`` is a struct-array reference recorded above. The field-ptr
-    # local goes into ``subscript_map`` with the appropriate scalar / vec /
-    # mat constructor; the trailing ``wp::load(var_Y)`` is then translated
-    # to that expression by the existing load rule + subscript inlining.
-    struct_field_addr_pat = re.compile(r"^\s*var_(\w+)\s*=\s*&\s*\(\s*var_(\w+)\s*->\s*(\w+)\s*\)\s*;\s*$")
+    # ---- Struct LOCAL variables (``q = SomeStruct(); q.field = ...``) ----
+    # We don't materialise the struct; instead, each field becomes its own
+    # MSL local (scalar / vec / mat). Field reads/writes route through those
+    # per-field locals via the same ``subscript_map`` mechanism used for
+    # struct-array fields.
+    from warp._src.codegen import Struct as _Struct  # noqa: PLC0415
+
+    struct_local_layouts: dict[str, _StructLayout] = {}
+    struct_local_is_arg: dict[str, bool] = {}
+    for var in adj.variables:
+        if isinstance(var.type, _Struct):
+            struct_local_layouts[var.label] = _struct_layout_for(var.type)
+            struct_local_is_arg[var.label] = False
+    for arg in adj.args:
+        if isinstance(arg.type, _Struct):
+            # Struct-typed kernel args are not yet supported (we'd need MLX
+            # to flatten the struct into a buffer of scalar fields, which is
+            # a separate launcher change).
+            raise MetalCodegenError(
+                f"Kernel {adj.fun_name!r} arg {arg.label!r}: "
+                "struct-typed kernel arguments are not yet supported on Metal "
+                "(use a wp.array(dtype=Struct) instead, or pass the fields as "
+                "separate args)"
+            )
+
+    def _per_field_local(struct_label: str, field_name: str) -> str:
+        # Double underscore separates struct label from field name to avoid
+        # clashes with raw Warp local labels (which are integers).
+        return f"var_{struct_label}__{field_name}"
+
+    # Struct field pointer pass: handle BOTH ``->`` (struct-array refs) and
+    # ``.`` (struct locals) field addresses. The result is the same shape:
+    # ``subscript_map[field_local]`` gets an expression that's used as the
+    # value when ``wp::load`` reads it, and as the LHS when ``wp::store``
+    # writes through it.
+    struct_field_addr_pat = re.compile(r"^\s*var_(\w+)\s*=\s*&\s*\(\s*var_(\w+)\s*(->|\.)\s*(\w+)\s*\)\s*;\s*$")
     for raw in forward_lines:
         m = struct_field_addr_pat.match(raw)
         if not m:
             continue
         field_local = m.group(1)
         struct_local = m.group(2)
-        field_name = m.group(3)
+        accessor = m.group(3)
+        field_name = m.group(4)
+
+        if accessor == ".":
+            # Struct-local field: alias to the per-field MSL local.
+            if struct_local not in struct_local_layouts:
+                continue
+            layout = struct_local_layouts[struct_local]
+            if field_name not in layout.fields:
+                raise MetalCodegenError(f"Kernel {adj.fun_name!r}: struct {layout.name!r} has no field {field_name!r}")
+            subscript_map[field_local] = _per_field_local(struct_local, field_name)
+            continue
+
+        # accessor == "->": struct-array field, build a flat-buffer expression.
         if struct_local not in struct_refs:
             continue
         arr_name, elem_idx_expr = struct_refs[struct_local]
@@ -963,7 +1014,7 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
             subscript_map[field_local] = f"{field_info.msl_type}({', '.join(comps)})"
         elif field_info.kind == _STRUCT_FIELD_KIND_MAT:
             rows, cols = field_info.rows, field_info.cols
-            msl_vec = f"{field_info.msl_type.split('x')[0]}"  # e.g. "float3" from "float3x3"
+            msl_vec = field_info.msl_type.split("x")[0]  # e.g. "float3" from "float3x3"
             col_strs: list[str] = []
             for c in range(cols):
                 col_components = [f"{arr_name}[({base}) + {r * cols + c}]" for r in range(rows)]
@@ -981,6 +1032,17 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
             # Struct-array pointer local — its ``->field`` accesses go
             # through ``subscript_map`` and the struct-pointer itself is
             # never used in code we emit.
+            continue
+        if var.label in struct_local_layouts:
+            # Struct *value* local — emit per-field locals instead, each
+            # zero-initialised so default-constructed structs behave as on
+            # CPU. The original struct local (var_X with ctype like
+            # ``Particle_4b7eabdf``) never appears in our emitted code.
+            layout = struct_local_layouts[var.label]
+            for field_name, field_info in layout.fields.items():
+                local_name = _per_field_local(var.label, field_name)
+                # MSL ``T()`` zero-constructs scalar / vec / mat values.
+                body_lines.append(f"    {field_info.msl_type} {local_name} = {field_info.msl_type}(0);")
             continue
         if var.label in vars_to_skip_decl:
             # Iterator-state or induction-variable for a translated for-loop;
@@ -1040,6 +1102,30 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
         # referenced via ``wp::load``.
         if struct_field_addr_pat.match(raw):
             continue
+        # Struct constructor line ``var_X = StructName_<hash>();`` — the
+        # per-field locals are zero-initialised at declaration so this is
+        # a no-op. Match by checking var_X is a known struct local and the
+        # call has no args.
+        m_ctor = re.match(r"^\s*var_(\w+)\s*=\s*\w+\s*\(\s*\)\s*;\s*$", raw)
+        if m_ctor and m_ctor.group(1) in struct_local_layouts:
+            continue
+        # ``wp::store(addr_var, value);`` — write through a field pointer.
+        # We translate by looking up the LHS expression we recorded in
+        # ``subscript_map`` for ``addr_var``.
+        m_store = re.match(
+            r"^(?P<indent>\s*)wp::store\s*\(\s*var_(?P<addr>\w+)\s*,\s*(?P<val>[^()]+?)\s*\)\s*;\s*$",
+            raw,
+        )
+        if m_store:
+            addr = m_store.group("addr")
+            value = m_store.group("val")
+            indent = m_store.group("indent")
+            if addr in subscript_map:
+                lhs = subscript_map[addr]
+                body_lines.append(_finalize(f"{indent}{lhs} = {value};"))
+                continue
+            # Stray wp::store — pass through; the unsupported-intrinsic
+            # guard will catch it.
         # ``builtin_tid2d(var_X, var_Y);`` / ``builtin_tid3d(...)`` —
         # arity-specific structural rewrite (the patterns table only handles
         # the 1-D form).
@@ -1095,6 +1181,40 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
                             body_lines.append(
                                 _finalize(f"{indent}{arr}[{elem_idx} * {stride} + {r * cols + c}] = {value}[{c}][{r}];")
                             )
+                    continue
+                if arr in struct_arr_info:
+                    # ``arr[i] = struct_local`` — scatter each field of the
+                    # struct local into its slot in the flat array buffer.
+                    layout = struct_arr_info[arr]
+                    if len(indices) == 1:
+                        elem_idx = indices[0]
+                    else:
+                        elem_idx = f"({_flat_index_expr(arr, indices)})"
+                    # Strip leading "var_" if present so we can reuse the
+                    # per-field-local naming convention.
+                    val_struct_label = value[len("var_") :] if value.startswith("var_") else value
+                    if val_struct_label not in struct_local_layouts:
+                        raise MetalCodegenError(
+                            f"Kernel {adj.fun_name!r}: ``arr[i] = X`` where X ({value!r}) is not a "
+                            "struct local; only stores from struct locals are supported on Metal"
+                        )
+                    base = f"{elem_idx} * {layout.scalars_per_elem}"
+                    for fname, finfo in layout.fields.items():
+                        src = _per_field_local(val_struct_label, fname)
+                        off = finfo.offset
+                        if finfo.kind == _STRUCT_FIELD_KIND_SCALAR:
+                            body_lines.append(_finalize(f"{indent}{arr}[{base} + {off}] = {src};"))
+                        elif finfo.kind == _STRUCT_FIELD_KIND_VEC:
+                            for k in range(finfo.size):
+                                body_lines.append(_finalize(f"{indent}{arr}[{base} + {off} + {k}] = {src}[{k}];"))
+                        elif finfo.kind == _STRUCT_FIELD_KIND_MAT:
+                            for r in range(finfo.rows):
+                                for c in range(finfo.cols):
+                                    body_lines.append(
+                                        _finalize(
+                                            f"{indent}{arr}[{base} + {off + r * finfo.cols + c}] = {src}[{c}][{r}];"
+                                        )
+                                    )
                     continue
                 flat_idx = _flat_index_expr(arr, indices)
                 body_lines.append(_finalize(f"{indent}{arr}[{flat_idx}] = {value};"))
