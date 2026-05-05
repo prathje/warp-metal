@@ -714,30 +714,45 @@ class TestMetalLaunch(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet)
 
-    def test_rejects_mixed_atomic_and_array_store(self):
-        # If a kernel writes one output via ``arr[idx] = ...`` and another via
-        # ``wp.atomic_add(...)``, our codegen rejects it because MLX makes all
-        # outputs of a single kernel atomic together — the regular store would
-        # no longer compile.
+    def test_mixed_atomic_and_regular_writes_match_cpu(self):
+        # When a kernel uses ``wp.atomic_*`` on one output and a regular
+        # ``arr[i] = val`` store on another, MLX makes ALL outputs of the
+        # kernel ``device atomic<T>*``. The codegen must translate the
+        # regular store into ``atomic_store_explicit`` so it compiles.
         snippet = textwrap.dedent(
             """
             import warp as wp
-            from warp._src.codegen_metal import MetalCodegenError, generate_msl_kernel
+            import numpy as np
 
             @wp.kernel
             def k(a: wp.array(dtype=wp.float32),
-                  c1: wp.array(dtype=wp.float32),
-                  c2: wp.array(dtype=wp.float32)):
+                  out_reg: wp.array(dtype=wp.float32),
+                  out_atom: wp.array(dtype=wp.float32)):
                 tid = wp.tid()
-                c1[tid] = a[tid]
-                wp.atomic_add(c2, 0, a[tid])
+                val = a[tid] * 2.0
+                out_reg[tid] = val
+                wp.atomic_add(out_atom, 0, val)
 
-            try:
-                generate_msl_kernel(k)
-            except MetalCodegenError as e:
-                assert 'mixes atomic and non-atomic' in str(e), str(e)
-            else:
-                raise AssertionError('expected MetalCodegenError for mixed kernel')
+            N = 32
+            rng = np.random.default_rng(0)
+            an = rng.standard_normal(N).astype(np.float32)
+
+            for dev in ('cpu', 'metal:0'):
+                a = wp.array(an, dtype=wp.float32, device=dev)
+                out_reg = wp.zeros(N, dtype=wp.float32, device=dev)
+                out_atom = wp.zeros(1, dtype=wp.float32, device=dev)
+                wp.launch(k, dim=N, inputs=[a],
+                          outputs=[out_reg, out_atom], device=dev)
+                if dev == 'cpu':
+                    cpu_reg = out_reg.numpy()
+                    cpu_atom = out_atom.numpy()
+                else:
+                    np.testing.assert_array_equal(out_reg.numpy(), cpu_reg)
+                    # Atomic-add ordering is non-deterministic; allow fp tol.
+                    np.testing.assert_allclose(out_atom.numpy(), cpu_atom,
+                                                rtol=1e-4, atol=1e-5)
+            # Sanity: ``out_reg`` is ``a * 2`` element-wise.
+            np.testing.assert_array_equal(cpu_reg, an * 2.0)
             """
         )
         _run_with_metal_enabled(self, snippet)
