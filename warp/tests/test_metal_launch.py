@@ -266,6 +266,159 @@ class TestMetalLaunch(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet)
 
+    def test_if_else_relu_matches_cpu(self):
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(a: wp.array(dtype=wp.float32), c: wp.array(dtype=wp.float32)):
+                tid = wp.tid()
+                if a[tid] > 0.0:
+                    c[tid] = a[tid]
+                else:
+                    c[tid] = 0.0
+
+            N = 1024
+            rng = np.random.default_rng(123)
+            an = rng.standard_normal(N).astype(np.float32)
+
+            c_cpu = wp.zeros(N, dtype=wp.float32, device='cpu')
+            wp.launch(k, dim=N,
+                      inputs=[wp.array(an, dtype=wp.float32, device='cpu')],
+                      outputs=[c_cpu], device='cpu')
+            c_m = wp.zeros(N, dtype=wp.float32, device='metal:0')
+            wp.launch(k, dim=N,
+                      inputs=[wp.array(an, dtype=wp.float32, device='metal:0')],
+                      outputs=[c_m], device='metal:0')
+            np.testing.assert_array_equal(c_cpu.numpy(), c_m.numpy())
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_if_else_select_matches_cpu(self):
+        # Two branches selected by an int32 condition array — exercises mixed
+        # dtypes plus the ``!= 0`` comparison.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(a: wp.array(dtype=wp.float32),
+                  b: wp.array(dtype=wp.float32),
+                  cond: wp.array(dtype=wp.int32),
+                  out: wp.array(dtype=wp.float32)):
+                tid = wp.tid()
+                if cond[tid] != 0:
+                    out[tid] = a[tid]
+                else:
+                    out[tid] = b[tid]
+
+            N = 512
+            rng = np.random.default_rng(7)
+            an = rng.standard_normal(N).astype(np.float32)
+            bn = rng.standard_normal(N).astype(np.float32)
+            cn = rng.integers(0, 2, size=N, dtype=np.int32)
+
+            out_cpu = wp.zeros(N, dtype=wp.float32, device='cpu')
+            wp.launch(k, dim=N,
+                      inputs=[wp.array(an, dtype=wp.float32, device='cpu'),
+                              wp.array(bn, dtype=wp.float32, device='cpu'),
+                              wp.array(cn, dtype=wp.int32, device='cpu')],
+                      outputs=[out_cpu], device='cpu')
+            out_m = wp.zeros(N, dtype=wp.float32, device='metal:0')
+            wp.launch(k, dim=N,
+                      inputs=[wp.array(an, dtype=wp.float32, device='metal:0'),
+                              wp.array(bn, dtype=wp.float32, device='metal:0'),
+                              wp.array(cn, dtype=wp.int32, device='metal:0')],
+                      outputs=[out_m], device='metal:0')
+            np.testing.assert_array_equal(out_cpu.numpy(), out_m.numpy())
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_if_else_all_comparison_ops_match_cpu(self):
+        # Exercises every binary comparison operator the codegen needs to
+        # support: ``<``, ``<=``, ``==``, ``!=``, ``>=``, ``>``. Each operator
+        # gates a write of a distinct constant so the output uniquely
+        # identifies which branch fired.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def klt(a: wp.array(dtype=wp.float32), c: wp.array(dtype=wp.int32)):
+                tid = wp.tid()
+                if a[tid] < 0.0:
+                    c[tid] = 1
+                else:
+                    c[tid] = 0
+
+            @wp.kernel
+            def kle(a: wp.array(dtype=wp.float32), c: wp.array(dtype=wp.int32)):
+                tid = wp.tid()
+                if a[tid] <= 0.0:
+                    c[tid] = 1
+                else:
+                    c[tid] = 0
+
+            @wp.kernel
+            def keq(a: wp.array(dtype=wp.int32), c: wp.array(dtype=wp.int32)):
+                tid = wp.tid()
+                if a[tid] == 7:
+                    c[tid] = 1
+                else:
+                    c[tid] = 0
+
+            @wp.kernel
+            def kne(a: wp.array(dtype=wp.int32), c: wp.array(dtype=wp.int32)):
+                tid = wp.tid()
+                if a[tid] != 7:
+                    c[tid] = 1
+                else:
+                    c[tid] = 0
+
+            @wp.kernel
+            def kge(a: wp.array(dtype=wp.float32), c: wp.array(dtype=wp.int32)):
+                tid = wp.tid()
+                if a[tid] >= 0.0:
+                    c[tid] = 1
+                else:
+                    c[tid] = 0
+
+            @wp.kernel
+            def kgt(a: wp.array(dtype=wp.float32), c: wp.array(dtype=wp.int32)):
+                tid = wp.tid()
+                if a[tid] > 0.0:
+                    c[tid] = 1
+                else:
+                    c[tid] = 0
+
+            rng = np.random.default_rng(2026)
+            for kf, dtype in [(klt, np.float32), (kle, np.float32),
+                              (keq, np.int32), (kne, np.int32),
+                              (kge, np.float32), (kgt, np.float32)]:
+                if dtype == np.float32:
+                    an = rng.standard_normal(257).astype(np.float32)
+                    a_w = lambda d: wp.array(an, dtype=wp.float32, device=d)
+                else:
+                    an = rng.integers(0, 15, size=257, dtype=np.int32)
+                    a_w = lambda d: wp.array(an, dtype=wp.int32, device=d)
+                c_cpu = wp.zeros(257, dtype=wp.int32, device='cpu')
+                c_m = wp.zeros(257, dtype=wp.int32, device='metal:0')
+                wp.launch(kf, dim=257, inputs=[a_w('cpu')], outputs=[c_cpu], device='cpu')
+                wp.launch(kf, dim=257, inputs=[a_w('metal:0')], outputs=[c_m], device='metal:0')
+                np.testing.assert_array_equal(
+                    c_cpu.numpy(), c_m.numpy(),
+                    err_msg=f'kernel {kf.adj.fun_name} mismatch'
+                )
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
     def test_rejects_adjoint_launch(self):
         snippet = textwrap.dedent(
             """
