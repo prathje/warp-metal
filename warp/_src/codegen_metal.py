@@ -10,10 +10,13 @@ CUDA-flavoured C++ statements that ``codegen.py`` already produces.
 
 Currently supported (anything else raises ``MetalCodegenError`` with a
 pointer to the offending statement):
-- 1-D ``wp.array`` args of scalar dtype (``float16/32``, ``int8/16/32/64``,
-  ``uint8/16/32/64``, ``bool``)
-- ``wp.tid()`` (1-D dispatch)
-- Address-of, load, store on 1-D arrays
+- ``wp.array`` / ``wp.array2d`` / ``wp.array3d`` of scalar dtype
+  (``float16/32``, ``int8/16/32/64``, ``uint8/16/32/64``, ``bool``)
+- ``wp.tid()`` for 1-, 2-, and 3-D launches (``dim`` may be int or tuple)
+- N-dimensional array reads/writes via row-major flat indexing
+  (``arr[i, j]`` -> ``arr[i * arr_shape[1] + j]``). MLX auto-generates
+  ``<inputname>_shape`` for inputs; the launcher appends a synthetic
+  ``<outputname>_shape`` argument for each multi-dim output.
 - Scalar arithmetic intrinsics: ``add``, ``sub``, ``mul``, ``div``, ``mod``
 - ``if`` / ``else`` blocks and the comparison operators ``<``, ``<=``,
   ``==``, ``!=``, ``>=``, ``>`` (Warp's IR pre-emits these in plain C/MSL
@@ -174,16 +177,21 @@ _MATH_BUILTIN_NAMES: tuple[str, ...] = (
 )
 
 
+# Multi-D versions of ``wp::address``, ``wp::array_store``, and
+# ``builtin_tid2d/3d`` are handled inline in ``generate_msl_kernel`` (their
+# arity varies with the array's rank, which doesn't fit a single
+# ``re.sub``-style rule).
+
 # Patterns are applied in order. Each entry is (regex, replacement). Captures
 # can be back-referenced with \1, \2, etc.
 _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
-    # wp.tid() -> thread_position_in_grid.x (we only support 1-D dispatch)
+    # wp.tid() -> thread_position_in_grid.x (1-D dispatch only — 2-D/3-D are
+    # handled by the structural matcher in ``generate_msl_kernel``).
     (re.compile(r"\bbuiltin_tid1d\s*\(\s*\)"), "(int)thread_position_in_grid.x"),
-    # wp::address(arr, idx) -> &arr[idx]  (used only if the dataflow collapse
-    # in ``generate_msl_kernel`` didn't fold it away — e.g. for non-arg
-    # array locals, which we don't currently support but emit a recognisable
-    # form for.)
-    (re.compile(r"wp::address\s*\(\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)"), r"&\1[\2]"),
+    # ``wp::address`` and ``wp::array_store`` are now both handled by the
+    # structural pre-pass in ``generate_msl_kernel`` (which knows the array's
+    # rank and emits row-major flat indexing). If a stray multi-arg call slips
+    # past, the unsupported-intrinsics guard will catch it.
     # wp::load(X) -> X
     # The dataflow collapse in ``generate_msl_kernel`` rewrites all our
     # ``wp::load`` operands from raw pointer locals to subscript expressions
@@ -191,11 +199,6 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     # there. If a non-collapsed load slips through, it'll fail the
     # ``_check_no_unsupported_intrinsics`` guard downstream.
     (re.compile(r"wp::load\s*\(\s*([^()]+?)\s*\)"), r"\1"),
-    # wp::array_store(arr, idx, val) -> arr[idx] = val
-    (
-        re.compile(r"wp::array_store\s*\(\s*([^,()]+?)\s*,\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)"),
-        r"\1[\2] = \3",
-    ),
     # Scalar arithmetic
     (re.compile(r"wp::add\s*\(\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)"), r"(\1 + \2)"),
     (re.compile(r"wp::sub\s*\(\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)"), r"(\1 - \2)"),
@@ -278,6 +281,69 @@ def _check_no_unsupported_intrinsics(line: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Multi-D array indexing
+# ---------------------------------------------------------------------------
+#
+# Warp's IR uses ``wp::address(arr, i, j, ...)`` and
+# ``wp::array_store(arr, i, j, ..., val)`` with variable arity. The runtime
+# computes the flat index from the array's strides; we don't have those at
+# codegen time, so we emit a row-major flat index using the array's *shape*
+# instead. For inputs MLX auto-generates ``<argname>_shape``; for outputs we
+# add a synthetic ``<argname>_shape`` input at launch time.
+#
+# Apple Silicon MLX outputs are guaranteed row-major contiguous (MLX
+# allocates them), so ``stride[k] = product(shape[k+1:])`` holds and a
+# shape-based index is equivalent to a strides-based one.
+
+_ADDRESS_MULTI_PAT = re.compile(
+    r"^(?P<indent>\s*)var_(?P<local>\w+)\s*=\s*"
+    r"wp::address\s*\(\s*var_(?P<arr>\w+)(?P<rest>(?:\s*,\s*var_\w+)+)\s*\)\s*;\s*$"
+)
+_ARRAY_STORE_MULTI_PAT = re.compile(
+    r"^(?P<indent>\s*)wp::array_store\s*\(\s*var_(?P<arr>\w+)(?P<rest>(?:\s*,\s*[^()]+?)+)\s*\)\s*;\s*$"
+)
+_TID_2D_PAT = re.compile(r"^(?P<indent>\s*)builtin_tid2d\s*\(\s*var_(?P<i>\w+)\s*,\s*var_(?P<j>\w+)\s*\)\s*;\s*$")
+_TID_3D_PAT = re.compile(
+    r"^(?P<indent>\s*)builtin_tid3d\s*\(\s*var_(?P<i>\w+)\s*,\s*var_(?P<j>\w+)\s*,\s*var_(?P<k>\w+)\s*\)\s*;\s*$"
+)
+
+
+def _flat_index_expr(arr_name: str, index_var_names: list[str]) -> str:
+    """Build a row-major flat-index expression for ``arr[i, j, ...]``.
+
+    For 1-D, returns the lone index unchanged. For 2-D, returns
+    ``i * arr_shape[1] + j``. For 3-D, ``i * arr_shape[1] * arr_shape[2]
+    + j * arr_shape[2] + k``. Index var names should already include the
+    ``var_`` prefix.
+    """
+    n = len(index_var_names)
+    if n == 1:
+        return index_var_names[0]
+    terms: list[str] = []
+    for k, idx in enumerate(index_var_names):
+        if k == n - 1:
+            terms.append(idx)
+        else:
+            stride = " * ".join(f"{arr_name}_shape[{j}]" for j in range(k + 1, n))
+            terms.append(f"({idx} * {stride})")
+    return " + ".join(terms)
+
+
+def _split_array_store_args(rest: str) -> list[str]:
+    """Split the trailing argument list of ``wp::array_store(arr, ...)``.
+
+    The leading comma and surrounding whitespace are part of ``rest``. Returns
+    the comma-separated args verbatim (with whitespace stripped). For
+    ``, var_0, var_1, var_3``, returns ``['var_0', 'var_1', 'var_3']``.
+    """
+    # Trim the leading ``,`` and any whitespace, then split on top-level commas.
+    # The IR doesn't put nested commas inside parens here (loaded values come
+    # in as ``var_X``), so a naive split is safe.
+    parts = [p.strip() for p in rest.split(",")]
+    return [p for p in parts if p]
+
+
 @dataclass
 class MetalKernelArtifact:
     """Everything ``mx.fast.metal_kernel`` needs to compile a kernel.
@@ -301,6 +367,11 @@ class MetalKernelArtifact:
     # ``device atomic<T>*`` in the generated function signature, and the
     # ``init_value=0.0`` fallback is applied at call time.
     atomic_outputs: bool = False
+    # Names of output arguments whose shape we pass as a synthetic kernel
+    # input (because MLX only auto-generates ``<name>_shape`` for *inputs*).
+    # The launcher constructs ``mx.array(value.shape, dtype=int32)`` for each
+    # of these and appends them to the MLX inputs list, in order.
+    output_shape_inputs: list[str] = field(default_factory=list)
 
 
 def _strip_comments_and_directives(line: str) -> str | None:
@@ -541,25 +612,31 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
         )
 
     # --- Dataflow simplification ---------------------------------------
-    # Warp's IR splits an ``arr[i]`` read into ``addr = wp::address(arr, i);``
-    # followed by ``val = wp::load(addr);``. The intermediate ``addr`` is a
-    # typed pointer in CUDA C++ but in MSL it would inherit a specific address
-    # space (``const constant`` for inputs vs ``device`` for outputs) that we
+    # Warp's IR splits an ``arr[i]`` (or ``arr[i, j, ...]``) read into
+    # ``addr = wp::address(arr, i, j, ...);`` followed by
+    # ``val = wp::load(addr);``. The intermediate ``addr`` is a typed pointer
+    # in CUDA C++ but in MSL it would inherit a specific address space
+    # (``const constant`` for inputs vs ``device`` for outputs) that we
     # can't easily express in a separately-declared local. Collapsing the
     # ``address``/``load`` pair into a direct subscript sidesteps the issue
     # entirely and yields cleaner MSL.
-    subscript_map: dict[str, str] = {}  # var label -> "arr[idx]" string
-    # Warp local labels are integers (``var_0``, ``var_1``); arg labels start
-    # with a letter (``var_a``). Both are valid ``\w+`` so use that.
-    address_pattern = re.compile(r"\s*var_(\w+)\s*=\s*wp::address\s*\(\s*var_(\w+)\s*,\s*var_(\w+)\s*\)\s*;\s*$")
+    #
+    # For multi-dim arrays we synthesize a row-major flat index from the
+    # array's shape (see ``_flat_index_expr``). The shape array is either
+    # auto-generated by MLX (for inputs) or appended as a synthetic input by
+    # the launcher (for outputs).
+    arg_label_set = {a.label for a in adj.args}
+    subscript_map: dict[str, str] = {}  # local label -> "arr[flat_idx]" string
     for raw in forward_lines:
-        m = address_pattern.match(raw)
+        m = _ADDRESS_MULTI_PAT.match(raw)
         if m:
-            local_label, arr_arg, idx_label = m.group(1), m.group(2), m.group(3)
-            # Only collapse if the array reference is one of the kernel args —
-            # otherwise the pointer source might be something more complex.
-            if any(arr_arg == a.label for a in adj.args):
-                subscript_map[local_label] = f"{arr_arg}[var_{idx_label}]"
+            local_label = m.group("local")
+            arr_arg = m.group("arr")
+            if arr_arg not in arg_label_set:
+                continue
+            indices = re.findall(r"var_(\w+)", m.group("rest"))
+            index_var_names = [f"var_{i}" for i in indices]
+            subscript_map[local_label] = f"{arr_arg}[{_flat_index_expr(arr_arg, index_var_names)}]"
 
     # --- Local variable declarations -----------------------------------
     body_lines: list[str] = []
@@ -585,39 +662,93 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
             body_lines.append(f"    const {msl_type} var_{var.label} = {_msl_constant_str(var.constant)};")
 
     # --- Forward statements --------------------------------------------
-    for raw in forward_lines:
-        line = _strip_comments_and_directives(raw)
-        if line is None:
-            continue
-        # Skip the now-redundant address lines.
-        if address_pattern.match(raw):
-            continue
-        translated = _translate_intrinsics(line.strip())
-        # Inline subscripts for any var that became part of subscript_map.
-        # Replace ``wp::load(var_X)`` patterns with the array subscript first,
-        # then any bare ``var_X`` reference.
+    def _finalize(translated: str) -> str:
+        # Inline subscripts that the address-collapse produced.
         for local_label, subscript in subscript_map.items():
             translated = re.sub(rf"\bvar_{re.escape(local_label)}\b", subscript, translated)
-        # Re-run intrinsic translation in case wp::load(var_1) became wp::load(arr[idx]).
+        # Re-run intrinsic translation in case ``wp::load(var_1)`` became
+        # ``wp::load(arr[idx])``.
         translated = _translate_intrinsics(translated)
-        # Rename ``var_<argname>`` -> ``<argname>`` so the body matches MLX's
-        # generated function signature (which uses the names from
+        # Rename ``var_<argname>`` -> ``<argname>`` so the body matches the
+        # MLX-generated function signature (which uses the names from
         # ``input_names``/``output_names`` directly).
         for arg in adj.args:
             translated = re.sub(rf"\bvar_{re.escape(arg.label)}\b", arg.label, translated)
         _check_no_unsupported_intrinsics(translated)
-        body_lines.append(f"    {translated}")
+        return translated
+
+    for raw in forward_lines:
+        line = _strip_comments_and_directives(raw)
+        if line is None:
+            continue
+        # Address lines have been folded into ``subscript_map``.
+        if _ADDRESS_MULTI_PAT.match(raw):
+            continue
+        # ``builtin_tid2d(var_X, var_Y);`` / ``builtin_tid3d(...)`` —
+        # arity-specific structural rewrite (the patterns table only handles
+        # the 1-D form).
+        m = _TID_2D_PAT.match(raw)
+        if m:
+            indent = m.group("indent")
+            i_label = m.group("i")
+            j_label = m.group("j")
+            body_lines.append(_finalize(f"{indent}var_{i_label} = (int)thread_position_in_grid.x;"))
+            body_lines.append(_finalize(f"{indent}var_{j_label} = (int)thread_position_in_grid.y;"))
+            continue
+        m = _TID_3D_PAT.match(raw)
+        if m:
+            indent = m.group("indent")
+            i_label = m.group("i")
+            j_label = m.group("j")
+            k_label = m.group("k")
+            body_lines.append(_finalize(f"{indent}var_{i_label} = (int)thread_position_in_grid.x;"))
+            body_lines.append(_finalize(f"{indent}var_{j_label} = (int)thread_position_in_grid.y;"))
+            body_lines.append(_finalize(f"{indent}var_{k_label} = (int)thread_position_in_grid.z;"))
+            continue
+        # ``wp::array_store(arr, idx0, idx1, ..., val);`` — variable arity,
+        # rewrite to ``arr[flat_idx] = val;``.
+        m = _ARRAY_STORE_MULTI_PAT.match(raw)
+        if m:
+            indent = m.group("indent")
+            arr = m.group("arr")
+            parts = _split_array_store_args(m.group("rest"))
+            if len(parts) < 2:
+                # Defensive: malformed; let it fall through to the unsupported
+                # guard with the original line text.
+                pass
+            else:
+                indices = parts[:-1]
+                value = parts[-1]
+                flat_idx = _flat_index_expr(arr, indices)
+                body_lines.append(_finalize(f"{indent}{arr}[{flat_idx}] = {value};"))
+                continue
+        translated = _translate_intrinsics(line.strip())
+        body_lines.append(f"    {_finalize(translated)}")
 
     source = "\n".join(body_lines) + "\n"
+
+    # Synthesise shape-inputs for any multi-dim *output* array. MLX
+    # auto-generates ``<name>_shape`` for inputs only; outputs need it
+    # supplied as a separate kernel argument. The launcher will append a
+    # corresponding ``mx.array(value.shape, dtype=int32)`` for each.
+    output_shape_inputs: list[str] = []
+    for out_arg in output_args:
+        ndim = getattr(out_arg.type, "ndim", 1) or 1
+        if ndim > 1:
+            output_shape_inputs.append(out_arg.label)
+
+    base_input_names = [a.label for a in input_args]
+    extra_input_names = [f"{name}_shape" for name in output_shape_inputs]
 
     return MetalKernelArtifact(
         name=adj.fun_name,
         source=source,
-        input_names=[a.label for a in input_args],
+        input_names=base_input_names + extra_input_names,
         output_names=[a.label for a in output_args],
         input_args=input_args,
         output_args=output_args,
         atomic_outputs=has_atomic,
+        output_shape_inputs=output_shape_inputs,
     )
 
 
@@ -730,10 +861,14 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device):
 
     arg_by_name = {a.label: (i, a) for i, a in enumerate(kernel.adj.args)}
 
-    # ---- Build MLX inputs in artifact.input_names order ----
+    # ---- Build MLX inputs ----
+    # Order must match ``artifact.input_names``: real inputs first (from the
+    # kernel signature, in declaration order), then synthetic shape inputs
+    # for each multi-dim output (one per entry in ``output_shape_inputs``).
     mlx_inputs: list = []
-    for input_name in artifact.input_names:
-        idx, arg_var = arg_by_name[input_name]
+    for arg_var in artifact.input_args:
+        input_name = arg_var.label
+        idx, _ = arg_by_name[input_name]
         value = fwd_args[idx]
         if _is_array_arg(arg_var):
             if not getattr(value, "device", None) or not value.device.is_metal:
@@ -755,6 +890,15 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device):
             # Scalar input — convert to a 0-D mx.array literal.
             mx_dtype = _wp_dtype_to_mx_dtype(arg_var.type)
             mlx_inputs.append(mx.array(value, dtype=mx_dtype))
+
+    # Append synthetic ``<outname>_shape`` inputs for each multi-dim output
+    # array. MLX auto-generates ``<inputname>_shape`` for *inputs*, so the
+    # codegen body can use the same naming uniformly.
+    for out_name in artifact.output_shape_inputs:
+        idx, _ = arg_by_name[out_name]
+        value = fwd_args[idx]
+        shape_arr = mx.array(np.array(value.shape, dtype=np.int32), dtype=mx.int32)
+        mlx_inputs.append(shape_arr)
 
     # ---- Build MLX output specs from user's output wp.arrays ----
     output_shapes: list = []
@@ -778,15 +922,39 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device):
         output_dest_arrays.append(value)
 
     # ---- Compute grid ----
+    # Warp's ``dim`` can be an int (1-D) or a sequence (multi-D). MLX takes
+    # a 3-tuple ``grid=(x, y, z)`` where ``thread_position_in_grid.x`` ranges
+    # over the *first* element. Warp's ``i, j = wp.tid()`` returns indices in
+    # the same order as ``dim``, so element 0 of ``dim`` -> ``.x``.
     if isinstance(dim, int):
-        total = dim
+        dims = (dim,)
     else:
-        total = 1
-        for d in dim:
-            total *= d
-    if total <= 0:
+        dims = tuple(dim)
+    if len(dims) == 0:
         return
-    threadgroup_size = min(256, total)
+    if len(dims) > 3:
+        raise RuntimeError(
+            f"Metal backend supports up to 3-D launches; kernel '{kernel.key}' was launched with dim={dim}"
+        )
+    if any(d <= 0 for d in dims):
+        return
+    grid_x = dims[0]
+    grid_y = dims[1] if len(dims) >= 2 else 1
+    grid_z = dims[2] if len(dims) >= 3 else 1
+    grid = (grid_x, grid_y, grid_z)
+    # Pick a threadgroup that's at most 256 threads total and never larger
+    # than each grid dimension.
+    if len(dims) == 1:
+        tg = (min(256, grid_x), 1, 1)
+    elif len(dims) == 2:
+        tg_x = min(16, grid_x)
+        tg_y = min(16, grid_y)
+        tg = (tg_x, tg_y, 1)
+    else:
+        tg_x = min(8, grid_x)
+        tg_y = min(8, grid_y)
+        tg_z = min(4, grid_z)
+        tg = (tg_x, tg_y, tg_z)
 
     # MLX outputs are uninitialized by default. For atomic-output kernels
     # we *must* zero-initialize so the first ``atomic_fetch_add`` accumulates
@@ -799,8 +967,8 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device):
 
     out_mx_list = mlx_kernel(
         inputs=mlx_inputs,
-        grid=(total, 1, 1),
-        threadgroup=(threadgroup_size, 1, 1),
+        grid=grid,
+        threadgroup=tg,
         output_shapes=output_shapes,
         output_dtypes=output_dtypes,
         init_value=init_value,

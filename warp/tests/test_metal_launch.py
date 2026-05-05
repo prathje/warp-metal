@@ -814,6 +814,142 @@ class TestMetalLaunch(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet)
 
+    def test_2d_array_copy_matches_cpu(self):
+        # Simplest 2D test: copy ``src[i, j]`` into ``dst[i, j]``. Exercises
+        # ``builtin_tid2d``, multi-arg ``wp::address`` / ``wp::array_store``,
+        # and the synthetic ``<output>_shape`` input mechanism.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(src: wp.array2d(dtype=wp.float32),
+                  dst: wp.array2d(dtype=wp.float32)):
+                i, j = wp.tid()
+                dst[i, j] = src[i, j]
+
+            for H, W in ((1, 1), (3, 5), (12, 17), (33, 65)):
+                rng = np.random.default_rng(H * 1000 + W)
+                src_np = rng.standard_normal((H, W)).astype(np.float32)
+                dst_cpu = wp.zeros((H, W), dtype=wp.float32, device='cpu')
+                dst_m = wp.zeros((H, W), dtype=wp.float32, device='metal:0')
+                wp.launch(k, dim=(H, W),
+                          inputs=[wp.array(src_np, dtype=wp.float32, device='cpu')],
+                          outputs=[dst_cpu], device='cpu')
+                wp.launch(k, dim=(H, W),
+                          inputs=[wp.array(src_np, dtype=wp.float32, device='metal:0')],
+                          outputs=[dst_m], device='metal:0')
+                np.testing.assert_array_equal(
+                    dst_cpu.numpy(), dst_m.numpy(),
+                    err_msg=f'2D copy {H}x{W} mismatch',
+                )
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_2d_mixed_with_1d_input_matches_cpu(self):
+        # Per-row scaling — a 2D output written using a 1D scale array.
+        # Exercises mixed 1-D and 2-D array indexing in the same kernel.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(a: wp.array2d(dtype=wp.float32),
+                  scale: wp.array(dtype=wp.float32),
+                  out: wp.array2d(dtype=wp.float32)):
+                i, j = wp.tid()
+                out[i, j] = a[i, j] * scale[i]
+
+            H, W = 16, 32
+            rng = np.random.default_rng(7)
+            an = rng.standard_normal((H, W)).astype(np.float32)
+            sn = rng.standard_normal(H).astype(np.float32)
+            out_cpu = wp.zeros((H, W), dtype=wp.float32, device='cpu')
+            out_m = wp.zeros((H, W), dtype=wp.float32, device='metal:0')
+            wp.launch(k, dim=(H, W),
+                      inputs=[wp.array(an, dtype=wp.float32, device='cpu'),
+                              wp.array(sn, dtype=wp.float32, device='cpu')],
+                      outputs=[out_cpu], device='cpu')
+            wp.launch(k, dim=(H, W),
+                      inputs=[wp.array(an, dtype=wp.float32, device='metal:0'),
+                              wp.array(sn, dtype=wp.float32, device='metal:0')],
+                      outputs=[out_m], device='metal:0')
+            np.testing.assert_array_equal(out_cpu.numpy(), out_m.numpy())
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_3d_array_add_matches_cpu(self):
+        # Elementwise add on 3-D arrays. Exercises ``builtin_tid3d`` and the
+        # 3-term flat-index expression.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(a: wp.array3d(dtype=wp.float32),
+                  b: wp.array3d(dtype=wp.float32),
+                  c: wp.array3d(dtype=wp.float32)):
+                i, j, k = wp.tid()
+                c[i, j, k] = a[i, j, k] + b[i, j, k]
+
+            D, H, W = 5, 7, 11
+            rng = np.random.default_rng(2026)
+            an = rng.standard_normal((D, H, W)).astype(np.float32)
+            bn = rng.standard_normal((D, H, W)).astype(np.float32)
+            c_cpu = wp.zeros((D, H, W), dtype=wp.float32, device='cpu')
+            c_m = wp.zeros((D, H, W), dtype=wp.float32, device='metal:0')
+            wp.launch(k, dim=(D, H, W),
+                      inputs=[wp.array(an, dtype=wp.float32, device='cpu'),
+                              wp.array(bn, dtype=wp.float32, device='cpu')],
+                      outputs=[c_cpu], device='cpu')
+            wp.launch(k, dim=(D, H, W),
+                      inputs=[wp.array(an, dtype=wp.float32, device='metal:0'),
+                              wp.array(bn, dtype=wp.float32, device='metal:0')],
+                      outputs=[c_m], device='metal:0')
+            np.testing.assert_array_equal(c_cpu.numpy(), c_m.numpy())
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_2d_array_with_for_loop_matches_cpu(self):
+        # Row-sum: each thread sums its row. Combines 2D indexing with a
+        # dynamic-range for-loop, which mirrors the IR shape of several
+        # mujoco_warp kernels (e.g. ``_extract_dof_A_diag``).
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(a: wp.array2d(dtype=wp.float32), n: wp.int32,
+                  out: wp.array(dtype=wp.float32)):
+                i = wp.tid()
+                s = float(0.0)
+                for j in range(n):
+                    s = s + a[i, j]
+                out[i] = s
+
+            H, W = 32, 9
+            rng = np.random.default_rng(11)
+            an = rng.standard_normal((H, W)).astype(np.float32)
+            out_cpu = wp.zeros(H, dtype=wp.float32, device='cpu')
+            out_m = wp.zeros(H, dtype=wp.float32, device='metal:0')
+            wp.launch(k, dim=H,
+                      inputs=[wp.array(an, dtype=wp.float32, device='cpu'), W],
+                      outputs=[out_cpu], device='cpu')
+            wp.launch(k, dim=H,
+                      inputs=[wp.array(an, dtype=wp.float32, device='metal:0'), W],
+                      outputs=[out_m], device='metal:0')
+            np.testing.assert_array_equal(out_cpu.numpy(), out_m.numpy())
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
     def test_rejects_adjoint_launch(self):
         snippet = textwrap.dedent(
             """
