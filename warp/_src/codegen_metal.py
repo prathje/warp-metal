@@ -25,6 +25,9 @@ pointer to the offending statement):
 - ``for i in range(...)`` loops, both static (Warp unrolls them, so this
   is a no-op) and dynamic (a structural pre-pass rewrites Warp's
   ``goto``-based loop into a real MSL ``for``).
+- ``while cond:`` loops with ``break`` and ``continue``. MSL rejects
+  ``goto`` and labeled statements outright, so a pre-pass rewrites the
+  goto-based IR as ``while (true) { ... if (!cond) break; ... continue; }``.
 - ``wp::assign(dst, src)`` (in-place mutation, used by the loop body for
   accumulator updates).
 - Atomic ops on output arrays — ``wp.atomic_add``, ``wp.atomic_sub``,
@@ -206,6 +209,11 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         re.compile(r"wp::assign\s*\(\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)\s*;"),
         r"\1 = \2;",
     ),
+    # ``wp::copy(value)`` is an explicit value copy used by Warp to bind a
+    # loaded value to a fresh local (e.g. ``n = a[tid]`` produces
+    # ``var_n = wp::copy(var_loaded)``). For scalar / pointer types the copy
+    # is just plain assignment.
+    (re.compile(r"wp::copy\s*\(\s*([^()]+?)\s*\)"), r"\1"),
     # Atomic ops on array elements. MLX-allocated outputs flagged with
     # ``atomic_outputs=True`` are typed ``device atomic<T>*``, so the
     # ``&arr[idx]`` we form here is already a valid atomic-pointer operand.
@@ -334,6 +342,67 @@ _END_LABEL_PAT = re.compile(r"^\s*end_for_(\d+)\s*:\s*;\s*$")
 _GOTO_START_PAT = re.compile(r"^\s*goto\s+start_for_(\d+)\s*;\s*$")
 
 
+_WHILE_START_PAT = re.compile(r"^\s*start_while_(\d+)\s*:\s*;\s*$")
+_WHILE_END_PAT = re.compile(r"^\s*end_while_(\d+)\s*:\s*;\s*$")
+_WHILE_COND_TEST_PAT = re.compile(
+    r"^(?P<indent>\s*)if\s*\(\s*\(\s*var_(?P<cond>\w+)\s*\)\s*==\s*false\s*\)\s*goto\s+end_while_(\d+)\s*;\s*$"
+)
+_WHILE_GOTO_START_PAT = re.compile(r"^(?P<indent>\s*)goto\s+start_while_(\d+)\s*;\s*$")
+_WHILE_GOTO_END_PAT = re.compile(r"^(?P<indent>\s*)goto\s+end_while_(\d+)\s*;\s*$")
+
+
+def _preprocess_while_loops(lines: list[str]) -> list[str]:
+    """Rewrite Warp's goto-based ``while`` IR into MSL ``while (true) { ... }``.
+
+    Pattern (per loop, ``K`` is a numeric label suffix):
+
+        start_while_K:;
+        ... cond computation ...
+        if ((var_X) == false) goto end_while_K;
+            ... body ...
+        goto start_while_K;
+        end_while_K:;
+
+    Rewrite:
+
+        while (true) {
+            ... cond computation ...
+            if (!var_X) { break; }
+            ... body ...
+            continue;
+        }
+
+    A mid-body ``goto end_while_K;`` (Warp's lowering of ``break``) becomes
+    ``break;``; a mid-body ``goto start_while_K;`` (``continue``) becomes
+    ``continue;``. MSL does not allow ``goto`` or labeled statements at all,
+    so this rewrite is mandatory — verified empirically (the literal goto
+    form fails at MSL compile time with "labeled statements are not
+    supported in Metal").
+    """
+    out: list[str] = []
+    for line in lines:
+        if _WHILE_START_PAT.match(line):
+            out.append("while (true) {")
+            continue
+        if _WHILE_END_PAT.match(line):
+            out.append("}")
+            continue
+        m = _WHILE_COND_TEST_PAT.match(line)
+        if m:
+            out.append(f"{m.group('indent')}if (!var_{m.group('cond')}) {{ break; }}")
+            continue
+        m = _WHILE_GOTO_START_PAT.match(line)
+        if m:
+            out.append(f"{m.group('indent')}continue;")
+            continue
+        m = _WHILE_GOTO_END_PAT.match(line)
+        if m:
+            out.append(f"{m.group('indent')}break;")
+            continue
+        out.append(line)
+    return out
+
+
 def _preprocess_for_loops(lines: list[str]) -> tuple[list[str], set[str]]:
     """Rewrite dynamic-range goto-loops as MSL ``for`` loops.
 
@@ -409,12 +478,15 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
     if not getattr(adj, "blocks", None):
         adj.build(builder=None, default_builder_options={"enable_backward": False})
 
-    # Preprocess: rewrite dynamic-range goto-loops into ``for`` loops. Static
-    # ranges are pre-unrolled by Warp and pass through untouched. Returns a
-    # transformed line list plus a set of Warp local labels whose top-level
-    # declaration should be suppressed (the iter-state object and the
-    # induction variable, which the generated ``for`` declares inline).
+    # Preprocess: rewrite dynamic-range goto-loops into ``for`` loops, then
+    # rewrite ``while`` goto-loops into ``while (true) { ... }`` (MSL doesn't
+    # support ``goto`` or labeled statements at all). Static-range ``for``s
+    # are pre-unrolled by Warp and pass through untouched. The for-loop pass
+    # also returns a set of local labels whose top-level declaration should
+    # be suppressed (the range iter-state object and the induction variable,
+    # which the generated ``for`` declares inline).
     forward_lines, vars_to_skip_decl = _preprocess_for_loops(adj.blocks[0].body_forward)
+    forward_lines = _preprocess_while_loops(forward_lines)
 
     # Classify each array arg as input or output by scanning the IR strings.
     # MLX inputs are ``const device T*`` (read-only) — verified empirically —
