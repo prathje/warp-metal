@@ -247,6 +247,26 @@ class WhileCondBreak(Node):
     cond_var: str
 
 
+@dataclass(frozen=True)
+class _DoWhileZero(Node):
+    """Synthetic ``do { body } while (0);`` wrapper used when an inlined
+    function's body contains mid-function ``return`` statements that we
+    rewrote to ``break`` — the wrapper makes those breaks exit the entire
+    inlined region in one hop without a goto.
+    """
+
+    body: tuple[Node, ...]
+
+
+@dataclass(frozen=True)
+class _RawLine(Node):
+    """A literal pre-formatted MSL line. Used by the inliner to emit
+    variable declarations for the inlined locals (whose mangled names
+    aren't in the host kernel's ``adj.variables`` table, so the standard
+    declaration loop wouldn't emit them).
+    """
+
+
 # ---------------------------------------------------------------------------
 # Expression nodes
 # ---------------------------------------------------------------------------
@@ -589,6 +609,13 @@ def _emit_into(nodes, out: list[str]) -> None:
             out.append("while (true) {")
             _emit_into(list(n.body), out)
             out.append("}")
+        elif isinstance(n, _DoWhileZero):
+            # Inlined function bodies that contain mid-function returns get
+            # wrapped in ``do { ... } while (0);`` so the rewritten breaks
+            # exit the whole region in one hop. MSL accepts ``do/while``.
+            out.append("do {")
+            _emit_into(list(n.body), out)
+            out.append("} while (0);")
         else:
             out.append(n.raw)
 
@@ -872,6 +899,304 @@ def _drop_goto(body: tuple[Node, ...] | list[Node], target: str) -> list[Node]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Function inlining (Phase 2)
+# ---------------------------------------------------------------------------
+# Some kernels (notably ``_limit_pos`` and the other sensor-write kernels in
+# mujoco_warp) write their output only by passing it to a ``@wp.func`` user
+# helper. The output-array detector in ``generate_msl_kernel`` scans for
+# direct write ops (``wp::array_store`` / ``wp::atomic_*`` / our synthetic
+# scalar-store), so without inlining those kernels are rejected as having no
+# outputs. Inlining splices the helper's body into the call site so the
+# downstream pipeline sees the writes directly.
+#
+# What we do:
+#   1. Walk the AST. When we find a user-function call node:
+#      a. Resolve the called overload via the kernel's reference table.
+#      b. Build the callee's IR (forward only).
+#      c. Mangle every callee local label to ``<inline_id>__<orig>`` so it
+#         can't collide with caller locals or other inlined calls.
+#      d. Substitute callee parameter names with the caller's actual arg
+#         expressions (a textual sub on each line).
+#      e. Parse the substituted lines, structurally fold them.
+#      f. Recurse: inline any nested user calls in the same way.
+#      g. If the body contains any ``return``, wrap it in ``do { ... }
+#         while (0)`` and rewrite each ``return`` to ``break``. MSL accepts
+#         ``do/while``.
+#   2. Splice the resulting node list at the call site.
+#
+# Output equivalence is no longer the test for this pass — there is no
+# "existing pipeline" to compare against (function-call kernels are
+# rejected today). Correctness is verified end-to-end by the launch tests:
+# inlined kernels run on Metal and produce the same answers as on CPU.
+
+
+_INLINE_ID_COUNTER = [0]
+
+
+def _next_inline_id() -> int:
+    _INLINE_ID_COUNTER[0] += 1
+    return _INLINE_ID_COUNTER[0]
+
+
+def _substitute_var_refs(line: str, subs: dict[str, str]) -> str:
+    """Replace every ``var_<X>`` or ``ret_<i>`` token in ``line`` per ``subs``.
+
+    Uses ``\\b`` word boundaries so we substitute whole identifiers only —
+    no mid-identifier matches and no recursion into the replacement value.
+    """
+    if not subs:
+        return line
+
+    def repl(m: re.Match[str]) -> str:
+        full = m.group(0)
+        return subs.get(full, full)
+
+    # Match both forms in one sweep so ``ret_0 = var_x;`` translates
+    # correctly. Order doesn't matter because each match is local.
+    return re.sub(r"\b(?:var_|ret_)\w+\b", repl, line)
+
+
+def _build_function_overload_table(adj) -> dict[str, Any]:
+    """Map mangled call-site names (e.g. ``"_write_scalar_0"``) back to the
+    specialized ``Function`` overload whose adj we can build and inline.
+
+    Each overload exposes its full mangled name as ``native_func`` (set
+    when the overload is registered). The IR call-site name comes from
+    that field directly, so we use it as the lookup key.
+    """
+    refs = adj.get_references()
+    fn_table = refs[2]
+    out: dict[str, Any] = {}
+    for fn in fn_table:
+        for overload in fn.user_overloads.values():
+            native = getattr(overload, "native_func", None)
+            if native is not None:
+                out[native] = overload
+    return out
+
+
+def _has_return(nodes: tuple[Node, ...] | list[Node]) -> bool:
+    for n in nodes:
+        if isinstance(n, Return):
+            return True
+        if isinstance(n, If) and _has_return(n.body):
+            return True
+        if isinstance(n, (For, While)) and _has_return(n.body):
+            # Returns inside loops still need wrapping.
+            return True
+    return False
+
+
+def _rewrite_returns_to_breaks(nodes: tuple[Node, ...] | list[Node]) -> list[Node]:
+    """Replace ``return;`` with ``break;`` (used after wrapping in do-while-0).
+
+    Recurses into ``If`` bodies. Does NOT descend into ``For`` / ``While``
+    — a return inside an inner loop would need a separate flag-based
+    rewrite (``return`` from inside a loop is uncommon enough that we
+    leave it as a future-work hazard; if we hit it the resulting ``break``
+    would only break the inner loop, not the do-while-0 wrapper).
+    """
+    out: list[Node] = []
+    for n in nodes:
+        if isinstance(n, Return):
+            indent = _leading_indent(n.raw)
+            out.append(Break(raw=f"{indent}break;"))
+            continue
+        if isinstance(n, If):
+            out.append(
+                If(
+                    raw=n.raw,
+                    cond=n.cond,
+                    body=tuple(_rewrite_returns_to_breaks(n.body)),
+                    raw_open=n.raw_open,
+                    raw_close=n.raw_close,
+                )
+            )
+            continue
+        out.append(n)
+    return out
+
+
+# NOTE: ``_DoWhileZero`` is defined near the other structured-body node
+# types (above) so every fold pass can ``isinstance`` against it without an
+# import cycle.
+
+
+def _inline_one_call(
+    fn_overload,
+    caller_args: tuple[str, ...],
+    fn_map: dict[str, Any],
+    depth: int,
+    max_depth: int,
+) -> list[Node]:
+    """Inline a single user-function call. Returns the spliced node list."""
+    if depth > max_depth:
+        from warp._src.codegen_metal import MetalCodegenError  # noqa: PLC0415
+
+        raise MetalCodegenError(
+            f"function inlining exceeded max depth {max_depth} — possible recursion in {fn_overload.key!r}"
+        )
+
+    # Build the callee's IR.
+    if not getattr(fn_overload.adj, "blocks", None):
+        fn_overload.adj.build(builder=None, default_builder_options={"enable_backward": False})
+
+    fn_lines = fn_overload.adj.blocks[0].body_forward
+
+    # Build the substitution map.
+    inline_id = _next_inline_id()
+    fn_param_labels = [a.label for a in fn_overload.adj.args]
+    n_params = len(fn_param_labels)
+    n_caller_args = len(caller_args)
+
+    # A value-returning ``@wp.func`` like
+    #   def f(x): return a, b
+    # lowers in Warp's IR to a body that writes its return values into
+    # special ``ret_0``, ``ret_1``, ... locals before a bare ``return;``.
+    # The call site looks like ``f_<id>(input1, ..., ret0_dst, ret1_dst);``
+    # — caller args after the regular params are output slots.
+    if n_caller_args < n_params:
+        from warp._src.codegen_metal import MetalCodegenError  # noqa: PLC0415
+
+        raise MetalCodegenError(f"inlining {fn_overload.key!r}: expected at least {n_params} args, got {n_caller_args}")
+    n_returns = n_caller_args - n_params
+
+    subs: dict[str, str] = {}
+    for pname, caller_arg in zip(fn_param_labels, caller_args[:n_params], strict=True):
+        subs[f"var_{pname}"] = caller_arg
+    # Map each ret_<i> to the corresponding extra caller arg.
+    for i in range(n_returns):
+        subs[f"ret_{i}"] = caller_args[n_params + i]
+    # Mangle locals (everything not a parameter).
+    fn_param_set = set(fn_param_labels)
+    for var in fn_overload.adj.variables:
+        if var.label in fn_param_set:
+            continue
+        subs[f"var_{var.label}"] = f"var_{inline_id}__{var.label}"
+
+    substituted_lines = [_substitute_var_refs(line, subs) for line in fn_lines]
+
+    # Parse + structurally fold the substituted body.
+    fn_nodes = parse(substituted_lines)
+    fn_folded, fold_skip = fold(fn_nodes)
+
+    # Recursively inline nested user calls.
+    fn_folded = _inline_walk(fn_folded, fn_map, depth + 1, max_depth)
+
+    # Emit declarations for the inlined locals. They aren't in the host
+    # kernel's ``adj.variables`` table, so the standard declaration loop in
+    # ``generate_msl_kernel`` doesn't see them. We emit them as raw lines
+    # at the splice point.
+    from warp._src.codegen_metal import _msl_constant_str, _msl_var_type  # noqa: PLC0415
+
+    decls: list[Node] = []
+    for var in fn_overload.adj.variables:
+        if var.label in fn_param_set:
+            continue
+        # Skip locals that the for-loop fold already absorbed (range
+        # iterator and induction variables are declared inline by the
+        # synthetic ``for (...) {`` line).
+        if var.label in fold_skip:
+            continue
+        # Skip ret_<i> "locals": they get substituted away by the
+        # ret-to-output mapping, so no declaration needed.
+        if var.label.startswith("ret_") or var.ctype() == "wp::range_t":
+            continue
+        try:
+            msl_type = _msl_var_type(var.ctype())
+        except Exception:
+            # If a type isn't recognized, skip — the unsupported-intrinsic
+            # guard will surface a clear error if the variable is actually
+            # referenced.
+            continue
+        mangled = f"var_{inline_id}__{var.label}"
+        if var.constant is None:
+            decls.append(_RawLine(raw=f"    {msl_type} {mangled};"))
+        else:
+            decls.append(_RawLine(raw=f"    const {msl_type} {mangled} = {_msl_constant_str(var.constant)};"))
+
+    # If the body contains any return, wrap and convert to break.
+    if _has_return(fn_folded):
+        body_with_breaks = _rewrite_returns_to_breaks(fn_folded)
+        return [*decls, _DoWhileZero(raw="", body=tuple(body_with_breaks))]
+
+    return [*decls, *fn_folded]
+
+
+def _inline_walk(
+    nodes: tuple[Node, ...] | list[Node],
+    fn_map: dict[str, Any],
+    depth: int,
+    max_depth: int,
+) -> list[Node]:
+    out: list[Node] = []
+    for n in nodes:
+        # Detect void user-function call.
+        if isinstance(n, VoidCall) and n.op == "user_call":
+            name = dict(n.extra).get("name")
+            if name in fn_map:
+                spliced = _inline_one_call(fn_map[name], n.args, fn_map, depth, max_depth)
+                out.extend(spliced)
+                continue
+
+        # Recurse into structured bodies.
+        if isinstance(n, If):
+            out.append(
+                If(
+                    raw=n.raw,
+                    cond=n.cond,
+                    body=tuple(_inline_walk(n.body, fn_map, depth, max_depth)),
+                    raw_open=n.raw_open,
+                    raw_close=n.raw_close,
+                )
+            )
+            continue
+        if isinstance(n, For):
+            out.append(
+                For(
+                    raw=n.raw,
+                    iter_var=n.iter_var,
+                    range_var=n.range_var,
+                    start=n.start,
+                    stop=n.stop,
+                    body=tuple(_inline_walk(n.body, fn_map, depth, max_depth)),
+                )
+            )
+            continue
+        if isinstance(n, While):
+            out.append(
+                While(
+                    raw=n.raw,
+                    label_k=n.label_k,
+                    body=tuple(_inline_walk(n.body, fn_map, depth, max_depth)),
+                )
+            )
+            continue
+        if isinstance(n, _DoWhileZero):
+            out.append(
+                _DoWhileZero(
+                    raw=n.raw,
+                    body=tuple(_inline_walk(n.body, fn_map, depth, max_depth)),
+                )
+            )
+            continue
+        out.append(n)
+    return out
+
+
+def inline_user_calls(nodes: list[Node], kernel_adj, max_depth: int = 8) -> list[Node]:
+    """Splice every user-``@wp.func`` call into the AST tree.
+
+    See the module-level docstring for the algorithm. ``kernel_adj`` is the
+    top-level kernel's ``Adjoint`` object (used for the references table).
+    """
+    fn_map = _build_function_overload_table(kernel_adj)
+    if not fn_map:
+        return list(nodes)
+    return _inline_walk(nodes, fn_map, depth=0, max_depth=max_depth)
+
+
 _UNSUPPORTED_CTYPE_PREFIXES = ("wp::str", "wp::tuple_t")
 
 
@@ -939,6 +1264,9 @@ def _apply_drop_unsupported(nodes: tuple[Node, ...] | list[Node], drop: set[str]
                     body=tuple(_apply_drop_unsupported(n.body, drop)),
                 )
             )
+            continue
+        if isinstance(n, _DoWhileZero):
+            out.append(_DoWhileZero(raw=n.raw, body=tuple(_apply_drop_unsupported(n.body, drop))))
             continue
         out.append(n)
     return out
@@ -1015,7 +1343,7 @@ def _collect_slice_aliases(
                 step_l = _strip_var_prefix(args[2])
                 if start_l is not None and start_l == stop_l and step_l is not None and const_int_vars.get(step_l) == 0:
                     out[n.lhs] = start_l
-        elif isinstance(n, (If, For, While)):
+        elif isinstance(n, (If, For, While, _DoWhileZero)):
             _collect_slice_aliases(n.body, out, const_int_vars)
 
 
@@ -1038,7 +1366,7 @@ def _collect_view_aliases(
                     and all(s is not None and s in slice_aliases for s in slice_labels)
                 ):
                     out[n.lhs] = (arr_l, [slice_aliases[s] for s in slice_labels])
-        elif isinstance(n, (If, For, While)):
+        elif isinstance(n, (If, For, While, _DoWhileZero)):
             _collect_view_aliases(n.body, out, slice_aliases, arg_label_set)
 
 
@@ -1167,6 +1495,14 @@ def _apply_view_rewrites(
                 )
             )
             continue
+        if isinstance(n, _DoWhileZero):
+            out.append(
+                _DoWhileZero(
+                    raw=n.raw,
+                    body=tuple(_apply_view_rewrites(n.body, slice_aliases, view_aliases)),
+                )
+            )
+            continue
 
         out.append(n)
     return out
@@ -1234,7 +1570,7 @@ def _collect_vec_address_aliases(
                     idx_labels = [_strip_var_prefix(a) for a in args[1:]]
                     if all(s is not None for s in idx_labels):
                         out[n.lhs] = (arr_l, list(idx_labels))  # type: ignore[arg-type]
-        elif isinstance(n, (If, For, While)):
+        elif isinstance(n, (If, For, While, _DoWhileZero)):
             _collect_vec_address_aliases(n.body, out, arg_label_set, vec_arr_info)
 
 
@@ -1254,7 +1590,7 @@ def _collect_indexref_aliases(
                     arr_name, idx_labels = addr_aliases[addr_l]
                     out[n.lhs] = (arr_name, idx_labels, comp_l)
                     referenced_addr_locals.add(addr_l)
-        elif isinstance(n, (If, For, While)):
+        elif isinstance(n, (If, For, While, _DoWhileZero)):
             _collect_indexref_aliases(n.body, out, referenced_addr_locals, addr_aliases)
 
 
@@ -1349,6 +1685,16 @@ def _apply_indexref_rewrites(
                 While(
                     raw=n.raw,
                     label_k=n.label_k,
+                    body=tuple(
+                        _apply_indexref_rewrites(n.body, indexref_aliases, referenced_addr_locals, vec_arr_info)
+                    ),
+                )
+            )
+            continue
+        if isinstance(n, _DoWhileZero):
+            out.append(
+                _DoWhileZero(
+                    raw=n.raw,
                     body=tuple(
                         _apply_indexref_rewrites(n.body, indexref_aliases, referenced_addr_locals, vec_arr_info)
                     ),

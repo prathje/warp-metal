@@ -128,6 +128,7 @@ from warp._src.codegen_metal_ast import fold as _ast_fold
 from warp._src.codegen_metal_ast import fold_drop_unsupported_locals as _ast_fold_drop
 from warp._src.codegen_metal_ast import fold_indexref_writes as _ast_fold_indexref
 from warp._src.codegen_metal_ast import fold_views as _ast_fold_views
+from warp._src.codegen_metal_ast import inline_user_calls as _ast_inline
 from warp._src.codegen_metal_ast import parse as _ast_parse
 
 if TYPE_CHECKING:
@@ -982,6 +983,11 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
 
     _ast_nodes = _ast_parse(adj.blocks[0].body_forward)
     _ast_nodes, _struct_skip = _ast_fold(_ast_nodes)
+    # Inline ``@wp.func`` user-function calls into the kernel body before
+    # the view / indexref / drop folds run, so those folds see the spliced-
+    # in writes (otherwise kernels that write outputs only via helper
+    # functions would be rejected as having no outputs).
+    _ast_nodes = _ast_inline(_ast_nodes, adj)
     _ast_nodes, _drop_skip = _ast_fold_drop(_ast_nodes, adj)
     _ast_nodes, _view_skip = _ast_fold_views(_ast_nodes, adj)
     _ast_nodes, _indexref_skip = _ast_fold_indexref(_ast_nodes, adj, _early_vec_arr_info)

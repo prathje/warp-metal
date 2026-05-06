@@ -997,6 +997,95 @@ class TestMetalLaunch(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet)
 
+    def test_user_function_inlining_void_matches_cpu(self):
+        # ``@wp.func`` helpers that take an output array and write through
+        # it (the canonical mujoco_warp ``_write_scalar`` pattern) get
+        # spliced into the call site at codegen time. Without inlining,
+        # the kernel would be rejected as having no output array.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.func
+            def _scale_and_clip(scale: wp.float32, clip: wp.float32, val: wp.float32,
+                                out: wp.array(dtype=wp.float32), idx: wp.int32):
+                v = val * scale
+                if v > clip:
+                    out[idx] = clip
+                    return
+                if v < -clip:
+                    out[idx] = -clip
+                    return
+                out[idx] = v
+
+            @wp.kernel
+            def k(a: wp.array(dtype=wp.float32),
+                  scale: wp.float32, clip: wp.float32,
+                  out: wp.array(dtype=wp.float32)):
+                tid = wp.tid()
+                _scale_and_clip(scale, clip, a[tid], out, tid)
+
+            N = 16
+            rng = np.random.default_rng(0)
+            an = rng.standard_normal(N).astype(np.float32) * 5.0
+            for dev in ('cpu', 'metal:0'):
+                a = wp.array(an, dtype=wp.float32, device=dev)
+                out = wp.zeros(N, dtype=wp.float32, device=dev)
+                wp.launch(k, dim=N, inputs=[a, 2.0, 3.0], outputs=[out], device=dev)
+                if dev == 'cpu':
+                    cpu_out = out.numpy()
+                else:
+                    np.testing.assert_array_equal(cpu_out, out.numpy())
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_user_function_inlining_value_return_matches_cpu(self):
+        # ``@wp.func`` helpers that return tuple values (lowered by Warp
+        # to ``ret_<i>`` writes plus extra output args at the call site)
+        # also inline correctly.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.func
+            def _normalize_with_norm(x: wp.vec3):
+                n = wp.length(x)
+                if n == 0.0:
+                    return x, float(0.0)
+                return x / n, n
+
+            @wp.kernel
+            def k(v: wp.array(dtype=wp.vec3),
+                  out_dir: wp.array(dtype=wp.vec3),
+                  out_len: wp.array(dtype=wp.float32)):
+                tid = wp.tid()
+                d, n = _normalize_with_norm(v[tid])
+                out_dir[tid] = d
+                out_len[tid] = n
+
+            N = 8
+            rng = np.random.default_rng(0)
+            vn = rng.standard_normal((N, 3)).astype(np.float32)
+            # Throw in one zero vector to exercise the early-return branch.
+            vn[3] = (0.0, 0.0, 0.0)
+            for dev in ('cpu', 'metal:0'):
+                v = wp.array(vn, dtype=wp.vec3, device=dev)
+                out_dir = wp.zeros(N, dtype=wp.vec3, device=dev)
+                out_len = wp.zeros(N, dtype=wp.float32, device=dev)
+                wp.launch(k, dim=N, inputs=[v], outputs=[out_dir, out_len], device=dev)
+                if dev == 'cpu':
+                    cpu_dir = out_dir.numpy()
+                    cpu_len = out_len.numpy()
+                else:
+                    np.testing.assert_allclose(cpu_dir, out_dir.numpy(), rtol=1e-5)
+                    np.testing.assert_allclose(cpu_len, out_len.numpy(), rtol=1e-5)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
     def test_dynamic_range_two_arg_matches_cpu(self):
         # ``range(start, stop)`` with non-constant bounds lowers to
         # ``wp::range(var_start, var_stop)``. Our for-loop preprocessor
