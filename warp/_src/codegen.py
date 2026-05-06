@@ -1629,7 +1629,14 @@ class Adjoint:
                 func.adj.used_by_backward_kernel = True
 
             if adj.builder is None:
-                func.build(None)
+                # Propagate the parent kernel's builder options into the
+                # recursively-built user function so its value-funcs (e.g.
+                # ``tile_value_func`` reading ``codegen.options['block_dim']``)
+                # see a populated options dict instead of the empty one
+                # ``adj.build(None)`` would otherwise install. Required by
+                # the Metal backend, which calls ``adj.build`` with
+                # ``builder=None`` and a non-empty ``default_builder_options``.
+                func.build(None, default_builder_options=adj.builder_options)
 
             elif func not in adj.builder.functions:
                 adj.builder.build_function(func)
@@ -1823,7 +1830,7 @@ class Adjoint:
 
             # Build the function if not already built
             if adj.builder is None:
-                func.build(None)
+                func.build(None, default_builder_options=adj.builder_options)
             elif func not in adj.builder.functions:
                 adj.builder.build_function(func)
 

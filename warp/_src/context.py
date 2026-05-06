@@ -550,8 +550,13 @@ class Function:
         bound_args = tuple(bound_args.arguments.values())
         return call_builtin_from_desc(desc, bound_args)
 
-    def build(self, builder: ModuleBuilder | None):
-        self.adj.build(builder)
+    def build(self, builder: ModuleBuilder | None, default_builder_options: dict[str, Any] | None = None):
+        # ``default_builder_options`` is only used when ``builder`` is None
+        # (the kernel is being built without a registered module). The Metal
+        # backend uses this path so the parent kernel's options dict (with
+        # ``block_dim``, ``output_arch``, etc.) propagates into recursively-
+        # built user functions whose value-funcs read the global options.
+        self.adj.build(builder, default_builder_options=default_builder_options)
 
         # complete the function return type after we have analyzed it (inferred from return statement in ast)
         if not self.value_func:
@@ -8433,7 +8438,7 @@ def launch(
             raise RuntimeError("Metal backend does not yet support record_cmd launches")
         from warp._src.codegen_metal import launch_metal_kernel  # noqa: PLC0415
 
-        launch_metal_kernel(kernel, dim, inputs, outputs, device)
+        launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim=block_dim)
         return
 
     # construct launch bounds
