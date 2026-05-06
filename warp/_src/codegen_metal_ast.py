@@ -1100,6 +1100,194 @@ def _apply_view_rewrites(
     return out
 
 
+# ---------------------------------------------------------------------------
+# Indexref-write fold (Phase 1.2b)
+# ---------------------------------------------------------------------------
+# Fold ``address(vec_arr, i, j) + indexref(addr, k) + store(ptr, val)`` into
+# a synthetic ``wp::__metal_scalar_store__`` token that the body emitter in
+# :mod:`warp._src.codegen_metal` recognises and lowers to a direct flat-
+# offset subscript write. Used by kernels that mutate a single vec component
+# of an output (``out[i, j][k] = val`` in user code).
+#
+# Output-equivalent to ``_preprocess_indexref_writes`` from the regex
+# pipeline.
+
+
+_STORE_OPS = ("store", "assign_inplace", "add_inplace", "sub_inplace", "mul_inplace", "div_inplace")
+
+
+def fold_indexref_writes(
+    nodes: list[Node],
+    adj,
+    vec_arr_info: dict[str, tuple[int, str]],
+) -> tuple[list[Node], set[str]]:
+    """Fold the address/indexref/store chain into a synthetic scalar store.
+
+    Returns ``(rewritten_nodes, skip_decls)``.
+    """
+    arg_label_set = {a.label for a in adj.args}
+
+    # 1. Find ``var_X = wp::address(vec_arr, idx_args...)`` for vec-typed args.
+    addr_aliases: dict[str, tuple[str, list[str]]] = {}
+    _collect_vec_address_aliases(nodes, addr_aliases, arg_label_set, vec_arr_info)
+
+    # 2. Find ``var_Y = wp::indexref(var_X, var_idx)`` whose source is a
+    #    recorded vec-address alias.
+    indexref_aliases: dict[str, tuple[str, list[str], str]] = {}
+    referenced_addr_locals: set[str] = set()
+    _collect_indexref_aliases(nodes, indexref_aliases, referenced_addr_locals, addr_aliases)
+
+    if not indexref_aliases:
+        return nodes, set()
+
+    skip_decls = set(referenced_addr_locals) | set(indexref_aliases)
+    return (
+        _apply_indexref_rewrites(nodes, indexref_aliases, referenced_addr_locals, vec_arr_info),
+        skip_decls,
+    )
+
+
+def _collect_vec_address_aliases(
+    nodes: tuple[Node, ...] | list[Node],
+    out: dict[str, tuple[str, list[str]]],
+    arg_label_set: set[str],
+    vec_arr_info: dict[str, tuple[int, str]],
+) -> None:
+    for n in nodes:
+        if isinstance(n, Assign) and isinstance(n.expr, Builtin) and n.expr.name == "address":
+            args = n.expr.args
+            if len(args) >= 2:
+                arr_l = _strip_var_prefix(args[0])
+                if arr_l is not None and arr_l in arg_label_set and arr_l in vec_arr_info:
+                    idx_labels = [_strip_var_prefix(a) for a in args[1:]]
+                    if all(s is not None for s in idx_labels):
+                        out[n.lhs] = (arr_l, list(idx_labels))  # type: ignore[arg-type]
+        elif isinstance(n, (If, For, While)):
+            _collect_vec_address_aliases(n.body, out, arg_label_set, vec_arr_info)
+
+
+def _collect_indexref_aliases(
+    nodes: tuple[Node, ...] | list[Node],
+    out: dict[str, tuple[str, list[str], str]],
+    referenced_addr_locals: set[str],
+    addr_aliases: dict[str, tuple[str, list[str]]],
+) -> None:
+    for n in nodes:
+        if isinstance(n, Assign) and isinstance(n.expr, Builtin) and n.expr.name == "indexref":
+            args = n.expr.args
+            if len(args) == 2:
+                addr_l = _strip_var_prefix(args[0])
+                comp_l = _strip_var_prefix(args[1])
+                if addr_l is not None and addr_l in addr_aliases and comp_l is not None:
+                    arr_name, idx_labels = addr_aliases[addr_l]
+                    out[n.lhs] = (arr_name, idx_labels, comp_l)
+                    referenced_addr_locals.add(addr_l)
+        elif isinstance(n, (If, For, While)):
+            _collect_indexref_aliases(n.body, out, referenced_addr_locals, addr_aliases)
+
+
+def _apply_indexref_rewrites(
+    nodes: tuple[Node, ...] | list[Node],
+    indexref_aliases: dict[str, tuple[str, list[str], str]],
+    referenced_addr_locals: set[str],
+    vec_arr_info: dict[str, tuple[int, str]],
+) -> list[Node]:
+    out: list[Node] = []
+    for n in nodes:
+        # Drop the address def whose only purpose was to feed an indexref.
+        if (
+            isinstance(n, Assign)
+            and n.lhs in referenced_addr_locals
+            and isinstance(n.expr, Builtin)
+            and n.expr.name == "address"
+        ):
+            continue
+        # Drop the indexref def itself.
+        if (
+            isinstance(n, Assign)
+            and n.lhs in indexref_aliases
+            and isinstance(n.expr, Builtin)
+            and n.expr.name == "indexref"
+        ):
+            continue
+        # Replace the store-through-the-indexref-pointer with the synthetic
+        # token.
+        if isinstance(n, VoidCall) and n.op in _STORE_OPS and len(n.args) == 2:
+            ref_l = _strip_var_prefix(n.args[0])
+            if ref_l is not None and ref_l in indexref_aliases:
+                arr_name, idx_labels, comp_label = indexref_aliases[ref_l]
+                val = n.args[1]
+                vec_n, _ = vec_arr_info[arr_name]
+                idx_vars = [f"var_{lbl}" for lbl in idx_labels]
+                if len(idx_vars) == 1:
+                    elem_idx = idx_vars[0]
+                else:
+                    terms: list[str] = []
+                    for k, idx in enumerate(idx_vars):
+                        if k == len(idx_vars) - 1:
+                            terms.append(idx)
+                        else:
+                            stride = " * ".join(f"{arr_name}_shape[{j}]" for j in range(k + 1, len(idx_vars)))
+                            terms.append(f"{idx} * {stride}")
+                    elem_idx = " + ".join(terms)
+                flat_idx = f"({elem_idx}) * {vec_n} + var_{comp_label}"
+                # The existing preprocessor emits this token at fixed
+                # 4-space indent; mirror that for output equivalence.
+                new_raw = f"    wp::__metal_scalar_store__(var_{arr_name}, {n.op}, {flat_idx}, {val});"
+                out.append(
+                    VoidCall(
+                        raw=new_raw,
+                        op="__metal_scalar_store__",
+                        args=(f"var_{arr_name}", n.op, flat_idx, val),
+                        extra=(),
+                    )
+                )
+                continue
+
+        # Recurse.
+        if isinstance(n, If):
+            out.append(
+                If(
+                    raw=n.raw,
+                    cond=n.cond,
+                    body=tuple(
+                        _apply_indexref_rewrites(n.body, indexref_aliases, referenced_addr_locals, vec_arr_info)
+                    ),
+                    raw_open=n.raw_open,
+                    raw_close=n.raw_close,
+                )
+            )
+            continue
+        if isinstance(n, For):
+            out.append(
+                For(
+                    raw=n.raw,
+                    iter_var=n.iter_var,
+                    range_var=n.range_var,
+                    start=n.start,
+                    stop=n.stop,
+                    body=tuple(
+                        _apply_indexref_rewrites(n.body, indexref_aliases, referenced_addr_locals, vec_arr_info)
+                    ),
+                )
+            )
+            continue
+        if isinstance(n, While):
+            out.append(
+                While(
+                    raw=n.raw,
+                    label_k=n.label_k,
+                    body=tuple(
+                        _apply_indexref_rewrites(n.body, indexref_aliases, referenced_addr_locals, vec_arr_info)
+                    ),
+                )
+            )
+            continue
+
+        out.append(n)
+    return out
+
+
 def _rewrite_while_body(body: list[Node], k_suffix: str) -> list[Node]:
     """Rewrite this loop's break/continue/cond-test into structural forms.
 
