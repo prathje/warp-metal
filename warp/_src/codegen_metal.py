@@ -1009,9 +1009,10 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
     # the view / indexref / drop folds run, so those folds see the spliced-
     # in writes (otherwise kernels that write outputs only via helper
     # functions would be rejected as having no outputs). The inliner also
-    # returns each inlined int-constant local so ``fold_views`` can
-    # recognise slice-step constants from inside inlined bodies.
-    _ast_nodes, _inlined_const_ints = _ast_inline(_ast_nodes, adj)
+    # surfaces inlined int-constants and inlined struct locals so the
+    # downstream slice-step recogniser and field-pointer pass can treat
+    # them the same as kernel-level ones.
+    _ast_nodes, _inlined_const_ints, _inlined_struct_locals = _ast_inline(_ast_nodes, adj)
     _ast_nodes, _drop_skip = _ast_fold_drop(_ast_nodes, adj)
     _ast_nodes, _view_skip = _ast_fold_views(_ast_nodes, adj, extra_const_ints=_inlined_const_ints)
     _ast_nodes, _indexref_skip = _ast_fold_indexref(_ast_nodes, adj, _early_vec_arr_info)
@@ -1222,6 +1223,13 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
         if isinstance(var.type, _Struct):
             struct_local_layouts[var.label] = _struct_layout_for(var.type)
             struct_local_is_arg[var.label] = False
+    # Struct locals discovered inside inlined helper bodies (e.g. the
+    # ``Geom`` struct built by ``geom_collision_pair`` for primitive
+    # narrowphase). Their mangled labels live in the kernel body but
+    # not in ``adj.variables``, so the inliner returns them on the side.
+    for mangled_label, struct_cls in _inlined_struct_locals.items():
+        struct_local_layouts[mangled_label] = _struct_layout_for(struct_cls)
+        struct_local_is_arg[mangled_label] = False
     # Struct-typed kernel args: the launcher serialises the struct instance
     # into a flat scalar buffer (see ``_array_view_dtype_and_shape`` for
     # arrays; struct args use the same per-field layout). The kernel sees
@@ -1363,6 +1371,8 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
             # ``Particle_4b7eabdf``) never appears in our emitted code.
             layout = struct_local_layouts[var.label]
             for field_name, field_info in layout.fields.items():
+                if field_info.kind == _STRUCT_FIELD_KIND_ARRAY_UNUSED:
+                    continue
                 local_name = _per_field_local(var.label, field_name)
                 # MSL ``T()`` zero-constructs scalar / vec / mat values.
                 body_lines.append(f"    {field_info.msl_type} {local_name} = {field_info.msl_type}(0);")
@@ -1382,6 +1392,17 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
             body_lines.append(f"    {msl_type} var_{var.label};")
         else:
             body_lines.append(f"    const {msl_type} var_{var.label} = {_msl_constant_str(var.constant)};")
+
+    # Emit per-field local declarations for inlined struct locals (their
+    # mangled labels are not in ``adj.variables`` so the loop above
+    # didn't catch them).
+    for mangled_label in _inlined_struct_locals:
+        layout = struct_local_layouts[mangled_label]
+        for field_name, field_info in layout.fields.items():
+            if field_info.kind == _STRUCT_FIELD_KIND_ARRAY_UNUSED:
+                continue
+            local_name = _per_field_local(mangled_label, field_name)
+            body_lines.append(f"    {field_info.msl_type} {local_name} = {field_info.msl_type}(0);")
 
     # --- Forward statements --------------------------------------------
     def _finalize(translated: str) -> str:
