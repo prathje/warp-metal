@@ -123,6 +123,13 @@ import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from warp._src.codegen_metal_ast import emit as _ast_emit
+from warp._src.codegen_metal_ast import fold as _ast_fold
+from warp._src.codegen_metal_ast import fold_drop_unsupported_locals as _ast_fold_drop
+from warp._src.codegen_metal_ast import fold_indexref_writes as _ast_fold_indexref
+from warp._src.codegen_metal_ast import fold_views as _ast_fold_views
+from warp._src.codegen_metal_ast import parse as _ast_parse
+
 if TYPE_CHECKING:
     pass
 
@@ -1381,38 +1388,29 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
     if not getattr(adj, "blocks", None):
         adj.build(builder=None, default_builder_options={"enable_backward": False})
 
-    # Preprocess: rewrite dynamic-range goto-loops into ``for`` loops, then
-    # rewrite ``while`` goto-loops into ``while (true) { ... }`` (MSL doesn't
-    # support ``goto`` or labeled statements at all). Static-range ``for``s
-    # are pre-unrolled by Warp and pass through untouched. The for-loop pass
-    # also returns a set of local labels whose top-level declaration should
-    # be suppressed (the range iter-state object and the induction variable,
-    # which the generated ``for`` declares inline).
-    forward_lines, vars_to_skip_decl = _preprocess_for_loops(adj.blocks[0].body_forward)
-    forward_lines = _preprocess_while_loops(forward_lines)
-    # Drop dead-code lines producing unsupported-scalar-type values
-    # (printf calls, ``wp::tuple_t`` constructions). These have no runtime
-    # effect on Metal and would otherwise hit the unsupported-ctype guard.
-    forward_lines, drop_skip_decls = _preprocess_drop_unsupported_locals(forward_lines, adj)
-    vars_to_skip_decl |= drop_skip_decls
-    # Slice/view preprocessing: ``arr[i]`` on a multi-dim array becomes a
-    # ``slice_t`` + ``view`` pair we fold into direct array ops on the
-    # underlying argument. Emits no extra MSL — the slice_t and view locals
-    # become declaration-skipped aliases.
-    forward_lines, view_skip_decls = _preprocess_views(forward_lines, adj)
-    vars_to_skip_decl |= view_skip_decls
-    # Indexref-write preprocessing: ``out[i, j][k] = val`` lowers to an
-    # ``address + indexref + store`` chain that our output detector misses
-    # because it scans for ``array_store``/``atomic_*`` only. We rewrite
-    # the chain to a synthetic ``wp::__metal_scalar_store__`` token. Needs
-    # ``vec_arr_info``, which is computed below — so do a quick scan for it.
+    # Preprocess via the AST pipeline (see ``warp._src.codegen_metal_ast``):
+    #   parse → structural fold (for/while/if) → drop unsupported locals
+    #          → view fold → indexref-write fold → emit
+    #
+    # Output-equivalent to the old chain of ``_preprocess_*`` functions
+    # (validated bit-exact against every kernel reachable through
+    # ``mujoco_warp.step()``). The codegen-time win shows up in Phase 1.4
+    # when the body emit loop below also moves to the AST tree — for now
+    # we still emit a flat string list and the existing regex sweep takes
+    # over from there.
     _early_vec_arr_info: dict[str, tuple[int, str]] = {}
     for arg in adj.args:
         v_info = _vec_dtype_info(arg)
         if v_info is not None:
             _early_vec_arr_info[arg.label] = v_info
-    forward_lines, indexref_skip_decls = _preprocess_indexref_writes(forward_lines, adj, _early_vec_arr_info)
-    vars_to_skip_decl |= indexref_skip_decls
+
+    _ast_nodes = _ast_parse(adj.blocks[0].body_forward)
+    _ast_nodes, _struct_skip = _ast_fold(_ast_nodes)
+    _ast_nodes, _drop_skip = _ast_fold_drop(_ast_nodes, adj)
+    _ast_nodes, _view_skip = _ast_fold_views(_ast_nodes, adj)
+    _ast_nodes, _indexref_skip = _ast_fold_indexref(_ast_nodes, adj, _early_vec_arr_info)
+    forward_lines = _ast_emit(_ast_nodes)
+    vars_to_skip_decl: set[str] = _struct_skip | _drop_skip | _view_skip | _indexref_skip
 
     # Classify each array arg as input or output by scanning the IR strings.
     # MLX inputs are ``const device T*`` (read-only) — verified empirically —
