@@ -21,14 +21,6 @@ from __future__ import annotations
 import unittest
 
 import warp as wp
-from warp._src.codegen_metal import (
-    _preprocess_drop_unsupported_locals,
-    _preprocess_for_loops,
-    _preprocess_indexref_writes,
-    _preprocess_views,
-    _preprocess_while_loops,
-    _vec_dtype_info,
-)
 from warp._src.codegen_metal_ast import (
     AddrOf,
     Assign,
@@ -57,9 +49,6 @@ from warp._src.codegen_metal_ast import (
     WhileCondTest,
     emit,
     fold,
-    fold_drop_unsupported_locals,
-    fold_indexref_writes,
-    fold_views,
     parse,
     parse_line,
 )
@@ -317,39 +306,15 @@ class TestMetalASTRoundTrip(unittest.TestCase):
 
 
 class TestMetalASTFold(unittest.TestCase):
-    """Verify the fold pass produces structured nodes equivalent in shape and
-    output to running ``_preprocess_for_loops + _preprocess_while_loops``
-    from :mod:`warp._src.codegen_metal`.
+    """Structural fold tests: confirm ``fold`` produces ``For``/``While``/
+    ``If`` nodes in the right shape on synthetic kernels. End-to-end
+    correctness (does the kernel actually compute the right answer on
+    Metal?) is covered by ``test_metal_launch.py``.
     """
 
-    def _fold_ir(self, kernel) -> tuple[list, set[str], list[str]]:
-        """Build IR, parse, fold; also return the existing-pipeline output
-        for comparison."""
+    def _fold(self, kernel):
         lines = _kernel_ir(kernel)
-        nodes = parse(lines)
-        folded, skip = fold(nodes)
-
-        # Existing pipeline output (the spec we must match).
-        old_for, _ = _preprocess_for_loops(lines)
-        old_lines = _preprocess_while_loops(old_for)
-        return folded, skip, old_lines
-
-    def _assert_equivalent(self, kernel):
-        """Folded emit must equal the existing preprocessor output."""
-        lines = _kernel_ir(kernel)
-        nodes = parse(lines)
-        folded, skip = fold(nodes)
-        new_lines = emit(folded)
-
-        old_for, old_skip = _preprocess_for_loops(lines)
-        old_lines = _preprocess_while_loops(old_for)
-
-        self.assertEqual(
-            new_lines,
-            old_lines,
-            f"emit(fold(parse(...))) != preprocess(...) on kernel {kernel.key!r}",
-        )
-        self.assertEqual(skip, old_skip, f"skip set mismatch on kernel {kernel.key!r}")
+        return fold(parse(lines))
 
     def test_dynamic_for_loop_one_arg_range(self):
         @wp.kernel
@@ -360,12 +325,12 @@ class TestMetalASTFold(unittest.TestCase):
                 s += i
             out[tid] = s
 
-        folded, _, _ = self._fold_ir(k)
-        # The body should contain exactly one For node.
+        folded, skip = self._fold(k)
         for_nodes = [n for n in folded if isinstance(n, For)]
         self.assertEqual(len(for_nodes), 1)
         self.assertEqual(for_nodes[0].start, "0")
-        self._assert_equivalent(k)
+        # The for opener's range and iter vars are flagged as decl-skipped.
+        self.assertEqual(len(skip), 2)
 
     def test_dynamic_for_loop_two_arg_range(self):
         @wp.kernel
@@ -376,13 +341,12 @@ class TestMetalASTFold(unittest.TestCase):
                 s += i
             out[tid] = s
 
-        folded, _, _ = self._fold_ir(k)
+        folded, _ = self._fold(k)
         for_nodes = [n for n in folded if isinstance(n, For)]
         self.assertEqual(len(for_nodes), 1)
-        self.assertNotEqual(for_nodes[0].start, "0")  # start is the explicit var
-        self._assert_equivalent(k)
+        self.assertNotEqual(for_nodes[0].start, "0")  # start is an explicit var
 
-    def test_while_loop(self):
+    def test_while_loop_no_remaining_gotos(self):
         @wp.kernel
         def k(a: wp.array(dtype=wp.int32), out: wp.array(dtype=wp.int32)):
             tid = wp.tid()
@@ -393,20 +357,17 @@ class TestMetalASTFold(unittest.TestCase):
                 n -= 1
             out[tid] = s
 
-        folded, _, _ = self._fold_ir(k)
+        folded, _ = self._fold(k)
         while_nodes = [n for n in folded if isinstance(n, While)]
         self.assertEqual(len(while_nodes), 1)
-        # The body must contain a WhileCondBreak (the cond test was rewritten)
-        # and no Goto referencing this loop's labels.
         body = while_nodes[0].body
         self.assertTrue(any(isinstance(n, WhileCondBreak) for n in body))
         self.assertFalse(
-            any(isinstance(n, Goto) and ("while" in n.target) for n in body),
+            any(isinstance(n, Goto) and "while" in n.target for n in body),
             "structured while body should contain no goto-to-while-labels",
         )
-        self._assert_equivalent(k)
 
-    def test_while_loop_with_break(self):
+    def test_while_loop_with_break_folds_to_break_node(self):
         @wp.kernel
         def k(a: wp.array(dtype=wp.int32), out: wp.array(dtype=wp.int32)):
             tid = wp.tid()
@@ -418,30 +379,24 @@ class TestMetalASTFold(unittest.TestCase):
                 i += 1
             out[tid] = i
 
-        folded, _, _ = self._fold_ir(k)
+        folded, _ = self._fold(k)
         while_nodes = [n for n in folded if isinstance(n, While)]
         self.assertEqual(len(while_nodes), 1)
 
-        # The break must have been folded into a Break node, somewhere in the
-        # body or its nested If.
         def _has_break(nodes):
             for nn in nodes:
                 if isinstance(nn, Break):
                     return True
-                if isinstance(nn, If):
-                    if _has_break(list(nn.body)):
-                        return True
-                    if nn.else_body is not None and _has_break(list(nn.else_body)):
-                        return True
+                if isinstance(nn, If) and _has_break(list(nn.body)):
+                    return True
             return False
 
         self.assertTrue(_has_break(list(while_nodes[0].body)))
-        self._assert_equivalent(k)
 
     def test_if_else_lowers_to_two_ifs(self):
         # Warp lowers Python ``if/else`` to two separate ``if`` statements
-        # (the second on the negated condition), so we expect two If nodes
-        # and never a structured else-arm.
+        # (the second on the negated condition), so we never see a
+        # structured else-arm in the AST.
         @wp.kernel
         def k(a: wp.array(dtype=wp.int32), out: wp.array(dtype=wp.int32)):
             tid = wp.tid()
@@ -451,10 +406,9 @@ class TestMetalASTFold(unittest.TestCase):
             else:
                 out[tid] = -x
 
-        folded, _, _ = self._fold_ir(k)
+        folded, _ = self._fold(k)
         if_nodes = [n for n in folded if isinstance(n, If)]
         self.assertGreaterEqual(len(if_nodes), 2)
-        self._assert_equivalent(k)
 
     def test_nested_for_in_while(self):
         @wp.kernel
@@ -468,238 +422,22 @@ class TestMetalASTFold(unittest.TestCase):
                 n -= 1
             out[tid] = s
 
-        self._assert_equivalent(k)
+        folded, _ = self._fold(k)
+        # Outer While, with For nested inside it (Warp may also wrap the
+        # condition test in an If — we just need the For to be inside the
+        # While body, transitively).
+        whiles = [n for n in folded if isinstance(n, While)]
+        self.assertEqual(len(whiles), 1)
 
+        def _find_for(nodes):
+            for nn in nodes:
+                if isinstance(nn, For):
+                    return True
+                if isinstance(nn, (If, While, For)) and _find_for(list(nn.body)):
+                    return True
+            return False
 
-class TestMetalASTViewsFold(unittest.TestCase):
-    """Verify ``fold_views`` produces output equivalent to running
-    ``_preprocess_views`` on the existing for/while-preprocessed lines.
-    """
-
-    def _assert_views_equivalent(self, kernel):
-        kernel.adj.build(builder=None, default_builder_options={"enable_backward": False})
-        lines = kernel.adj.blocks[0].body_forward
-
-        # New pipeline: parse -> fold (for/while/if) -> fold_views -> emit.
-        nodes = parse(lines)
-        folded, fold_skip = fold(nodes)
-        view_folded, view_skip = fold_views(folded, kernel.adj)
-        new_lines = emit(view_folded)
-
-        # Existing pipeline: for/while preprocess, then views preprocess.
-        old_for, old_for_skip = _preprocess_for_loops(lines)
-        old_after_while = _preprocess_while_loops(old_for)
-        old_lines, old_view_skip = _preprocess_views(old_after_while, kernel.adj)
-
-        self.assertEqual(
-            new_lines,
-            old_lines,
-            f"emit(fold_views(...)) != _preprocess_views(...) on kernel {kernel.key!r}",
-        )
-        # Combined skip-sets should match: for/while skip union view skip on each side.
-        self.assertEqual(
-            fold_skip | view_skip,
-            old_for_skip | old_view_skip,
-            f"combined skip set mismatch on kernel {kernel.key!r}",
-        )
-
-    def test_kernel_with_no_views(self):
-        # Sanity: the pass should be a no-op (modulo the for-while fold)
-        # when no slice/view ops are present.
-        @wp.kernel
-        def k(a: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
-            tid = wp.tid()
-            out[tid] = a[tid] * 2.0
-
-        self._assert_views_equivalent(k)
-
-    def test_arr2d_row_read(self):
-        # ``arr2d[i]`` lowers to slice_t + view, which we fold into direct
-        # ``arr[i, j]`` flattened addressing.
-        @wp.kernel
-        def k(a: wp.array2d(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
-            tid = wp.tid()
-            row = a[tid]
-            s = float(0.0)
-            for j in range(a.shape[1]):
-                s += row[j]
-            out[tid] = s
-
-        self._assert_views_equivalent(k)
-
-    def test_arr2d_atomic_scatter_through_view(self):
-        # ``wp.atomic_add(out2d[i], j, val)`` exercises the atomic flat-index
-        # rewrite path.
-        @wp.kernel
-        def k(
-            a: wp.array2d(dtype=wp.float32),
-            cols: wp.array(dtype=wp.int32),
-            out: wp.array2d(dtype=wp.float32),
-        ):
-            tid = wp.tid()
-            row = a[tid]
-            j = cols[tid]
-            wp.atomic_add(out[tid], j, row[j] * 2.0)
-
-        self._assert_views_equivalent(k)
-
-    def test_arr2d_array_store_through_view(self):
-        @wp.kernel
-        def k(a: wp.array2d(dtype=wp.float32), out: wp.array2d(dtype=wp.float32)):
-            tid = wp.tid()
-            row_in = a[tid]
-            row_out = out[tid]
-            for j in range(a.shape[1]):
-                row_out[j] = row_in[j] * 3.0 + 1.0
-
-        self._assert_views_equivalent(k)
-
-    def test_view_inside_for_loop(self):
-        # The view definition itself can occur inside a for body — walker
-        # must recurse into folded For nodes and not just the top level.
-        @wp.kernel
-        def k(a: wp.array2d(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
-            tid = wp.tid()
-            s = float(0.0)
-            for i in range(a.shape[0]):
-                row = a[i]
-                s += row[tid]
-            out[tid] = s
-
-        self._assert_views_equivalent(k)
-
-
-class TestMetalASTIndexrefWritesFold(unittest.TestCase):
-    """Verify ``fold_indexref_writes`` produces output equivalent to running
-    ``_preprocess_indexref_writes`` on the existing pipeline output.
-    """
-
-    def _vec_arr_info(self, kernel) -> dict[str, tuple[int, str]]:
-        info: dict[str, tuple[int, str]] = {}
-        for arg in kernel.adj.args:
-            v = _vec_dtype_info(arg)
-            if v is not None:
-                info[arg.label] = v
-        return info
-
-    def _assert_indexref_equivalent(self, kernel):
-        kernel.adj.build(builder=None, default_builder_options={"enable_backward": False})
-        lines = kernel.adj.blocks[0].body_forward
-        info = self._vec_arr_info(kernel)
-
-        # New pipeline.
-        nodes = parse(lines)
-        folded, _ = fold(nodes)
-        view_folded, _ = fold_views(folded, kernel.adj)
-        ix_folded, ix_skip = fold_indexref_writes(view_folded, kernel.adj, info)
-        new_lines = emit(ix_folded)
-
-        # Existing pipeline.
-        old_for, _ = _preprocess_for_loops(lines)
-        old_after_while = _preprocess_while_loops(old_for)
-        old_after_views, _ = _preprocess_views(old_after_while, kernel.adj)
-        old_lines, old_skip = _preprocess_indexref_writes(old_after_views, kernel.adj, info)
-
-        self.assertEqual(
-            new_lines,
-            old_lines,
-            f"emit(fold_indexref_writes(...)) != _preprocess_indexref_writes(...) on kernel {kernel.key!r}",
-        )
-        self.assertEqual(ix_skip, old_skip, f"skip set mismatch on kernel {kernel.key!r}")
-
-    def test_no_indexref_writes_is_passthrough(self):
-        @wp.kernel
-        def k(a: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
-            tid = wp.tid()
-            out[tid] = a[tid] * 2.0
-
-        self._assert_indexref_equivalent(k)
-
-    def test_vec_component_write_via_indexref(self):
-        # ``out[i, 0][k] = val`` lowers to address + indexref + store on a
-        # vec-typed output array.
-        @wp.kernel
-        def k(out: wp.array2d(dtype=wp.spatial_vector)):
-            worldid, k = wp.tid()
-            out[worldid, 0][k] = float(worldid * 10 + k)
-
-        self._assert_indexref_equivalent(k)
-
-
-class TestMetalASTDropUnsupportedFold(unittest.TestCase):
-    """Verify ``fold_drop_unsupported_locals`` matches the existing
-    ``_preprocess_drop_unsupported_locals`` output.
-    """
-
-    def _assert_drop_equivalent(self, kernel):
-        kernel.adj.build(builder=None, default_builder_options={"enable_backward": False})
-        lines = kernel.adj.blocks[0].body_forward
-
-        # New pipeline.
-        nodes = parse(lines)
-        folded, _ = fold(nodes)
-        dropped, drop_skip = fold_drop_unsupported_locals(folded, kernel.adj)
-        new_lines = emit(dropped)
-
-        # Existing pipeline. Order matters: the regex pipeline runs
-        # drop-unsupported BEFORE views/indexref. We mimic that here so the
-        # comparison stays apples-to-apples.
-        old_for, _ = _preprocess_for_loops(lines)
-        old_after_while = _preprocess_while_loops(old_for)
-        old_lines, old_skip = _preprocess_drop_unsupported_locals(old_after_while, kernel.adj)
-
-        self.assertEqual(
-            new_lines,
-            old_lines,
-            f"emit(fold_drop_unsupported_locals(...)) != "
-            f"_preprocess_drop_unsupported_locals(...) on kernel {kernel.key!r}",
-        )
-        self.assertEqual(drop_skip, old_skip, f"skip set mismatch on kernel {kernel.key!r}")
-
-    def test_no_unsupported_is_passthrough(self):
-        @wp.kernel
-        def k(a: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
-            tid = wp.tid()
-            out[tid] = a[tid]
-
-        self._assert_drop_equivalent(k)
-
-    def test_printf_dropped(self):
-        @wp.kernel
-        def k(out: wp.array(dtype=wp.int32), flag: wp.array(dtype=wp.int32)):
-            tid = wp.tid()
-            if flag[tid] == 0:
-                wp.printf("warn tid=%u\n", tid)
-            out[tid] = tid * 2
-
-        self._assert_drop_equivalent(k)
-
-    def test_dead_tuple_dropped(self):
-        @wp.kernel
-        def k(idx: wp.array(dtype=wp.int32), out: wp.array(dtype=wp.int32)):
-            tid = wp.tid()
-            # ``wp.matrix(..., shape=(...), dtype=int)`` constructs an
-            # internal tuple_t for the shape arg that is never read.
-            table = wp.matrix(
-                10,
-                11,
-                20,
-                21,
-                30,
-                31,
-                40,
-                41,
-                50,
-                51,
-                60,
-                61,
-                shape=(6, 2),
-                dtype=int,
-            )
-            i = idx[tid]
-            out[tid] = table[i, 0] + table[i, 1] * 100
-
-        self._assert_drop_equivalent(k)
+        self.assertTrue(_find_for(list(whiles[0].body)))
 
 
 if __name__ == "__main__":
