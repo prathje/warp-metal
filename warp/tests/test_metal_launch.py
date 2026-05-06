@@ -825,6 +825,47 @@ class TestMetalLaunch(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet)
 
+    def test_vec_element_inplace_matches_cpu(self):
+        # ``vec[i] = val``, ``vec[i] *= val``, etc. lower to
+        # ``wp::*_inplace(vec, idx, val)`` (3-arg form), distinct from the
+        # 2-arg ``wp::store(field_ptr, val)``. We translate the 3-arg form
+        # to MSL's native ``vec[idx] op= val``. Exercises both native vec3
+        # and the custom ``wp_vec6_float`` (spatial_vector) struct.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k_vec3(out: wp.array(dtype=wp.vec3)):
+                tid = wp.tid()
+                v = wp.vec3(1.0, 2.0, 3.0)
+                v[0] = float(tid)
+                v[1] *= 2.0
+                v[2] += 10.0
+                out[tid] = v
+
+            @wp.kernel
+            def k_spatial(out: wp.array(dtype=wp.spatial_vector)):
+                tid = wp.tid()
+                v = wp.spatial_vector(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+                v[0] = float(tid)
+                v[3] = float(tid) + 100.0
+                v[5] *= 2.0
+                out[tid] = v
+
+            N = 8
+            for kernel, dtype in ((k_vec3, wp.vec3), (k_spatial, wp.spatial_vector)):
+                results = {}
+                for dev in ('cpu', 'metal:0'):
+                    out = wp.zeros(N, dtype=dtype, device=dev)
+                    wp.launch(kernel, dim=N, outputs=[out], device=dev)
+                    results[dev] = out.numpy()
+                np.testing.assert_array_equal(results['cpu'], results['metal:0'])
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
     def test_dynamic_range_two_arg_matches_cpu(self):
         # ``range(start, stop)`` with non-constant bounds lowers to
         # ``wp::range(var_start, var_stop)``. Our for-loop preprocessor

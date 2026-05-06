@@ -1554,6 +1554,26 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
             "mul_inplace": "*=",
             "div_inplace": "/=",
         }
+        # 3-arg form: ``wp::*_inplace(vec, idx, val)`` — element-wise
+        # assignment to a vec local (``vec[idx] op= val``). MSL natively
+        # supports indexed write on its built-in vector types, and our
+        # ``wp_vecN_<scalar>`` struct exposes a writable ``operator[]``,
+        # so the translation is direct. Match before the 2-arg form because
+        # ``[^()]+?`` for the value would otherwise eat the comma + index.
+        elem_inplace_pat = re.compile(
+            r"^(?P<indent>\s*)wp::(?P<op>assign_inplace|add_inplace|sub_inplace|"
+            r"mul_inplace|div_inplace)\s*\(\s*var_(?P<vec>\w+)\s*,\s*var_(?P<idx>\w+)\s*,\s*"
+            r"(?P<val>[^()]+?)\s*\)\s*;\s*$"
+        )
+        m_elem = elem_inplace_pat.match(raw)
+        if m_elem:
+            indent = m_elem.group("indent")
+            op = store_op_map[m_elem.group("op")]
+            vec = m_elem.group("vec")
+            idx = m_elem.group("idx")
+            value = m_elem.group("val")
+            body_lines.append(_finalize(f"{indent}var_{vec}[var_{idx}] {op} {value};"))
+            continue
         store_pat = re.compile(
             r"^(?P<indent>\s*)wp::(?P<op>store|assign_inplace|add_inplace|sub_inplace|"
             r"mul_inplace|div_inplace)\s*\(\s*var_(?P<addr>\w+)\s*,\s*(?P<val>[^()]+?)\s*\)\s*;\s*$"
