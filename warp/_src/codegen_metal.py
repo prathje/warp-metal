@@ -2451,6 +2451,48 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
         translated = _translate_intrinsics(line.strip())
         body_lines.append(f"    {_finalize(translated)}")
 
+    # ---- Atomic-output init prologue --------------------------------
+    # MLX's ``mx.fast.metal_kernel`` zero-initialises every output buffer
+    # when ``atomic_outputs=True``, which wipes data the kernel expects
+    # to read back from a previous launch (mujoco_warp's iterative
+    # linesearch reads ``efc_Ma_out`` to compute residuals). For each
+    # atomic output we accept a synthetic ``<name>__init`` input carrying
+    # the user's current array contents and prepend a per-thread copy so
+    # the buffer is seeded before the kernel's compute runs. Partition
+    # is by ``thread_position_in_grid.x`` (worldid) — fits 1-D launches
+    # and mujoco_warp's ``dim=nworld`` pattern.
+    atomic_init_outputs: list[str] = []
+    if has_atomic:
+        atomic_init_outputs = [a.label for a in output_args if a.label in atomic_arg_names]
+    if atomic_init_outputs:
+        prologue: list[str] = [
+            "    // -- Atomic-output init prologue (seed from user wp.array data) --",
+            "    {",
+            "        int _init_w = (int)thread_position_in_grid.x;",
+        ]
+        for out_name in atomic_init_outputs:
+            arg_var = next(a for a in output_args if a.label == out_name)
+            ndim = getattr(arg_var.type, "ndim", 1)
+            v_info = _vec_dtype_info(arg_var)
+            m_info = _mat_dtype_info(arg_var)
+            inner_extra = 1 if v_info is not None else (2 if m_info is not None else 0)
+            stride_terms = [f"{out_name}_shape[{k}]" for k in range(1, ndim + inner_extra)]
+            stride_expr = " * ".join(stride_terms) if stride_terms else "1"
+            prologue.extend(
+                [
+                    f"        int _init_stride_{out_name} = {stride_expr};",
+                    f"        for (int _init_i = 0; _init_i < _init_stride_{out_name}; ++_init_i) {{",
+                    f"            int _init_flat = _init_w * _init_stride_{out_name} + _init_i;",
+                    f"            atomic_store_explicit(&{out_name}[_init_flat], "
+                    f"{out_name}__init[_init_flat], memory_order_relaxed);",
+                    "        }",
+                ]
+            )
+        prologue.append("    }")
+        # Prepend before the body so the shape-pack rewrite below picks up
+        # the prologue's ``arr_shape[k]`` references.
+        body_lines = prologue + body_lines
+
     source = "\n".join(body_lines) + "\n"
 
     # ---- Pack per-array shape arrays into a single buffer ------------
@@ -2528,13 +2570,14 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
     # ``arr.shape[k]`` in the kernel. Empty when no kernel arr uses
     # ``.shape``.
     extra_input_names = ["__shapes_packed"] if _shape_arrs_seen else []
+    init_input_names = [f"{n}__init" for n in atomic_init_outputs]
 
     header = _build_kernel_header(source)
 
     return MetalKernelArtifact(
         name=adj.fun_name,
         source=source,
-        input_names=base_input_names + extra_input_names,
+        input_names=base_input_names + init_input_names + extra_input_names,
         output_names=[a.label for a in output_args],
         input_args=input_args,
         output_args=output_args,
@@ -2968,6 +3011,38 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim: int = 2
             # Scalar input — convert to a 0-D mx.array literal.
             mx_dtype = _wp_dtype_to_mx_dtype(arg_var.type)
             mlx_inputs.append(mx.array(value, dtype=mx_dtype))
+
+    # Append init-shadow buffers for atomic outputs. Each ``<name>__init``
+    # input carries the user's current array data so the kernel prologue
+    # can seed the (zero-initialised) atomic output before compute runs.
+    # See ``generate_msl_kernel`` for the matching prologue emission.
+    init_shadow_names = [n for n in artifact.input_names if n.endswith("__init")]
+    for init_name in init_shadow_names:
+        out_name = init_name[: -len("__init")]
+        if out_name not in arg_by_name:
+            raise RuntimeError(
+                f"Kernel '{kernel.key}' atomic init shadow '{init_name}' references "
+                f"unknown output '{out_name}'"
+            )
+        idx, _ = arg_by_name[out_name]
+        value = fwd_args[idx]
+        if not getattr(value, "device", None) or not value.device.is_metal:
+            raise RuntimeError(
+                f"Kernel '{kernel.key}' atomic init shadow '{init_name}' must back a "
+                f"Metal-device wp.array; got {getattr(value, 'device', '?')}"
+            )
+        mx_dtype, view_shape = _array_view_dtype_and_shape(value)
+        if value.ptr is None or value.size == 0:
+            mlx_inputs.append(mx.zeros(view_shape, dtype=mx_dtype))
+            continue
+        mx_buf = _metal_get_buffer(value.ptr)
+        if mx_buf is None:
+            raise RuntimeError(
+                f"Kernel '{kernel.key}' atomic init shadow '{init_name}' has no registered "
+                f"MLX buffer (ptr={value.ptr})"
+            )
+        typed = mx_buf.view(mx_dtype).reshape(view_shape)
+        mlx_inputs.append(typed)
 
     # Append the packed shape buffer if the kernel needs any ``arr.shape``
     # access. ``__shapes_packed`` is a single flat int32 array containing
