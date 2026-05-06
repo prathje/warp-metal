@@ -167,6 +167,87 @@ class VoidCall(Node):
 
 
 # ---------------------------------------------------------------------------
+# Structured nodes — produced by the fold pass (Phase 1.1)
+# ---------------------------------------------------------------------------
+# These don't appear after :func:`parse`; they only exist after :func:`fold`
+# has paired matching brace tokens and recognised for/while preambles.
+
+
+@dataclass(frozen=True)
+class If(Node):
+    """An ``if`` block.
+
+    Warp's IR lowers Python ``if/else`` to two separate ``if`` statements
+    (the second on the negated condition), so we don't carry an else-arm.
+    The condition is the bare expression text (e.g., ``"var_29"`` or
+    ``"!var_12"``). ``raw_open`` and ``raw_close`` are the literal lines
+    that bracket the block in the input — preserved verbatim so emission
+    keeps the original indent.
+    """
+
+    cond: str
+    body: tuple[Node, ...]
+    raw_open: str
+    raw_close: str
+
+
+@dataclass(frozen=True)
+class For(Node):
+    """A dynamic-range ``for`` loop.
+
+    Folded from Warp's 4-line goto-based opener
+    (``wp::range`` / ``start_for_K:;`` / ``iter_cmp`` / ``iter_next``) plus
+    the trailing ``goto start_for_K`` / ``end_for_K:;`` pair. ``range_var``
+    is the local label of the ``wp::range_t`` value (its declaration is
+    suppressed downstream — the MSL ``for`` declares the induction
+    variable inline). ``start`` and ``stop`` are bare textual expressions
+    (e.g., ``"0"``, ``"var_N"``, or for the 2-arg form ``"var_S"``,
+    ``"var_E"``).
+    """
+
+    iter_var: str
+    range_var: str
+    start: str
+    stop: str
+    body: tuple[Node, ...]
+
+
+@dataclass(frozen=True)
+class While(Node):
+    """A ``while`` loop, folded from Warp's goto-based form.
+
+    ``label_k`` is the numeric loop suffix (e.g., ``"3"`` for ``start_while_3``)
+    used by the fold pass to rewrite mid-body ``goto start_while_K`` /
+    ``goto end_while_K`` into :class:`Continue` / :class:`Break` and the
+    canonical condition test into :class:`WhileCondBreak`.
+    """
+
+    label_k: str
+    body: tuple[Node, ...]
+
+
+@dataclass(frozen=True)
+class Break(Node):
+    """``break;`` — folded from a mid-body ``goto end_while_K``."""
+
+
+@dataclass(frozen=True)
+class Continue(Node):
+    """``continue;`` — folded from a mid-body ``goto start_while_K``."""
+
+
+@dataclass(frozen=True)
+class WhileCondBreak(Node):
+    """Folded form of ``if ((var_C) == false) goto end_while_K;``.
+
+    Emitted as ``if (!var_C) { break; }`` so a structurally-rewritten
+    while loop has no remaining ``goto`` references.
+    """
+
+    cond_var: str
+
+
+# ---------------------------------------------------------------------------
 # Expression nodes
 # ---------------------------------------------------------------------------
 # RHS shapes for ``Assign``. We don't fully decompose composite expressions
@@ -481,8 +562,351 @@ def parse(lines: list[str]) -> list[Node]:
 def emit(nodes: list[Node]) -> list[str]:
     """Re-emit a parsed node list as IR strings.
 
-    For Phase 1 every node carries its original ``raw`` line so this round-
-    trips bit-exactly. As subsequent commits replace nodes with typed
-    rewritten versions, this function will format from typed fields instead.
+    Flat nodes emit their raw line; structured nodes emit their open/close
+    pair around a recursive walk of their body.
     """
-    return [n.raw for n in nodes]
+    out: list[str] = []
+    _emit_into(nodes, out)
+    return out
+
+
+def _emit_into(nodes, out: list[str]) -> None:
+    for n in nodes:
+        if isinstance(n, If):
+            out.append(n.raw_open)
+            _emit_into(list(n.body), out)
+            out.append(n.raw_close)
+        elif isinstance(n, For):
+            # Match the existing ``_preprocess_for_loops`` output, which
+            # emits the synthetic ``for (...) {`` and matching ``}`` at
+            # column 0 regardless of nesting. We can revisit indentation
+            # cosmetics after Phase 1.3 lands.
+            out.append(f"for (int var_{n.iter_var} = {n.start}; var_{n.iter_var} < {n.stop}; ++var_{n.iter_var}) {{")
+            _emit_into(list(n.body), out)
+            out.append("}")
+        elif isinstance(n, While):
+            # Same column-0 convention as ``_preprocess_while_loops``.
+            out.append("while (true) {")
+            _emit_into(list(n.body), out)
+            out.append("}")
+        else:
+            out.append(n.raw)
+
+
+# ---------------------------------------------------------------------------
+# Structural fold (Phase 1.1)
+# ---------------------------------------------------------------------------
+# Recognise the goto/label patterns that Warp emits for dynamic ranges and
+# while loops and fold them into structured For / While nodes whose body is
+# a recursively-folded list. Also pair every BlockOpen with its matching
+# BlockClose / BlockElse and produce :class:`If` nodes.
+#
+# The fold is OUTPUT-EQUIVALENT to running ``_preprocess_for_loops`` then
+# ``_preprocess_while_loops`` from :mod:`warp._src.codegen_metal`: emitting
+# the folded tree produces the same lines those preprocessors do. This is
+# the validation contract for Phase 1.1 — we don't reinvent the rewrite,
+# just structure it.
+
+
+_RANGE_LINE = re.compile(r"^\s*var_(\w+)\s*=\s*wp::range\s*\(\s*var_(\w+)\s*(?:,\s*var_(\w+)\s*)?\)\s*;\s*$")
+_INDENT_OF = re.compile(r"^(\s*)")
+
+
+def _leading_indent(s: str) -> str:
+    """Return the leading whitespace of ``s``."""
+    m = _INDENT_OF.match(s)
+    return m.group(1) if m else ""
+
+
+def fold(nodes: list[Node]) -> tuple[list[Node], set[str]]:
+    """Fold for/while/if patterns into structured nodes.
+
+    Returns ``(folded_nodes, vars_to_skip_decl)`` where the second value
+    lists the local labels whose top-level declaration must be suppressed
+    (the ``wp::range_t`` iterator object and the for-loop induction
+    variable, both of which the synthetic ``for`` line declares inline).
+    """
+    skip: set[str] = set()
+    folded, _ = _fold_range(nodes, 0, len(nodes), end_label=None, skip=skip)
+    return folded, skip
+
+
+def _match_for_opener(nodes: list[Node], i: int) -> tuple[Node, str, str, str, str, str] | None:
+    """If ``nodes[i:i+4]`` is a Warp for-loop opener, return its parts.
+
+    Returns ``(range_assign, range_var, start_expr, stop_expr, iter_var, k_suffix)``
+    or ``None`` if the 4-line shape doesn't match.
+    """
+    if i + 3 >= len(nodes):
+        return None
+    n0 = nodes[i]
+    if not isinstance(n0, Assign):
+        return None
+    m = _RANGE_LINE.match(n0.raw)
+    if not m:
+        return None
+    range_var = m.group(1)
+    if m.group(3) is None:
+        start_expr = "0"
+        stop_expr = f"var_{m.group(2)}"
+    else:
+        start_expr = f"var_{m.group(2)}"
+        stop_expr = f"var_{m.group(3)}"
+
+    n1 = nodes[i + 1]
+    if not isinstance(n1, Label) or not n1.name.startswith("start_for_"):
+        return None
+    k_suffix = n1.name[len("start_for_") :]
+
+    n2 = nodes[i + 2]
+    if not isinstance(n2, ForIterCmp):
+        return None
+    if n2.iter_var != range_var:
+        return None
+    if n2.end_label != f"end_for_{k_suffix}":
+        return None
+
+    n3 = nodes[i + 3]
+    if not isinstance(n3, Assign):
+        return None
+    # The iter_next assignment looks like ``var_Y = wp::iter_next(var_X);``.
+    iter_next_match = re.match(r"^\s*var_(\w+)\s*=\s*wp::iter_next\s*\(\s*var_(\w+)\s*\)\s*;\s*$", n3.raw)
+    if not iter_next_match or iter_next_match.group(2) != range_var:
+        return None
+    iter_var = iter_next_match.group(1)
+    return n0, range_var, start_expr, stop_expr, iter_var, k_suffix
+
+
+def _fold_range(
+    nodes: list[Node],
+    start: int,
+    end: int,
+    end_label: str | None,
+    skip: set[str],
+) -> tuple[list[Node], int]:
+    """Fold ``nodes[start:end]`` into structured form.
+
+    ``end_label`` (when not ``None``) is the matching close label for the
+    enclosing structure; encountering it stops the fold and returns the
+    consumed range. The single-pass scan handles for-loops, while-loops,
+    and if blocks — anything else passes through unchanged.
+
+    Returns ``(folded_nodes, next_index)`` where ``next_index`` is the
+    position immediately after the consumed range (one past ``end_label``).
+    """
+    out: list[Node] = []
+    i = start
+    while i < end:
+        n = nodes[i]
+
+        # For-loop opener (4-line shape: range / start_label / iter_cmp / iter_next).
+        opener = _match_for_opener(nodes, i)
+        if opener is not None:
+            range_node, range_var, start_expr, stop_expr, iter_var, k_suffix = opener
+            body_nodes, after = _fold_range(nodes, i + 4, end, end_label=f"end_for_{k_suffix}", skip=skip)
+            # Drop every ``goto start_for_K`` in the body — both the trailing
+            # one (implicit in the for opener) and any mid-body ones (Warp's
+            # lowering of ``continue``). This matches the existing
+            # ``_preprocess_for_loops`` behaviour, which drops them all.
+            # NOTE: silently dropping ``continue`` is a pre-existing bug; we
+            # preserve it here for output equivalence and can fix it in a
+            # follow-up that emits ``continue;`` instead.
+            body_nodes = _drop_goto(body_nodes, f"start_for_{k_suffix}")
+            skip.add(range_var)
+            skip.add(iter_var)
+            out.append(
+                For(
+                    raw=range_node.raw,
+                    iter_var=iter_var,
+                    range_var=range_var,
+                    start=start_expr,
+                    stop=stop_expr,
+                    body=tuple(body_nodes),
+                )
+            )
+            i = after
+            continue
+
+        # While-loop opener (``start_while_K:;``).
+        if isinstance(n, Label) and n.name.startswith("start_while_"):
+            k_suffix = n.name[len("start_while_") :]
+            body_nodes, after = _fold_range(nodes, i + 1, end, end_label=f"end_while_{k_suffix}", skip=skip)
+            # Rewrite mid-body break/continue/cond-test into structural forms
+            # so the resulting While body has no remaining ``goto`` references
+            # to this loop's labels.
+            body_nodes = _rewrite_while_body(body_nodes, k_suffix)
+            out.append(
+                While(
+                    raw=n.raw,
+                    label_k=k_suffix,
+                    body=tuple(body_nodes),
+                )
+            )
+            i = after
+            continue
+
+        # Stop fold if we hit the enclosing structure's close label.
+        if end_label is not None and isinstance(n, Label) and n.name == end_label:
+            return out, i + 1
+
+        # If-block (no else — Warp lowers ``if/else`` to two separate ifs).
+        if isinstance(n, BlockOpen):
+            body_nodes, after = _fold_if_body(nodes, i + 1, end, skip)
+            close_node = nodes[after]
+            if not isinstance(close_node, BlockClose):
+                raise MetalASTParseError(f"if-body terminated by unexpected node {type(close_node).__name__}")
+            out.append(
+                If(
+                    raw=n.raw,
+                    cond=n.cond,
+                    body=tuple(body_nodes),
+                    raw_open=n.raw,
+                    raw_close=close_node.raw,
+                )
+            )
+            i = after + 1
+            continue
+
+        out.append(n)
+        i += 1
+
+    if end_label is not None:
+        raise MetalASTParseError(f"unterminated structure: expected label {end_label!r} before end of input")
+    return out, end
+
+
+def _fold_if_body(nodes: list[Node], start: int, end: int, skip: set[str]) -> tuple[list[Node], int]:
+    """Fold an if-body, stopping at the matching BlockClose.
+
+    Recurses into nested for/while/if. Returns the folded body and the
+    index of the terminating BlockClose.
+    """
+    out: list[Node] = []
+    i = start
+    while i < end:
+        n = nodes[i]
+        if isinstance(n, BlockClose):
+            return out, i
+
+        opener = _match_for_opener(nodes, i)
+        if opener is not None:
+            range_node, range_var, start_expr, stop_expr, iter_var, k_suffix = opener
+            body_nodes, after = _fold_range(nodes, i + 4, end, end_label=f"end_for_{k_suffix}", skip=skip)
+            if body_nodes and isinstance(body_nodes[-1], Goto) and body_nodes[-1].target == f"start_for_{k_suffix}":
+                body_nodes = body_nodes[:-1]
+            skip.add(range_var)
+            skip.add(iter_var)
+            out.append(
+                For(
+                    raw=range_node.raw,
+                    iter_var=iter_var,
+                    range_var=range_var,
+                    start=start_expr,
+                    stop=stop_expr,
+                    body=tuple(body_nodes),
+                )
+            )
+            i = after
+            continue
+
+        if isinstance(n, Label) and n.name.startswith("start_while_"):
+            k_suffix = n.name[len("start_while_") :]
+            body_nodes, after = _fold_range(nodes, i + 1, end, end_label=f"end_while_{k_suffix}", skip=skip)
+            body_nodes = _rewrite_while_body(body_nodes, k_suffix)
+            out.append(
+                While(
+                    raw=n.raw,
+                    label_k=k_suffix,
+                    body=tuple(body_nodes),
+                )
+            )
+            i = after
+            continue
+
+        if isinstance(n, BlockOpen):
+            inner, after = _fold_if_body(nodes, i + 1, end, skip)
+            close_node = nodes[after]
+            if not isinstance(close_node, BlockClose):
+                raise MetalASTParseError(f"if-body terminated by unexpected node {type(close_node).__name__}")
+            out.append(
+                If(
+                    raw=n.raw,
+                    cond=n.cond,
+                    body=tuple(inner),
+                    raw_open=n.raw,
+                    raw_close=close_node.raw,
+                )
+            )
+            i = after + 1
+            continue
+
+        out.append(n)
+        i += 1
+
+    raise MetalASTParseError("unterminated if body: hit end of input before }")
+
+
+def _drop_goto(body: tuple[Node, ...] | list[Node], target: str) -> list[Node]:
+    """Recursively drop every ``Goto(target=...)`` in ``body``.
+
+    Recurses into :class:`If` bodies. Inner :class:`For` and :class:`While`
+    nodes are left alone — gotos belonging to them have already been
+    resolved by their own fold pass.
+    """
+    out: list[Node] = []
+    for n in body:
+        if isinstance(n, Goto) and n.target == target:
+            continue
+        if isinstance(n, If):
+            out.append(
+                If(
+                    raw=n.raw,
+                    cond=n.cond,
+                    body=tuple(_drop_goto(n.body, target)),
+                    raw_open=n.raw_open,
+                    raw_close=n.raw_close,
+                )
+            )
+            continue
+        out.append(n)
+    return out
+
+
+def _rewrite_while_body(body: list[Node], k_suffix: str) -> list[Node]:
+    """Rewrite this loop's break/continue/cond-test into structural forms.
+
+    Recurses into nested :class:`If` bodies. Inner :class:`For` and
+    :class:`While` nodes have already had their own labels resolved by
+    their own fold pass; their bodies aren't re-traversed here.
+    """
+    start_target = f"start_while_{k_suffix}"
+    end_target = f"end_while_{k_suffix}"
+    out: list[Node] = []
+    for n in body:
+        if isinstance(n, Goto) and n.target == start_target:
+            out.append(Continue(raw=f"{_leading_indent(n.raw)}continue;"))
+            continue
+        if isinstance(n, Goto) and n.target == end_target:
+            out.append(Break(raw=f"{_leading_indent(n.raw)}break;"))
+            continue
+        if isinstance(n, WhileCondTest) and n.end_label == end_target:
+            out.append(
+                WhileCondBreak(
+                    raw=f"{_leading_indent(n.raw)}if (!var_{n.cond_var}) {{ break; }}",
+                    cond_var=n.cond_var,
+                )
+            )
+            continue
+        if isinstance(n, If):
+            out.append(
+                If(
+                    raw=n.raw,
+                    cond=n.cond,
+                    body=tuple(_rewrite_while_body(list(n.body), k_suffix)),
+                    raw_open=n.raw_open,
+                    raw_close=n.raw_close,
+                )
+            )
+            continue
+        out.append(n)
+    return out
