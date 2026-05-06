@@ -1673,6 +1673,165 @@ def _apply_view_rewrites(
 
 
 _STORE_OPS = ("store", "assign_inplace", "add_inplace", "sub_inplace", "mul_inplace", "div_inplace")
+_ATOMIC_OPS = ("atomic_add", "atomic_sub", "atomic_min", "atomic_max")
+_ATOMIC_TO_MSL = {
+    "atomic_add": "atomic_fetch_add_explicit",
+    "atomic_sub": "atomic_fetch_sub_explicit",
+    "atomic_min": "atomic_fetch_min_explicit",
+    "atomic_max": "atomic_fetch_max_explicit",
+}
+
+
+def fold_multidim_atomics(
+    nodes: list[Node],
+    adj,
+    vec_arr_info: dict[str, tuple[int, str]],
+) -> list[Node]:
+    """Flatten multi-dim ``wp::atomic_<op>(arr, i, j, ..., val)`` calls.
+
+    Warp's IR for ``wp.atomic_add(arr2d, i, j, val)`` lowers to a 4-arg
+    builtin call (one per index dim plus the value). The downstream
+    intrinsic regex in ``codegen_metal`` only handles the 3-arg form
+    (``arr, idx, val``); the 4+-arg form ends up as a malformed
+    ``atomic_fetch_*_explicit`` call with too many args.
+
+    Two cases:
+
+      - **Scalar-dtype arr**: rewrite to 3-arg form
+        ``wp::atomic_<op>(arr, flat_idx, val)`` where ``flat_idx`` is
+        ``i * shape[1] * ... + j * shape[N-1] + ...``. The downstream
+        regex then translates correctly.
+
+      - **Vec-dtype arr**: MSL has no atomic on vector types, so we
+        expand into N component-wise atomic ops emitted as raw
+        ``atomic_fetch_<op>_explicit(&arr[idx*N + k], val[k], ...)``
+        lines via :class:`_RawLine`. The Assign's LHS (which Warp's IR
+        sets to the *previous* value before the atomic) is required to
+        be unreferenced — we don't materialise it, since vec-atomic
+        return values are rarely used and reconstructing the previous
+        vec from N scalar swaps would be racy anyway.
+
+    Mat-dtype atomic isn't seen in the kernels we cover; if encountered,
+    it falls through and surfaces a clear error in the unsupported-
+    intrinsic guard.
+    """
+    arg_label_set = {a.label for a in adj.args}
+    return _apply_multidim_atomics(nodes, vec_arr_info, arg_label_set)
+
+
+def _apply_multidim_atomics(
+    nodes: tuple[Node, ...] | list[Node],
+    vec_arr_info: dict[str, tuple[int, str]],
+    arg_label_set: set[str],
+) -> list[Node]:
+    out: list[Node] = []
+    for n in nodes:
+        if (
+            isinstance(n, Assign)
+            and isinstance(n.expr, Builtin)
+            and n.expr.name in _ATOMIC_OPS
+            and len(n.expr.args) > 3
+        ):
+            args = n.expr.args
+            arr_arg = args[0]
+            arr_label = _strip_var_prefix(arr_arg)
+            if arr_label is None or arr_label not in arg_label_set:
+                out.append(n)
+                continue
+            indices = list(args[1:-1])
+            value = args[-1]
+            indent = _leading_indent(n.raw)
+
+            # Build a flat index — same shape as ``_flat_index_expr`` in
+            # codegen_metal, but this module doesn't import that one to
+            # avoid a cycle. The ``arr_shape[k]`` references get rewritten
+            # later by the ``__shapes_packed`` packer in
+            # ``generate_msl_kernel``.
+            n_idx = len(indices)
+            if n_idx == 1:
+                flat_idx = indices[0]
+            else:
+                terms: list[str] = []
+                for k, idx in enumerate(indices):
+                    if k == n_idx - 1:
+                        terms.append(idx)
+                    else:
+                        stride = " * ".join(f"{arr_label}_shape[{j}]" for j in range(k + 1, n_idx))
+                        terms.append(f"{idx} * {stride}")
+                flat_idx = " + ".join(terms)
+
+            if arr_label in vec_arr_info:
+                vec_n, _ = vec_arr_info[arr_label]
+                msl_name = _ATOMIC_TO_MSL[n.expr.name]
+                # Per-component atomic ops. Use parens around flat_idx
+                # since the per-component multiply binds tighter.
+                base = f"({flat_idx}) * {vec_n}"
+                for k in range(vec_n):
+                    out.append(
+                        _RawLine(
+                            raw=(f"{indent}{msl_name}(&{arr_label}[{base} + {k}], {value}[{k}], memory_order_relaxed);")
+                        )
+                    )
+                continue
+
+            # Scalar-dtype arr: collapse to 3-arg form. Downstream regex
+            # turns it into the right ``atomic_fetch_*_explicit`` call.
+            new_raw = f"{indent}var_{n.lhs} = wp::{n.expr.name}(var_{arr_label}, {flat_idx}, {value});"
+            out.append(
+                Assign(
+                    raw=new_raw,
+                    lhs=n.lhs,
+                    expr=Builtin(
+                        raw=f"wp::{n.expr.name}(var_{arr_label}, {flat_idx}, {value})",
+                        name=n.expr.name,
+                        args=(f"var_{arr_label}", flat_idx, value),
+                    ),
+                )
+            )
+            continue
+
+        if isinstance(n, If):
+            out.append(
+                If(
+                    raw=n.raw,
+                    cond=n.cond,
+                    body=tuple(_apply_multidim_atomics(n.body, vec_arr_info, arg_label_set)),
+                    raw_open=n.raw_open,
+                    raw_close=n.raw_close,
+                )
+            )
+            continue
+        if isinstance(n, For):
+            out.append(
+                For(
+                    raw=n.raw,
+                    iter_var=n.iter_var,
+                    range_var=n.range_var,
+                    start=n.start,
+                    stop=n.stop,
+                    body=tuple(_apply_multidim_atomics(n.body, vec_arr_info, arg_label_set)),
+                )
+            )
+            continue
+        if isinstance(n, While):
+            out.append(
+                While(
+                    raw=n.raw,
+                    label_k=n.label_k,
+                    body=tuple(_apply_multidim_atomics(n.body, vec_arr_info, arg_label_set)),
+                )
+            )
+            continue
+        if isinstance(n, _DoWhileZero):
+            out.append(
+                _DoWhileZero(
+                    raw=n.raw,
+                    body=tuple(_apply_multidim_atomics(n.body, vec_arr_info, arg_label_set)),
+                )
+            )
+            continue
+        out.append(n)
+    return out
 
 
 def fold_indexref_writes(
