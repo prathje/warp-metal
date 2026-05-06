@@ -825,6 +825,79 @@ class TestMetalLaunch(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet)
 
+    def test_big_mat_lookup_table_matches_cpu(self):
+        # ``wp.matrix(..., shape=(R, C), dtype=int)`` for non-native sizes
+        # (R or C > 4) emits a ``wp_matRxC_<scalar>`` custom struct in the
+        # kernel header, with a flat row-major ``_make`` factory and a
+        # ``wp_mat_extract`` accessor. Used by mujoco_warp's flex kernels
+        # for static edge-vertex lookup tables.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(idx: wp.array(dtype=wp.int32),
+                  out: wp.array(dtype=wp.int32)):
+                tid = wp.tid()
+                table = wp.matrix(
+                    10, 11,
+                    20, 21,
+                    30, 31,
+                    40, 41,
+                    50, 51,
+                    60, 61,
+                    shape=(6, 2),
+                    dtype=int,
+                )
+                i = idx[tid]
+                out[tid] = table[i, 0] + table[i, 1] * 100
+
+            N = 6
+            idx_n = np.arange(N, dtype=np.int32)
+            results = {}
+            for dev in ('cpu', 'metal:0'):
+                idx = wp.array(idx_n, dtype=wp.int32, device=dev)
+                out = wp.zeros(N, dtype=wp.int32, device=dev)
+                wp.launch(k, dim=N, inputs=[idx], outputs=[out], device=dev)
+                results[dev] = out.numpy()
+            np.testing.assert_array_equal(results['cpu'], results['metal:0'])
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_printf_and_dead_tuples_codegen(self):
+        # ``wp.printf`` calls and ``wp.matrix(..., shape=(R, C))`` sugar
+        # emit ``wp::str`` constants and ``wp::tuple_t`` locals in the IR
+        # that are never read by the kernel body. The preprocess pass
+        # drops the printf lines and tuple constructions so the
+        # unsupported-ctype guard never fires. Pure codegen-passes test:
+        # we just need the kernels to compile and run cleanly.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(out: wp.array(dtype=wp.int32),
+                  flag: wp.array(dtype=wp.int32)):
+                tid = wp.tid()
+                if flag[tid] == 0:
+                    wp.printf('warning: thread %u tripped\\n', tid)
+                out[tid] = tid * 2
+
+            N = 8
+            results = {}
+            for dev in ('cpu', 'metal:0'):
+                flag = wp.zeros(N, dtype=wp.int32, device=dev)
+                out = wp.zeros(N, dtype=wp.int32, device=dev)
+                wp.launch(k, dim=N, inputs=[flag], outputs=[out], device=dev)
+                results[dev] = out.numpy()
+            np.testing.assert_array_equal(results['cpu'], results['metal:0'])
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
     def test_diag_vec3_to_mat3x3_matches_cpu(self):
         # ``wp.diag(vec3)`` builds a 3x3 diagonal matrix. We route this
         # through a ``wp_diag_float3`` helper emitted in the kernel header.
