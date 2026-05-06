@@ -242,16 +242,31 @@ def _vec_t_to_msl(n: int, scalar_ctype: str) -> str:
     return f"wp_vec{n}_{msl_scalar}"
 
 
+def _msl_mat_name(rows: int, cols: int, msl_scalar: str) -> str:
+    """Return the MSL type name for ``mat_t<R, C, T>``.
+
+    Native ``floatRxC`` for R, C in {2, 3, 4}; ``wp_matRxC_<scalar>`` for
+    larger sizes (custom struct emitted in the kernel header).
+    """
+    if rows in _MSL_VEC_NATIVE_N and cols in _MSL_VEC_NATIVE_N:
+        return f"{msl_scalar}{rows}x{cols}"
+    return f"wp_mat{rows}x{cols}_{msl_scalar}"
+
+
 def _mat_t_to_msl(rows: int, cols: int, scalar_ctype: str) -> str:
-    """Translate ``wp::mat_t<R, C, wp::TYPE>`` to its MSL name (e.g. ``float3x3``)."""
-    if rows not in _MSL_VEC_SUPPORTED_N or cols not in _MSL_VEC_SUPPORTED_N:
-        raise MetalCodegenError(
-            f"MSL codegen does not yet support mat{rows}x{cols} (only sizes 2, 3, 4 per dim have native MSL types)"
-        )
+    """Translate ``wp::mat_t<R, C, wp::TYPE>`` to its MSL name.
+
+    For sizes in {2, 3, 4} per dim this returns the native ``floatRxC``.
+    For larger sizes it returns ``wp_matRxC_<scalar>`` for which the
+    codegen emits a custom struct in the kernel header (alongside the
+    big-vec structs).
+    """
+    if rows < 2 or cols < 2:
+        raise MetalCodegenError(f"MSL codegen: mat_t<{rows}, {cols}, ...> not supported (need >= 2 per dim)")
     full_ctype = f"wp::{scalar_ctype}"
     if full_ctype not in _MSL_VEC_SCALAR_PREFIX:
         raise MetalCodegenError(f"MSL codegen does not yet support mat_t element type {full_ctype!r}")
-    return f"{_MSL_VEC_SCALAR_PREFIX[full_ctype]}{rows}x{cols}"
+    return _msl_mat_name(rows, cols, _MSL_VEC_SCALAR_PREFIX[full_ctype])
 
 
 def _translate_vec_t_in(text: str) -> str:
@@ -360,6 +375,60 @@ def _emit_spatial_helpers() -> str:
     )
 
 
+_BIG_MAT_NAME_PAT = re.compile(r"\bwp_mat(\d+)x(\d+)_(\w+)\b")
+
+
+def _emit_big_mat_struct(name: str, rows: int, cols: int, msl_scalar: str) -> str:
+    """Emit the MSL declaration for a custom big-mat struct.
+
+    Storage is row-major (matches Warp's IR semantics directly) — element
+    ``(r, c)`` lives at ``c[r * cols + c]``. We expose a flat row-major
+    ``_make`` factory and a ``_extract`` helper for ``wp::extract(m, r, c)``.
+    No arithmetic operator overloads are emitted: the kernels we currently
+    cover use big mats as static lookup tables only (constructor, ``where``,
+    ``extract``), not for matrix algebra.
+    """
+    n = rows * cols
+    body: list[str] = []
+    body.append(f"struct {name} {{")
+    body.append(f"    {msl_scalar} c[{n}];")
+    body.append("};")
+    args = ", ".join(f"{msl_scalar} v{i}" for i in range(n))
+    body.append(f"inline {name} {name}_make({args}) {{")
+    body.append(f"    {name} r;")
+    for i in range(n):
+        body.append(f"    r.c[{i}] = v{i};")
+    body.append("    return r;")
+    body.append("}")
+    body.append(f"inline {msl_scalar} wp_mat_extract({name} m, int row, int col) {{ return m.c[row * {cols} + col]; }}")
+    return "\n".join(body)
+
+
+_NATIVE_MAT_NAME_PAT = re.compile(r"\b(float|int|uint)([234])x([234])\b")
+
+
+def _emit_native_mat_extract_overloads(source: str) -> str:
+    """Emit ``wp_mat_extract`` overloads for each native ``floatRxC`` /
+    ``intRxC`` referenced in the kernel source.
+
+    Native MSL matrices are column-major, so ``m[c][r]`` reads logical row
+    ``r``, column ``c``. Wrapping that as a free function lets the same
+    ``wp_mat_extract`` translation work for both native and big-mat types
+    via overload resolution.
+    """
+    seen: set[tuple[str, int, int]] = set()
+    for m in _NATIVE_MAT_NAME_PAT.finditer(source):
+        seen.add((m.group(1), int(m.group(2)), int(m.group(3))))
+    if not seen:
+        return ""
+    parts: list[str] = []
+    for scalar, rows, cols in sorted(seen):
+        parts.append(
+            f"inline {scalar} wp_mat_extract({scalar}{rows}x{cols} m, int row, int col) {{ return m[col][row]; }}"
+        )
+    return "\n".join(parts)
+
+
 _DIAG_HELPER_FLOAT3 = (
     "inline float3x3 wp_diag_float3(float3 v) {\n"
     "    return float3x3(float3(v[0], 0.0f, 0.0f), "
@@ -371,24 +440,38 @@ _DIAG_HELPER_FLOAT3 = (
 
 def _build_kernel_header(source: str) -> str:
     """Scan ``source`` for helpers we need to emit (big-vec structs,
-    spatial helpers, diag helper) and return their definitions.
+    big-mat structs, spatial helpers, diag helper, ``wp_mat_extract``
+    overloads) and return their definitions.
     """
-    seen: set[tuple[int, str]] = set()
+    seen_vec: set[tuple[int, str]] = set()
     for m in _BIG_VEC_NAME_PAT.finditer(source):
         n = int(m.group(1))
         scalar = m.group(2)
         if scalar not in _MSL_PREFIX_TO_SAME:
             continue
         if n in _MSL_VEC_NATIVE_N:
-            # Shouldn't happen — native sizes use the ``floatN`` form, not
-            # the custom name — but guard defensively.
             continue
-        seen.add((n, scalar))
+        seen_vec.add((n, scalar))
+    seen_mat: set[tuple[int, int, str]] = set()
+    for m in _BIG_MAT_NAME_PAT.finditer(source):
+        rows = int(m.group(1))
+        cols = int(m.group(2))
+        scalar = m.group(3)
+        if scalar not in _MSL_PREFIX_TO_SAME:
+            continue
+        if rows in _MSL_VEC_NATIVE_N and cols in _MSL_VEC_NATIVE_N:
+            continue
+        seen_mat.add((rows, cols, scalar))
     parts: list[str] = []
-    for n, scalar in sorted(seen):
+    for n, scalar in sorted(seen_vec):
         parts.append(_emit_big_vec_struct(f"wp_vec{n}_{scalar}", n, scalar))
-    if (6, "float") in seen:
+    if (6, "float") in seen_vec:
         parts.append(_emit_spatial_helpers())
+    for rows, cols, scalar in sorted(seen_mat):
+        parts.append(_emit_big_mat_struct(f"wp_mat{rows}x{cols}_{scalar}", rows, cols, scalar))
+    native_mat_overloads = _emit_native_mat_extract_overloads(source)
+    if native_mat_overloads:
+        parts.append(native_mat_overloads)
     if "wp_diag_float3" in source:
         parts.append(_DIAG_HELPER_FLOAT3)
     if not parts:
@@ -435,7 +518,12 @@ def _rewrite_vec_t_brace_constructor(text: str) -> str:
 
 def _rewrite_mat_t_constructor(text: str) -> str:
     """Rewrite ``wp::mat_t<R, C, wp::T>(v00, v01, ..., v(R-1)(C-1))`` (row-major
-    flat) into ``floatRxC(floatR(v00, v10, ...), floatR(v01, v11, ...), ...)``.
+    flat, optionally brace-wrapped) into MSL form.
+
+    For native sizes (R, C in {2, 3, 4}) we emit ``floatRxC`` constructed
+    column-by-column from row-major args. For larger sizes we route to
+    ``wp_matRxC_<scalar>_make`` which takes the row-major flat args
+    directly (the struct stores row-major).
 
     Constructors with the wrong arg count or unsupported types are left
     untouched; the unsupported-intrinsic guard catches them downstream.
@@ -445,21 +533,25 @@ def _rewrite_mat_t_constructor(text: str) -> str:
     def repl(m: re.Match[str]) -> str:
         rows, cols = int(m.group(1)), int(m.group(2))
         scalar = m.group(3)
-        args_str = m.group(4)
+        args_str = m.group(4).strip()
+        if args_str.startswith("{") and args_str.endswith("}"):
+            args_str = args_str[1:-1].strip()
         args = [a.strip() for a in args_str.split(",") if a.strip()]
         if len(args) != rows * cols:
             return m.group(0)
         full_ctype = f"wp::{scalar}"
-        if full_ctype not in _MSL_VEC_SCALAR_PREFIX or rows not in _MSL_VEC_SUPPORTED_N:
+        if full_ctype not in _MSL_VEC_SCALAR_PREFIX or rows < 2 or cols < 2:
             return m.group(0)
         msl_scalar = _MSL_VEC_SCALAR_PREFIX[full_ctype]
-        msl_vec = f"{msl_scalar}{rows}"
-        msl_mat = f"{msl_scalar}{rows}x{cols}"
-        col_strs: list[str] = []
-        for c in range(cols):
-            col_components = [args[r * cols + c] for r in range(rows)]
-            col_strs.append(f"{msl_vec}({', '.join(col_components)})")
-        return f"{msl_mat}({', '.join(col_strs)})"
+        if rows in _MSL_VEC_NATIVE_N and cols in _MSL_VEC_NATIVE_N:
+            msl_vec = f"{msl_scalar}{rows}"
+            msl_mat = f"{msl_scalar}{rows}x{cols}"
+            col_strs: list[str] = []
+            for c in range(cols):
+                col_components = [args[r * cols + c] for r in range(rows)]
+                col_strs.append(f"{msl_vec}({', '.join(col_components)})")
+            return f"{msl_mat}({', '.join(col_strs)})"
+        return f"wp_mat{rows}x{cols}_{msl_scalar}_make({', '.join(args)})"
 
     return pat.sub(repl, text)
 
@@ -650,11 +742,14 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bwp::spatial_bottom\b"), "wp_spatial_bottom"),
     # ``wp::extract(mat, i, j)`` (3-arg, matrix form) — must come BEFORE the
     # 2-arg vec form below, otherwise the non-greedy ``[^()]+?`` for the
-    # second arg would swallow ``i, j`` together. MSL matrices are
-    # column-major (``m[col][row]``), so the row/col arg order is reversed.
+    # second arg would swallow ``i, j`` together. We dispatch to
+    # ``wp_mat_extract``, which has overloads emitted in the kernel header
+    # for each native ``floatRxC`` (column-major: returns ``m[col][row]``)
+    # and each big-mat ``wp_matRxC_<scalar>`` (row-major: returns
+    # ``m.c[row * cols + col]``).
     (
         re.compile(r"wp::extract\s*\(\s*([^,()]+?)\s*,\s*([^,()]+?)\s*,\s*([^,()]+?)\s*\)"),
-        r"\1[\3][\2]",
+        r"wp_mat_extract(\1, \2, \3)",
     ),
     # ``wp::extract(vec, idx)`` returns the i-th component. MSL vector types
     # support the C-style ``[i]`` subscript directly.
@@ -1027,6 +1122,41 @@ _STORE_2ARG_PAT = re.compile(
     r"^\s*wp::(store|assign_inplace|add_inplace|sub_inplace|mul_inplace|div_inplace)\s*"
     r"\(\s*var_(\w+)\s*,\s*([^()]+?)\s*\)\s*;\s*$"
 )
+_UNSUPPORTED_CTYPE_PREFIXES = ("wp::str", "wp::tuple_t")
+_PRINTF_PAT = re.compile(r"^\s*printf\s*\(.*\)\s*;\s*$")
+
+
+def _preprocess_drop_unsupported_locals(forward_lines: list[str], adj) -> tuple[list[str], set[str]]:
+    """Drop dead-code lines producing unsupported-scalar-type values.
+
+    ``wp::str`` constants only feed ``wp.printf`` calls (diagnostic
+    warnings — MSL has no usable printf in regular kernels). ``wp::tuple_t``
+    locals are constructed by ``wp.matrix(..., shape=(N,M), dtype=int)``
+    sugar but never read by the kernel body. Both are safe to elide
+    entirely: drop the assignment lines, drop the printf calls, and skip
+    the locals' declarations so the unsupported-ctype path is never taken.
+    """
+    skip_decls: set[str] = set()
+    drop_locals: set[str] = set()
+    for var in adj.variables:
+        ct = var.ctype()
+        if any(ct.startswith(p) for p in _UNSUPPORTED_CTYPE_PREFIXES):
+            skip_decls.add(var.label)
+            drop_locals.add(var.label)
+
+    if not drop_locals:
+        return forward_lines, skip_decls
+
+    assign_pat = re.compile(r"^\s*var_(\w+)\s*=\s*")
+    out_lines: list[str] = []
+    for raw in forward_lines:
+        if _PRINTF_PAT.match(raw):
+            continue
+        m = assign_pat.match(raw)
+        if m and m.group(1) in drop_locals:
+            continue
+        out_lines.append(raw)
+    return out_lines, skip_decls
 
 
 def _preprocess_indexref_writes(
@@ -1260,6 +1390,11 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
     # which the generated ``for`` declares inline).
     forward_lines, vars_to_skip_decl = _preprocess_for_loops(adj.blocks[0].body_forward)
     forward_lines = _preprocess_while_loops(forward_lines)
+    # Drop dead-code lines producing unsupported-scalar-type values
+    # (printf calls, ``wp::tuple_t`` constructions). These have no runtime
+    # effect on Metal and would otherwise hit the unsupported-ctype guard.
+    forward_lines, drop_skip_decls = _preprocess_drop_unsupported_locals(forward_lines, adj)
+    vars_to_skip_decl |= drop_skip_decls
     # Slice/view preprocessing: ``arr[i]`` on a multi-dim array becomes a
     # ``slice_t`` + ``view`` pair we fold into direct array ops on the
     # underlying argument. Emits no extra MSL — the slice_t and view locals
