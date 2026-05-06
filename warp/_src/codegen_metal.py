@@ -852,28 +852,72 @@ def _msl_pointer_type(ctype: str) -> str:
     return f"{_POINTER_ADDRESS_SPACE} {_msl_scalar_type(inner)}*"
 
 
-_TILE_CTYPE_PAT = re.compile(
-    r"wp::tile_(?:shared|register)_t<\s*wp::(\w+)\s*,"
-    r"\s*wp::tile_layout_strided_t<\s*wp::tile_shape_t<\s*(\d+)\s*(?:,\s*(\d+))?\s*>"
-)
+_TILE_CTYPE_HEAD_PAT = re.compile(r"wp::tile_(shared|register)_t<\s*(.+)$")
+_TILE_SHAPE_PAT = re.compile(r"wp::tile_shape_t<\s*(\d+)\s*(?:,\s*(\d+))?\s*>")
+
+
+def _parse_tile_ctype(ctype: str) -> tuple[str, str, int, int] | None:
+    """Parse ``wp::tile_(shared|register)_t<dtype, layout<shape<R[, C]>, ...>, ...>``.
+
+    Returns ``(kind, dtype_ctype, rows, cols)`` or ``None`` if ``ctype`` isn't a
+    tile type. ``kind`` is ``"shared"`` or ``"register"``. ``dtype_ctype`` is
+    the raw inner type — could be a scalar (``wp::float32``) or a vec_t
+    (``wp::vec_t<3, wp::float32>``).
+    """
+    head = _TILE_CTYPE_HEAD_PAT.search(ctype)
+    if head is None:
+        return None
+    kind = head.group(1)
+    rest = head.group(2)
+    # Walk ``rest`` finding the comma at depth 0 that separates dtype from
+    # layout — the dtype might itself contain ``<...>`` (vec_t case).
+    depth = 0
+    split_at = None
+    for i, ch in enumerate(rest):
+        if ch == "<":
+            depth += 1
+        elif ch == ">":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            split_at = i
+            break
+    if split_at is None:
+        return None
+    dtype_ctype = rest[:split_at].strip()
+    shape_match = _TILE_SHAPE_PAT.search(rest[split_at:])
+    if shape_match is None:
+        return None
+    rows = int(shape_match.group(1))
+    cols = int(shape_match.group(2)) if shape_match.group(2) else 1
+    return kind, dtype_ctype, rows, cols
 
 
 def _msl_var_type(ctype: str) -> str:
     """Translate a local variable's ctype to MSL."""
     if ctype.endswith("*"):
         return _msl_pointer_type(ctype)
-    # Tile types — ``wp::tile_shared_t<wp::float32, wp::tile_layout_strided_t<
-    # wp::tile_shape_t<R, C>, ...>, ...>`` — get rewritten to our private-
-    # memory ``wp_tile_RxC_<scalar>`` struct (see ``_emit_tile_struct``).
-    # 1-D tiles drop the second shape dim, so we treat them as ``Rx1``.
-    m = _TILE_CTYPE_PAT.search(ctype)
-    if m:
-        scalar_ctype = f"wp::{m.group(1)}"
-        if scalar_ctype not in _SCALAR_CTYPE_TO_MSL:
-            raise MetalCodegenError(f"MSL codegen does not yet support tile of type {scalar_ctype!r}")
-        rows = int(m.group(2))
-        cols = int(m.group(3)) if m.group(3) else 1
-        return f"wp_tile_{rows}x{cols}_{_SCALAR_CTYPE_TO_MSL[scalar_ctype]}"
+    # Tile types translate two ways depending on element shape:
+    #   * shape == (1,) or (1, 1) — a single-thread tile of one element.
+    #     With ``block_dim=1`` (the Metal default) every register-tile
+    #     produced by ``wp.tile`` / ``wp.tile_reduce`` collapses to this,
+    #     so we lower the type to the inner element type itself. The
+    #     ``var_X = wp::tile<...>(var_x)`` IR becomes a plain assign and
+    #     ``wp::tile_reduce<op>(tile)`` returns the value unchanged.
+    #   * larger shapes — the standard ``wp_tile_RxC_<scalar>`` private-
+    #     memory struct (see ``_emit_tile_struct``). Currently scalar-
+    #     element only; vec/mat elements at >1 size aren't yet supported.
+    parsed = _parse_tile_ctype(ctype)
+    if parsed is not None:
+        kind, dtype_ctype, rows, cols = parsed
+        if rows == 1 and cols == 1:
+            return _msl_scalar_type(dtype_ctype)
+        # Larger tiles use scalar-only struct emission for now.
+        if dtype_ctype not in _SCALAR_CTYPE_TO_MSL:
+            raise MetalCodegenError(
+                f"MSL codegen: tile of {dtype_ctype!r} (shape {rows}x{cols}) not yet supported "
+                "(only scalar-element tiles with R*C > 1 emit a struct)"
+            )
+        return f"wp_tile_{rows}x{cols}_{_SCALAR_CTYPE_TO_MSL[dtype_ctype]}"
     return _msl_scalar_type(ctype)
 
 
@@ -960,12 +1004,13 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     # wp.tid() -> thread_position_in_grid.x (1-D dispatch only — 2-D/3-D are
     # handled by the structural matcher in ``generate_msl_kernel``).
     (re.compile(r"\bbuiltin_tid1d\s*\(\s*\)"), "(int)thread_position_in_grid.x"),
-    # wp.block_dim() -> threads_per_threadgroup.y. Used by mujoco_warp's
-    # sparse-Cholesky kernels (``_solve_LD_sparse_fused``) which 2-D-launch
-    # as ``dim=(nworld, block_dim), block_dim=block_dim`` and unpack tid as
-    # the second coordinate. The threadgroup must be sized so its y-extent
-    # equals the launch's ``block_dim``; the launcher handles that below.
-    (re.compile(r"\bbuiltin_block_dim\s*\(\s*\)"), "(int)threads_per_threadgroup.y"),
+    # wp.block_dim() always lowers to literal ``1`` on the Metal backend.
+    # This pairs with the ``block_dim=1`` setting in
+    # ``generate_msl_kernel`` and the ``tg_y=1`` launcher policy below to
+    # run every cooperative-tile kernel serially per threadgroup. Remove
+    # this special-case once we implement real threadgroup-cooperative
+    # tiles.
+    (re.compile(r"\bbuiltin_block_dim\s*\(\s*\)"), "1"),
     # ``WP_TILE_SYNC()`` is the macro used by ``@wp.func_native`` shims like
     # mujoco_warp's ``_syncthreads`` — translate to MSL's threadgroup
     # barrier. With single-thread threadgroups it's a no-op; with bigger
@@ -1127,6 +1172,58 @@ for _name in _MATH_BUILTIN_NAMES:
 del _name
 
 
+def _wrap_atomic_load_reads(text: str, arr_name: str) -> str:
+    """Wrap occurrences of ``= arr_name[<balanced...>]`` in atomic_load.
+
+    A regex won't suffice because the index expression can contain nested
+    ``[...]`` (e.g. ``arr[i * shape[k] + j]``). We scan forward, count
+    bracket depth, and rewrite the matched span.
+    """
+    out_parts: list[str] = []
+    i = 0
+    n = len(text)
+    needle = f"= {arr_name}["
+    while i < n:
+        j = text.find(needle, i)
+        if j < 0:
+            out_parts.append(text[i:])
+            break
+        # Verify it's preceded by either ``=`` whitespace or another ``=``
+        # of an assignment (i.e. the ``=`` belongs to ``var_X = arr[...]``,
+        # not to ``... == arr[...]`` or ``+= arr[...]`` etc.). Easiest
+        # filter: the character before the ``=`` must be whitespace or
+        # ``)``; the character before THAT must NOT also be ``=``/``!``/
+        # ``<``/``>``/``+``/``-``/``*``/``/``.
+        prev_eq = j  # index of ``=``
+        prev_ch = text[prev_eq - 1] if prev_eq > 0 else ""
+        prev2 = text[prev_eq - 2] if prev_eq > 1 else ""
+        if prev_ch == "=" or (prev_ch == " " and prev2 in "=!<>+-*/"):
+            # Not a plain assignment.
+            out_parts.append(text[i:j + len(needle)])
+            i = j + len(needle)
+            continue
+        out_parts.append(text[i:j])
+        # Find the matching close bracket, accounting for nesting.
+        bracket_start = j + len(needle)
+        depth = 1
+        k = bracket_start
+        while k < n and depth > 0:
+            if text[k] == "[":
+                depth += 1
+            elif text[k] == "]":
+                depth -= 1
+            k += 1
+        if depth != 0:
+            # Unbalanced — fall back to no-op for safety.
+            out_parts.append(text[j:k])
+            i = k
+            continue
+        idx_expr = text[bracket_start:k - 1]
+        out_parts.append(f"= atomic_load_explicit(&{arr_name}[{idx_expr}], memory_order_relaxed)")
+        i = k
+    return "".join(out_parts)
+
+
 def _translate_intrinsics(line: str) -> str:
     """Apply intrinsic substitutions until convergence."""
     prev = None
@@ -1154,6 +1251,48 @@ def _translate_intrinsics(line: str) -> str:
 #     local in mujoco_warp's pattern.
 #   Cholesky-solve: ``var_X = wp::tile_cholesky_solve<false>(var_a, var_b, var_c, var_L, var_b_in, var_x_out)``
 
+
+# ``wp::tile<dtype>(x)`` — pack a per-thread value into a register tile of
+# shape (block_dim,). With block_dim=1 the tile *is* the value, so we
+# lower to a plain assign.
+_TILE_BUILTIN_TILE_PAT = re.compile(
+    r"\bvar_(\w+)\s*=\s*wp::tile\s*<[^()]*>\s*\(\s*var_(\w+)\s*\)"
+)
+# ``wp::tile_reduce(op_fn, tile)`` — reduce across threads. The op (``wp::add``,
+# user fn, etc.) comes as the first *argument*, not as a template arg.
+# With block_dim=1 the tile is a single element; the reduction is a no-op
+# and the output is just the input value.
+_TILE_REDUCE_PAT = re.compile(
+    r"\bvar_(\w+)\s*=\s*wp::tile_reduce\s*\(\s*[\w:]+\s*,\s*var_(\w+)\s*\)"
+)
+# ``wp::tile_zeros<dtype, ...>()`` / ``wp::tile_ones<dtype, ...>()`` —
+# constant-fill register tile. With block_dim=1 it's the corresponding
+# scalar 0 / 1 (or vec ``T(0)`` / ``T(1)``).
+_TILE_ZEROS_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_zeros\s*<\s*wp::(\w+)\s*[^>]*>\s*\(\s*\)")
+_TILE_ONES_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_ones\s*<\s*wp::(\w+)\s*[^>]*>\s*\(\s*\)")
+# ``wp::tile_arange<int>(N)`` with N=1 → ``var_X = 0``. Larger N would need
+# a struct; not supported yet (and not used at block_dim=1).
+_TILE_ARANGE_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_arange\s*<[^>]*>\s*\(\s*\d+\s*\)")
+# ``wp::tile_map<fn>(args...)`` — element-wise map. With block_dim=1 each
+# tile is a scalar; reduces to a direct call to the target function. The
+# template arg holds the function name (e.g. ``wp_mul`` or a user fn).
+_TILE_MAP_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_map\s*<\s*([^,>]+?)\s*>\s*\(([^)]*)\)")
+# ``wp::tile_extract(tile, idx)`` — read the i-th element of a tile. For a
+# 1-element tile the only valid index is 0 and the result is the scalar
+# value itself.
+_TILE_EXTRACT_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_extract\s*\(\s*var_(\w+)\s*,\s*[^)]+?\s*\)")
+# ``wp::tile_assign(dst, src, offset_tuple)`` — copy ``src`` into ``dst``
+# at ``offset``. With single-element tiles ``offset=(0,0)`` and the call
+# is just ``dst = src``.
+_TILE_ASSIGN_PAT = re.compile(r"\bwp::tile_assign\s*\(([^)]*)\)")
+# ``wp::tile_transpose<...>(t)`` — for shape (1,1) it's a no-op.
+_TILE_TRANSPOSE_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_transpose\s*<[^()]*>\s*\(\s*var_(\w+)\s*\)")
+# ``wp::tile_broadcast<dtype, ...>(t)`` — broadcasting a single value
+# back to a single value is a copy.
+_TILE_BROADCAST_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_broadcast\s*<[^()]*>\s*\(\s*var_(\w+)\s*\)")
+# ``wp::tile_matmul(a, b, out)`` — at shape (1,1)x(1,1) this is just a
+# scalar multiply; not yet emitted because the failing kernels we cover
+# don't reach this path.
 
 _TILE_LOAD_PAT = re.compile(
     r"\bvar_(\w+)\s*=\s*wp::tile_load\s*<\s*wp::(\w+)\s*,\s*\w+\s*,\s*\w+\s*,\s*(\d+)\s*(?:,\s*(\d+)\s*)?>\s*\(([^)]*)\)"
@@ -1299,6 +1438,64 @@ def _translate_tile_intrinsics(line: str, tile_var_dims: dict[str, tuple[int, in
         msl_scalar = L_dims[2]
         helper = f"wp_tile_{n}x{n}_{msl_scalar}_cholesky_solve_{k}"
         return f"var_{lhs} = {helper}({L_arg}, {b_arg})"
+
+    # Block-dim=1 register-tile reductions to plain scalar / vec values.
+    # ``var_X = wp::tile<dtype>(var_x)``  →  ``var_X = var_x``
+    line = _TILE_BUILTIN_TILE_PAT.sub(r"var_\1 = var_\2", line)
+    # ``var_X = wp::tile_reduce<op>(var_t)``  →  ``var_X = var_t``
+    line = _TILE_REDUCE_PAT.sub(r"var_\1 = var_\2", line)
+
+    def repl_zeros(m: re.Match[str]) -> str:
+        scalar_ctype = f"wp::{m.group(2)}"
+        msl = _SCALAR_CTYPE_TO_MSL.get(scalar_ctype, "float")
+        return f"var_{m.group(1)} = ({msl})0"
+
+    def repl_ones(m: re.Match[str]) -> str:
+        scalar_ctype = f"wp::{m.group(2)}"
+        msl = _SCALAR_CTYPE_TO_MSL.get(scalar_ctype, "float")
+        return f"var_{m.group(1)} = ({msl})1"
+
+    line = _TILE_ZEROS_PAT.sub(repl_zeros, line)
+    line = _TILE_ONES_PAT.sub(repl_ones, line)
+    line = _TILE_ARANGE_PAT.sub(r"var_\1 = 0", line)
+
+    def repl_map(m: re.Match[str]) -> str:
+        # ``var_X = wp::tile_map<fn>(args...)`` — single-element tile case.
+        # Just call ``fn(args...)``. ``fn`` may be a builtin (``wp_mul``,
+        # ``wp_add``) or a user function — both expand to direct MSL.
+        lhs = m.group(1)
+        fn = m.group(2).strip()
+        # Drop ``wp::`` prefix and special-case the common ones to
+        # operators (matches what the regular ``wp::add`` / ``wp::mul``
+        # patterns elsewhere produce).
+        if fn.startswith("wp::"):
+            op = fn[len("wp::"):]
+            args = m.group(3)
+            if op in ("add", "sub", "mul", "div"):
+                op_sym = {"add": "+", "sub": "-", "mul": "*", "div": "/"}[op]
+                a, b = (a.strip() for a in args.split(",", 1))
+                return f"var_{lhs} = ({a} {op_sym} {b})"
+            return f"var_{lhs} = {fn}({args})"
+        # User function — call directly. Strips templating wrapper.
+        return f"var_{lhs} = {fn}({m.group(3)})"
+
+    line = _TILE_MAP_PAT.sub(repl_map, line)
+
+    def repl_assign(m: re.Match[str]) -> str:
+        # ``wp::tile_assign(dst, src, offset_tuple)``. With shape (1,1)
+        # tiles the offset is always 0 and we drop it. The IR emits the
+        # offset as a ``wp::tuple_t`` literal which is a separate token —
+        # split on top-level commas and take the first two args.
+        args = [a.strip() for a in m.group(1).split(",")]
+        if len(args) < 2:
+            return m.group(0)
+        return f"{args[0]} = {args[1]}"
+
+    line = _TILE_ASSIGN_PAT.sub(repl_assign, line)
+    line = _TILE_TRANSPOSE_PAT.sub(r"var_\1 = var_\2", line)
+    line = _TILE_BROADCAST_PAT.sub(r"var_\1 = var_\2", line)
+    # ``var_X = wp::tile_extract(var_t, idx)`` with shape (1,) → ``var_X = var_t``.
+    line = _TILE_EXTRACT_PAT.sub(r"var_\1 = var_\2", line)
 
     line = _TILE_LOAD_PAT.sub(repl_load, line)
     line = _TILE_STORE_PAT.sub(repl_store, line)
@@ -1460,12 +1657,19 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
     # rather than CUDA cuBLASDx LTO IR. ``block_dim`` is required by some
     # of those dispatch funcs even on the no-MathDx path.
     if not getattr(adj, "blocks", None):
+        # ``block_dim=1`` forces the cooperative-tile builtins (``wp.tile``,
+        # ``wp.tile_reduce``, etc.) to compile-time-shape themselves as
+        # single-element tiles. The Metal backend currently runs every
+        # cooperative-tile kernel serially (1 thread per threadgroup) — see
+        # ``launch_metal_kernel`` for the matching launcher policy. Once
+        # we implement real threadgroup-cooperative tiles this can climb
+        # back to a real value.
         adj.build(
             builder=None,
             default_builder_options={
                 "enable_backward": False,
                 "output_arch": None,
-                "block_dim": 256,
+                "block_dim": 1,
             },
         )
     # When the kernel is part of a registered module (``module="unique"``),
@@ -1924,18 +2128,26 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
     # Map tile-typed locals to ``(rows, cols, msl_scalar)`` for the tile-
     # intrinsic translator (it needs the result-tile shape for cholesky /
     # cholesky_solve, where dimensions don't appear in the call's template
-    # args).
+    # args). Only scalar-element shared tiles get an entry — register
+    # tiles of shape (1,1) collapse to plain values via ``_msl_var_type``
+    # and don't need a struct shape in this map.
     tile_var_dims: dict[str, tuple[int, int, str]] = {}
     for var in adj.variables:
-        m = _TILE_CTYPE_PAT.search(var.ctype())
-        if m is None:
+        parsed = _parse_tile_ctype(var.ctype())
+        if parsed is None:
             continue
-        scalar_ctype = f"wp::{m.group(1)}"
-        if scalar_ctype not in _SCALAR_CTYPE_TO_MSL:
+        _kind, dtype_ctype, rows, cols = parsed
+        if dtype_ctype not in _SCALAR_CTYPE_TO_MSL:
             continue
-        rows = int(m.group(2))
-        cols = int(m.group(3)) if m.group(3) else 1
-        tile_var_dims[var.label] = (rows, cols, _SCALAR_CTYPE_TO_MSL[scalar_ctype])
+        if rows == 1 and cols == 1:
+            continue
+        tile_var_dims[var.label] = (rows, cols, _SCALAR_CTYPE_TO_MSL[dtype_ctype])
+
+    # When ``atomic_outputs=True`` is passed to ``mx.fast.metal_kernel``,
+    # *every* output buffer comes through as ``device atomic<T>*``. Reads
+    # via plain subscripting won't compile, so we'll wrap them in
+    # ``atomic_load_explicit`` inside ``_finalize``.
+    atomic_output_names: set[str] = {a.label for a in output_args} if has_atomic else set()
 
     # --- Forward statements --------------------------------------------
     def _finalize(translated: str) -> str:
@@ -1971,6 +2183,18 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
         # ``input_names``/``output_names`` directly).
         for arg in adj.args:
             translated = re.sub(rf"\bvar_{re.escape(arg.label)}\b", arg.label, translated)
+        # When the kernel uses ``wp.atomic_*`` on any output, MLX makes
+        # *every* output ``device atomic<T>*``. Plain reads
+        # ``var_X = atomic_arr[idx]`` then fail to compile because MSL
+        # forbids implicit conversion from atomic to value. Wrap each such
+        # read in ``atomic_load_explicit(&arr[idx], memory_order_relaxed)``.
+        # The index expression can contain nested ``[...]`` (shape lookups
+        # like ``arr[i * shape[k] + j]``), so we manually scan for the
+        # matching close bracket instead of using a single-shot regex with
+        # a character-class exclusion.
+        if has_atomic:
+            for out_name in atomic_output_names:
+                translated = _wrap_atomic_load_reads(translated, out_name)
         _check_no_unsupported_intrinsics(translated)
         return translated
 
@@ -2809,26 +3033,20 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim: int = 2
     grid_y = dims[1] if len(dims) >= 2 else 1
     grid_z = dims[2] if len(dims) >= 3 else 1
     grid = (grid_x, grid_y, grid_z)
-    # Pick a threadgroup that's at most 256 threads total and never larger
-    # than each grid dimension. For 2-D launches we honor ``block_dim`` on
-    # the y-axis — that's where mujoco_warp packs the per-block tid for
-    # tile-cooperative kernels (e.g. ``_solve_LD_sparse_fused``). The
-    # threadgroup y-extent must match the launch's ``block_dim`` so that
-    # ``threads_per_threadgroup.y`` (which we lower ``wp.block_dim()`` to)
-    # returns the value the kernel expects.
+    # Threadgroup policy: 1 thread on the y/z axes for cooperative-tile
+    # kernels (which pack their per-block tid on y) so ``wp.block_dim()``
+    # — which we lower to literal ``1`` in the IR — agrees with the
+    # actual threadgroup width. The kernel's ``for tid in range(0, N, 1)``
+    # loop then iterates everything serially. The launch's ``block_dim``
+    # parameter is intentionally ignored here; once we implement real
+    # cooperative tiles this will switch back to honoring it.
     if len(dims) == 1:
         tg = (min(256, grid_x), 1, 1)
     elif len(dims) == 2:
-        tg_y = min(block_dim, grid_y) if block_dim and block_dim > 0 else min(16, grid_y)
-        # Cap x so total tg threads stay under MSL's 1024-thread/group cap.
-        max_x = max(1, 256 // max(tg_y, 1))
-        tg_x = min(max_x, grid_x)
-        tg = (tg_x, tg_y, 1)
+        tg = (min(256, grid_x), 1, 1)
     else:
-        tg_x = min(8, grid_x)
-        tg_y = min(8, grid_y)
-        tg_z = min(4, grid_z)
-        tg = (tg_x, tg_y, tg_z)
+        tg = (min(64, grid_x), 1, 1)
+    del block_dim  # unused — see comment above
 
     # MLX outputs are uninitialized by default. For atomic-output kernels
     # we *must* zero-initialize so the first ``atomic_fetch_add`` accumulates
