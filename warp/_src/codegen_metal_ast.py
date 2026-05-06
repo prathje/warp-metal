@@ -68,7 +68,14 @@ class Empty(Node):
 
 @dataclass(frozen=True)
 class Return(Node):
-    """Bare ``return;`` (Warp kernels never return a value)."""
+    """``return;`` or ``return <value>;``.
+
+    ``value`` is the bare expression text when present (single-value
+    returning ``@wp.func`` helpers lower to this form), or ``None`` for
+    a bare return. Top-level kernels never carry a value.
+    """
+
+    value: str | None = None
 
 
 @dataclass(frozen=True)
@@ -359,6 +366,7 @@ _RE_EMPTY = re.compile(r"^\s*$")
 _RE_COMMENT = re.compile(r"^\s*//")
 _RE_PRAGMA = re.compile(r"^\s*#")
 _RE_RETURN = re.compile(r"^\s*return\s*;\s*$")
+_RE_RETURN_VALUE = re.compile(r"^\s*return\s+(?P<value>.+?)\s*;\s*$")
 _RE_BLOCK_OPEN = re.compile(r"^\s*if\s*\(\s*(?P<cond>.+?)\s*\)\s*\{\s*$")
 _RE_BLOCK_ELSE = re.compile(r"^\s*\}\s*else\s*\{\s*$")
 _RE_BLOCK_CLOSE = re.compile(r"^\s*\}\s*$")
@@ -506,7 +514,10 @@ def parse_line(line: str) -> Node:
     if _RE_PRAGMA.match(line):
         return Pragma(raw=line)
     if _RE_RETURN.match(line):
-        return Return(raw=line)
+        return Return(raw=line, value=None)
+    m = _RE_RETURN_VALUE.match(line)
+    if m:
+        return Return(raw=line, value=m.group("value"))
 
     m = _RE_LABEL.match(line)
     if m:
@@ -964,15 +975,39 @@ def _build_function_overload_table(adj) -> dict[str, Any]:
     Each overload exposes its full mangled name as ``native_func`` (set
     when the overload is registered). The IR call-site name comes from
     that field directly, so we use it as the lookup key.
+
+    Pulls candidates from two sources:
+      1. ``adj.get_references()[2]`` — Warp's own table of directly-
+         referenced user functions.
+      2. ``adj.func.__globals__`` — every Function-typed name visible in
+         the kernel's module. Some kernels (notably JIT-defined inner
+         kernels like ``_primitive_narrowphase__locals__primitive_narrowphase``)
+         call functions that aren't in the ``get_references`` table even
+         though they're emitted in the IR; we want to inline those too.
     """
+    from warp._src.context import Function  # noqa: PLC0415
+
+    out: dict[str, Any] = {}
+
     refs = adj.get_references()
     fn_table = refs[2]
-    out: dict[str, Any] = {}
     for fn in fn_table:
         for overload in fn.user_overloads.values():
             native = getattr(overload, "native_func", None)
             if native is not None:
                 out[native] = overload
+
+    func = getattr(adj, "func", None)
+    globals_dict = getattr(func, "__globals__", None) if func is not None else None
+    if globals_dict is not None:
+        for value in globals_dict.values():
+            if not isinstance(value, Function):
+                continue
+            for overload in value.user_overloads.values():
+                native = getattr(overload, "native_func", None)
+                if native is not None and native not in out:
+                    out[native] = overload
+
     return out
 
 
@@ -988,8 +1023,17 @@ def _has_return(nodes: tuple[Node, ...] | list[Node]) -> bool:
     return False
 
 
-def _rewrite_returns_to_breaks(nodes: tuple[Node, ...] | list[Node]) -> list[Node]:
+def _rewrite_returns_to_breaks(
+    nodes: tuple[Node, ...] | list[Node],
+    return_value_dst: str | None = None,
+) -> list[Node]:
     """Replace ``return;`` with ``break;`` (used after wrapping in do-while-0).
+
+    For single-value-returning functions, Warp's IR uses ``return <expr>;``
+    to carry the value. ``return_value_dst`` (when set) is the bare
+    variable name (without the ``var_`` prefix) where each such value
+    should be assigned before the synthetic break — that's how
+    ``var_X = foo(...)`` calls splice in.
 
     Recurses into ``If`` bodies. Does NOT descend into ``For`` / ``While``
     — a return inside an inner loop would need a separate flag-based
@@ -1001,14 +1045,25 @@ def _rewrite_returns_to_breaks(nodes: tuple[Node, ...] | list[Node]) -> list[Nod
     for n in nodes:
         if isinstance(n, Return):
             indent = _leading_indent(n.raw)
-            out.append(Break(raw=f"{indent}break;"))
+            if n.value is not None:
+                if return_value_dst is None:
+                    # The function returns a value but no caller LHS — drop
+                    # the value (it's unobservable from the caller side)
+                    # and emit just the break.
+                    out.append(Break(raw=f"{indent}break;"))
+                else:
+                    # Synthesize ``var_<dst> = <value>;`` then ``break;``.
+                    out.append(_RawLine(raw=f"{indent}var_{return_value_dst} = {n.value};"))
+                    out.append(Break(raw=f"{indent}break;"))
+            else:
+                out.append(Break(raw=f"{indent}break;"))
             continue
         if isinstance(n, If):
             out.append(
                 If(
                     raw=n.raw,
                     cond=n.cond,
-                    body=tuple(_rewrite_returns_to_breaks(n.body)),
+                    body=tuple(_rewrite_returns_to_breaks(n.body, return_value_dst)),
                     raw_open=n.raw_open,
                     raw_close=n.raw_close,
                 )
@@ -1029,8 +1084,20 @@ def _inline_one_call(
     fn_map: dict[str, Any],
     depth: int,
     max_depth: int,
+    const_ints_out: dict[str, int],
+    return_value_dst: str | None = None,
 ) -> list[Node]:
-    """Inline a single user-function call. Returns the spliced node list."""
+    """Inline a single user-function call. Returns the spliced node list.
+
+    ``const_ints_out`` is mutated to record every inlined int-typed
+    constant local (mangled label → int value) so subsequent passes can
+    treat them the same as ``adj.variables`` constants.
+
+    ``return_value_dst`` (when non-None) is the bare variable name where
+    each ``return <value>;`` in the callee body should write before the
+    synthetic break — used for single-value-returning calls of the form
+    ``var_X = foo(args);``.
+    """
     if depth > max_depth:
         from warp._src.codegen_metal import MetalCodegenError  # noqa: PLC0415
 
@@ -1082,7 +1149,7 @@ def _inline_one_call(
     fn_folded, fold_skip = fold(fn_nodes)
 
     # Recursively inline nested user calls.
-    fn_folded = _inline_walk(fn_folded, fn_map, depth + 1, max_depth)
+    fn_folded = _inline_walk(fn_folded, fn_map, depth + 1, max_depth, const_ints_out)
 
     # Emit declarations for the inlined locals. They aren't in the host
     # kernel's ``adj.variables`` table, so the standard declaration loop in
@@ -1110,15 +1177,21 @@ def _inline_one_call(
             # guard will surface a clear error if the variable is actually
             # referenced.
             continue
-        mangled = f"var_{inline_id}__{var.label}"
+        mangled_label = f"{inline_id}__{var.label}"
+        mangled = f"var_{mangled_label}"
         if var.constant is None:
             decls.append(_RawLine(raw=f"    {msl_type} {mangled};"))
         else:
             decls.append(_RawLine(raw=f"    const {msl_type} {mangled} = {_msl_constant_str(var.constant)};"))
+            # Record int constants so downstream passes (notably
+            # fold_views' slice-step check) can recognise inlined
+            # const-zeros the same as kernel-level ones.
+            if isinstance(var.constant, int) and not isinstance(var.constant, bool):
+                const_ints_out[mangled_label] = var.constant
 
     # If the body contains any return, wrap and convert to break.
     if _has_return(fn_folded):
-        body_with_breaks = _rewrite_returns_to_breaks(fn_folded)
+        body_with_breaks = _rewrite_returns_to_breaks(fn_folded, return_value_dst)
         return [*decls, _DoWhileZero(raw="", body=tuple(body_with_breaks))]
 
     return [*decls, *fn_folded]
@@ -1129,16 +1202,35 @@ def _inline_walk(
     fn_map: dict[str, Any],
     depth: int,
     max_depth: int,
+    const_ints_out: dict[str, int],
 ) -> list[Node]:
     out: list[Node] = []
     for n in nodes:
-        # Detect void user-function call.
+        # Void user-function call.
         if isinstance(n, VoidCall) and n.op == "user_call":
             name = dict(n.extra).get("name")
             if name in fn_map:
-                spliced = _inline_one_call(fn_map[name], n.args, fn_map, depth, max_depth)
+                spliced = _inline_one_call(fn_map[name], n.args, fn_map, depth, max_depth, const_ints_out)
                 out.extend(spliced)
                 continue
+
+        # Single-value-returning user call: ``var_X = foo(args)``. The
+        # callee's body uses ``return <value>;`` form; the rewriter
+        # converts each one into ``var_X = value; break;`` before
+        # wrapping the body in ``do { ... } while (0);``.
+        if isinstance(n, Assign) and isinstance(n.expr, UserCall) and n.expr.name in fn_map:
+            name = n.expr.name
+            spliced = _inline_one_call(
+                fn_map[name],
+                n.expr.args,
+                fn_map,
+                depth,
+                max_depth,
+                const_ints_out,
+                return_value_dst=n.lhs,
+            )
+            out.extend(spliced)
+            continue
 
         # Recurse into structured bodies.
         if isinstance(n, If):
@@ -1146,7 +1238,7 @@ def _inline_walk(
                 If(
                     raw=n.raw,
                     cond=n.cond,
-                    body=tuple(_inline_walk(n.body, fn_map, depth, max_depth)),
+                    body=tuple(_inline_walk(n.body, fn_map, depth, max_depth, const_ints_out)),
                     raw_open=n.raw_open,
                     raw_close=n.raw_close,
                 )
@@ -1160,7 +1252,7 @@ def _inline_walk(
                     range_var=n.range_var,
                     start=n.start,
                     stop=n.stop,
-                    body=tuple(_inline_walk(n.body, fn_map, depth, max_depth)),
+                    body=tuple(_inline_walk(n.body, fn_map, depth, max_depth, const_ints_out)),
                 )
             )
             continue
@@ -1169,7 +1261,7 @@ def _inline_walk(
                 While(
                     raw=n.raw,
                     label_k=n.label_k,
-                    body=tuple(_inline_walk(n.body, fn_map, depth, max_depth)),
+                    body=tuple(_inline_walk(n.body, fn_map, depth, max_depth, const_ints_out)),
                 )
             )
             continue
@@ -1177,7 +1269,7 @@ def _inline_walk(
             out.append(
                 _DoWhileZero(
                     raw=n.raw,
-                    body=tuple(_inline_walk(n.body, fn_map, depth, max_depth)),
+                    body=tuple(_inline_walk(n.body, fn_map, depth, max_depth, const_ints_out)),
                 )
             )
             continue
@@ -1185,16 +1277,27 @@ def _inline_walk(
     return out
 
 
-def inline_user_calls(nodes: list[Node], kernel_adj, max_depth: int = 8) -> list[Node]:
+def inline_user_calls(nodes: list[Node], kernel_adj, max_depth: int = 8) -> tuple[list[Node], dict[str, int]]:
     """Splice every user-``@wp.func`` call into the AST tree.
 
-    See the module-level docstring for the algorithm. ``kernel_adj`` is the
-    top-level kernel's ``Adjoint`` object (used for the references table).
+    Returns ``(inlined_nodes, inlined_const_ints)``. The second value maps
+    each inlined int-typed constant local (e.g. ``"<id>__40"``) to its
+    integer value so subsequent passes (``fold_views`` in particular)
+    can treat inlined constants the same as the kernel's own
+    ``adj.variables`` constants. Without this, view-aliases inside an
+    inlined body don't get recognised because the slice_t ``step``
+    operand's constness is invisible.
+
+    ``kernel_adj`` is the top-level kernel's ``Adjoint`` object — used
+    for the references table that resolves call-site mangled names
+    back to Function overloads.
     """
     fn_map = _build_function_overload_table(kernel_adj)
     if not fn_map:
-        return list(nodes)
-    return _inline_walk(nodes, fn_map, depth=0, max_depth=max_depth)
+        return list(nodes), {}
+    inlined_const_ints: dict[str, int] = {}
+    out = _inline_walk(nodes, fn_map, depth=0, max_depth=max_depth, const_ints_out=inlined_const_ints)
+    return out, inlined_const_ints
 
 
 _UNSUPPORTED_CTYPE_PREFIXES = ("wp::str", "wp::tuple_t")
@@ -1292,17 +1395,25 @@ def _apply_drop_unsupported(nodes: tuple[Node, ...] | list[Node], drop: set[str]
 # definitions become declaration-skipped aliases.
 
 
-def fold_views(nodes: list[Node], adj) -> tuple[list[Node], set[str]]:
+def fold_views(nodes: list[Node], adj, extra_const_ints: dict[str, int] | None = None) -> tuple[list[Node], set[str]]:
     """Fold view aliases through the tree.
 
-    Returns ``(rewritten_nodes, skip_decls)`` — local labels whose top-level
-    declarations should be suppressed (the slice_t and view aliases).
+    ``extra_const_ints`` lets the caller supply additional const-int locals
+    that aren't in ``adj.variables`` — used by the inliner to surface
+    inlined constants so slice/view recognition works inside inlined
+    bodies.
+
+    Returns ``(rewritten_nodes, skip_decls)`` — local labels whose top-
+    level declarations should be suppressed (the slice_t and view
+    aliases).
     """
     arg_label_set = {a.label for a in adj.args}
     const_int_vars: dict[str, int] = {}
     for var in adj.variables:
         if var.constant is not None and isinstance(var.constant, int):
             const_int_vars[var.label] = var.constant
+    if extra_const_ints:
+        const_int_vars.update(extra_const_ints)
 
     slice_aliases: dict[str, str] = {}
     _collect_slice_aliases(nodes, slice_aliases, const_int_vars)
