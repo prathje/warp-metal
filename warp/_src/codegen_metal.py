@@ -127,6 +127,7 @@ from warp._src.codegen_metal_ast import emit as _ast_emit
 from warp._src.codegen_metal_ast import fold as _ast_fold
 from warp._src.codegen_metal_ast import fold_drop_unsupported_locals as _ast_fold_drop
 from warp._src.codegen_metal_ast import fold_indexref_writes as _ast_fold_indexref
+from warp._src.codegen_metal_ast import fold_multidim_atomics as _ast_fold_multidim_atomics
 from warp._src.codegen_metal_ast import fold_views as _ast_fold_views
 from warp._src.codegen_metal_ast import inline_user_calls as _ast_inline
 from warp._src.codegen_metal_ast import parse as _ast_parse
@@ -437,6 +438,38 @@ def _emit_native_mat_extract_overloads(source: str) -> str:
     return "\n".join(parts)
 
 
+_NATIVE_VEC_NAME_PAT = re.compile(r"\b(float|int|uint)([234])\b")
+
+
+def _emit_wp_dot_overloads(source: str) -> str:
+    """Emit ``wp_dot`` overloads for every vector type used in ``source``.
+
+    MSL's ``metal::dot`` only knows about its native ``floatN`` etc.; our
+    custom ``wp_vecN_<scalar>`` big-vec structs need a hand-rolled
+    sum-of-products. Wrapping the call as ``wp_dot`` lets the codegen emit
+    one uniform translation regardless of operand type — the C++ overload
+    resolver picks the right body.
+    """
+    parts: list[str] = []
+    seen_native: set[tuple[str, int]] = set()
+    for m in _NATIVE_VEC_NAME_PAT.finditer(source):
+        seen_native.add((m.group(1), int(m.group(2))))
+    for scalar, n in sorted(seen_native):
+        parts.append(f"inline {scalar} wp_dot({scalar}{n} a, {scalar}{n} b) {{ return metal::dot(a, b); }}")
+
+    seen_big: set[tuple[int, str]] = set()
+    for m in _BIG_VEC_NAME_PAT.finditer(source):
+        n = int(m.group(1))
+        scalar = m.group(2)
+        if n in _MSL_VEC_NATIVE_N or scalar not in _MSL_PREFIX_TO_SAME:
+            continue
+        seen_big.add((n, scalar))
+    for n, scalar in sorted(seen_big):
+        body_terms = " + ".join(f"a.c[{i}] * b.c[{i}]" for i in range(n))
+        parts.append(f"inline {scalar} wp_dot(wp_vec{n}_{scalar} a, wp_vec{n}_{scalar} b) {{ return {body_terms}; }}")
+    return "\n".join(parts)
+
+
 _DIAG_HELPER_FLOAT3 = (
     "inline float3x3 wp_diag_float3(float3 v) {\n"
     "    return float3x3(float3(v[0], 0.0f, 0.0f), "
@@ -482,6 +515,10 @@ def _build_kernel_header(source: str) -> str:
         parts.append(native_mat_overloads)
     if "wp_diag_float3" in source:
         parts.append(_DIAG_HELPER_FLOAT3)
+    if "wp_dot" in source:
+        dot_overloads = _emit_wp_dot_overloads(source)
+        if dot_overloads:
+            parts.append(dot_overloads)
     if not parts:
         return ""
     return "\n".join(parts) + "\n"
@@ -519,6 +556,13 @@ def _rewrite_vec_t_brace_constructor(text: str) -> str:
         msl_scalar = _MSL_VEC_SCALAR_PREFIX[full_ctype]
         if n in _MSL_VEC_NATIVE_N:
             return f"{msl_scalar}{n}({args_str})"
+        # Zero-arg ``wp::vec_t<N, T>()`` is the default-construction
+        # form Warp uses for ``vec_t = vec5()`` style local declarations.
+        # The custom big-vec struct's brace value-init (``T{}``) zero-
+        # initialises its scalar array, so we route to that instead of
+        # the N-arg ``_make`` factory which would need N zero literals.
+        if not args_str:
+            return f"wp_vec{n}_{msl_scalar}{{}}"
         return f"wp_vec{n}_{msl_scalar}_make({args_str})"
 
     return pat.sub(repl, text)
@@ -729,7 +773,7 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     # ``wp::length_sq(V)`` is the squared length of a vector. MSL has no
     # native ``length_squared``, so we translate to the dot of the vector
     # with itself — works for native ``floatN`` types.
-    (re.compile(r"wp::length_sq\s*\(\s*([^()]+?)\s*\)"), r"metal::dot(\1, \1)"),
+    (re.compile(r"wp::length_sq\s*\(\s*([^()]+?)\s*\)"), r"wp_dot(\1, \1)"),
     # ``wp::assign(target, value)`` — used by Warp to model in-place mutation
     # of a local (e.g. accumulator updates inside a loop). Translate to a
     # plain assignment statement.
@@ -836,7 +880,14 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
 # simple ``wp::name`` -> ``metal::name`` substitution; the argument list is
 # left intact for MSL to resolve via overload.
 for _name in _MATH_BUILTIN_NAMES:
-    _INTRINSIC_PATTERNS.append((re.compile(rf"\bwp::{_name}\b"), f"metal::{_name}"))
+    # ``dot`` needs custom overloads to support our big-vec structs;
+    # route it through a ``wp_dot`` wrapper that dispatches to either
+    # ``metal::dot`` (native floatN) or our hand-rolled sum-of-products
+    # (big-vec). Other math builtins fall back to the metal namespace.
+    if _name == "dot":
+        _INTRINSIC_PATTERNS.append((re.compile(rf"\bwp::{_name}\b"), "wp_dot"))
+    else:
+        _INTRINSIC_PATTERNS.append((re.compile(rf"\bwp::{_name}\b"), f"metal::{_name}"))
 del _name
 
 
@@ -1029,6 +1080,10 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
     _ast_nodes, _drop_skip = _ast_fold_drop(_ast_nodes, adj)
     _ast_nodes, _view_skip = _ast_fold_views(_ast_nodes, adj, extra_const_ints=_inlined_const_ints)
     _ast_nodes, _indexref_skip = _ast_fold_indexref(_ast_nodes, adj, _early_vec_arr_info)
+    # Flatten multi-dim ``wp::atomic_<op>(arr, i, j, ..., val)`` into the
+    # 3-arg form the intrinsic regex handles, expanding to per-component
+    # atomics for vec-typed arrays.
+    _ast_nodes = _ast_fold_multidim_atomics(_ast_nodes, adj, _early_vec_arr_info)
     forward_lines = _ast_emit(_ast_nodes)
     vars_to_skip_decl: set[str] = _struct_skip | _drop_skip | _view_skip | _indexref_skip
 
@@ -1042,6 +1097,13 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
     array_store_pat = re.compile(r"\s*wp::array_store\s*\(\s*var_([A-Za-z_]\w*)")
     atomic_pat = re.compile(r"wp::atomic_(?:add|sub|min|max)\s*\(\s*var_([A-Za-z_]\w*)")
     scalar_store_pat = re.compile(r"\s*wp::__metal_scalar_store__\s*\(\s*var_([A-Za-z_]\w*)")
+    # Per-component atomics emitted by the multi-dim atomic fold use raw
+    # ``atomic_fetch_<op>_explicit(&arr[...], val, ...)`` lines (no
+    # ``wp::`` prefix and no ``var_`` on the array name — the var prefix
+    # gets stripped because the array is also a kernel arg, which the
+    # name-substitution pass folds to its bare name later). Detect those
+    # too so the output classification picks up the write.
+    raw_atomic_pat = re.compile(r"atomic_fetch_(?:add|sub|min|max)_explicit\s*\(\s*&\s*(\w+)\[")
     for raw in forward_lines:
         m = array_store_pat.match(raw)
         if m:
@@ -1053,6 +1115,10 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
         m = scalar_store_pat.match(raw)
         if m:
             written_arg_names.add(m.group(1))
+        m = raw_atomic_pat.search(raw)
+        if m:
+            written_arg_names.add(m.group(1))
+            atomic_arg_names.add(m.group(1))
 
     # MLX's ``atomic_outputs`` flag is per-kernel, not per-output: when set,
     # *every* output is typed ``device atomic<T>*``. We can still support
@@ -1073,7 +1139,13 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
             # Scalar arg — always an input.
             input_args.append(arg)
             continue
-        if arg.label in written_arg_names:
+        # Args whose names end in ``_out`` are conventionally outputs in
+        # mujoco_warp (and most Warp kernels). Treat them as outputs even
+        # when the body has no detected writes — this happens for kernels
+        # whose write paths are all behind conditionals that don't fire
+        # for trivial models (e.g. ``primitive_narrowphase`` with no
+        # contact pairs). MLX still needs them bound as output buffers.
+        if arg.label in written_arg_names or arg.label.endswith("_out"):
             output_args.append(arg)
         else:
             input_args.append(arg)
@@ -2065,6 +2137,17 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device):
 
     from warp._src.codegen import Struct  # noqa: PLC0415
     from warp._src.context import _metal_get_buffer, runtime  # noqa: PLC0415
+
+    # Empty launches (any dim component is 0) produce no work, so skip
+    # codegen entirely — that lets us tolerate kernels we can't yet
+    # codegen (e.g. ones that exceed Metal's 31 buffer-arg HW limit) as
+    # long as the model never actually runs them with non-zero dim.
+    if isinstance(dim, int):
+        _dims_check = (dim,)
+    else:
+        _dims_check = tuple(dim)
+    if any(d <= 0 for d in _dims_check):
+        return
 
     artifact, mlx_kernel = _get_or_build_metal_kernel(kernel)
 
