@@ -616,14 +616,21 @@ def _emit_into(nodes, out: list[str]) -> None:
         elif isinstance(n, For):
             # Match the existing ``_preprocess_for_loops`` output, which
             # emits the synthetic ``for (...) {`` and matching ``}`` at
-            # column 0 regardless of nesting. We can revisit indentation
-            # cosmetics after Phase 1.3 lands.
+            # column 0 regardless of nesting.
+            #
+            # The iter_var is declared at function scope (its decl is
+            # emitted by the kernel-level decl loop, not skipped) so that
+            # later code outside the loop body can still reference it —
+            # this matches Warp's flat IR semantics and is required by
+            # mujoco_warp's iterative linesearch which mutates the iter
+            # var inside an early-break path. We therefore *don't* re-
+            # declare with ``int`` here; just assign in the init clause.
             iv = n.iter_var
             if n.step == "1":
                 inc = f"++var_{iv}"
             else:
                 inc = f"var_{iv} += {n.step}"
-            out.append(f"for (int var_{iv} = {n.start}; var_{iv} < {n.stop}; {inc}) {{")
+            out.append(f"for (var_{iv} = {n.start}; var_{iv} < {n.stop}; {inc}) {{")
             _emit_into(list(n.body), out)
             out.append("}")
         elif isinstance(n, While):
@@ -772,9 +779,12 @@ def _fold_range(
             # NOTE: silently dropping ``continue`` is a pre-existing bug; we
             # preserve it here for output equivalence and can fix it in a
             # follow-up that emits ``continue;`` instead.
-            body_nodes = _drop_goto(body_nodes, f"start_for_{k_suffix}")
+            body_nodes = _drop_goto(body_nodes, f"start_for_{k_suffix}", end_target=f"end_for_{k_suffix}")
+            # Suppress the ``wp::range_t`` opaque-iterator local decl —
+            # MSL has no equivalent type and the synthetic ``for`` emits
+            # its own state. Keep the iter_var's decl so the variable
+            # stays in scope for any post-loop reads (see ``For`` emit).
             skip.add(range_var)
-            skip.add(iter_var)
             out.append(
                 For(
                     raw=range_node.raw,
@@ -854,10 +864,16 @@ def _fold_if_body(nodes: list[Node], start: int, end: int, skip: set[str]) -> tu
         if opener is not None:
             range_node, range_var, start_expr, stop_expr, step_expr, iter_var, k_suffix = opener
             body_nodes, after = _fold_range(nodes, i + 4, end, end_label=f"end_for_{k_suffix}", skip=skip)
-            if body_nodes and isinstance(body_nodes[-1], Goto) and body_nodes[-1].target == f"start_for_{k_suffix}":
-                body_nodes = body_nodes[:-1]
+            # Drop the trailing ``goto start_for_K`` and rewrite mid-body
+            # ``goto end_for_K`` to ``break;`` (matches the top-level
+            # ``_fold_range`` for-fold). Without this, for-loops folded
+            # inside if-bodies would leak raw gotos.
+            body_nodes = _drop_goto(body_nodes, f"start_for_{k_suffix}", end_target=f"end_for_{k_suffix}")
+            # Suppress the ``wp::range_t`` opaque-iterator local decl —
+            # MSL has no equivalent type and the synthetic ``for`` emits
+            # its own state. Keep the iter_var's decl so the variable
+            # stays in scope for any post-loop reads (see ``For`` emit).
             skip.add(range_var)
-            skip.add(iter_var)
             out.append(
                 For(
                     raw=range_node.raw,
@@ -909,8 +925,18 @@ def _fold_if_body(nodes: list[Node], start: int, end: int, skip: set[str]) -> tu
     raise MetalASTParseError("unterminated if body: hit end of input before }")
 
 
-def _drop_goto(body: tuple[Node, ...] | list[Node], target: str) -> list[Node]:
-    """Recursively drop every ``Goto(target=...)`` in ``body``.
+def _drop_goto(body: tuple[Node, ...] | list[Node], target: str, end_target: str | None = None) -> list[Node]:
+    """Recursively drop ``Goto(start_target)`` and rewrite ``Goto(end_target)``
+    to ``break;``.
+
+    ``target`` is the loop's start label (``start_for_K``); gotos to it are
+    Warp's lowering of ``continue`` plus the implicit trailing one and we
+    drop them to match the existing for-loop fold behaviour.
+    ``end_target`` (when supplied) is the loop's end label
+    (``end_for_K``); gotos to it are Warp's lowering of an early
+    ``break``-style exit (e.g. the conditional terminator that mujoco_warp's
+    iterative linesearch emits) and we rewrite each one to ``break;`` so
+    the iter_var stays in scope and the body re-uses the structured exit.
 
     Recurses into :class:`If` bodies. Inner :class:`For` and :class:`While`
     nodes are left alone — gotos belonging to them have already been
@@ -920,12 +946,16 @@ def _drop_goto(body: tuple[Node, ...] | list[Node], target: str) -> list[Node]:
     for n in body:
         if isinstance(n, Goto) and n.target == target:
             continue
+        if isinstance(n, Goto) and end_target is not None and n.target == end_target:
+            indent = _leading_indent(n.raw)
+            out.append(Break(raw=f"{indent}break;"))
+            continue
         if isinstance(n, If):
             out.append(
                 If(
                     raw=n.raw,
                     cond=n.cond,
-                    body=tuple(_drop_goto(n.body, target)),
+                    body=tuple(_drop_goto(n.body, target, end_target)),
                     raw_open=n.raw_open,
                     raw_close=n.raw_close,
                 )
