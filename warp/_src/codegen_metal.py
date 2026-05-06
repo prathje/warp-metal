@@ -798,6 +798,28 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         re.compile(r"wp::diag\s*\(\s*([^()]+?)\s*\)"),
         r"wp_diag_float3(\1)",
     ),
+    # ``wp::identity<N, wp::T>()`` builds an NxN identity matrix. MSL's
+    # native floatNxN single-scalar constructor fills the diagonal, so
+    # ``floatNxN(1.0f)`` is the identity. (Same for int/uint.)
+    (
+        re.compile(r"wp::identity\s*<\s*(\d+)\s*,\s*wp::(\w+)\s*>\s*\(\s*\)"),
+        lambda m: (
+            f"{_MSL_VEC_SCALAR_PREFIX[f'wp::{m.group(2)}']}{m.group(1)}x{m.group(1)}(1.0f)"
+            if f"wp::{m.group(2)}" in _MSL_VEC_SCALAR_PREFIX
+            else m.group(0)
+        ),
+    ),
+    # ``wp::cw_mul`` / ``wp::cw_div`` — component-wise multiply / divide for
+    # vector operands. MSL's ``vec / vec`` and ``vec * vec`` are already
+    # component-wise.
+    (
+        re.compile(r"wp::cw_mul\s*\(\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)"),
+        r"((\1) * (\2))",
+    ),
+    (
+        re.compile(r"wp::cw_div\s*\(\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)"),
+        r"((\1) / (\2))",
+    ),
     # Strip Warp scalar-type cast wrappers ``wp::T(x)``. Includes the unsuffixed
     # Python-style names ``wp::float``, ``wp::int``, etc. that Warp emits for
     # ``float(x)`` / ``int(x)`` constructor calls in user code.
@@ -986,10 +1008,12 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
     # Inline ``@wp.func`` user-function calls into the kernel body before
     # the view / indexref / drop folds run, so those folds see the spliced-
     # in writes (otherwise kernels that write outputs only via helper
-    # functions would be rejected as having no outputs).
-    _ast_nodes = _ast_inline(_ast_nodes, adj)
+    # functions would be rejected as having no outputs). The inliner also
+    # returns each inlined int-constant local so ``fold_views`` can
+    # recognise slice-step constants from inside inlined bodies.
+    _ast_nodes, _inlined_const_ints = _ast_inline(_ast_nodes, adj)
     _ast_nodes, _drop_skip = _ast_fold_drop(_ast_nodes, adj)
-    _ast_nodes, _view_skip = _ast_fold_views(_ast_nodes, adj)
+    _ast_nodes, _view_skip = _ast_fold_views(_ast_nodes, adj, extra_const_ints=_inlined_const_ints)
     _ast_nodes, _indexref_skip = _ast_fold_indexref(_ast_nodes, adj, _early_vec_arr_info)
     forward_lines = _ast_emit(_ast_nodes)
     vars_to_skip_decl: set[str] = _struct_skip | _drop_skip | _view_skip | _indexref_skip
@@ -1086,6 +1110,12 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
             struct_arr_info[arg.label] = s_info
 
     subscript_map: dict[str, str] = {}  # local label -> "arr[flat_idx]" string
+    # Field pointers that point into a struct's array field. Those fields
+    # aren't materialised on Metal (the launcher doesn't pack arrays into
+    # the struct's flat buffer), so writes through these pointers are
+    # silently dropped and reads raise — handled in the store and load
+    # branches below.
+    unused_field_ptrs: set[str] = set()
     # Locals that resolve to ``<arr>_shape`` (the MLX-supplied shape array).
     # Tracked separately so we can recognise them when emitting / skipping
     # ``wp::load`` and ``wp::extract`` lines that operate on the shape struct.
@@ -1231,6 +1261,14 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
                     raise MetalCodegenError(
                         f"Kernel {adj.fun_name!r}: struct {layout.name!r} has no field {field_name!r}"
                     )
+                field_info = layout.fields[field_name]
+                if field_info.kind == _STRUCT_FIELD_KIND_ARRAY_UNUSED:
+                    # Array fields aren't materialised on Metal. Mark the
+                    # field pointer so any store / read through it is
+                    # rejected with a clear error (or, for stores, silently
+                    # dropped — see the store handling below).
+                    unused_field_ptrs.add(field_local)
+                    continue
                 subscript_map[field_local] = _per_field_local(struct_local, field_name)
                 continue
             # Struct-arg field: the launcher serialises the struct into a
@@ -1243,6 +1281,9 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
                     raise MetalCodegenError(
                         f"Kernel {adj.fun_name!r}: struct arg {struct_local!r} has no field {field_name!r}"
                     )
+                if field_info.kind == _STRUCT_FIELD_KIND_ARRAY_UNUSED:
+                    unused_field_ptrs.add(field_local)
+                    continue
                 base = str(field_info.offset)
                 if field_info.kind == _STRUCT_FIELD_KIND_SCALAR:
                     subscript_map[field_local] = f"{struct_local}[{base}]"
@@ -1254,12 +1295,16 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
                     subscript_map[field_local] = f"{ctor}({', '.join(comps)})"
                 elif field_info.kind == _STRUCT_FIELD_KIND_MAT:
                     rows, cols = field_info.rows, field_info.cols
-                    msl_vec = field_info.msl_type.split("x")[0]
-                    col_strs: list[str] = []
-                    for c in range(cols):
-                        col_components = [f"{struct_local}[{base} + {r * cols + c}]" for r in range(rows)]
-                        col_strs.append(f"{msl_vec}({', '.join(col_components)})")
-                    subscript_map[field_local] = f"{field_info.msl_type}({', '.join(col_strs)})"
+                    if rows in _MSL_VEC_NATIVE_N and cols in _MSL_VEC_NATIVE_N:
+                        msl_vec = field_info.msl_type.split("x")[0]
+                        col_strs: list[str] = []
+                        for c in range(cols):
+                            col_components = [f"{struct_local}[{base} + {r * cols + c}]" for r in range(rows)]
+                            col_strs.append(f"{msl_vec}({', '.join(col_components)})")
+                        subscript_map[field_local] = f"{field_info.msl_type}({', '.join(col_strs)})"
+                    else:
+                        comps = [f"{struct_local}[{base} + {r * cols + c}]" for r in range(rows) for c in range(cols)]
+                        subscript_map[field_local] = f"{field_info.msl_type}_make({', '.join(comps)})"
                 continue
             continue
 
@@ -1271,6 +1316,9 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
         field_info = layout.fields.get(field_name)
         if field_info is None:
             raise MetalCodegenError(f"Kernel {adj.fun_name!r}: struct {layout.name!r} has no field {field_name!r}")
+        if field_info.kind == _STRUCT_FIELD_KIND_ARRAY_UNUSED:
+            unused_field_ptrs.add(field_local)
+            continue
         base = f"{elem_idx_expr} * {layout.scalars_per_elem} + {field_info.offset}"
         if field_info.kind == _STRUCT_FIELD_KIND_SCALAR:
             subscript_map[field_local] = f"{arr_name}[{base}]"
@@ -1280,12 +1328,17 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
             subscript_map[field_local] = f"{ctor}({', '.join(comps)})"
         elif field_info.kind == _STRUCT_FIELD_KIND_MAT:
             rows, cols = field_info.rows, field_info.cols
-            msl_vec = field_info.msl_type.split("x")[0]  # e.g. "float3" from "float3x3"
-            col_strs: list[str] = []
-            for c in range(cols):
-                col_components = [f"{arr_name}[({base}) + {r * cols + c}]" for r in range(rows)]
-                col_strs.append(f"{msl_vec}({', '.join(col_components)})")
-            subscript_map[field_local] = f"{field_info.msl_type}({', '.join(col_strs)})"
+            if rows in _MSL_VEC_NATIVE_N and cols in _MSL_VEC_NATIVE_N:
+                msl_vec = field_info.msl_type.split("x")[0]  # e.g. "float3" from "float3x3"
+                col_strs: list[str] = []
+                for c in range(cols):
+                    col_components = [f"{arr_name}[({base}) + {r * cols + c}]" for r in range(rows)]
+                    col_strs.append(f"{msl_vec}({', '.join(col_components)})")
+                subscript_map[field_local] = f"{field_info.msl_type}({', '.join(col_strs)})"
+            else:
+                # Big-mat custom struct: row-major flat factory.
+                comps = [f"{arr_name}[({base}) + {r * cols + c}]" for r in range(rows) for c in range(cols)]
+                subscript_map[field_local] = f"{field_info.msl_type}_make({', '.join(comps)})"
 
     # --- Local variable declarations -----------------------------------
     body_lines: list[str] = []
@@ -1293,6 +1346,10 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
         if var.label in subscript_map:
             # This local was a pointer into an array arg; we'll inline its
             # uses below, so it doesn't need a declaration.
+            continue
+        if var.label in unused_field_ptrs:
+            # Pointer into a struct's array field — not materialised on
+            # Metal. Writes are dropped, so the local is unreferenced.
             continue
         if var.label in struct_refs:
             # Struct-array pointer local — its ``->field`` accesses go
@@ -1429,6 +1486,10 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
             value = m_store.group("val")
             indent = m_store.group("indent")
             op = store_op_map[m_store.group("op")]
+            if addr in unused_field_ptrs:
+                # Drop the write — the target struct field is an array
+                # field that isn't materialised on Metal.
+                continue
             if addr in subscript_map:
                 lhs = subscript_map[addr]
                 body_lines.append(_finalize(f"{indent}{lhs} {op} {value};"))
@@ -1572,13 +1633,15 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
                             for k in range(finfo.size):
                                 body_lines.append(_finalize(_emit_scalar_write(f"{base} + {off} + {k}", f"{src}[{k}]")))
                         elif finfo.kind == _STRUCT_FIELD_KIND_MAT:
+                            native = finfo.rows in _MSL_VEC_NATIVE_N and finfo.cols in _MSL_VEC_NATIVE_N
                             for r in range(finfo.rows):
                                 for c in range(finfo.cols):
+                                    rhs = f"{src}[{c}][{r}]" if native else f"{src}.c[{r * finfo.cols + c}]"
                                     body_lines.append(
                                         _finalize(
                                             _emit_scalar_write(
                                                 f"{base} + {off + r * finfo.cols + c}",
-                                                f"{src}[{c}][{r}]",
+                                                rhs,
                                             )
                                         )
                                     )
@@ -1619,6 +1682,17 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
     )
 
 
+def _is_array_arg_type(t) -> bool:
+    """Return True if ``t`` is a ``wp.array`` family type annotation."""
+    from warp._src.types import _ArrayAnnotationBase, array, indexedarray  # noqa: PLC0415
+
+    if isinstance(t, (array, indexedarray)):
+        return True
+    if isinstance(t, _ArrayAnnotationBase):
+        return True
+    return getattr(t, "_wp_generic_type_str_", None) in ("array_t", "indexedarray_t")
+
+
 def _is_array_arg(var) -> bool:
     """Return True if a kernel arg's type is a ``wp.array`` family.
 
@@ -1630,16 +1704,7 @@ def _is_array_arg(var) -> bool:
         and is missing the ``_wp_generic_type_str_`` marker the older form
         carries).
     """
-    # Lazy import to avoid import cycle with warp._src.types.
-    from warp._src.types import _ArrayAnnotationBase, array, indexedarray  # noqa: PLC0415
-
-    t = var.type
-    if isinstance(t, (array, indexedarray)):
-        return True
-    if isinstance(t, _ArrayAnnotationBase):
-        return True
-    # ``wp.array`` annotations live as classes too:
-    return getattr(t, "_wp_generic_type_str_", None) in ("array_t", "indexedarray_t")
+    return _is_array_arg_type(var.type)
 
 
 def _vec_dtype_info(arg) -> tuple[int, str] | None:
@@ -1718,6 +1783,13 @@ def _mat_dtype_info(arg) -> tuple[int, int, str] | None:
 _STRUCT_FIELD_KIND_SCALAR = "scalar"
 _STRUCT_FIELD_KIND_VEC = "vec"
 _STRUCT_FIELD_KIND_MAT = "mat"
+_STRUCT_FIELD_KIND_ARRAY_UNUSED = "array_unused"
+"""Sentinel for ``wp.array``-typed struct fields. We allow them to exist in
+the layout (so the struct's other fields can still be read/written) but
+their slot has size 0: any read or write through such a field raises a
+clear MetalCodegenError. Used for kernels that pass a model struct with
+mesh array fields where only the primitive (scalar / vec / mat) fields
+are actually accessed at runtime."""
 
 
 @dataclass
@@ -1754,14 +1826,17 @@ def _classify_struct_field(fname: str, ftype) -> tuple[str, int, str, int, int]:
         rows, cols = int(ftype._shape_[0]), int(ftype._shape_[1])
         scalar_cls = ftype._wp_scalar_type_
         scalar_ctype = f"wp::{scalar_cls.__name__}"
-        if (
-            rows not in _MSL_VEC_SUPPORTED_N
-            or cols not in _MSL_VEC_SUPPORTED_N
-            or scalar_ctype not in _MSL_VEC_SCALAR_PREFIX
-        ):
+        if rows < 2 or cols < 2 or scalar_ctype not in _MSL_VEC_SCALAR_PREFIX:
             raise MetalCodegenError(f"MSL codegen does not support mat field {fname!r} of {ftype!r} in a struct")
         msl_scalar = _MSL_VEC_SCALAR_PREFIX[scalar_ctype]
-        return _STRUCT_FIELD_KIND_MAT, rows * cols, f"{msl_scalar}{rows}x{cols}", rows, cols
+        # Native ``floatNxN`` for sizes in {2, 3, 4} per dim; otherwise the
+        # custom ``wp_matRxC_<scalar>`` struct (header-emitted big-mat).
+        return _STRUCT_FIELD_KIND_MAT, rows * cols, _msl_mat_name(rows, cols, msl_scalar), rows, cols
+    # array (1D, 2D, ..., any dtype) — tag as unused. Only kernels that
+    # never actually read/write the field will codegen successfully; if
+    # the field is touched, the field-pointer pass raises a clear error.
+    if _is_array_arg_type(ftype):
+        return _STRUCT_FIELD_KIND_ARRAY_UNUSED, 0, "<array>", 0, 0
     # Scalar
     name = getattr(ftype, "__name__", None)
     if name is None:
