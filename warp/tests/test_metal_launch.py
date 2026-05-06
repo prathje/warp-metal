@@ -825,6 +825,64 @@ class TestMetalLaunch(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet)
 
+    def test_diag_vec3_to_mat3x3_matches_cpu(self):
+        # ``wp.diag(vec3)`` builds a 3x3 diagonal matrix. We route this
+        # through a ``wp_diag_float3`` helper emitted in the kernel header.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(v: wp.array(dtype=wp.vec3),
+                  m: wp.array(dtype=wp.mat33),
+                  out: wp.array(dtype=wp.mat33)):
+                tid = wp.tid()
+                # m @ diag(v) @ transpose(m) — typical body-inertia transform
+                out[tid] = m[tid] @ wp.diag(v[tid]) @ wp.transpose(m[tid])
+
+            N = 8
+            rng = np.random.default_rng(0)
+            vn = rng.standard_normal((N, 3)).astype(np.float32)
+            mn = rng.standard_normal((N, 3, 3)).astype(np.float32)
+            results = {}
+            for dev in ('cpu', 'metal:0'):
+                v = wp.array(vn, dtype=wp.vec3, device=dev)
+                m = wp.array(mn, dtype=wp.mat33, device=dev)
+                out = wp.zeros(N, dtype=wp.mat33, device=dev)
+                wp.launch(k, dim=N, inputs=[v, m], outputs=[out], device=dev)
+                results[dev] = out.numpy()
+            np.testing.assert_allclose(results['cpu'], results['metal:0'], rtol=1e-5)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_indexref_scalar_write_matches_cpu(self):
+        # ``out[i, j][k] = val`` lowers to ``address + indexref + store``.
+        # Our preprocessor folds this into a synthetic scalar-store token
+        # so the underlying array is correctly classified as an output and
+        # the write becomes a direct flat-offset subscript assignment.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(out: wp.array2d(dtype=wp.spatial_vector)):
+                worldid, k = wp.tid()
+                out[worldid, 0][k] = float(worldid * 10 + k)
+
+            N = 4
+            results = {}
+            for dev in ('cpu', 'metal:0'):
+                out = wp.zeros((N, 1), dtype=wp.spatial_vector, device=dev)
+                wp.launch(k, dim=(N, 6), outputs=[out], device=dev)
+                results[dev] = out.numpy()
+            np.testing.assert_array_equal(results['cpu'], results['metal:0'])
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
     def test_vec_element_inplace_matches_cpu(self):
         # ``vec[i] = val``, ``vec[i] *= val``, etc. lower to
         # ``wp::*_inplace(vec, idx, val)`` (3-arg form), distinct from the
