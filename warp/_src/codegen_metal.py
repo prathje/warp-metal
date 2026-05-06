@@ -360,10 +360,18 @@ def _emit_spatial_helpers() -> str:
     )
 
 
+_DIAG_HELPER_FLOAT3 = (
+    "inline float3x3 wp_diag_float3(float3 v) {\n"
+    "    return float3x3(float3(v[0], 0.0f, 0.0f), "
+    "float3(0.0f, v[1], 0.0f), "
+    "float3(0.0f, 0.0f, v[2]));\n"
+    "}"
+)
+
+
 def _build_kernel_header(source: str) -> str:
-    """Scan ``source`` for ``wp_vecN_<scalar>`` struct names and emit a
-    header block defining each unique one (plus spatial helpers if vec6
-    structs are present).
+    """Scan ``source`` for helpers we need to emit (big-vec structs,
+    spatial helpers, diag helper) and return their definitions.
     """
     seen: set[tuple[int, str]] = set()
     for m in _BIG_VEC_NAME_PAT.finditer(source):
@@ -376,13 +384,15 @@ def _build_kernel_header(source: str) -> str:
             # the custom name — but guard defensively.
             continue
         seen.add((n, scalar))
-    if not seen:
-        return ""
     parts: list[str] = []
     for n, scalar in sorted(seen):
         parts.append(_emit_big_vec_struct(f"wp_vec{n}_{scalar}", n, scalar))
     if (6, "float") in seen:
         parts.append(_emit_spatial_helpers())
+    if "wp_diag_float3" in source:
+        parts.append(_DIAG_HELPER_FLOAT3)
+    if not parts:
+        return ""
     return "\n".join(parts) + "\n"
 
 
@@ -676,6 +686,14 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (
         re.compile(r"wp::atomic_max\s*\(\s*([^,()]+?)\s*,\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)"),
         r"atomic_fetch_max_explicit(&\1[\2], \3, memory_order_relaxed)",
+    ),
+    # ``wp::diag(vec3)`` builds a 3x3 diagonal matrix. MSL has no native
+    # diag-from-vector helper, so we route it through ``wp_diag_float3``
+    # (emitted in the kernel header when this token appears in the source).
+    # Only the vec3 form is supported — it's the only size used in practice.
+    (
+        re.compile(r"wp::diag\s*\(\s*([^()]+?)\s*\)"),
+        r"wp_diag_float3(\1)",
     ),
     # Strip Warp scalar-type cast wrappers ``wp::T(x)``. Includes the unsuffixed
     # Python-style names ``wp::float``, ``wp::int``, etc. that Warp emits for
@@ -1004,6 +1022,102 @@ _VIEW_ATOMIC_PAT = re.compile(
 )
 
 
+_INDEXREF_PAT = re.compile(r"^\s*var_(\w+)\s*=\s*wp::indexref\s*\(\s*var_(\w+)\s*,\s*var_(\w+)\s*\)\s*;\s*$")
+_STORE_2ARG_PAT = re.compile(
+    r"^\s*wp::(store|assign_inplace|add_inplace|sub_inplace|mul_inplace|div_inplace)\s*"
+    r"\(\s*var_(\w+)\s*,\s*([^()]+?)\s*\)\s*;\s*$"
+)
+
+
+def _preprocess_indexref_writes(
+    forward_lines: list[str],
+    adj,
+    vec_arr_info: dict[str, tuple[int, str]],
+) -> tuple[list[str], set[str]]:
+    """Fold ``address(vec_arr, i, j) + indexref(addr, k) + store(ptr, val)``
+    into a synthetic scalar write to ``vec_arr[..., k]``.
+
+    Used by kernels that zero / mutate a single vec component of an output
+    (``out[i, j][k] = val`` in user code). Without this rewrite, our
+    output-array detector misses the write entirely (it scans for
+    ``wp::array_store`` and ``wp::atomic_*`` only) and the kernel is
+    rejected as having no outputs.
+
+    The synthetic line has the form
+    ``wp::__metal_scalar_store__(arr, op, flat_idx_expr, val);`` — a custom
+    token the body emitter recognises and turns into a direct subscript
+    write.
+
+    Returns ``(rewritten_lines, skip_decls)`` — declarations of the
+    address and indexref locals are dropped.
+    """
+    arg_label_set = {a.label for a in adj.args}
+    address_pat = re.compile(r"^\s*var_(\w+)\s*=\s*wp::address\s*\(\s*var_(\w+)((?:\s*,\s*var_\w+)+)\s*\)\s*;\s*$")
+    addr_aliases: dict[str, tuple[str, list[str]]] = {}
+    for raw in forward_lines:
+        m = address_pat.match(raw)
+        if not m:
+            continue
+        addr_local = m.group(1)
+        arr_name = m.group(2)
+        if arr_name not in arg_label_set or arr_name not in vec_arr_info:
+            continue
+        idx_labels = re.findall(r"var_(\w+)", m.group(3))
+        addr_aliases[addr_local] = (arr_name, idx_labels)
+
+    indexref_aliases: dict[str, tuple[str, list[str], str]] = {}
+    referenced_addr_locals: set[str] = set()
+    for raw in forward_lines:
+        m = _INDEXREF_PAT.match(raw)
+        if not m:
+            continue
+        ref_local, addr_local, comp_label = m.group(1), m.group(2), m.group(3)
+        if addr_local not in addr_aliases:
+            continue
+        arr_name, idx_labels = addr_aliases[addr_local]
+        indexref_aliases[ref_local] = (arr_name, idx_labels, comp_label)
+        referenced_addr_locals.add(addr_local)
+
+    if not indexref_aliases:
+        return forward_lines, set()
+
+    skip_decls: set[str] = set(referenced_addr_locals) | set(indexref_aliases.keys())
+    out_lines: list[str] = []
+    for raw in forward_lines:
+        m = address_pat.match(raw)
+        if m and m.group(1) in referenced_addr_locals:
+            continue
+        m = _INDEXREF_PAT.match(raw)
+        if m and m.group(1) in indexref_aliases:
+            continue
+        m = _STORE_2ARG_PAT.match(raw)
+        if m and m.group(2) in indexref_aliases:
+            op = m.group(1)
+            ref_local = m.group(2)
+            val = m.group(3).strip()
+            arr_name, idx_labels, comp_label = indexref_aliases[ref_local]
+            vec_n, _ = vec_arr_info[arr_name]
+            idx_vars = [f"var_{l}" for l in idx_labels]
+            n = len(idx_vars)
+            if n == 1:
+                elem_idx = idx_vars[0]
+            else:
+                terms = []
+                for k, idx in enumerate(idx_vars):
+                    if k == n - 1:
+                        terms.append(idx)
+                    else:
+                        stride = " * ".join(f"{arr_name}_shape[{j}]" for j in range(k + 1, n))
+                        terms.append(f"{idx} * {stride}")
+                elem_idx = " + ".join(terms)
+            flat_idx = f"({elem_idx}) * {vec_n} + var_{comp_label}"
+            out_lines.append(f"    wp::__metal_scalar_store__(var_{arr_name}, {op}, {flat_idx}, {val});")
+            continue
+        out_lines.append(raw)
+
+    return out_lines, skip_decls
+
+
 def _preprocess_views(forward_lines: list[str], adj) -> tuple[list[str], set[str]]:
     """Rewrite ``slice_t`` + ``view`` IR patterns into direct array ops.
 
@@ -1152,6 +1266,18 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
     # become declaration-skipped aliases.
     forward_lines, view_skip_decls = _preprocess_views(forward_lines, adj)
     vars_to_skip_decl |= view_skip_decls
+    # Indexref-write preprocessing: ``out[i, j][k] = val`` lowers to an
+    # ``address + indexref + store`` chain that our output detector misses
+    # because it scans for ``array_store``/``atomic_*`` only. We rewrite
+    # the chain to a synthetic ``wp::__metal_scalar_store__`` token. Needs
+    # ``vec_arr_info``, which is computed below — so do a quick scan for it.
+    _early_vec_arr_info: dict[str, tuple[int, str]] = {}
+    for arg in adj.args:
+        v_info = _vec_dtype_info(arg)
+        if v_info is not None:
+            _early_vec_arr_info[arg.label] = v_info
+    forward_lines, indexref_skip_decls = _preprocess_indexref_writes(forward_lines, adj, _early_vec_arr_info)
+    vars_to_skip_decl |= indexref_skip_decls
 
     # Classify each array arg as input or output by scanning the IR strings.
     # MLX inputs are ``const device T*`` (read-only) — verified empirically —
@@ -1162,6 +1288,7 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
     atomic_arg_names: set[str] = set()
     array_store_pat = re.compile(r"\s*wp::array_store\s*\(\s*var_([A-Za-z_]\w*)")
     atomic_pat = re.compile(r"wp::atomic_(?:add|sub|min|max)\s*\(\s*var_([A-Za-z_]\w*)")
+    scalar_store_pat = re.compile(r"\s*wp::__metal_scalar_store__\s*\(\s*var_([A-Za-z_]\w*)")
     for raw in forward_lines:
         m = array_store_pat.match(raw)
         if m:
@@ -1170,6 +1297,9 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
         if m:
             written_arg_names.add(m.group(1))
             atomic_arg_names.add(m.group(1))
+        m = scalar_store_pat.match(raw)
+        if m:
+            written_arg_names.add(m.group(1))
 
     # MLX's ``atomic_outputs`` flag is per-kernel, not per-output: when set,
     # *every* output is typed ``device atomic<T>*``. We can still support
@@ -1610,6 +1740,38 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
             body_lines.append(_finalize(f"{indent}var_{i_label} = (int)thread_position_in_grid.x;"))
             body_lines.append(_finalize(f"{indent}var_{j_label} = (int)thread_position_in_grid.y;"))
             body_lines.append(_finalize(f"{indent}var_{k_label} = (int)thread_position_in_grid.z;"))
+            continue
+        # ``wp::__metal_scalar_store__(arr, op, flat_idx, val);`` — synthetic
+        # token emitted by ``_preprocess_indexref_writes`` for single-
+        # component writes through ``address + indexref + store``. The
+        # flat_idx already accounts for the vec stride, so this lowers to
+        # a plain scalar subscript write (or atomic store under atomic mode).
+        scalar_store_match = re.match(
+            r"^(?P<indent>\s*)wp::__metal_scalar_store__\s*\(\s*var_(?P<arr>\w+)\s*,\s*"
+            r"(?P<op>store|assign_inplace|add_inplace|sub_inplace|mul_inplace|div_inplace)\s*,\s*"
+            r"(?P<idx>[^,]+(?:,[^,]+)*?)\s*,\s*(?P<val>[^()]+?)\s*\)\s*;\s*$",
+            raw,
+        )
+        if scalar_store_match:
+            indent = scalar_store_match.group("indent")
+            arr = scalar_store_match.group("arr")
+            op_name = scalar_store_match.group("op")
+            idx = scalar_store_match.group("idx").strip()
+            val = scalar_store_match.group("val").strip()
+            output_arg_names = {a.label for a in output_args}
+            op_sym = {
+                "store": "=",
+                "assign_inplace": "=",
+                "add_inplace": "+=",
+                "sub_inplace": "-=",
+                "mul_inplace": "*=",
+                "div_inplace": "/=",
+            }[op_name]
+            if has_atomic and arr in output_arg_names and op_sym == "=":
+                line_out = f"{indent}atomic_store_explicit(&{arr}[{idx}], {val}, memory_order_relaxed);"
+            else:
+                line_out = f"{indent}{arr}[{idx}] {op_sym} {val};"
+            body_lines.append(_finalize(line_out))
             continue
         # ``wp::array_store(arr, idx0, idx1, ..., val);`` — variable arity,
         # rewrite to ``arr[flat_idx] = val;`` (or per-component for vec-typed
