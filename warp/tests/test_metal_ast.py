@@ -21,18 +21,22 @@ from __future__ import annotations
 import unittest
 
 import warp as wp
+from warp._src.codegen_metal import _preprocess_for_loops, _preprocess_while_loops
 from warp._src.codegen_metal_ast import (
     AddrOf,
     Assign,
     BlockClose,
     BlockElse,
     BlockOpen,
+    Break,
     Builtin,
     Comment,
     Const,
     Empty,
+    For,
     ForIterCmp,
     Goto,
+    If,
     Label,
     MetalASTParseError,
     Pragma,
@@ -41,8 +45,11 @@ from warp._src.codegen_metal_ast import (
     UserCall,
     Var,
     VoidCall,
+    While,
+    WhileCondBreak,
     WhileCondTest,
     emit,
+    fold,
     parse,
     parse_line,
 )
@@ -297,6 +304,161 @@ class TestMetalASTRoundTrip(unittest.TestCase):
             wp.atomic_add(out, 0, a[tid])
 
         self._roundtrip(k)
+
+
+class TestMetalASTFold(unittest.TestCase):
+    """Verify the fold pass produces structured nodes equivalent in shape and
+    output to running ``_preprocess_for_loops + _preprocess_while_loops``
+    from :mod:`warp._src.codegen_metal`.
+    """
+
+    def _fold_ir(self, kernel) -> tuple[list, set[str], list[str]]:
+        """Build IR, parse, fold; also return the existing-pipeline output
+        for comparison."""
+        lines = _kernel_ir(kernel)
+        nodes = parse(lines)
+        folded, skip = fold(nodes)
+
+        # Existing pipeline output (the spec we must match).
+        old_for, _ = _preprocess_for_loops(lines)
+        old_lines = _preprocess_while_loops(old_for)
+        return folded, skip, old_lines
+
+    def _assert_equivalent(self, kernel):
+        """Folded emit must equal the existing preprocessor output."""
+        lines = _kernel_ir(kernel)
+        nodes = parse(lines)
+        folded, skip = fold(nodes)
+        new_lines = emit(folded)
+
+        old_for, old_skip = _preprocess_for_loops(lines)
+        old_lines = _preprocess_while_loops(old_for)
+
+        self.assertEqual(
+            new_lines,
+            old_lines,
+            f"emit(fold(parse(...))) != preprocess(...) on kernel {kernel.key!r}",
+        )
+        self.assertEqual(skip, old_skip, f"skip set mismatch on kernel {kernel.key!r}")
+
+    def test_dynamic_for_loop_one_arg_range(self):
+        @wp.kernel
+        def k(a: wp.array(dtype=wp.int32), out: wp.array(dtype=wp.int32)):
+            tid = wp.tid()
+            s = int(0)
+            for i in range(a[tid]):
+                s += i
+            out[tid] = s
+
+        folded, _, _ = self._fold_ir(k)
+        # The body should contain exactly one For node.
+        for_nodes = [n for n in folded if isinstance(n, For)]
+        self.assertEqual(len(for_nodes), 1)
+        self.assertEqual(for_nodes[0].start, "0")
+        self._assert_equivalent(k)
+
+    def test_dynamic_for_loop_two_arg_range(self):
+        @wp.kernel
+        def k(starts: wp.array(dtype=wp.int32), stops: wp.array(dtype=wp.int32), out: wp.array(dtype=wp.int32)):
+            tid = wp.tid()
+            s = int(0)
+            for i in range(starts[tid], stops[tid]):
+                s += i
+            out[tid] = s
+
+        folded, _, _ = self._fold_ir(k)
+        for_nodes = [n for n in folded if isinstance(n, For)]
+        self.assertEqual(len(for_nodes), 1)
+        self.assertNotEqual(for_nodes[0].start, "0")  # start is the explicit var
+        self._assert_equivalent(k)
+
+    def test_while_loop(self):
+        @wp.kernel
+        def k(a: wp.array(dtype=wp.int32), out: wp.array(dtype=wp.int32)):
+            tid = wp.tid()
+            n = a[tid]
+            s = int(0)
+            while n > 0:
+                s += n
+                n -= 1
+            out[tid] = s
+
+        folded, _, _ = self._fold_ir(k)
+        while_nodes = [n for n in folded if isinstance(n, While)]
+        self.assertEqual(len(while_nodes), 1)
+        # The body must contain a WhileCondBreak (the cond test was rewritten)
+        # and no Goto referencing this loop's labels.
+        body = while_nodes[0].body
+        self.assertTrue(any(isinstance(n, WhileCondBreak) for n in body))
+        self.assertFalse(
+            any(isinstance(n, Goto) and ("while" in n.target) for n in body),
+            "structured while body should contain no goto-to-while-labels",
+        )
+        self._assert_equivalent(k)
+
+    def test_while_loop_with_break(self):
+        @wp.kernel
+        def k(a: wp.array(dtype=wp.int32), out: wp.array(dtype=wp.int32)):
+            tid = wp.tid()
+            i = int(0)
+            n = a[tid]
+            while True:
+                if i >= n:
+                    break
+                i += 1
+            out[tid] = i
+
+        folded, _, _ = self._fold_ir(k)
+        while_nodes = [n for n in folded if isinstance(n, While)]
+        self.assertEqual(len(while_nodes), 1)
+
+        # The break must have been folded into a Break node, somewhere in the
+        # body or its nested If.
+        def _has_break(nodes):
+            for nn in nodes:
+                if isinstance(nn, Break):
+                    return True
+                if isinstance(nn, If):
+                    if _has_break(list(nn.body)):
+                        return True
+                    if nn.else_body is not None and _has_break(list(nn.else_body)):
+                        return True
+            return False
+
+        self.assertTrue(_has_break(list(while_nodes[0].body)))
+        self._assert_equivalent(k)
+
+    def test_if_else_lowers_to_two_ifs(self):
+        # Warp lowers Python ``if/else`` to two separate ``if`` statements
+        # (the second on the negated condition), so we expect two If nodes
+        # and never a structured else-arm.
+        @wp.kernel
+        def k(a: wp.array(dtype=wp.int32), out: wp.array(dtype=wp.int32)):
+            tid = wp.tid()
+            x = a[tid]
+            if x > 0:
+                out[tid] = x * 2
+            else:
+                out[tid] = -x
+
+        folded, _, _ = self._fold_ir(k)
+        if_nodes = [n for n in folded if isinstance(n, If)]
+        self.assertGreaterEqual(len(if_nodes), 2)
+        self._assert_equivalent(k)
+
+    def test_nested_for_in_while(self):
+        @wp.kernel
+        def k(a: wp.array(dtype=wp.int32), out: wp.array(dtype=wp.int32)):
+            tid = wp.tid()
+            s = int(0)
+            n = a[tid]
+            while n > 0:
+                for j in range(n):
+                    s += j
+                n -= 1
+            out[tid] = s
+
+        self._assert_equivalent(k)
 
 
 if __name__ == "__main__":
