@@ -3104,6 +3104,19 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim: int = 2
         )
     if any(d <= 0 for d in dims):
         return
+    # ``wp.launch_tiled(dim=D, block_dim=B)`` appends ``B`` as a trailing
+    # grid dim (see ``warp._src.context.launch_tiled``) and expects each of
+    # the resulting ``D × B`` threads to cooperate within a tile. We lower
+    # ``wp.block_dim()`` to literal ``1`` so cooperative-tile kernels run
+    # serially per tile — keep only one thread per tile by collapsing the
+    # appended trailing dim. Without this collapse, mujoco_warp's
+    # ``linesearch_iterative`` (launched with ``block_dim=32``) runs 32
+    # threads each striding through ``for dofid in range(tid, nv, 1)`` and
+    # multiply-counts every dof < ``block_dim`` — observed as a 3× scaling
+    # of qacc on the freejoint sphere (block_dim=32, nv=6 → dof 2 hit by
+    # threads y=0,1,2).
+    if len(dims) > 1 and dims[-1] == block_dim and block_dim > 1:
+        dims = dims[:-1]
     grid_x = dims[0]
     grid_y = dims[1] if len(dims) >= 2 else 1
     grid_z = dims[2] if len(dims) >= 3 else 1
@@ -3121,7 +3134,6 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim: int = 2
         tg = (min(256, grid_x), 1, 1)
     else:
         tg = (min(64, grid_x), 1, 1)
-    del block_dim  # unused — see comment above
 
     # MLX outputs are uninitialized by default. For atomic-output kernels
     # we *must* zero-initialize so the first ``atomic_fetch_add`` accumulates
