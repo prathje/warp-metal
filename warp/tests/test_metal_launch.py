@@ -825,6 +825,46 @@ class TestMetalLaunch(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet)
 
+    def test_dynamic_range_two_arg_matches_cpu(self):
+        # ``range(start, stop)`` with non-constant bounds lowers to
+        # ``wp::range(var_start, var_stop)``. Our for-loop preprocessor
+        # rewrites this to ``for (int i = start; i < stop; ++i)``.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(a: wp.array(dtype=wp.float32),
+                  starts: wp.array(dtype=wp.int32),
+                  stops: wp.array(dtype=wp.int32),
+                  out: wp.array(dtype=wp.float32)):
+                tid = wp.tid()
+                s = float(0.0)
+                for i in range(starts[tid], stops[tid]):
+                    s += a[i]
+                out[tid] = s
+
+            N, M = 32, 64
+            rng = np.random.default_rng(0)
+            an = rng.standard_normal(M).astype(np.float32)
+            starts_n = rng.integers(0, M // 2, size=N, dtype=np.int32)
+            stops_n = (starts_n + rng.integers(0, M // 2, size=N, dtype=np.int32) + 1)
+            stops_n = np.minimum(stops_n, M).astype(np.int32)
+            results = {}
+            for dev in ('cpu', 'metal:0'):
+                a = wp.array(an, dtype=wp.float32, device=dev)
+                starts = wp.array(starts_n, dtype=wp.int32, device=dev)
+                stops = wp.array(stops_n, dtype=wp.int32, device=dev)
+                out = wp.zeros(N, dtype=wp.float32, device=dev)
+                wp.launch(k, dim=N, inputs=[a, starts, stops],
+                          outputs=[out], device=dev)
+                results[dev] = out.numpy()
+            np.testing.assert_allclose(results['cpu'], results['metal:0'], rtol=1e-5)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
     def test_slice_view_array_store_matches_cpu(self):
         # Regular ``out2d[i][j] = val`` store path through a view.
         snippet = textwrap.dedent(

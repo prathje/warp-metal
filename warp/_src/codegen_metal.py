@@ -836,7 +836,7 @@ def _strip_comments_and_directives(line: str) -> str | None:
 # need no rewrite — they appear as straight-line code. The dynamic pattern is
 # always:
 #
-#     var_X = wp::range(var_N);
+#     var_X = wp::range(var_N);                        // or range(var_S, var_E)
 #     start_for_K:;
 #         if (iter_cmp(var_X) == 0) goto end_for_K;
 #         var_Y = wp::iter_next(var_X);
@@ -844,12 +844,13 @@ def _strip_comments_and_directives(line: str) -> str | None:
 #         goto start_for_K;
 #     end_for_K:;
 #
-# We rewrite the opener to ``for (int var_Y = 0; var_Y < var_N; ++var_Y) {``,
-# the trailing ``goto`` to nothing, and the end label to ``}``. The MSL
-# compiler does support ``goto`` so a more literal lowering would also work,
-# but a real ``for`` produces cleaner emitted code that's easy to read in
-# debug builds and removes the need to declare a ``range_t`` type.
-_RANGE_PAT = re.compile(r"^\s*var_(\w+)\s*=\s*wp::range\s*\(\s*var_(\w+)\s*\)\s*;\s*$")
+# We rewrite the opener to ``for (int var_Y = <start>; var_Y < <stop>;
+# ++var_Y) {``, the trailing ``goto`` to nothing, and the end label to ``}``.
+# 1-arg ``range(stop)`` uses start=0; 2-arg ``range(start, stop)`` uses the
+# supplied bounds. The MSL compiler does support ``goto`` so a more literal
+# lowering would also work, but a real ``for`` produces cleaner emitted code
+# and removes the need to declare a ``range_t`` type.
+_RANGE_PAT = re.compile(r"^\s*var_(\w+)\s*=\s*wp::range\s*\(\s*var_(\w+)\s*(?:,\s*var_(\w+)\s*)?\)\s*;\s*$")
 _START_LABEL_PAT = re.compile(r"^\s*start_for_(\d+)\s*:\s*;\s*$")
 _ITER_CMP_PAT = re.compile(r"^\s*if\s*\(\s*iter_cmp\s*\(\s*var_(\w+)\s*\)\s*==\s*0\s*\)\s*goto\s+end_for_(\d+)\s*;\s*$")
 _ITER_NEXT_PAT = re.compile(r"^\s*var_(\w+)\s*=\s*wp::iter_next\s*\(\s*var_(\w+)\s*\)\s*;\s*$")
@@ -948,11 +949,18 @@ def _preprocess_for_loops(lines: list[str]) -> tuple[list[str], set[str]]:
                 and m_start.group(1) == m_cmp.group(2)
             ):
                 range_var_label = m_range.group(1)
-                range_arg_label = m_range.group(2)
+                # 1-arg ``range(stop)`` -> group(3) is None, start=0.
+                # 2-arg ``range(start, stop)`` -> both groups present.
+                if m_range.group(3) is None:
+                    start_expr = "0"
+                    stop_expr = f"var_{m_range.group(2)}"
+                else:
+                    start_expr = f"var_{m_range.group(2)}"
+                    stop_expr = f"var_{m_range.group(3)}"
                 iter_var_label = m_next.group(1)
                 processed.append(
-                    f"for (int var_{iter_var_label} = 0; "
-                    f"var_{iter_var_label} < var_{range_arg_label}; "
+                    f"for (int var_{iter_var_label} = {start_expr}; "
+                    f"var_{iter_var_label} < {stop_expr}; "
                     f"++var_{iter_var_label}) {{"
                 )
                 # Range-iterator local doesn't exist in MSL output; iter var
