@@ -978,6 +978,142 @@ def _preprocess_for_loops(lines: list[str]) -> tuple[list[str], set[str]]:
     return processed, skip
 
 
+_SLICE_T_PAT = re.compile(
+    r"^\s*var_(\w+)\s*=\s*wp::slice_t\s*\(\s*var_(\w+)\s*,\s*var_(\w+)\s*,\s*var_(\w+)\s*\)\s*;\s*$"
+)
+_VIEW_PAT = re.compile(r"^\s*var_(\w+)\s*=\s*wp::view\s*\(\s*var_(\w+)((?:\s*,\s*var_\w+)+)\s*\)\s*;\s*$")
+_VIEW_ADDRESS_PAT = re.compile(
+    r"^(?P<indent>\s*)var_(?P<local>\w+)\s*=\s*"
+    r"wp::address\s*\(\s*var_(?P<arr>\w+)(?P<rest>(?:\s*,\s*var_\w+)*)\s*\)\s*;\s*$"
+)
+_VIEW_ARRAY_STORE_PAT = re.compile(
+    r"^(?P<indent>\s*)wp::array_store\s*\(\s*var_(?P<arr>\w+)(?P<rest>(?:\s*,\s*[^()]+?)+)\s*\)\s*;\s*$"
+)
+_VIEW_ATOMIC_PAT = re.compile(
+    r"^(?P<indent>\s*)var_(?P<local>\w+)\s*=\s*"
+    r"wp::(?P<op>atomic_(?:add|sub|min|max))\s*\(\s*var_(?P<arr>\w+)\s*,\s*"
+    r"(?P<idx>[^,()]+?)\s*,\s*(?P<val>[^()]+?)\s*\)\s*;\s*$"
+)
+
+
+def _preprocess_views(forward_lines: list[str], adj) -> tuple[list[str], set[str]]:
+    """Rewrite ``slice_t`` + ``view`` IR patterns into direct array ops.
+
+    Warp lowers ``arr[i]`` (single integer index on a multi-dim array) to:
+
+        var_S = wp::slice_t(i, i, 0);   // step=0 means "integer index"
+        var_V = wp::view(arr, var_S);
+        ... uses of var_V ...
+
+    We only support this integer-index pattern — full slices (``arr[i:j]``)
+    aren't seen in mujoco_warp's hot path. The view's downstream uses
+    (``wp::address``, ``wp::array_store``, ``wp::atomic_*``) are translated
+    into the underlying-array equivalent with the leading slice index(es)
+    prepended; the ``slice_t`` and ``view`` declaration lines drop out.
+
+    Views passed to a user-defined function aren't supported (we'd need to
+    inline the call) — caught later by the unsupported-intrinsic guard.
+
+    Returns ``(rewritten_lines, skip_decls)`` — locals whose top-level
+    declarations should be suppressed (the slice_t and view labels).
+    """
+    arg_label_set = {a.label for a in adj.args}
+
+    const_int_vars: dict[str, int] = {}
+    for var in adj.variables:
+        if var.constant is not None and isinstance(var.constant, int):
+            const_int_vars[var.label] = var.constant
+
+    slice_aliases: dict[str, str] = {}  # slice_local -> idx_label
+    for raw in forward_lines:
+        m = _SLICE_T_PAT.match(raw)
+        if not m:
+            continue
+        local_label, start_l, stop_l, step_l = m.group(1), m.group(2), m.group(3), m.group(4)
+        if start_l == stop_l and const_int_vars.get(step_l) == 0:
+            slice_aliases[local_label] = start_l
+
+    view_aliases: dict[str, tuple[str, list[str]]] = {}
+    for raw in forward_lines:
+        m = _VIEW_PAT.match(raw)
+        if not m:
+            continue
+        view_label = m.group(1)
+        arr_name = m.group(2)
+        slice_labels = re.findall(r"var_(\w+)", m.group(3))
+        if arr_name not in arg_label_set:
+            continue
+        if not all(s in slice_aliases for s in slice_labels):
+            continue
+        view_aliases[view_label] = (arr_name, [slice_aliases[s] for s in slice_labels])
+
+    skip_decls: set[str] = set()
+    skip_decls.update(slice_aliases.keys())
+    skip_decls.update(view_aliases.keys())
+
+    if not view_aliases:
+        return forward_lines, skip_decls
+
+    out_lines: list[str] = []
+    for raw in forward_lines:
+        m = _SLICE_T_PAT.match(raw)
+        if m and m.group(1) in slice_aliases:
+            continue
+        m = _VIEW_PAT.match(raw)
+        if m and m.group(1) in view_aliases:
+            continue
+
+        m = _VIEW_ADDRESS_PAT.match(raw)
+        if m and m.group("arr") in view_aliases:
+            indent = m.group("indent")
+            local = m.group("local")
+            arr_name, lead_idx_labels = view_aliases[m.group("arr")]
+            tail_indices = re.findall(r"var_\w+", m.group("rest"))
+            all_indices = [f"var_{l}" for l in lead_idx_labels] + tail_indices
+            out_lines.append(f"{indent}var_{local} = wp::address(var_{arr_name}, {', '.join(all_indices)});")
+            continue
+
+        m = _VIEW_ARRAY_STORE_PAT.match(raw)
+        if m and m.group("arr") in view_aliases:
+            indent = m.group("indent")
+            arr_name, lead_idx_labels = view_aliases[m.group("arr")]
+            rest_parts = [p.strip() for p in m.group("rest").split(",") if p.strip()]
+            lead_strs = [f"var_{l}" for l in lead_idx_labels]
+            out_lines.append(f"{indent}wp::array_store(var_{arr_name}, {', '.join(lead_strs + rest_parts)});")
+            continue
+
+        m = _VIEW_ATOMIC_PAT.match(raw)
+        if m and m.group("arr") in view_aliases:
+            indent = m.group("indent")
+            local = m.group("local")
+            op = m.group("op")
+            arr_name, lead_idx_labels = view_aliases[m.group("arr")]
+            tail_idx = m.group("idx").strip()
+            val = m.group("val").strip()
+            all_indices = [f"var_{l}" for l in lead_idx_labels] + [tail_idx]
+            # ``wp::atomic_*`` intrinsic regex disallows parens in its index
+            # arg — build a flat-index expression without the outer parens
+            # that ``_flat_index_expr`` would add.
+            n = len(all_indices)
+            if n == 1:
+                flat_idx = all_indices[0]
+            else:
+                terms = []
+                for k, idx in enumerate(all_indices):
+                    if k == n - 1:
+                        terms.append(idx)
+                    else:
+                        stride = " * ".join(f"{arr_name}_shape[{j}]" for j in range(k + 1, n))
+                        terms.append(f"{idx} * {stride}")
+                flat_idx = " + ".join(terms)
+            out_lines.append(f"{indent}var_{local} = wp::{op}(var_{arr_name}, {flat_idx}, {val});")
+            continue
+
+        out_lines.append(raw)
+
+    return out_lines, skip_decls
+
+
 def generate_msl_kernel(kernel) -> MetalKernelArtifact:
     """Build an MSL artifact for a Warp ``Kernel`` object.
 
@@ -1002,6 +1138,12 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
     # which the generated ``for`` declares inline).
     forward_lines, vars_to_skip_decl = _preprocess_for_loops(adj.blocks[0].body_forward)
     forward_lines = _preprocess_while_loops(forward_lines)
+    # Slice/view preprocessing: ``arr[i]`` on a multi-dim array becomes a
+    # ``slice_t`` + ``view`` pair we fold into direct array ops on the
+    # underlying argument. Emits no extra MSL — the slice_t and view locals
+    # become declaration-skipped aliases.
+    forward_lines, view_skip_decls = _preprocess_views(forward_lines, adj)
+    vars_to_skip_decl |= view_skip_decls
 
     # Classify each array arg as input or output by scanning the IR strings.
     # MLX inputs are ``const device T*`` (read-only) — verified empirically —
@@ -1459,7 +1601,13 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
                 output_arg_names = {a.label for a in output_args}
                 use_atomic_store = has_atomic and arr in output_arg_names
 
-                def _emit_scalar_write(idx_expr: str, rhs: str) -> str:
+                def _emit_scalar_write(
+                    idx_expr: str,
+                    rhs: str,
+                    indent: str = indent,
+                    arr: str = arr,
+                    use_atomic_store: bool = use_atomic_store,
+                ) -> str:
                     if use_atomic_store:
                         return f"{indent}atomic_store_explicit(&{arr}[{idx_expr}], {rhs}, memory_order_relaxed);"
                     return f"{indent}{arr}[{idx_expr}] = {rhs};"
