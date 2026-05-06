@@ -1085,6 +1085,7 @@ def _inline_one_call(
     depth: int,
     max_depth: int,
     const_ints_out: dict[str, int],
+    struct_locals_out: dict[str, Any],
     return_value_dst: str | None = None,
 ) -> list[Node]:
     """Inline a single user-function call. Returns the spliced node list.
@@ -1092,6 +1093,10 @@ def _inline_one_call(
     ``const_ints_out`` is mutated to record every inlined int-typed
     constant local (mangled label → int value) so subsequent passes can
     treat them the same as ``adj.variables`` constants.
+
+    ``struct_locals_out`` is mutated to record every inlined Struct-typed
+    local (mangled label → Struct class) so the kernel-level field-
+    pointer pass can resolve field accesses on inlined struct instances.
 
     ``return_value_dst`` (when non-None) is the bare variable name where
     each ``return <value>;`` in the callee body should write before the
@@ -1149,7 +1154,18 @@ def _inline_one_call(
     fn_folded, fold_skip = fold(fn_nodes)
 
     # Recursively inline nested user calls.
-    fn_folded = _inline_walk(fn_folded, fn_map, depth + 1, max_depth, const_ints_out)
+    fn_folded = _inline_walk(fn_folded, fn_map, depth + 1, max_depth, const_ints_out, struct_locals_out)
+
+    # Record any Struct-typed locals so the kernel-level field-pointer
+    # pass can resolve field accesses on inlined struct instances.
+    from warp._src.codegen import Struct  # noqa: PLC0415
+
+    for var in fn_overload.adj.variables:
+        if var.label in fn_param_set:
+            continue
+        if isinstance(var.type, Struct):
+            mangled_label = f"{inline_id}__{var.label}"
+            struct_locals_out[mangled_label] = var.type
 
     # Emit declarations for the inlined locals. They aren't in the host
     # kernel's ``adj.variables`` table, so the standard declaration loop in
@@ -1203,6 +1219,7 @@ def _inline_walk(
     depth: int,
     max_depth: int,
     const_ints_out: dict[str, int],
+    struct_locals_out: dict[str, Any],
 ) -> list[Node]:
     out: list[Node] = []
     for n in nodes:
@@ -1210,7 +1227,15 @@ def _inline_walk(
         if isinstance(n, VoidCall) and n.op == "user_call":
             name = dict(n.extra).get("name")
             if name in fn_map:
-                spliced = _inline_one_call(fn_map[name], n.args, fn_map, depth, max_depth, const_ints_out)
+                spliced = _inline_one_call(
+                    fn_map[name],
+                    n.args,
+                    fn_map,
+                    depth,
+                    max_depth,
+                    const_ints_out,
+                    struct_locals_out,
+                )
                 out.extend(spliced)
                 continue
 
@@ -1227,6 +1252,7 @@ def _inline_walk(
                 depth,
                 max_depth,
                 const_ints_out,
+                struct_locals_out,
                 return_value_dst=n.lhs,
             )
             out.extend(spliced)
@@ -1238,7 +1264,7 @@ def _inline_walk(
                 If(
                     raw=n.raw,
                     cond=n.cond,
-                    body=tuple(_inline_walk(n.body, fn_map, depth, max_depth, const_ints_out)),
+                    body=tuple(_inline_walk(n.body, fn_map, depth, max_depth, const_ints_out, struct_locals_out)),
                     raw_open=n.raw_open,
                     raw_close=n.raw_close,
                 )
@@ -1252,7 +1278,7 @@ def _inline_walk(
                     range_var=n.range_var,
                     start=n.start,
                     stop=n.stop,
-                    body=tuple(_inline_walk(n.body, fn_map, depth, max_depth, const_ints_out)),
+                    body=tuple(_inline_walk(n.body, fn_map, depth, max_depth, const_ints_out, struct_locals_out)),
                 )
             )
             continue
@@ -1261,7 +1287,7 @@ def _inline_walk(
                 While(
                     raw=n.raw,
                     label_k=n.label_k,
-                    body=tuple(_inline_walk(n.body, fn_map, depth, max_depth, const_ints_out)),
+                    body=tuple(_inline_walk(n.body, fn_map, depth, max_depth, const_ints_out, struct_locals_out)),
                 )
             )
             continue
@@ -1269,7 +1295,7 @@ def _inline_walk(
             out.append(
                 _DoWhileZero(
                     raw=n.raw,
-                    body=tuple(_inline_walk(n.body, fn_map, depth, max_depth, const_ints_out)),
+                    body=tuple(_inline_walk(n.body, fn_map, depth, max_depth, const_ints_out, struct_locals_out)),
                 )
             )
             continue
@@ -1277,16 +1303,22 @@ def _inline_walk(
     return out
 
 
-def inline_user_calls(nodes: list[Node], kernel_adj, max_depth: int = 8) -> tuple[list[Node], dict[str, int]]:
+def inline_user_calls(
+    nodes: list[Node], kernel_adj, max_depth: int = 8
+) -> tuple[list[Node], dict[str, int], dict[str, Any]]:
     """Splice every user-``@wp.func`` call into the AST tree.
 
-    Returns ``(inlined_nodes, inlined_const_ints)``. The second value maps
-    each inlined int-typed constant local (e.g. ``"<id>__40"``) to its
-    integer value so subsequent passes (``fold_views`` in particular)
-    can treat inlined constants the same as the kernel's own
-    ``adj.variables`` constants. Without this, view-aliases inside an
-    inlined body don't get recognised because the slice_t ``step``
-    operand's constness is invisible.
+    Returns ``(inlined_nodes, inlined_const_ints, inlined_struct_locals)``:
+
+    - ``inlined_const_ints``: mangled label → int value for each
+      inlined const-int local. Lets ``fold_views`` recognise slice-step
+      constants from inside inlined bodies.
+
+    - ``inlined_struct_locals``: mangled label → ``Struct`` class for
+      each inlined struct local. Lets the kernel-level struct-field-
+      pointer pass resolve field accesses on structs constructed inside
+      inlined helper bodies (e.g. the ``Geom`` struct built by
+      ``geom_collision_pair`` for primitive narrowphase).
 
     ``kernel_adj`` is the top-level kernel's ``Adjoint`` object — used
     for the references table that resolves call-site mangled names
@@ -1294,10 +1326,18 @@ def inline_user_calls(nodes: list[Node], kernel_adj, max_depth: int = 8) -> tupl
     """
     fn_map = _build_function_overload_table(kernel_adj)
     if not fn_map:
-        return list(nodes), {}
+        return list(nodes), {}, {}
     inlined_const_ints: dict[str, int] = {}
-    out = _inline_walk(nodes, fn_map, depth=0, max_depth=max_depth, const_ints_out=inlined_const_ints)
-    return out, inlined_const_ints
+    inlined_struct_locals: dict[str, Any] = {}
+    out = _inline_walk(
+        nodes,
+        fn_map,
+        depth=0,
+        max_depth=max_depth,
+        const_ints_out=inlined_const_ints,
+        struct_locals_out=inlined_struct_locals,
+    )
+    return out, inlined_const_ints, inlined_struct_locals
 
 
 _UNSUPPORTED_CTYPE_PREFIXES = ("wp::str", "wp::tuple_t")
