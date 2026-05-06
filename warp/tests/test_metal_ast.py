@@ -23,8 +23,10 @@ import unittest
 import warp as wp
 from warp._src.codegen_metal import (
     _preprocess_for_loops,
+    _preprocess_indexref_writes,
     _preprocess_views,
     _preprocess_while_loops,
+    _vec_dtype_info,
 )
 from warp._src.codegen_metal_ast import (
     AddrOf,
@@ -54,6 +56,7 @@ from warp._src.codegen_metal_ast import (
     WhileCondTest,
     emit,
     fold,
+    fold_indexref_writes,
     fold_views,
     parse,
     parse_line,
@@ -491,7 +494,7 @@ class TestMetalASTViewsFold(unittest.TestCase):
             old_lines,
             f"emit(fold_views(...)) != _preprocess_views(...) on kernel {kernel.key!r}",
         )
-        # Combined skip-sets should match: for/while skip ∪ view skip on each side.
+        # Combined skip-sets should match: for/while skip union view skip on each side.
         self.assertEqual(
             fold_skip | view_skip,
             old_for_skip | old_view_skip,
@@ -562,6 +565,63 @@ class TestMetalASTViewsFold(unittest.TestCase):
             out[tid] = s
 
         self._assert_views_equivalent(k)
+
+
+class TestMetalASTIndexrefWritesFold(unittest.TestCase):
+    """Verify ``fold_indexref_writes`` produces output equivalent to running
+    ``_preprocess_indexref_writes`` on the existing pipeline output.
+    """
+
+    def _vec_arr_info(self, kernel) -> dict[str, tuple[int, str]]:
+        info: dict[str, tuple[int, str]] = {}
+        for arg in kernel.adj.args:
+            v = _vec_dtype_info(arg)
+            if v is not None:
+                info[arg.label] = v
+        return info
+
+    def _assert_indexref_equivalent(self, kernel):
+        kernel.adj.build(builder=None, default_builder_options={"enable_backward": False})
+        lines = kernel.adj.blocks[0].body_forward
+        info = self._vec_arr_info(kernel)
+
+        # New pipeline.
+        nodes = parse(lines)
+        folded, _ = fold(nodes)
+        view_folded, _ = fold_views(folded, kernel.adj)
+        ix_folded, ix_skip = fold_indexref_writes(view_folded, kernel.adj, info)
+        new_lines = emit(ix_folded)
+
+        # Existing pipeline.
+        old_for, _ = _preprocess_for_loops(lines)
+        old_after_while = _preprocess_while_loops(old_for)
+        old_after_views, _ = _preprocess_views(old_after_while, kernel.adj)
+        old_lines, old_skip = _preprocess_indexref_writes(old_after_views, kernel.adj, info)
+
+        self.assertEqual(
+            new_lines,
+            old_lines,
+            f"emit(fold_indexref_writes(...)) != _preprocess_indexref_writes(...) on kernel {kernel.key!r}",
+        )
+        self.assertEqual(ix_skip, old_skip, f"skip set mismatch on kernel {kernel.key!r}")
+
+    def test_no_indexref_writes_is_passthrough(self):
+        @wp.kernel
+        def k(a: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
+            tid = wp.tid()
+            out[tid] = a[tid] * 2.0
+
+        self._assert_indexref_equivalent(k)
+
+    def test_vec_component_write_via_indexref(self):
+        # ``out[i, 0][k] = val`` lowers to address + indexref + store on a
+        # vec-typed output array.
+        @wp.kernel
+        def k(out: wp.array2d(dtype=wp.spatial_vector)):
+            worldid, k = wp.tid()
+            out[worldid, 0][k] = float(worldid * 10 + k)
+
+        self._assert_indexref_equivalent(k)
 
 
 if __name__ == "__main__":
