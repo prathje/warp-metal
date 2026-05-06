@@ -757,6 +757,104 @@ class TestMetalLaunch(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet)
 
+    def test_slice_view_row_read_matches_cpu(self):
+        # ``arr2d[i]`` lowers to ``slice_t(i, i, 0)`` + ``view(arr, slice)``.
+        # The view is then indexed as ``view[j]`` to read ``arr2d[i, j]``.
+        # Our slice/view preprocessor folds those into direct array ops.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k_row_sum(a: wp.array2d(dtype=wp.float32),
+                          out: wp.array(dtype=wp.float32)):
+                tid = wp.tid()
+                row = a[tid]
+                s = float(0.0)
+                for j in range(a.shape[1]):
+                    s += row[j]
+                out[tid] = s
+
+            N, M = 8, 5
+            rng = np.random.default_rng(0)
+            an = rng.standard_normal((N, M)).astype(np.float32)
+            results = {}
+            for dev in ('cpu', 'metal:0'):
+                a = wp.array(an, dtype=wp.float32, device=dev)
+                out = wp.zeros(N, dtype=wp.float32, device=dev)
+                wp.launch(k_row_sum, dim=N, inputs=[a], outputs=[out], device=dev)
+                results[dev] = out.numpy()
+            np.testing.assert_allclose(results['cpu'], results['metal:0'], rtol=1e-5)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_slice_view_atomic_scatter_matches_cpu(self):
+        # ``wp.atomic_add(out2d[i], j, val)`` exercises the slice/view path
+        # through a multi-arg atomic intrinsic — we must flatten the leading
+        # slice index into the underlying array's flat offset.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(a: wp.array2d(dtype=wp.float32),
+                  cols: wp.array(dtype=wp.int32),
+                  out: wp.array2d(dtype=wp.float32)):
+                tid = wp.tid()
+                row_in = a[tid]
+                j = cols[tid]
+                wp.atomic_add(out[tid], j, row_in[j] * 2.0)
+
+            N, M = 8, 5
+            rng = np.random.default_rng(0)
+            an = rng.standard_normal((N, M)).astype(np.float32)
+            cols_n = rng.integers(0, M, size=N, dtype=np.int32)
+            results = {}
+            for dev in ('cpu', 'metal:0'):
+                a = wp.array(an, dtype=wp.float32, device=dev)
+                cols = wp.array(cols_n, dtype=wp.int32, device=dev)
+                out = wp.zeros((N, M), dtype=wp.float32, device=dev)
+                wp.launch(k, dim=N, inputs=[a, cols],
+                          outputs=[out], device=dev)
+                results[dev] = out.numpy()
+            np.testing.assert_allclose(results['cpu'], results['metal:0'], rtol=1e-5)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_slice_view_array_store_matches_cpu(self):
+        # Regular ``out2d[i][j] = val`` store path through a view.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(a: wp.array2d(dtype=wp.float32),
+                  out: wp.array2d(dtype=wp.float32)):
+                tid = wp.tid()
+                row_in = a[tid]
+                row_out = out[tid]
+                for j in range(a.shape[1]):
+                    row_out[j] = row_in[j] * 3.0 + 1.0
+
+            N, M = 8, 5
+            rng = np.random.default_rng(0)
+            an = rng.standard_normal((N, M)).astype(np.float32)
+            results = {}
+            for dev in ('cpu', 'metal:0'):
+                a = wp.array(an, dtype=wp.float32, device=dev)
+                out = wp.zeros((N, M), dtype=wp.float32, device=dev)
+                wp.launch(k, dim=N, inputs=[a], outputs=[out], device=dev)
+                results[dev] = out.numpy()
+            np.testing.assert_array_equal(results['cpu'], results['metal:0'])
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
     def test_while_loop_matches_cpu(self):
         # Triangular sum: ``s = sum(1..n)``. Exercises the structural
         # ``while``-as-``while(true){}`` rewrite plus mid-body mutation via
