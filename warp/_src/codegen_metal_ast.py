@@ -872,6 +872,78 @@ def _drop_goto(body: tuple[Node, ...] | list[Node], target: str) -> list[Node]:
     return out
 
 
+_UNSUPPORTED_CTYPE_PREFIXES = ("wp::str", "wp::tuple_t")
+
+
+def fold_drop_unsupported_locals(nodes: list[Node], adj) -> tuple[list[Node], set[str]]:
+    """Drop dead-code statements whose values are typed in something MSL
+    can't represent.
+
+    ``wp::str`` constants only feed ``wp.printf`` calls (diagnostic warnings
+    — MSL has no usable printf in regular kernels). ``wp::tuple_t`` locals
+    are constructed by ``wp.matrix(..., shape=(N,M), dtype=int)`` sugar but
+    never read by the kernel body. Both can be elided entirely: drop the
+    assignment lines, drop printf calls, and skip the locals' declarations.
+
+    Mirror of ``_preprocess_drop_unsupported_locals`` from the regex
+    pipeline.
+    """
+    drop_locals: set[str] = set()
+    for var in adj.variables:
+        ct = var.ctype()
+        if any(ct.startswith(p) for p in _UNSUPPORTED_CTYPE_PREFIXES):
+            drop_locals.add(var.label)
+    skip_decls = set(drop_locals)
+
+    if not drop_locals:
+        return nodes, skip_decls
+
+    return _apply_drop_unsupported(nodes, drop_locals), skip_decls
+
+
+def _apply_drop_unsupported(nodes: tuple[Node, ...] | list[Node], drop: set[str]) -> list[Node]:
+    out: list[Node] = []
+    for n in nodes:
+        if isinstance(n, VoidCall) and n.op == "printf":
+            continue
+        if isinstance(n, Assign) and n.lhs in drop:
+            continue
+        if isinstance(n, If):
+            out.append(
+                If(
+                    raw=n.raw,
+                    cond=n.cond,
+                    body=tuple(_apply_drop_unsupported(n.body, drop)),
+                    raw_open=n.raw_open,
+                    raw_close=n.raw_close,
+                )
+            )
+            continue
+        if isinstance(n, For):
+            out.append(
+                For(
+                    raw=n.raw,
+                    iter_var=n.iter_var,
+                    range_var=n.range_var,
+                    start=n.start,
+                    stop=n.stop,
+                    body=tuple(_apply_drop_unsupported(n.body, drop)),
+                )
+            )
+            continue
+        if isinstance(n, While):
+            out.append(
+                While(
+                    raw=n.raw,
+                    label_k=n.label_k,
+                    body=tuple(_apply_drop_unsupported(n.body, drop)),
+                )
+            )
+            continue
+        out.append(n)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # View / slice fold (Phase 1.2a)
 # ---------------------------------------------------------------------------

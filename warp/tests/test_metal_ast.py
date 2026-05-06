@@ -22,6 +22,7 @@ import unittest
 
 import warp as wp
 from warp._src.codegen_metal import (
+    _preprocess_drop_unsupported_locals,
     _preprocess_for_loops,
     _preprocess_indexref_writes,
     _preprocess_views,
@@ -56,6 +57,7 @@ from warp._src.codegen_metal_ast import (
     WhileCondTest,
     emit,
     fold,
+    fold_drop_unsupported_locals,
     fold_indexref_writes,
     fold_views,
     parse,
@@ -622,6 +624,82 @@ class TestMetalASTIndexrefWritesFold(unittest.TestCase):
             out[worldid, 0][k] = float(worldid * 10 + k)
 
         self._assert_indexref_equivalent(k)
+
+
+class TestMetalASTDropUnsupportedFold(unittest.TestCase):
+    """Verify ``fold_drop_unsupported_locals`` matches the existing
+    ``_preprocess_drop_unsupported_locals`` output.
+    """
+
+    def _assert_drop_equivalent(self, kernel):
+        kernel.adj.build(builder=None, default_builder_options={"enable_backward": False})
+        lines = kernel.adj.blocks[0].body_forward
+
+        # New pipeline.
+        nodes = parse(lines)
+        folded, _ = fold(nodes)
+        dropped, drop_skip = fold_drop_unsupported_locals(folded, kernel.adj)
+        new_lines = emit(dropped)
+
+        # Existing pipeline. Order matters: the regex pipeline runs
+        # drop-unsupported BEFORE views/indexref. We mimic that here so the
+        # comparison stays apples-to-apples.
+        old_for, _ = _preprocess_for_loops(lines)
+        old_after_while = _preprocess_while_loops(old_for)
+        old_lines, old_skip = _preprocess_drop_unsupported_locals(old_after_while, kernel.adj)
+
+        self.assertEqual(
+            new_lines,
+            old_lines,
+            f"emit(fold_drop_unsupported_locals(...)) != "
+            f"_preprocess_drop_unsupported_locals(...) on kernel {kernel.key!r}",
+        )
+        self.assertEqual(drop_skip, old_skip, f"skip set mismatch on kernel {kernel.key!r}")
+
+    def test_no_unsupported_is_passthrough(self):
+        @wp.kernel
+        def k(a: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
+            tid = wp.tid()
+            out[tid] = a[tid]
+
+        self._assert_drop_equivalent(k)
+
+    def test_printf_dropped(self):
+        @wp.kernel
+        def k(out: wp.array(dtype=wp.int32), flag: wp.array(dtype=wp.int32)):
+            tid = wp.tid()
+            if flag[tid] == 0:
+                wp.printf("warn tid=%u\n", tid)
+            out[tid] = tid * 2
+
+        self._assert_drop_equivalent(k)
+
+    def test_dead_tuple_dropped(self):
+        @wp.kernel
+        def k(idx: wp.array(dtype=wp.int32), out: wp.array(dtype=wp.int32)):
+            tid = wp.tid()
+            # ``wp.matrix(..., shape=(...), dtype=int)`` constructs an
+            # internal tuple_t for the shape arg that is never read.
+            table = wp.matrix(
+                10,
+                11,
+                20,
+                21,
+                30,
+                31,
+                40,
+                41,
+                50,
+                51,
+                60,
+                61,
+                shape=(6, 2),
+                dtype=int,
+            )
+            i = idx[tid]
+            out[tid] = table[i, 0] + table[i, 1] * 100
+
+        self._assert_drop_equivalent(k)
 
 
 if __name__ == "__main__":
