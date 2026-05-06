@@ -179,7 +179,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
     from warp.tests.test_linear_solvers import TestLinearSolvers
     from warp.tests.test_lvalue import TestLValue
     from warp.tests.test_math import TestMath
-    from warp.tests.test_metal_ast import TestMetalASTParseShapes, TestMetalASTRoundTrip
+    from warp.tests.test_metal_ast import TestMetalASTFold, TestMetalASTParseShapes, TestMetalASTRoundTrip
     from warp.tests.test_metal_codegen import TestMetalCodegenCompiles, TestMetalCodegenStructure
     from warp.tests.test_metal_device import TestMetalAllocator, TestMetalDevice, TestMetalDisabled
     from warp.tests.test_metal_launch import TestMetalLaunch
@@ -321,6 +321,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
         TestMempool,
         TestMesh,
         TestMetalAllocator,
+        TestMetalASTFold,
         TestMetalASTParseShapes,
         TestMetalASTRoundTrip,
         TestMetalCodegenCompiles,
