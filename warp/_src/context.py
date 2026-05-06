@@ -11837,7 +11837,7 @@ def launch(
             raise RuntimeError("Metal backend does not yet support record_cmd launches")
         from warp._src.codegen_metal import launch_metal_kernel  # noqa: PLC0415
 
-        launch_metal_kernel(kernel, dim, inputs, outputs, device)
+        launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim=block_dim)
         return
 
     dim, total_dim_size = _normalize_launch_dim(dim)

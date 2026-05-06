@@ -119,6 +119,7 @@ pointer to the offending statement):
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -361,6 +362,43 @@ def _emit_big_vec_struct(name: str, n: int, msl_scalar: str) -> str:
             body_lines.append(f"    r.c[{i}] = a.c[{i}] {op} b.c[{i}];")
         body_lines.append("    return r;")
         body_lines.append("}")
+    # Scalar operators. Warp lowers ``vec * scalar`` and ``scalar * vec``
+    # (and the equivalents for ``+``, ``-``, ``/``) to plain ``*``/``/``
+    # binary expressions, so MSL needs both orderings. Without these,
+    # kernels like ``cdof[dofid] * qvel[dofid]`` (spatial-vector ``*`` joint
+    # velocity) fail to compile.
+    for op in ("+", "-", "*", "/"):
+        body_lines.append(f"inline {name} operator{op}({name} a, {msl_scalar} s) {{")
+        body_lines.append(f"    {name} r;")
+        for i in range(n):
+            body_lines.append(f"    r.c[{i}] = a.c[{i}] {op} s;")
+        body_lines.append("    return r;")
+        body_lines.append("}")
+        body_lines.append(f"inline {name} operator{op}({msl_scalar} s, {name} a) {{")
+        body_lines.append(f"    {name} r;")
+        for i in range(n):
+            body_lines.append(f"    r.c[{i}] = s {op} a.c[{i}];")
+        body_lines.append("    return r;")
+        body_lines.append("}")
+    # Unary minus: ``-spatial_vec``. The IR lowers ``wp.neg(v)`` to
+    # ``-v`` for native vec types but for our big-vec structs the codegen
+    # path still funnels through ``wp_neg`` (see ``_INTRINSIC_PATTERNS``).
+    # Provide both forms so either lowering compiles.
+    body_lines.append(f"inline {name} operator-({name} a) {{")
+    body_lines.append(f"    {name} r;")
+    for i in range(n):
+        body_lines.append(f"    r.c[{i}] = -a.c[{i}];")
+    body_lines.append("    return r;")
+    body_lines.append("}")
+    # Equality / inequality: ``vec == zero`` shows up in actuator gating
+    # paths (e.g. ``_apply_ft`` checks whether a force-torque pair is the
+    # zero spatial vector). Component-wise compare; results AND/OR'd.
+    body_lines.append(f"inline bool operator==({name} a, {name} b) {{")
+    body_lines.append("    return " + " && ".join(f"a.c[{i}] == b.c[{i}]" for i in range(n)) + ";")
+    body_lines.append("}")
+    body_lines.append(f"inline bool operator!=({name} a, {name} b) {{")
+    body_lines.append("    return !(a == b);")
+    body_lines.append("}")
     return "\n".join(body_lines)
 
 
@@ -479,6 +517,149 @@ _DIAG_HELPER_FLOAT3 = (
 )
 
 
+# ---------------------------------------------------------------------------
+# Tile primitive emission (Phase 2 — Cholesky path for mujoco_warp)
+# ---------------------------------------------------------------------------
+# Warp's tile builtins (``wp.tile_load``, ``wp.tile_store``, ``wp.tile_cholesky``,
+# ``wp.tile_cholesky_solve``) target CUDA-LTO via cuBLASDx on the CUDA backend.
+# Metal has no equivalent runtime, so we hand-roll small-tile MSL helpers per
+# (rows, cols, scalar). The freejoint case uses 6×6 tiles (mass matrix factor)
+# and 6×1 (RHS); larger tile sizes are emitted on demand if the kernel uses
+# them. Single-thread / private memory only — see metal-shader-expert
+# guidance: for N ≤ 32 the synchronization cost of cooperative tiles
+# dominates the work on Apple Silicon.
+
+# Match struct *type* references only — anchored on a non-word, non-``_``
+# follow so we don't pick up the helper-function suffixes ``_load``,
+# ``_store``, ``_cholesky``, ``_cholesky_solve_K``.
+_TILE_SCALAR_ALT = "|".join(_MSL_PREFIX_TO_SAME)
+_TILE_NAME_PAT = re.compile(rf"\bwp_tile_(\d+)x(\d+)_({_TILE_SCALAR_ALT})(?![\w])")
+
+
+def _emit_tile_struct(rows: int, cols: int, msl_scalar: str) -> str:
+    """Emit the MSL declaration for a tile struct + load/store helpers.
+
+    Storage is row-major flat ``c[rows*cols]``. The struct is meant to live
+    in *private* (per-thread) memory — for the small N we currently handle
+    the compiler keeps it in registers entirely.
+    """
+    name = f"wp_tile_{rows}x{cols}_{msl_scalar}"
+    n = rows * cols
+    parts: list[str] = []
+    parts.append(f"struct {name} {{")
+    parts.append(f"    {msl_scalar} c[{n}];")
+    parts.append("};")
+    # Load: read an ``rows × cols`` sub-block from a row-major device array
+    # whose row stride is ``row_stride``. ``base`` is the flat offset of the
+    # 2-D slice (e.g. ``worldid * shape[1] * shape[2]`` for a 3-D array).
+    parts.append(
+        f"inline {name} {name}_load(device const {msl_scalar}* arr, "
+        "int base, int row_stride, int row_off, int col_off) {"
+    )
+    parts.append(f"    {name} t;")
+    for i in range(rows):
+        for j in range(cols):
+            parts.append(
+                f"    t.c[{i * cols + j}] = arr[base + (row_off + {i}) * row_stride + (col_off + {j})];"
+            )
+    parts.append("    return t;")
+    parts.append("}")
+    parts.append(
+        f"inline void {name}_store(device {msl_scalar}* arr, "
+        f"int base, int row_stride, int row_off, int col_off, {name} t) {{"
+    )
+    for i in range(rows):
+        for j in range(cols):
+            parts.append(
+                f"    arr[base + (row_off + {i}) * row_stride + (col_off + {j})] = t.c[{i * cols + j}];"
+            )
+    parts.append("}")
+    return "\n".join(parts)
+
+
+def _emit_tile_cholesky(n: int, msl_scalar: str) -> str:
+    """Emit ``wp_tile_NxN_<scalar>_cholesky`` — in-place lower Cholesky.
+
+    Crout's algorithm, fully unrolled for compile-time ``n``. ``precise::sqrt``
+    is used because MSL defaults to ``-ffast-math`` which would otherwise
+    reassociate accumulations and erode stability. ``max(diag, 1e-30)``
+    guards against denormal-flush turning a tiny pivot into hard zero.
+    """
+    name = f"wp_tile_{n}x{n}_{msl_scalar}"
+    parts: list[str] = []
+    parts.append(f"inline {name} {name}_cholesky({name} A) {{")
+    parts.append(f"    {name} L = A;")
+    parts.append(f"    for (int j = 0; j < {n}; ++j) {{")
+    parts.append(f"        {msl_scalar} d = L.c[j*{n} + j];")
+    parts.append("        for (int k = 0; k < j; ++k) {")
+    parts.append(f"            {msl_scalar} ljk = L.c[j*{n} + k];")
+    parts.append("            d -= ljk * ljk;")
+    parts.append("        }")
+    parts.append(f"        d = metal::max(d, ({msl_scalar})1e-30);")
+    parts.append(f"        {msl_scalar} ljj = metal::precise::sqrt(d);")
+    parts.append(f"        L.c[j*{n} + j] = ljj;")
+    parts.append(f"        {msl_scalar} inv = ({msl_scalar})1.0 / ljj;")
+    parts.append(f"        for (int i = j + 1; i < {n}; ++i) {{")
+    parts.append(f"            {msl_scalar} s = L.c[i*{n} + j];")
+    parts.append(f"            for (int k = 0; k < j; ++k) s -= L.c[i*{n} + k] * L.c[j*{n} + k];")
+    parts.append(f"            L.c[i*{n} + j] = s * inv;")
+    parts.append(f"            L.c[j*{n} + i] = ({msl_scalar})0.0;")
+    parts.append("        }")
+    parts.append("    }")
+    parts.append("    return L;")
+    parts.append("}")
+    return "\n".join(parts)
+
+
+def _emit_tile_cholesky_solve(n: int, k: int, msl_scalar: str) -> str:
+    """Emit ``wp_tile_NxN_<scalar>_cholesky_solve_K`` — solve ``L L^T X = B``.
+
+    The factor ``L`` is square ``N×N``; the RHS ``B`` is ``N×K`` (K=1 for
+    vector RHS, the common case). Returns the solution as the same-shape
+    tile. Forward/back substitute, no pivoting (L is already factored).
+    """
+    L_name = f"wp_tile_{n}x{n}_{msl_scalar}"
+    if k == 1:
+        B_name = f"wp_tile_{n}x1_{msl_scalar}"
+        parts: list[str] = []
+        parts.append(f"inline {B_name} {L_name}_cholesky_solve_1({L_name} L, {B_name} b) {{")
+        parts.append(f"    {B_name} x = b;")
+        # Forward: L y = b
+        parts.append(f"    for (int i = 0; i < {n}; ++i) {{")
+        parts.append(f"        {msl_scalar} s = x.c[i];")
+        parts.append(f"        for (int kk = 0; kk < i; ++kk) s -= L.c[i*{n} + kk] * x.c[kk];")
+        parts.append(f"        x.c[i] = s / L.c[i*{n} + i];")
+        parts.append("    }")
+        # Backward: L^T x = y
+        parts.append(f"    for (int i = {n} - 1; i >= 0; --i) {{")
+        parts.append(f"        {msl_scalar} s = x.c[i];")
+        parts.append(f"        for (int kk = i + 1; kk < {n}; ++kk) s -= L.c[kk*{n} + i] * x.c[kk];")
+        parts.append(f"        x.c[i] = s / L.c[i*{n} + i];")
+        parts.append("    }")
+        parts.append("    return x;")
+        parts.append("}")
+        return "\n".join(parts)
+    B_name = f"wp_tile_{n}x{k}_{msl_scalar}"
+    parts = []
+    parts.append(f"inline {B_name} {L_name}_cholesky_solve_{k}({L_name} L, {B_name} b) {{")
+    parts.append(f"    {B_name} x = b;")
+    parts.append(f"    for (int col = 0; col < {k}; ++col) {{")
+    parts.append(f"        for (int i = 0; i < {n}; ++i) {{")
+    parts.append(f"            {msl_scalar} s = x.c[i*{k} + col];")
+    parts.append(f"            for (int kk = 0; kk < i; ++kk) s -= L.c[i*{n} + kk] * x.c[kk*{k} + col];")
+    parts.append(f"            x.c[i*{k} + col] = s / L.c[i*{n} + i];")
+    parts.append("        }")
+    parts.append(f"        for (int i = {n} - 1; i >= 0; --i) {{")
+    parts.append(f"            {msl_scalar} s = x.c[i*{k} + col];")
+    parts.append(f"            for (int kk = i + 1; kk < {n}; ++kk) s -= L.c[kk*{n} + i] * x.c[kk*{k} + col];")
+    parts.append(f"            x.c[i*{k} + col] = s / L.c[i*{n} + i];")
+    parts.append("        }")
+    parts.append("    }")
+    parts.append("    return x;")
+    parts.append("}")
+    return "\n".join(parts)
+
+
 def _build_kernel_header(source: str) -> str:
     """Scan ``source`` for helpers we need to emit (big-vec structs,
     big-mat structs, spatial helpers, diag helper, ``wp_mat_extract``
@@ -519,6 +700,32 @@ def _build_kernel_header(source: str) -> str:
         dot_overloads = _emit_wp_dot_overloads(source)
         if dot_overloads:
             parts.append(dot_overloads)
+    # Tile primitive helpers. Emit struct + load/store for each tile shape
+    # the kernel references; emit Cholesky / Cholesky-solve only if those
+    # specific helpers appear in the source (they're invoked through
+    # ``<name>_cholesky`` / ``<name>_cholesky_solve_<K>`` suffixes the
+    # intrinsic-translation pass produces).
+    seen_tile: set[tuple[int, int, str]] = set()
+    for m in _TILE_NAME_PAT.finditer(source):
+        seen_tile.add((int(m.group(1)), int(m.group(2)), m.group(3)))
+    for rows, cols, scalar in sorted(seen_tile):
+        parts.append(_emit_tile_struct(rows, cols, scalar))
+    cholesky_pat = re.compile(r"\bwp_tile_(\d+)x(\d+)_(\w+)_cholesky\b(?!_solve)")
+    cholesky_solve_pat = re.compile(r"\bwp_tile_(\d+)x(\d+)_(\w+)_cholesky_solve_(\d+)\b")
+    seen_cholesky: set[tuple[int, str]] = set()
+    for m in cholesky_pat.finditer(source):
+        rows, cols = int(m.group(1)), int(m.group(2))
+        if rows == cols:
+            seen_cholesky.add((rows, m.group(3)))
+    for n, scalar in sorted(seen_cholesky):
+        parts.append(_emit_tile_cholesky(n, scalar))
+    seen_solve: set[tuple[int, int, str]] = set()
+    for m in cholesky_solve_pat.finditer(source):
+        rows, cols, k = int(m.group(1)), int(m.group(2)), int(m.group(4))
+        if rows == cols:
+            seen_solve.add((rows, k, m.group(3)))
+    for n, k, scalar in sorted(seen_solve):
+        parts.append(_emit_tile_cholesky_solve(n, k, scalar))
     if not parts:
         return ""
     return "\n".join(parts) + "\n"
@@ -645,10 +852,28 @@ def _msl_pointer_type(ctype: str) -> str:
     return f"{_POINTER_ADDRESS_SPACE} {_msl_scalar_type(inner)}*"
 
 
+_TILE_CTYPE_PAT = re.compile(
+    r"wp::tile_(?:shared|register)_t<\s*wp::(\w+)\s*,"
+    r"\s*wp::tile_layout_strided_t<\s*wp::tile_shape_t<\s*(\d+)\s*(?:,\s*(\d+))?\s*>"
+)
+
+
 def _msl_var_type(ctype: str) -> str:
     """Translate a local variable's ctype to MSL."""
     if ctype.endswith("*"):
         return _msl_pointer_type(ctype)
+    # Tile types — ``wp::tile_shared_t<wp::float32, wp::tile_layout_strided_t<
+    # wp::tile_shape_t<R, C>, ...>, ...>`` — get rewritten to our private-
+    # memory ``wp_tile_RxC_<scalar>`` struct (see ``_emit_tile_struct``).
+    # 1-D tiles drop the second shape dim, so we treat them as ``Rx1``.
+    m = _TILE_CTYPE_PAT.search(ctype)
+    if m:
+        scalar_ctype = f"wp::{m.group(1)}"
+        if scalar_ctype not in _SCALAR_CTYPE_TO_MSL:
+            raise MetalCodegenError(f"MSL codegen does not yet support tile of type {scalar_ctype!r}")
+        rows = int(m.group(2))
+        cols = int(m.group(3)) if m.group(3) else 1
+        return f"wp_tile_{rows}x{cols}_{_SCALAR_CTYPE_TO_MSL[scalar_ctype]}"
     return _msl_scalar_type(ctype)
 
 
@@ -735,6 +960,17 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     # wp.tid() -> thread_position_in_grid.x (1-D dispatch only — 2-D/3-D are
     # handled by the structural matcher in ``generate_msl_kernel``).
     (re.compile(r"\bbuiltin_tid1d\s*\(\s*\)"), "(int)thread_position_in_grid.x"),
+    # wp.block_dim() -> threads_per_threadgroup.y. Used by mujoco_warp's
+    # sparse-Cholesky kernels (``_solve_LD_sparse_fused``) which 2-D-launch
+    # as ``dim=(nworld, block_dim), block_dim=block_dim`` and unpack tid as
+    # the second coordinate. The threadgroup must be sized so its y-extent
+    # equals the launch's ``block_dim``; the launcher handles that below.
+    (re.compile(r"\bbuiltin_block_dim\s*\(\s*\)"), "(int)threads_per_threadgroup.y"),
+    # ``WP_TILE_SYNC()`` is the macro used by ``@wp.func_native`` shims like
+    # mujoco_warp's ``_syncthreads`` — translate to MSL's threadgroup
+    # barrier. With single-thread threadgroups it's a no-op; with bigger
+    # ones it's the same primitive CUDA's ``__syncthreads()`` provides.
+    (re.compile(r"\bWP_TILE_SYNC\s*\(\s*\)"), "threadgroup_barrier(mem_flags::mem_threadgroup)"),
     # ``wp::address`` and ``wp::array_store`` are now both handled by the
     # structural pre-pass in ``generate_msl_kernel`` (which knows the array's
     # rank and emits row-major flat indexing). If a stray multi-arg call slips
@@ -901,6 +1137,176 @@ def _translate_intrinsics(line: str) -> str:
     return line
 
 
+# Tile-primitive translators. Run as part of ``_finalize`` after the
+# regular intrinsic patterns. Each takes the post-pattern line and the
+# kernel's array-arg ndim map (so we can compute shape-aware base offsets
+# and row strides). See ``_emit_tile_struct`` / ``_emit_tile_cholesky``
+# for the helper signatures these calls translate to.
+#
+# IR shapes seen in mujoco_warp.step():
+#   2-D tile from a slice of a 3-D arr (mass-matrix factor):
+#     ``var_X = wp::tile_load<wp::float32, true, false, 6, 6>(var_arr, var_lead, var_off0, var_off1)``
+#   1-D tile from a slice of a 2-D arr (RHS for cholesky_solve):
+#     ``var_X = wp::tile_load<wp::float32, true, false, 6>(var_arr, var_lead, var_off)``
+#   Cholesky: ``var_X = wp::tile_cholesky<false>(var_a, var_b, var_c, var_in, var_out)``
+#     — five func args; first three are leading zeros from the cuBLASDx LTO
+#     calling convention (we ignore them); the in/out tiles are the same
+#     local in mujoco_warp's pattern.
+#   Cholesky-solve: ``var_X = wp::tile_cholesky_solve<false>(var_a, var_b, var_c, var_L, var_b_in, var_x_out)``
+
+
+_TILE_LOAD_PAT = re.compile(
+    r"\bvar_(\w+)\s*=\s*wp::tile_load\s*<\s*wp::(\w+)\s*,\s*\w+\s*,\s*\w+\s*,\s*(\d+)\s*(?:,\s*(\d+)\s*)?>\s*\(([^)]*)\)"
+)
+_TILE_STORE_PAT = re.compile(
+    r"\bwp::tile_store\s*<\s*wp::(\w+)\s*,\s*\w+\s*,\s*\w+\s*>\s*\(([^)]*)\)"
+)
+_TILE_CHOLESKY_PAT = re.compile(
+    r"\bvar_(\w+)\s*=\s*wp::tile_cholesky\s*<[^()]*>\s*\(([^)]*)\)"
+)
+_TILE_CHOLESKY_SOLVE_PAT = re.compile(
+    r"\bvar_(\w+)\s*=\s*wp::tile_cholesky_solve\s*<[^()]*>\s*\(([^)]*)\)"
+)
+
+
+def _build_flat_base_expr(arr_name: str, lead_idx_args: list[str], inner_dims: int) -> str:
+    """Compute the flat base offset of ``arr[lead_0, lead_1, ..., 0, 0, ...]``.
+
+    ``inner_dims`` is the rank of the tile (1 for vector RHS, 2 for matrix
+    factor); the array's rank is ``len(lead_idx_args) + inner_dims``.
+    Returns a textual expression in terms of ``var_*`` and ``<arr>_shape[k]``
+    that the downstream ``__shapes_packed`` packer rewrites to the per-arg
+    packed slot.
+    """
+    if not lead_idx_args:
+        return "0"
+    arr_ndim = len(lead_idx_args) + inner_dims
+    # Multiply each lead index by the product of all *trailing* dim sizes.
+    terms: list[str] = []
+    for i, idx in enumerate(lead_idx_args):
+        stride_dims = list(range(i + 1, arr_ndim))
+        if not stride_dims:
+            terms.append(idx)
+        else:
+            stride = " * ".join(f"{arr_name}_shape[{j}]" for j in stride_dims)
+            terms.append(f"{idx} * {stride}")
+    return " + ".join(terms)
+
+
+def _translate_tile_intrinsics(line: str, tile_var_dims: dict[str, tuple[int, int, str]]) -> str:
+    """Lower ``wp::tile_*`` calls to ``wp_tile_RxC_<scalar>_*`` helper calls.
+
+    ``tile_var_dims`` maps each tile local label to ``(rows, cols, msl_scalar)``
+    so we can pick the right helper for cholesky / cholesky_solve (whose
+    dimensions are inferred from their result tile's type rather than
+    template args).
+    """
+
+    def repl_load(m: re.Match[str]) -> str:
+        lhs = m.group(1)
+        scalar_ctype = f"wp::{m.group(2)}"
+        rows = int(m.group(3))
+        cols = int(m.group(4)) if m.group(4) else 1
+        msl_scalar = _SCALAR_CTYPE_TO_MSL.get(scalar_ctype)
+        if msl_scalar is None:
+            return m.group(0)
+        args = [a.strip() for a in m.group(5).split(",")]
+        # First arg is the array; remaining are leading slice indices then
+        # tile offsets. For a 2-D tile we have 2 trailing offsets; for a
+        # 1-D tile, 1 trailing offset.
+        arr = args[0]
+        n_off = 2 if cols > 1 else 1
+        lead_idx_args = args[1:-n_off] if len(args) > 1 + n_off else []
+        offsets = args[-n_off:]
+        arr_name = arr[len("var_"):] if arr.startswith("var_") else arr
+        base_expr = _build_flat_base_expr(arr_name, lead_idx_args, inner_dims=2 if cols > 1 else 1)
+        helper = f"wp_tile_{rows}x{cols}_{msl_scalar}_load"
+        if cols > 1:
+            row_stride = f"{arr_name}_shape[{len(lead_idx_args) + 1}]"
+            row_off, col_off = offsets
+        else:
+            row_stride = "1"
+            # Treat the 1-D tile load as a degenerate ``Rx1`` load with
+            # ``col_off=0`` so the same helper signature works.
+            row_off, col_off = offsets[0], "0"
+        return f"var_{lhs} = {helper}({arr}, {base_expr}, {row_stride}, {row_off}, {col_off})"
+
+    def repl_store(m: re.Match[str]) -> str:
+        scalar_ctype = f"wp::{m.group(1)}"
+        msl_scalar = _SCALAR_CTYPE_TO_MSL.get(scalar_ctype)
+        if msl_scalar is None:
+            return m.group(0)
+        args = [a.strip() for a in m.group(2).split(",")]
+        # Last arg is the source tile, first is the destination array,
+        # everything between is leading-slice indices + tile offsets.
+        arr = args[0]
+        tile_var = args[-1]
+        tile_label = tile_var[len("var_"):] if tile_var.startswith("var_") else tile_var
+        dims = tile_var_dims.get(tile_label)
+        if dims is None:
+            return m.group(0)
+        rows, cols, _ = dims
+        n_off = 2 if cols > 1 else 1
+        middle = args[1:-1]  # leading-idx + offsets
+        lead_idx_args = middle[:-n_off] if len(middle) > n_off else []
+        offsets = middle[-n_off:]
+        arr_name = arr[len("var_"):] if arr.startswith("var_") else arr
+        base_expr = _build_flat_base_expr(arr_name, lead_idx_args, inner_dims=2 if cols > 1 else 1)
+        helper = f"wp_tile_{rows}x{cols}_{msl_scalar}_store"
+        if cols > 1:
+            row_stride = f"{arr_name}_shape[{len(lead_idx_args) + 1}]"
+            row_off, col_off = offsets
+        else:
+            row_stride = "1"
+            row_off, col_off = offsets[0], "0"
+        return f"{helper}({arr}, {base_expr}, {row_stride}, {row_off}, {col_off}, {tile_var})"
+
+    def repl_cholesky(m: re.Match[str]) -> str:
+        lhs = m.group(1)
+        args = [a.strip() for a in m.group(2).split(",")]
+        # Drop the cuBLASDx-LTO leading three padding args.
+        if len(args) < 5:
+            return m.group(0)
+        in_arg = args[3]
+        in_label = in_arg[len("var_"):] if in_arg.startswith("var_") else in_arg
+        dims = tile_var_dims.get(in_label) or tile_var_dims.get(lhs)
+        if dims is None:
+            return m.group(0)
+        rows, cols, msl_scalar = dims
+        if rows != cols:
+            return m.group(0)
+        helper = f"wp_tile_{rows}x{cols}_{msl_scalar}_cholesky"
+        return f"var_{lhs} = {helper}({in_arg})"
+
+    def repl_cholesky_solve(m: re.Match[str]) -> str:
+        lhs = m.group(1)
+        args = [a.strip() for a in m.group(2).split(",")]
+        # Args layout for ``out = solve(L, b)`` (non-inplace): one leading
+        # padding zero, then ``L`` (square N×N), ``b`` (N×K), and ``out``
+        # (N×K — same local as the LHS).
+        if len(args) < 4:
+            return m.group(0)
+        L_arg = args[1]
+        b_arg = args[2]
+        L_label = L_arg[len("var_"):] if L_arg.startswith("var_") else L_arg
+        b_label = b_arg[len("var_"):] if b_arg.startswith("var_") else b_arg
+        L_dims = tile_var_dims.get(L_label)
+        b_dims = tile_var_dims.get(b_label) or tile_var_dims.get(lhs)
+        if L_dims is None or b_dims is None:
+            return m.group(0)
+        n = L_dims[0]
+        k = b_dims[1]
+        msl_scalar = L_dims[2]
+        helper = f"wp_tile_{n}x{n}_{msl_scalar}_cholesky_solve_{k}"
+        return f"var_{lhs} = {helper}({L_arg}, {b_arg})"
+
+    line = _TILE_LOAD_PAT.sub(repl_load, line)
+    line = _TILE_STORE_PAT.sub(repl_store, line)
+    line = _TILE_CHOLESKY_PAT.sub(repl_cholesky, line)
+    line = _TILE_CHOLESKY_SOLVE_PAT.sub(repl_cholesky_solve, line)
+    return line
+
+
 def _check_no_unsupported_intrinsics(line: str) -> None:
     """After translation, any remaining ``wp::`` or ``builtin_`` is unsupported."""
     if "wp::" in line or "builtin_" in line:
@@ -1048,8 +1454,34 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
     # Build the IR if not already built. Pass enable_backward=False because
     # we only consume the forward pass — the Metal backend does not yet
     # support autodiff.
+    #
+    # ``output_arch=None`` routes tile-LTO builtins (e.g., ``tile_cholesky``)
+    # to their CPU/no-MathDx dispatch so they emit plain function calls
+    # rather than CUDA cuBLASDx LTO IR. ``block_dim`` is required by some
+    # of those dispatch funcs even on the no-MathDx path.
     if not getattr(adj, "blocks", None):
-        adj.build(builder=None, default_builder_options={"enable_backward": False})
+        adj.build(
+            builder=None,
+            default_builder_options={
+                "enable_backward": False,
+                "output_arch": None,
+                "block_dim": 256,
+            },
+        )
+    # When the kernel is part of a registered module (``module="unique"``),
+    # ``adj.build`` sets ``adj.builder_options`` to the module's options
+    # dict, which our default options dict can't reach. Backfill the keys
+    # tile-builtin value-funcs read at codegen time so their lookups don't
+    # ``KeyError``. Use the kernel's per-launch ``block_dim`` if it was
+    # threaded through; otherwise the safe default mirrors the Warp CPU
+    # backend.
+    if getattr(adj, "builder_options", None) is not None:
+        adj.builder_options.setdefault("output_arch", None)
+        adj.builder_options.setdefault("block_dim", 256)
+    # Reset the global ``codegen.options`` ref to our merged dict so any
+    # value-func evaluated from ``add_call`` sees the same view.
+    import warp._src.codegen as _wp_codegen  # noqa: PLC0415
+    _wp_codegen.options = adj.builder_options
 
     # Preprocess via the AST pipeline (see ``warp._src.codegen_metal_ast``):
     #   parse → structural fold (for/while/if) → drop unsupported locals
@@ -1489,8 +1921,29 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
             local_name = _per_field_local(mangled_label, field_name)
             body_lines.append(f"    {field_info.msl_type} {local_name} = {field_info.msl_type}(0);")
 
+    # Map tile-typed locals to ``(rows, cols, msl_scalar)`` for the tile-
+    # intrinsic translator (it needs the result-tile shape for cholesky /
+    # cholesky_solve, where dimensions don't appear in the call's template
+    # args).
+    tile_var_dims: dict[str, tuple[int, int, str]] = {}
+    for var in adj.variables:
+        m = _TILE_CTYPE_PAT.search(var.ctype())
+        if m is None:
+            continue
+        scalar_ctype = f"wp::{m.group(1)}"
+        if scalar_ctype not in _SCALAR_CTYPE_TO_MSL:
+            continue
+        rows = int(m.group(2))
+        cols = int(m.group(3)) if m.group(3) else 1
+        tile_var_dims[var.label] = (rows, cols, _SCALAR_CTYPE_TO_MSL[scalar_ctype])
+
     # --- Forward statements --------------------------------------------
     def _finalize(translated: str) -> str:
+        # Lower tile intrinsics *before* the subscript-substitute pass —
+        # the tile pattern matches on the raw ``wp::tile_*<...>`` shape,
+        # which contains ``var_X`` operands that the substitute would
+        # otherwise rewrite to expressions and break the parse.
+        translated = _translate_tile_intrinsics(translated, tile_var_dims)
         # Inline subscripts that the address-collapse produced.
         for local_label, subscript in subscript_map.items():
             translated = re.sub(rf"\bvar_{re.escape(local_label)}\b", subscript, translated)
@@ -1521,9 +1974,25 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
         _check_no_unsupported_intrinsics(translated)
         return translated
 
+    # Match raw declaration lines emitted by the user-function inliner for
+    # *intermediate* pointer-typed locals (e.g. ``device int* var_21__9;``).
+    # When the kernel-level address-fold pass aliases that local into
+    # ``subscript_map``, the bare ``var_X`` reference inside the decl gets
+    # corrupted by the substitute pass in ``_finalize`` (which textually
+    # replaces ``var_X`` everywhere). The cleanest fix is to elide the decl
+    # itself once we know the local is aliased away.
+    inlined_decl_pat = re.compile(r"^\s*[\w<>:*\s]+?\s+var_(\w+)\s*;\s*$")
+
     for raw in forward_lines:
         line = _strip_comments_and_directives(raw)
         if line is None:
+            continue
+        # Drop inliner-emitted decls for locals that the address-fold pass
+        # aliased into ``subscript_map`` — leaving them in place would let
+        # ``_finalize`` substitute the alias expression *into* the decl,
+        # producing malformed MSL like ``device int* arr[idx];``.
+        m_decl = inlined_decl_pat.match(raw)
+        if m_decl and m_decl.group(1) in subscript_map:
             continue
         # Address lines have been folded into ``subscript_map``.
         if _ADDRESS_MULTI_PAT.match(raw):
@@ -1788,6 +2257,46 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
 
     if _shape_arrs_seen:
         source = "\n".join(_shape_idx_pat.sub(_replace_shape_ref, line) for line in body_lines) + "\n"
+
+    # ---- Drop unused kernel args ------------------------------------
+    # Kernels can have many declared args that go unreferenced in the
+    # emitted MSL — e.g. ``primitive_narrowphase`` with sphere-only
+    # collisions never touches the ``mesh_*`` arrays, and a contact-
+    # free model never writes to ``contact_*_out``. Each declared arg
+    # eats a buffer slot, and Metal HW caps a kernel at 31 buffer
+    # parameters. Filter ``input_args`` / ``output_args`` to just the
+    # ones the body actually mentions, so we stay under the limit on
+    # trivial models. The launcher skips any arg not in the artifact's
+    # used-args list.
+    _name_word_pat = re.compile(r"\b\w+\b")
+    _used_names: set[str] = set()
+    for line in source.splitlines():
+        for m in _name_word_pat.finditer(line):
+            _used_names.add(m.group(0))
+    input_args = [a for a in input_args if a.label in _used_names]
+    output_args = [a for a in output_args if a.label in _used_names]
+
+    if not output_args:
+        # Every declared output arg is unreferenced in the body — for
+        # this specialisation the kernel is truly write-free (e.g.
+        # ``primitive_narrowphase`` with sphere-only collisions and no
+        # mesh data, all of whose write paths are behind compile-time-
+        # eliminated branches). Return a no-op artifact; the launcher
+        # short-circuits when it sees an empty ``input_names`` /
+        # ``output_names``.
+        return MetalKernelArtifact(
+            name=adj.fun_name,
+            source="",
+            input_names=[],
+            output_names=[],
+            input_args=[],
+            output_args=[],
+            atomic_outputs=False,
+            output_shape_inputs=[],
+            shape_packed_arrs=(),
+            shape_packed_slot=_SHAPE_SLOT,
+            header="",
+        )
 
     base_input_names = [a.label for a in input_args]
     # ``__shapes_packed`` is a synthetic input the launcher fills with
@@ -2102,20 +2611,27 @@ def _get_or_build_metal_kernel(kernel):
     mlx_kernel = getattr(kernel, "_metal_mlx_kernel", None)
     if artifact is None or mlx_kernel is None:
         artifact = generate_msl_kernel(kernel)
-        mlx_kernel = mx.fast.metal_kernel(
-            name=artifact.name,
-            input_names=artifact.input_names,
-            output_names=artifact.output_names,
-            source=artifact.source,
-            atomic_outputs=artifact.atomic_outputs,
-            header=artifact.header,
-        )
+        # No-op kernel (every arg pruned as unused — see
+        # ``generate_msl_kernel``); we don't compile a Metal kernel for
+        # it. The launcher short-circuits when it sees the empty
+        # artifact.
+        if not artifact.input_names and not artifact.output_names:
+            mlx_kernel = None
+        else:
+            mlx_kernel = mx.fast.metal_kernel(
+                name=artifact.name,
+                input_names=artifact.input_names,
+                output_names=artifact.output_names,
+                source=artifact.source,
+                atomic_outputs=artifact.atomic_outputs,
+                header=artifact.header,
+            )
         kernel._metal_artifact = artifact
         kernel._metal_mlx_kernel = mlx_kernel
     return artifact, mlx_kernel
 
 
-def launch_metal_kernel(kernel, dim, inputs, outputs, device):
+def launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim: int = 256):
     """Dispatch a Warp kernel on a Metal device via MLX.
 
     This is the Metal-specific equivalent of the CUDA/CPU launch path in
@@ -2150,6 +2666,10 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device):
         return
 
     artifact, mlx_kernel = _get_or_build_metal_kernel(kernel)
+    # No-op kernel (the prune step found every declared output is
+    # unreferenced for this specialisation). Nothing to dispatch.
+    if mlx_kernel is None:
+        return
 
     fwd_args = list(inputs) + list(outputs)
     if len(fwd_args) != len(kernel.adj.args):
@@ -2290,12 +2810,19 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device):
     grid_z = dims[2] if len(dims) >= 3 else 1
     grid = (grid_x, grid_y, grid_z)
     # Pick a threadgroup that's at most 256 threads total and never larger
-    # than each grid dimension.
+    # than each grid dimension. For 2-D launches we honor ``block_dim`` on
+    # the y-axis — that's where mujoco_warp packs the per-block tid for
+    # tile-cooperative kernels (e.g. ``_solve_LD_sparse_fused``). The
+    # threadgroup y-extent must match the launch's ``block_dim`` so that
+    # ``threads_per_threadgroup.y`` (which we lower ``wp.block_dim()`` to)
+    # returns the value the kernel expects.
     if len(dims) == 1:
         tg = (min(256, grid_x), 1, 1)
     elif len(dims) == 2:
-        tg_x = min(16, grid_x)
-        tg_y = min(16, grid_y)
+        tg_y = min(block_dim, grid_y) if block_dim and block_dim > 0 else min(16, grid_y)
+        # Cap x so total tg threads stay under MSL's 1024-thread/group cap.
+        max_x = max(1, 256 // max(tg_y, 1))
+        tg_x = min(max_x, grid_x)
         tg = (tg_x, tg_y, 1)
     else:
         tg_x = min(8, grid_x)
@@ -2324,8 +2851,21 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device):
     # the final results rather than queued operations.
     if isinstance(out_mx_list, mx.array):
         out_mx_list = [out_mx_list]
-    for o in out_mx_list:
-        mx.eval(o)
+    try:
+        for o in out_mx_list:
+            mx.eval(o)
+    except Exception as e:
+        # Dump the failing MSL source on compile/launch errors to make
+        # codegen bugs debuggable (set WARP_METAL_DUMP_ON_FAIL=1).
+        if os.environ.get("WARP_METAL_DUMP_ON_FAIL"):
+            import tempfile
+            dump_dir = tempfile.mkdtemp(prefix=f"warp_metal_fail_{kernel.key}_")
+            with open(os.path.join(dump_dir, "header.metal"), "w") as f:
+                f.write(artifact.header or "")
+            with open(os.path.join(dump_dir, "source.metal"), "w") as f:
+                f.write(artifact.source or "")
+            print(f"[warp-metal] kernel '{kernel.key}' failed; dumped to {dump_dir}", flush=True)
+        raise
 
     # ---- Copy MLX outputs into the user's wp.array buffers ----
     for o_mx, dest in zip(out_mx_list, output_dest_arrays, strict=True):

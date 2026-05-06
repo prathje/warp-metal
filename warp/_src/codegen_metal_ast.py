@@ -217,6 +217,12 @@ class For(Node):
     start: str
     stop: str
     body: tuple[Node, ...]
+    # Stride for the induction variable. ``"1"`` for the common 1-/2-arg
+    # ``range(stop)`` / ``range(start, stop)`` forms; some kernel like
+    # mujoco_warp's ``_solve_LD_sparse_fused`` use 3-arg ``range(start,
+    # stop, step)`` where step is a runtime expression (e.g.
+    # ``BLOCK_DIM = wp.block_dim()``).
+    step: str = "1"
 
 
 @dataclass(frozen=True)
@@ -382,7 +388,7 @@ _RE_WHILE_COND = re.compile(
 )
 _RE_TID = re.compile(r"^\s*builtin_tid(?P<arity>\d)d?\s*\((?P<args>[^()]*)\)\s*;\s*$")
 _RE_ASSIGN = re.compile(r"^(?P<indent>\s*)var_(?P<lhs>\w+)\s*=\s*(?P<rhs>.+?)\s*;\s*$")
-_RE_VOID_CALL = re.compile(r"^(?P<indent>\s*)(?P<func>[\w:]+)\s*\((?P<args>.*)\)\s*;\s*$")
+_RE_VOID_CALL = re.compile(r"^(?P<indent>\s*)(?P<func>[\w:]+)\s*(?P<tpl><[^()]*>)?\s*\((?P<args>.*)\)\s*;\s*$")
 
 # RHS shape recognizers used inside Assign parsing. Each captures just enough
 # to label the operation; details that downstream passes need stay in the
@@ -612,7 +618,12 @@ def _emit_into(nodes, out: list[str]) -> None:
             # emits the synthetic ``for (...) {`` and matching ``}`` at
             # column 0 regardless of nesting. We can revisit indentation
             # cosmetics after Phase 1.3 lands.
-            out.append(f"for (int var_{n.iter_var} = {n.start}; var_{n.iter_var} < {n.stop}; ++var_{n.iter_var}) {{")
+            iv = n.iter_var
+            if n.step == "1":
+                inc = f"++var_{iv}"
+            else:
+                inc = f"var_{iv} += {n.step}"
+            out.append(f"for (int var_{iv} = {n.start}; var_{iv} < {n.stop}; {inc}) {{")
             _emit_into(list(n.body), out)
             out.append("}")
         elif isinstance(n, While):
@@ -646,7 +657,13 @@ def _emit_into(nodes, out: list[str]) -> None:
 # just structure it.
 
 
-_RANGE_LINE = re.compile(r"^\s*var_(\w+)\s*=\s*wp::range\s*\(\s*var_(\w+)\s*(?:,\s*var_(\w+)\s*)?\)\s*;\s*$")
+_RANGE_LINE = re.compile(
+    r"^\s*var_(\w+)\s*=\s*wp::range\s*\("
+    r"\s*var_(\w+)\s*"
+    r"(?:,\s*var_(\w+)\s*)?"
+    r"(?:,\s*var_(\w+)\s*)?"
+    r"\)\s*;\s*$"
+)
 _INDENT_OF = re.compile(r"^(\s*)")
 
 
@@ -669,11 +686,11 @@ def fold(nodes: list[Node]) -> tuple[list[Node], set[str]]:
     return folded, skip
 
 
-def _match_for_opener(nodes: list[Node], i: int) -> tuple[Node, str, str, str, str, str] | None:
+def _match_for_opener(nodes: list[Node], i: int) -> tuple[Node, str, str, str, str, str, str] | None:
     """If ``nodes[i:i+4]`` is a Warp for-loop opener, return its parts.
 
-    Returns ``(range_assign, range_var, start_expr, stop_expr, iter_var, k_suffix)``
-    or ``None`` if the 4-line shape doesn't match.
+    Returns ``(range_assign, range_var, start_expr, stop_expr, step_expr,
+    iter_var, k_suffix)`` or ``None`` if the 4-line shape doesn't match.
     """
     if i + 3 >= len(nodes):
         return None
@@ -687,9 +704,15 @@ def _match_for_opener(nodes: list[Node], i: int) -> tuple[Node, str, str, str, s
     if m.group(3) is None:
         start_expr = "0"
         stop_expr = f"var_{m.group(2)}"
+        step_expr = "1"
+    elif m.group(4) is None:
+        start_expr = f"var_{m.group(2)}"
+        stop_expr = f"var_{m.group(3)}"
+        step_expr = "1"
     else:
         start_expr = f"var_{m.group(2)}"
         stop_expr = f"var_{m.group(3)}"
+        step_expr = f"var_{m.group(4)}"
 
     n1 = nodes[i + 1]
     if not isinstance(n1, Label) or not n1.name.startswith("start_for_"):
@@ -712,7 +735,7 @@ def _match_for_opener(nodes: list[Node], i: int) -> tuple[Node, str, str, str, s
     if not iter_next_match or iter_next_match.group(2) != range_var:
         return None
     iter_var = iter_next_match.group(1)
-    return n0, range_var, start_expr, stop_expr, iter_var, k_suffix
+    return n0, range_var, start_expr, stop_expr, step_expr, iter_var, k_suffix
 
 
 def _fold_range(
@@ -740,7 +763,7 @@ def _fold_range(
         # For-loop opener (4-line shape: range / start_label / iter_cmp / iter_next).
         opener = _match_for_opener(nodes, i)
         if opener is not None:
-            range_node, range_var, start_expr, stop_expr, iter_var, k_suffix = opener
+            range_node, range_var, start_expr, stop_expr, step_expr, iter_var, k_suffix = opener
             body_nodes, after = _fold_range(nodes, i + 4, end, end_label=f"end_for_{k_suffix}", skip=skip)
             # Drop every ``goto start_for_K`` in the body — both the trailing
             # one (implicit in the for opener) and any mid-body ones (Warp's
@@ -760,6 +783,7 @@ def _fold_range(
                     start=start_expr,
                     stop=stop_expr,
                     body=tuple(body_nodes),
+                    step=step_expr,
                 )
             )
             i = after
@@ -828,7 +852,7 @@ def _fold_if_body(nodes: list[Node], start: int, end: int, skip: set[str]) -> tu
 
         opener = _match_for_opener(nodes, i)
         if opener is not None:
-            range_node, range_var, start_expr, stop_expr, iter_var, k_suffix = opener
+            range_node, range_var, start_expr, stop_expr, step_expr, iter_var, k_suffix = opener
             body_nodes, after = _fold_range(nodes, i + 4, end, end_label=f"end_for_{k_suffix}", skip=skip)
             if body_nodes and isinstance(body_nodes[-1], Goto) and body_nodes[-1].target == f"start_for_{k_suffix}":
                 body_nodes = body_nodes[:-1]
@@ -842,6 +866,7 @@ def _fold_if_body(nodes: list[Node], start: int, end: int, skip: set[str]) -> tu
                     start=start_expr,
                     stop=stop_expr,
                     body=tuple(body_nodes),
+                    step=step_expr,
                 )
             )
             i = after
@@ -1110,9 +1135,21 @@ def _inline_one_call(
             f"function inlining exceeded max depth {max_depth} — possible recursion in {fn_overload.key!r}"
         )
 
-    # Build the callee's IR.
+    # Build the callee's IR. Pass the same default options the top-level
+    # kernel build uses (see ``codegen_metal.generate_msl_kernel``) so that
+    # tile-builtin value funcs (``wp.tile``, ``wp.tile_cholesky_solve``,
+    # etc.) which read ``options["block_dim"]`` / ``options["output_arch"]``
+    # don't crash with a KeyError when the callee is a wrapper around tile
+    # primitives.
     if not getattr(fn_overload.adj, "blocks", None):
-        fn_overload.adj.build(builder=None, default_builder_options={"enable_backward": False})
+        fn_overload.adj.build(
+            builder=None,
+            default_builder_options={
+                "enable_backward": False,
+                "output_arch": None,
+                "block_dim": 256,
+            },
+        )
 
     fn_lines = fn_overload.adj.blocks[0].body_forward
 
@@ -1154,6 +1191,18 @@ def _inline_one_call(
     fn_folded, fold_skip = fold(fn_nodes)
 
     # Recursively inline nested user calls.
+    #
+    # The callee's body may reference *other* ``@wp.func``s that the
+    # kernel itself never calls directly (e.g. a passive-dynamics kernel
+    # whose only @wp.func reference is a wrapper which then calls
+    # ``mul_quat`` and ``quat_to_vel``). Those names won't be in the
+    # kernel-level ``fn_map``, so without expansion the recursive walk
+    # leaves them as undeclared identifiers in the emitted MSL. Merge in
+    # the callee's own overload table — keyed by mangled native-func name
+    # — before recursing.
+    callee_fn_map = _build_function_overload_table(fn_overload.adj)
+    if callee_fn_map:
+        fn_map = {**fn_map, **callee_fn_map}
     fn_folded = _inline_walk(fn_folded, fn_map, depth + 1, max_depth, const_ints_out, struct_locals_out)
 
     # Record any Struct-typed locals so the kernel-level field-pointer
@@ -1279,6 +1328,7 @@ def _inline_walk(
                     start=n.start,
                     stop=n.stop,
                     body=tuple(_inline_walk(n.body, fn_map, depth, max_depth, const_ints_out, struct_locals_out)),
+                    step=n.step,
                 )
             )
             continue
@@ -1396,6 +1446,7 @@ def _apply_drop_unsupported(nodes: tuple[Node, ...] | list[Node], drop: set[str]
                     start=n.start,
                     stop=n.stop,
                     body=tuple(_apply_drop_unsupported(n.body, drop)),
+                    step=n.step,
                 )
             )
             continue
@@ -1573,6 +1624,56 @@ def _apply_view_rewrites(
                 out.append(VoidCall(raw=new_raw, op="array_store", args=new_args, extra=n.extra))
                 continue
 
+        # ``wp::tile_load<dt, bc, al, R[, C]>(view, off_0[, off_1])`` with a
+        # view of a higher-rank kernel arg. Rewrite to substitute the
+        # underlying array name and prepend the leading slice indices —
+        # downstream the ``wp::tile_load`` intrinsic regex computes the
+        # flat ``base`` offset and ``row_stride`` from the array's shape.
+        if (
+            isinstance(n, Assign)
+            and isinstance(n.expr, Builtin)
+            and n.expr.name == "tile_load"
+        ):
+            view_arr_l = _strip_var_prefix(n.expr.args[0]) if n.expr.args else None
+            if view_arr_l is not None and view_arr_l in view_aliases:
+                arr_name, lead_idx_labels = view_aliases[view_arr_l]
+                tail = list(n.expr.args[1:])
+                lead = [f"var_{l}" for l in lead_idx_labels]
+                new_args = (f"var_{arr_name}", *lead, *tail)
+                tpl_match = re.search(r"wp::tile_load\s*(<[^()]*>)", n.expr.raw)
+                tpl = tpl_match.group(1) if tpl_match else ""
+                indent = _leading_indent(n.raw)
+                new_raw = f"{indent}var_{n.lhs} = wp::tile_load{tpl}({', '.join(new_args)});"
+                out.append(
+                    Assign(
+                        raw=new_raw,
+                        lhs=n.lhs,
+                        expr=Builtin(
+                            raw=f"wp::tile_load{tpl}({', '.join(new_args)})",
+                            name="tile_load",
+                            args=new_args,
+                        ),
+                    )
+                )
+                continue
+
+        # ``wp::tile_store<dt, bc, al>(view, off_0[, off_1], tile)`` — same
+        # treatment as tile_load above, but the tile arg sits at the end
+        # so we prepend leading indices before it.
+        if isinstance(n, VoidCall) and n.op == "tile_store":
+            view_arr_l = _strip_var_prefix(n.args[0]) if n.args else None
+            if view_arr_l is not None and view_arr_l in view_aliases:
+                arr_name, lead_idx_labels = view_aliases[view_arr_l]
+                tail = list(n.args[1:])
+                lead = [f"var_{l}" for l in lead_idx_labels]
+                new_args = (f"var_{arr_name}", *lead, *tail)
+                tpl_match = re.search(r"wp::tile_store\s*(<[^()]*>)", n.raw)
+                tpl = tpl_match.group(1) if tpl_match else ""
+                indent = _leading_indent(n.raw)
+                new_raw = f"{indent}wp::tile_store{tpl}({', '.join(new_args)});"
+                out.append(VoidCall(raw=new_raw, op="tile_store", args=new_args, extra=n.extra))
+                continue
+
         if (
             isinstance(n, Assign)
             and isinstance(n.expr, Builtin)
@@ -1634,6 +1735,7 @@ def _apply_view_rewrites(
                     start=n.start,
                     stop=n.stop,
                     body=tuple(_apply_view_rewrites(n.body, slice_aliases, view_aliases)),
+                    step=n.step,
                 )
             )
             continue
@@ -1726,6 +1828,34 @@ def _apply_multidim_atomics(
 ) -> list[Node]:
     out: list[Node] = []
     for n in nodes:
+        # 3-arg atomic on a vec-typed array: ``wp::atomic_<op>(arr, idx, vec_val)``.
+        # MSL has no atomic op on vector types, so this must expand to N
+        # per-component scalar atomics regardless of how many user-visible
+        # dims the original call had. (Multi-dim calls reach this branch via
+        # ``_apply_view_rewrites`` which already pre-flattens the index.)
+        if (
+            isinstance(n, Assign)
+            and isinstance(n.expr, Builtin)
+            and n.expr.name in _ATOMIC_OPS
+            and len(n.expr.args) == 3
+        ):
+            arr_arg = n.expr.args[0]
+            arr_label = _strip_var_prefix(arr_arg)
+            if arr_label is not None and arr_label in arg_label_set and arr_label in vec_arr_info:
+                flat_idx = n.expr.args[1]
+                value = n.expr.args[2]
+                indent = _leading_indent(n.raw)
+                vec_n, _ = vec_arr_info[arr_label]
+                msl_name = _ATOMIC_TO_MSL[n.expr.name]
+                base = f"({flat_idx}) * {vec_n}"
+                for k in range(vec_n):
+                    out.append(
+                        _RawLine(
+                            raw=(f"{indent}{msl_name}(&{arr_label}[{base} + {k}], {value}[{k}], memory_order_relaxed);")
+                        )
+                    )
+                continue
+
         if (
             isinstance(n, Assign)
             and isinstance(n.expr, Builtin)
@@ -1810,6 +1940,7 @@ def _apply_multidim_atomics(
                     start=n.start,
                     stop=n.stop,
                     body=tuple(_apply_multidim_atomics(n.body, vec_arr_info, arg_label_set)),
+                    step=n.step,
                 )
             )
             continue
@@ -1987,6 +2118,7 @@ def _apply_indexref_rewrites(
                     body=tuple(
                         _apply_indexref_rewrites(n.body, indexref_aliases, referenced_addr_locals, vec_arr_info)
                     ),
+                    step=n.step,
                 )
             )
             continue
