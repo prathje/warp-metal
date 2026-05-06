@@ -21,7 +21,11 @@ from __future__ import annotations
 import unittest
 
 import warp as wp
-from warp._src.codegen_metal import _preprocess_for_loops, _preprocess_while_loops
+from warp._src.codegen_metal import (
+    _preprocess_for_loops,
+    _preprocess_views,
+    _preprocess_while_loops,
+)
 from warp._src.codegen_metal_ast import (
     AddrOf,
     Assign,
@@ -50,6 +54,7 @@ from warp._src.codegen_metal_ast import (
     WhileCondTest,
     emit,
     fold,
+    fold_views,
     parse,
     parse_line,
 )
@@ -459,6 +464,104 @@ class TestMetalASTFold(unittest.TestCase):
             out[tid] = s
 
         self._assert_equivalent(k)
+
+
+class TestMetalASTViewsFold(unittest.TestCase):
+    """Verify ``fold_views`` produces output equivalent to running
+    ``_preprocess_views`` on the existing for/while-preprocessed lines.
+    """
+
+    def _assert_views_equivalent(self, kernel):
+        kernel.adj.build(builder=None, default_builder_options={"enable_backward": False})
+        lines = kernel.adj.blocks[0].body_forward
+
+        # New pipeline: parse -> fold (for/while/if) -> fold_views -> emit.
+        nodes = parse(lines)
+        folded, fold_skip = fold(nodes)
+        view_folded, view_skip = fold_views(folded, kernel.adj)
+        new_lines = emit(view_folded)
+
+        # Existing pipeline: for/while preprocess, then views preprocess.
+        old_for, old_for_skip = _preprocess_for_loops(lines)
+        old_after_while = _preprocess_while_loops(old_for)
+        old_lines, old_view_skip = _preprocess_views(old_after_while, kernel.adj)
+
+        self.assertEqual(
+            new_lines,
+            old_lines,
+            f"emit(fold_views(...)) != _preprocess_views(...) on kernel {kernel.key!r}",
+        )
+        # Combined skip-sets should match: for/while skip ∪ view skip on each side.
+        self.assertEqual(
+            fold_skip | view_skip,
+            old_for_skip | old_view_skip,
+            f"combined skip set mismatch on kernel {kernel.key!r}",
+        )
+
+    def test_kernel_with_no_views(self):
+        # Sanity: the pass should be a no-op (modulo the for-while fold)
+        # when no slice/view ops are present.
+        @wp.kernel
+        def k(a: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
+            tid = wp.tid()
+            out[tid] = a[tid] * 2.0
+
+        self._assert_views_equivalent(k)
+
+    def test_arr2d_row_read(self):
+        # ``arr2d[i]`` lowers to slice_t + view, which we fold into direct
+        # ``arr[i, j]`` flattened addressing.
+        @wp.kernel
+        def k(a: wp.array2d(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
+            tid = wp.tid()
+            row = a[tid]
+            s = float(0.0)
+            for j in range(a.shape[1]):
+                s += row[j]
+            out[tid] = s
+
+        self._assert_views_equivalent(k)
+
+    def test_arr2d_atomic_scatter_through_view(self):
+        # ``wp.atomic_add(out2d[i], j, val)`` exercises the atomic flat-index
+        # rewrite path.
+        @wp.kernel
+        def k(
+            a: wp.array2d(dtype=wp.float32),
+            cols: wp.array(dtype=wp.int32),
+            out: wp.array2d(dtype=wp.float32),
+        ):
+            tid = wp.tid()
+            row = a[tid]
+            j = cols[tid]
+            wp.atomic_add(out[tid], j, row[j] * 2.0)
+
+        self._assert_views_equivalent(k)
+
+    def test_arr2d_array_store_through_view(self):
+        @wp.kernel
+        def k(a: wp.array2d(dtype=wp.float32), out: wp.array2d(dtype=wp.float32)):
+            tid = wp.tid()
+            row_in = a[tid]
+            row_out = out[tid]
+            for j in range(a.shape[1]):
+                row_out[j] = row_in[j] * 3.0 + 1.0
+
+        self._assert_views_equivalent(k)
+
+    def test_view_inside_for_loop(self):
+        # The view definition itself can occur inside a for body — walker
+        # must recurse into folded For nodes and not just the top level.
+        @wp.kernel
+        def k(a: wp.array2d(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
+            tid = wp.tid()
+            s = float(0.0)
+            for i in range(a.shape[0]):
+                row = a[i]
+                s += row[tid]
+            out[tid] = s
+
+        self._assert_views_equivalent(k)
 
 
 if __name__ == "__main__":

@@ -872,6 +872,234 @@ def _drop_goto(body: tuple[Node, ...] | list[Node], target: str) -> list[Node]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# View / slice fold (Phase 1.2a)
+# ---------------------------------------------------------------------------
+# Fold ``slice_t`` + ``view`` IR patterns into direct array ops on the
+# underlying argument. Output-equivalent to ``_preprocess_views`` from
+# :mod:`warp._src.codegen_metal`, but operates on parsed nodes and recurses
+# into structured bodies so view ops nested inside For/While/If get handled
+# the same as top-level ones.
+#
+# Supported pattern (the only one mujoco_warp uses):
+#
+#     var_S = wp::slice_t(i, i, 0);          // step == 0 == "integer index"
+#     var_V = wp::view(arr, var_S, ...);     // arr is a kernel arg
+#     ... downstream wp::address / wp::array_store / wp::atomic_* on var_V ...
+#
+# The downstream ops are rewritten into the same ops on ``arr``, with the
+# slice's integer index(es) prepended to the index list. Slice and view
+# definitions become declaration-skipped aliases.
+
+
+def fold_views(nodes: list[Node], adj) -> tuple[list[Node], set[str]]:
+    """Fold view aliases through the tree.
+
+    Returns ``(rewritten_nodes, skip_decls)`` — local labels whose top-level
+    declarations should be suppressed (the slice_t and view aliases).
+    """
+    arg_label_set = {a.label for a in adj.args}
+    const_int_vars: dict[str, int] = {}
+    for var in adj.variables:
+        if var.constant is not None and isinstance(var.constant, int):
+            const_int_vars[var.label] = var.constant
+
+    slice_aliases: dict[str, str] = {}
+    _collect_slice_aliases(nodes, slice_aliases, const_int_vars)
+
+    view_aliases: dict[str, tuple[str, list[str]]] = {}
+    _collect_view_aliases(nodes, view_aliases, slice_aliases, arg_label_set)
+
+    skip_decls: set[str] = set(slice_aliases) | set(view_aliases)
+    if not view_aliases:
+        return nodes, skip_decls
+
+    return _apply_view_rewrites(nodes, slice_aliases, view_aliases), skip_decls
+
+
+def _strip_var_prefix(s: str) -> str | None:
+    """``"var_X"`` -> ``"X"``; anything else -> ``None``."""
+    if s.startswith("var_"):
+        return s[len("var_") :]
+    return None
+
+
+def _collect_slice_aliases(
+    nodes: tuple[Node, ...] | list[Node],
+    out: dict[str, str],
+    const_int_vars: dict[str, int],
+) -> None:
+    """Walk the tree, recording every supported ``wp::slice_t(i, i, 0)`` def.
+
+    The supported pattern is integer-index only: start==stop AND step is a
+    locally-constant zero.
+    """
+    for n in nodes:
+        if isinstance(n, Assign) and isinstance(n.expr, Builtin) and n.expr.name == "slice_t":
+            args = n.expr.args
+            if len(args) == 3:
+                start_l = _strip_var_prefix(args[0])
+                stop_l = _strip_var_prefix(args[1])
+                step_l = _strip_var_prefix(args[2])
+                if start_l is not None and start_l == stop_l and step_l is not None and const_int_vars.get(step_l) == 0:
+                    out[n.lhs] = start_l
+        elif isinstance(n, (If, For, While)):
+            _collect_slice_aliases(n.body, out, const_int_vars)
+
+
+def _collect_view_aliases(
+    nodes: tuple[Node, ...] | list[Node],
+    out: dict[str, tuple[str, list[str]]],
+    slice_aliases: dict[str, str],
+    arg_label_set: set[str],
+) -> None:
+    """Walk the tree, recording every supported ``wp::view(arr, slice...)``."""
+    for n in nodes:
+        if isinstance(n, Assign) and isinstance(n.expr, Builtin) and n.expr.name == "view":
+            args = n.expr.args
+            if len(args) >= 2:
+                arr_l = _strip_var_prefix(args[0])
+                slice_labels = [_strip_var_prefix(a) for a in args[1:]]
+                if (
+                    arr_l is not None
+                    and arr_l in arg_label_set
+                    and all(s is not None and s in slice_aliases for s in slice_labels)
+                ):
+                    out[n.lhs] = (arr_l, [slice_aliases[s] for s in slice_labels])
+        elif isinstance(n, (If, For, While)):
+            _collect_view_aliases(n.body, out, slice_aliases, arg_label_set)
+
+
+def _apply_view_rewrites(
+    nodes: tuple[Node, ...] | list[Node],
+    slice_aliases: dict[str, str],
+    view_aliases: dict[str, tuple[str, list[str]]],
+) -> list[Node]:
+    out: list[Node] = []
+    for n in nodes:
+        # 1. Drop slice_t / view definitions we resolved as aliases.
+        if (
+            isinstance(n, Assign)
+            and n.lhs in slice_aliases
+            and isinstance(n.expr, Builtin)
+            and n.expr.name == "slice_t"
+        ):
+            continue
+        if isinstance(n, Assign) and n.lhs in view_aliases and isinstance(n.expr, Builtin) and n.expr.name == "view":
+            continue
+
+        # 2. Rewrite address / array_store / atomic_* on a view.
+        if isinstance(n, Assign) and isinstance(n.expr, Builtin) and n.expr.name == "address":
+            view_arr_l = _strip_var_prefix(n.expr.args[0]) if n.expr.args else None
+            if view_arr_l is not None and view_arr_l in view_aliases:
+                arr_name, lead_idx_labels = view_aliases[view_arr_l]
+                tail = list(n.expr.args[1:])
+                all_indices = [f"var_{l}" for l in lead_idx_labels] + tail
+                indent = _leading_indent(n.raw)
+                new_raw = f"{indent}var_{n.lhs} = wp::address(var_{arr_name}, {', '.join(all_indices)});"
+                out.append(
+                    Assign(
+                        raw=new_raw,
+                        lhs=n.lhs,
+                        expr=Builtin(
+                            raw=new_raw.strip().rstrip(";").split("=", 1)[1].strip(),
+                            name="address",
+                            args=(f"var_{arr_name}", *all_indices),
+                        ),
+                    )
+                )
+                continue
+
+        if isinstance(n, VoidCall) and n.op == "array_store":
+            view_arr_l = _strip_var_prefix(n.args[0]) if n.args else None
+            if view_arr_l is not None and view_arr_l in view_aliases:
+                arr_name, lead_idx_labels = view_aliases[view_arr_l]
+                tail = list(n.args[1:])
+                lead = [f"var_{l}" for l in lead_idx_labels]
+                indent = _leading_indent(n.raw)
+                new_args = (f"var_{arr_name}", *lead, *tail)
+                new_raw = f"{indent}wp::array_store({', '.join(new_args)});"
+                out.append(VoidCall(raw=new_raw, op="array_store", args=new_args, extra=n.extra))
+                continue
+
+        if (
+            isinstance(n, Assign)
+            and isinstance(n.expr, Builtin)
+            and n.expr.name in ("atomic_add", "atomic_sub", "atomic_min", "atomic_max")
+        ):
+            view_arr_l = _strip_var_prefix(n.expr.args[0]) if n.expr.args else None
+            if view_arr_l is not None and view_arr_l in view_aliases:
+                arr_name, lead_idx_labels = view_aliases[view_arr_l]
+                tail_idx = n.expr.args[1].strip()
+                val = n.expr.args[2].strip()
+                all_idx = [f"var_{l}" for l in lead_idx_labels] + [tail_idx]
+                # Build a flat index without outer parens (the atomic
+                # intrinsic regex in codegen_metal disallows them in the
+                # index slot).
+                if len(all_idx) == 1:
+                    flat_idx = all_idx[0]
+                else:
+                    terms: list[str] = []
+                    for k, idx in enumerate(all_idx):
+                        if k == len(all_idx) - 1:
+                            terms.append(idx)
+                        else:
+                            stride = " * ".join(f"{arr_name}_shape[{j}]" for j in range(k + 1, len(all_idx)))
+                            terms.append(f"{idx} * {stride}")
+                    flat_idx = " + ".join(terms)
+                indent = _leading_indent(n.raw)
+                new_raw = f"{indent}var_{n.lhs} = wp::{n.expr.name}(var_{arr_name}, {flat_idx}, {val});"
+                out.append(
+                    Assign(
+                        raw=new_raw,
+                        lhs=n.lhs,
+                        expr=Builtin(
+                            raw=f"wp::{n.expr.name}(var_{arr_name}, {flat_idx}, {val})",
+                            name=n.expr.name,
+                            args=(f"var_{arr_name}", flat_idx, val),
+                        ),
+                    )
+                )
+                continue
+
+        # 3. Recurse into structured bodies.
+        if isinstance(n, If):
+            out.append(
+                If(
+                    raw=n.raw,
+                    cond=n.cond,
+                    body=tuple(_apply_view_rewrites(n.body, slice_aliases, view_aliases)),
+                    raw_open=n.raw_open,
+                    raw_close=n.raw_close,
+                )
+            )
+            continue
+        if isinstance(n, For):
+            out.append(
+                For(
+                    raw=n.raw,
+                    iter_var=n.iter_var,
+                    range_var=n.range_var,
+                    start=n.start,
+                    stop=n.stop,
+                    body=tuple(_apply_view_rewrites(n.body, slice_aliases, view_aliases)),
+                )
+            )
+            continue
+        if isinstance(n, While):
+            out.append(
+                While(
+                    raw=n.raw,
+                    label_k=n.label_k,
+                    body=tuple(_apply_view_rewrites(n.body, slice_aliases, view_aliases)),
+                )
+            )
+            continue
+
+        out.append(n)
+    return out
+
+
 def _rewrite_while_body(body: list[Node], k_suffix: str) -> list[Node]:
     """Rewrite this loop's break/continue/cond-test into structural forms.
 
