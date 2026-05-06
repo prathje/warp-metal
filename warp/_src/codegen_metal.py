@@ -949,11 +949,24 @@ class MetalKernelArtifact:
     # ``device atomic<T>*`` in the generated function signature, and the
     # ``init_value=0.0`` fallback is applied at call time.
     atomic_outputs: bool = False
-    # Names of output arguments whose shape we pass as a synthetic kernel
-    # input (because MLX only auto-generates ``<name>_shape`` for *inputs*).
-    # The launcher constructs ``mx.array(value.shape, dtype=int32)`` for each
-    # of these and appends them to the MLX inputs list, in order.
+    # Legacy: names of outputs whose shape we used to pass as a synthetic
+    # per-output ``<name>_shape`` input. Now superseded by the packed
+    # shape buffer (see ``shape_packed_arrs``); kept on the artifact for
+    # one release in case anything else reads it. Always empty in new
+    # code.
     output_shape_inputs: list[str] = field(default_factory=list)
+    # Names of every kernel arg whose ``arr.shape[k]`` is referenced from
+    # the body. The launcher concatenates each one's runtime shape into
+    # a single ``__shapes_packed`` int32 buffer, ordered to match this
+    # tuple. The codegen emits ``__shapes_packed[i*<slot> + k]`` for the
+    # k-th dim of the i-th array in this list. Combining shapes into one
+    # buffer keeps the total kernel-arg count under Metal's 31-slot
+    # hardware limit.
+    shape_packed_arrs: tuple[str, ...] = ()
+    # Per-array shape slot size in ``__shapes_packed`` (each array gets
+    # ``shape_packed_slot`` int32s, padded with zeros). Warp arrays cap
+    # at 4 dims so 4 is plenty.
+    shape_packed_slot: int = 4
     # MSL declarations to inject before the kernel function body — used for
     # custom big-vec structs (vec5, vec6 = spatial_vector, vec8) that don't
     # have native MSL ``floatN`` equivalents. Empty for kernels that only
@@ -1675,18 +1688,41 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
 
     source = "\n".join(body_lines) + "\n"
 
-    # Synthesise shape-inputs for any multi-dim *output* array. MLX
-    # auto-generates ``<name>_shape`` for inputs only; outputs need it
-    # supplied as a separate kernel argument. The launcher will append a
-    # corresponding ``mx.array(value.shape, dtype=int32)`` for each.
-    output_shape_inputs: list[str] = []
-    for out_arg in output_args:
-        ndim = getattr(out_arg.type, "ndim", 1) or 1
-        if ndim > 1:
-            output_shape_inputs.append(out_arg.label)
+    # ---- Pack per-array shape arrays into a single buffer ------------
+    # Without this, every multi-dim array referenced via ``<name>_shape``
+    # in the source would get its own ``int*`` buffer parameter (MLX
+    # auto-generates one for each input that uses ``<name>_shape``, plus
+    # we used to add one per multi-dim output explicitly). Metal limits a
+    # kernel to 31 buffer arguments; mujoco_warp's larger kernels easily
+    # exceed that. Combining all shape arrays into a single
+    # ``__shapes_packed`` buffer (with each array's shape at a known
+    # offset) brings us back well under the limit.
+    _SHAPE_SLOT = 4  # max ndim per array — Warp arrays cap at 4D
+    _shape_idx_pat = re.compile(r"\b(\w+)_shape\[([^\]]+)\]")
+    _shape_arrs_seen: list[str] = []
+    arg_label_set_local = {a.label for a in adj.args}
+    for line in body_lines:
+        for _m in _shape_idx_pat.finditer(line):
+            _arr = _m.group(1)
+            if _arr in arg_label_set_local and _arr not in _shape_arrs_seen:
+                _shape_arrs_seen.append(_arr)
+    _shape_offsets: dict[str, int] = {a: i * _SHAPE_SLOT for i, a in enumerate(_shape_arrs_seen)}
+
+    def _replace_shape_ref(m: re.Match[str]) -> str:
+        arr = m.group(1)
+        if arr not in _shape_offsets:
+            return m.group(0)
+        return f"__shapes_packed[{_shape_offsets[arr]} + {m.group(2)}]"
+
+    if _shape_arrs_seen:
+        source = "\n".join(_shape_idx_pat.sub(_replace_shape_ref, line) for line in body_lines) + "\n"
 
     base_input_names = [a.label for a in input_args]
-    extra_input_names = [f"{name}_shape" for name in output_shape_inputs]
+    # ``__shapes_packed`` is a synthetic input the launcher fills with
+    # the concatenated shapes of every multi-dim array referenced via
+    # ``arr.shape[k]`` in the kernel. Empty when no kernel arr uses
+    # ``.shape``.
+    extra_input_names = ["__shapes_packed"] if _shape_arrs_seen else []
 
     header = _build_kernel_header(source)
 
@@ -1698,7 +1734,9 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
         input_args=input_args,
         output_args=output_args,
         atomic_outputs=has_atomic,
-        output_shape_inputs=output_shape_inputs,
+        output_shape_inputs=[],
+        shape_packed_arrs=tuple(_shape_arrs_seen),
+        shape_packed_slot=_SHAPE_SLOT,
         header=header,
     )
 
@@ -2054,13 +2092,24 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device):
                     f"Kernel '{kernel.key}' argument '{input_name}' must be a wp.array on a Metal "
                     f"device; got {getattr(value, 'device', '?')}"
                 )
+            mx_dtype, view_shape = _array_view_dtype_and_shape(value)
+            # Empty arrays have ``ptr=None`` (Warp doesn't allocate a buffer
+            # for zero-size data). MLX still needs a typed buffer of the
+            # right shape bound to every kernel input — supply a fresh
+            # zero-element ``mx.array`` of matching shape and dtype. The
+            # kernel won't actually read from it because dim-loops over
+            # the array's shape produce no iterations.
+            if value.ptr is None or value.size == 0:
+                import mlx.core as mx  # noqa: PLC0415
+
+                mlx_inputs.append(mx.zeros(view_shape, dtype=mx_dtype))
+                continue
             mx_buf = _metal_get_buffer(value.ptr)
             if mx_buf is None:
                 raise RuntimeError(
                     f"Kernel '{kernel.key}' argument '{input_name}' has no registered MLX buffer "
                     f"(ptr={value.ptr}). Was it allocated by Warp's Metal allocator?"
                 )
-            mx_dtype, view_shape = _array_view_dtype_and_shape(value)
             # ``view`` reinterprets bytes (no copy); ``reshape`` flattens / shapes for MLX.
             typed = mx_buf.view(mx_dtype).reshape(view_shape)
             mlx_inputs.append(typed)
@@ -2093,14 +2142,26 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device):
             mx_dtype = _wp_dtype_to_mx_dtype(arg_var.type)
             mlx_inputs.append(mx.array(value, dtype=mx_dtype))
 
-    # Append synthetic ``<outname>_shape`` inputs for each multi-dim output
-    # array. MLX auto-generates ``<inputname>_shape`` for *inputs*, so the
-    # codegen body can use the same naming uniformly.
-    for out_name in artifact.output_shape_inputs:
-        idx, _ = arg_by_name[out_name]
-        value = fwd_args[idx]
-        shape_arr = mx.array(np.array(value.shape, dtype=np.int32), dtype=mx.int32)
-        mlx_inputs.append(shape_arr)
+    # Append the packed shape buffer if the kernel needs any ``arr.shape``
+    # access. ``__shapes_packed`` is a single flat int32 array containing
+    # the runtime shape of every multi-dim array referenced from the
+    # kernel body, padded so each array gets exactly ``shape_packed_slot``
+    # entries. The codegen emits ``__shapes_packed[i*slot + k]`` for the
+    # k-th dim of the i-th array (``i`` is the array's index in
+    # ``artifact.shape_packed_arrs``).
+    if artifact.shape_packed_arrs:
+        slot = artifact.shape_packed_slot
+        packed = np.zeros(len(artifact.shape_packed_arrs) * slot, dtype=np.int32)
+        for i, arr_name in enumerate(artifact.shape_packed_arrs):
+            idx, _ = arg_by_name[arr_name]
+            value = fwd_args[idx]
+            # Vec/mat/struct dtypes expand the inner dim in the MLX view
+            # — match ``_array_view_dtype_and_shape``'s logic.
+            _, mlx_view_shape = _array_view_dtype_and_shape(value)
+            shape = list(mlx_view_shape)
+            for k, dim_k in enumerate(shape[:slot]):
+                packed[i * slot + k] = dim_k
+        mlx_inputs.append(mx.array(packed, dtype=mx.int32))
 
     # ---- Build MLX output specs from user's output wp.arrays ----
     output_shapes: list = []
