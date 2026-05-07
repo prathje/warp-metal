@@ -429,17 +429,50 @@ def _emit_big_mat_struct(name: str, rows: int, cols: int, msl_scalar: str) -> st
     """Emit the MSL declaration for a custom big-mat struct.
 
     Storage is row-major (matches Warp's IR semantics directly) — element
-    ``(r, c)`` lives at ``c[r * cols + c]``. We expose a flat row-major
-    ``_make`` factory and a ``_extract`` helper for ``wp::extract(m, r, c)``.
+    ``(r, c)`` lives at ``c[r * cols + c]``. Exposes:
+      * Flat row-major ``_make`` factory.
+      * ``operator[](int)`` for both read (returns a row vector by value)
+        and write (returns a small proxy that overloads ``= vec`` to
+        dispatch to per-element stores). Cartpole's narrowphase uses
+        ``mat[i] = vec3`` (set row) and ``vec3 v = mat[i]`` (get row);
+        the proxy resolves both.
+      * ``_extract`` helper for ``wp::extract(m, r, c)``.
     No arithmetic operator overloads are emitted: the kernels we currently
-    cover use big mats as static lookup tables only (constructor, ``where``,
-    ``extract``), not for matrix algebra.
+    cover use big mats as struct fields (zero-init, row write, row read),
+    not for matrix algebra.
     """
     n = rows * cols
+    # Row-vector type. Native ``floatN`` / ``intN`` for cols in 2..4 and
+    # supported scalars; otherwise the custom ``wp_vecN_<scalar>`` struct.
+    if cols in (2, 3, 4) and msl_scalar in _MSL_PREFIX_TO_SAME:
+        row_type = f"{msl_scalar}{cols}"
+        row_make = f"{row_type}(" + ", ".join(f"c[i*{cols}+{j}]" for j in range(cols)) + ")"
+        proxy_assign = "; ".join(f"p[{j}] = v[{j}]" for j in range(cols))
+        proxy_read = f"{row_type}(" + ", ".join(f"p[{j}]" for j in range(cols)) + ")"
+    else:
+        row_type = f"wp_vec{cols}_{msl_scalar}"
+        row_make = f"{row_type}{{" + ", ".join(f"c[i*{cols}+{j}]" for j in range(cols)) + "}"
+        proxy_assign = "; ".join(f"p[{j}] = v.c[{j}]" for j in range(cols))
+        proxy_read = f"{row_type}{{" + ", ".join(f"p[{j}]" for j in range(cols)) + "}"
+    proxy = f"{name}_row_ref"
     body: list[str] = []
+    # Forward-declare the proxy so the struct's non-const operator[]
+    # signature can name it before the proxy body is emitted.
+    body.append(f"struct {proxy};")
     body.append(f"struct {name} {{")
     body.append(f"    {msl_scalar} c[{n}];")
+    body.append(f"    inline {row_type} operator[](int i) const thread {{ return {row_make}; }}")
+    body.append(f"    inline {proxy} operator[](int i) thread;")
     body.append("};")
+    body.append(f"struct {proxy} {{")
+    body.append(f"    thread {msl_scalar}* p;")
+    body.append(f"    inline operator {row_type}() const thread {{ return {proxy_read}; }}")
+    body.append(f"    inline thread {proxy}& operator=({row_type} v) thread {{")
+    body.append(f"        {proxy_assign};")
+    body.append("        return *this;")
+    body.append("    }")
+    body.append("};")
+    body.append(f"inline {proxy} {name}::operator[](int i) thread {{ return {proxy}{{&c[i*{cols}]}}; }}")
     args = ", ".join(f"{msl_scalar} v{i}" for i in range(n))
     body.append(f"inline {name} {name}_make({args}) {{")
     body.append(f"    {name} r;")
@@ -978,12 +1011,20 @@ def _rewrite_mat_t_constructor(text: str) -> str:
         if args_str.startswith("{") and args_str.endswith("}"):
             args_str = args_str[1:-1].strip()
         args = [a.strip() for a in args_str.split(",") if a.strip()]
-        if len(args) != rows * cols:
-            return m.group(0)
         full_ctype = f"wp::{scalar}"
         if full_ctype not in _MSL_VEC_SCALAR_PREFIX or rows < 2 or cols < 2:
             return m.group(0)
         msl_scalar = _MSL_VEC_SCALAR_PREFIX[full_ctype]
+        # Empty-args ``wp::mat_t<R,C,T>()`` — value-initialisation. MSL
+        # native ``floatRxC()`` (no args) doesn't compile (no default
+        # constructor); ``floatRxC(0)`` broadcasts zero. For our custom
+        # big-mat structs we use ``T()`` (aggregate init zeros ``c[]``).
+        if not args:
+            if rows in _MSL_VEC_NATIVE_N and cols in _MSL_VEC_NATIVE_N:
+                return f"{msl_scalar}{rows}x{cols}(0)"
+            return f"wp_mat{rows}x{cols}_{msl_scalar}()"
+        if len(args) != rows * cols:
+            return m.group(0)
         if rows in _MSL_VEC_NATIVE_N and cols in _MSL_VEC_NATIVE_N:
             msl_vec = f"{msl_scalar}{rows}"
             msl_mat = f"{msl_scalar}{rows}x{cols}"
@@ -2579,7 +2620,19 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
                     continue
                 local_name = _per_field_local(var.label, field_name)
                 # MSL ``T()`` zero-constructs scalar / vec / mat values.
-                body_lines.append(f"    {field_info.msl_type} {local_name} = {field_info.msl_type}(0);")
+                # Zero-init form differs by type:
+                #   - Native MSL types (``float``, ``float3``, ``float3x3``,
+                #     ``int2``, etc.) accept ``T(0)`` — broadcasts the int
+                #     to fill all components/elements.
+                #   - Custom structs (``wp_mat6x3_float``, ``wp_vec6_float``)
+                #     have no one-int constructor; aggregate value-init
+                #     ``T()`` zeros the trailing ``c[N]`` array.
+                _zero = (
+                    f"{field_info.msl_type}()"
+                    if field_info.msl_type.startswith(("wp_mat", "wp_vec"))
+                    else f"{field_info.msl_type}(0)"
+                )
+                body_lines.append(f"    {field_info.msl_type} {local_name} = {_zero};")
             continue
         if var.label in vars_to_skip_decl:
             # Iterator-state or induction-variable for a translated for-loop;
@@ -2606,7 +2659,12 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
             if field_info.kind == _STRUCT_FIELD_KIND_ARRAY_UNUSED:
                 continue
             local_name = _per_field_local(mangled_label, field_name)
-            body_lines.append(f"    {field_info.msl_type} {local_name} = {field_info.msl_type}(0);")
+            _zero = (
+                f"{field_info.msl_type}()"
+                if field_info.msl_type.startswith(("wp_mat", "wp_vec"))
+                else f"{field_info.msl_type}(0)"
+            )
+            body_lines.append(f"    {field_info.msl_type} {local_name} = {_zero};")
 
     # Map tile-typed locals to ``(rows, cols, msl_scalar)`` for the tile-
     # intrinsic translator (it needs the result-tile shape for cholesky /
@@ -2675,6 +2733,15 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
         # Warp uses for vec5+) needs the braces stripped and the type
         # renamed before the bare-type translator below sees it.
         translated = _rewrite_mat_t_constructor(translated)
+        # Some IR paths emit the CPU-side native ``floatRxC()`` directly
+        # (skipping the ``wp::mat_t<R,C,T>()`` form the rewriter above
+        # expects). Native MSL matrix types reject the no-arg form;
+        # ``floatRxC(0)`` zero-broadcasts. Rewrite locally.
+        translated = re.sub(
+            r"\b((?:float|half|int|uint)\d+x\d+)\s*\(\s*\)",
+            r"\1(0)",
+            translated,
+        )
         translated = _rewrite_vec_t_brace_constructor(translated)
         # Bare ``wp::vec_t<N, ...>`` and ``wp::mat_t<R, C, ...>`` type
         # references (in declarations etc.) get renamed to the MSL native
