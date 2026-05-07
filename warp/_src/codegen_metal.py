@@ -595,6 +595,13 @@ def _emit_tile_cholesky(n: int, msl_scalar: str) -> str:
     parts: list[str] = []
     parts.append(f"inline {name} {name}_cholesky({name} A) {{")
     parts.append(f"    {name} L = A;")
+    # Disable unrolling on the outer ``j`` loop. With N>=8 and the natural
+    # full unroll of the triple-nested loops, Apple's MSL compiler
+    # silently elides the writes ``L.c[(N-1)*N + 0..N-3]`` — only the
+    # last two entries of the bottom row come back correct (e.g. for N=8
+    # rows 7,col 0..5 = 0; row 7 col 6, 7 are right). Holding the j loop
+    # at runtime keeps the writes aligned with the algorithm.
+    parts.append("    #pragma clang loop unroll(disable)")
     parts.append(f"    for (int j = 0; j < {n}; ++j) {{")
     parts.append(f"        {msl_scalar} d = L.c[j*{n} + j];")
     parts.append("        for (int k = 0; k < j; ++k) {")
@@ -630,13 +637,18 @@ def _emit_tile_cholesky_solve(n: int, k: int, msl_scalar: str) -> str:
         parts: list[str] = []
         parts.append(f"inline {B_name} {L_name}_cholesky_solve_1({L_name} L, {B_name} b) {{")
         parts.append(f"    {B_name} x = b;")
-        # Forward: L y = b
+        # Forward: L y = b. Same Apple-MSL unroll bug as ``_cholesky``: at
+        # N>=8 a fully unrolled triangular solve drops the writes to
+        # x.c[N-1] (and sometimes the row before). Pin the outer loop
+        # at runtime to keep the writes intact.
+        parts.append("    #pragma clang loop unroll(disable)")
         parts.append(f"    for (int i = 0; i < {n}; ++i) {{")
         parts.append(f"        {msl_scalar} s = x.c[i];")
         parts.append(f"        for (int kk = 0; kk < i; ++kk) s -= L.c[i*{n} + kk] * x.c[kk];")
         parts.append(f"        x.c[i] = s / L.c[i*{n} + i];")
         parts.append("    }")
         # Backward: L^T x = y
+        parts.append("    #pragma clang loop unroll(disable)")
         parts.append(f"    for (int i = {n} - 1; i >= 0; --i) {{")
         parts.append(f"        {msl_scalar} s = x.c[i];")
         parts.append(f"        for (int kk = i + 1; kk < {n}; ++kk) s -= L.c[kk*{n} + i] * x.c[kk];")
