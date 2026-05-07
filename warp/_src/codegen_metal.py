@@ -3146,17 +3146,35 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
         for m in view_read_pat.finditer(raw):
             if m.group(1) in output_label_set:
                 read_outputs.add(m.group(1))
+    # Detect kernels that don't follow the ``dim=(nworld, ...)`` launch
+    # convention. The init prologue uses
+    # ``_init_w = thread_position_in_grid.x`` to partition output
+    # initialisation per worldid; kernels like ``_primitive_narrowphase``
+    # (launched with ``dim=ncollision``) and ``_efc_contact_init``
+    # instead read worldid via an array indirection
+    # (``worldid = collision_worldid_in[wp.tid()]``), so thread.x is a
+    # collision_id, *not* a worldid. Running the prologue with
+    # thread.x as the partition would seed wrong output slots and race
+    # with body atomic_adds (we observed cartpole's ``nefc`` over-
+    # counting 28 vs CPU 12). For these kernels we skip the prologue
+    # entirely — mujoco_warp's caller-side ``d.nefc.zero_()`` plus
+    # MLX's ``init_value=0.0`` for atomic outputs gives the same
+    # net result as a zero-seed prologue would.
+    non_standard_launch = any(
+        "_worldid_in" in a.label for a in adj.args if _is_array_arg(a)
+    )
     init_outputs: list[str] = []
-    if has_atomic:
+    if has_atomic and not non_standard_launch:
         # Every atomic output gets seeded so atomic_add accumulates from
         # the user's previous value (else MLX zero-init wipes it).
         init_outputs.extend(a.label for a in output_args if a.label in atomic_arg_names)
     # Plus any output the kernel reads back from — preserves elements
     # the kernel doesn't write (kinematics_branch / sensor partial
     # writes) and lets read-then-write patterns see real prior values.
-    for a in output_args:
-        if a.label in read_outputs and a.label not in init_outputs:
-            init_outputs.append(a.label)
+    if not non_standard_launch:
+        for a in output_args:
+            if a.label in read_outputs and a.label not in init_outputs:
+                init_outputs.append(a.label)
     if init_outputs:
         # The init prologue must run before any thread executes the body,
         # otherwise its (idempotent) atomic_stores can clobber a sibling
