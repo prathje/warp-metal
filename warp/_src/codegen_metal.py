@@ -1313,6 +1313,15 @@ _TILE_BROADCAST_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_broadcast\s*<[^()]
 # don't reach this path.
 
 _TILE_LOAD_PAT = re.compile(
+    # Two template-arg shapes Warp emits:
+    #   - ``<dtype, layout, transpose, R[, C]>``      (the original 4/5 form)
+    #   - ``<dtype, shared, bounds_check, R, C>``     (the blocked-Cholesky
+    #     form — ``shared`` selects threadgroup-memory storage,
+    #     ``bounds_check`` toggles edge guards). On single-thread Metal we
+    #     ignore both flags: the per-thread struct buffer doesn't need
+    #     bounds checks (we're loading a fixed (R, C) into a fixed-sized
+    #     local), and "shared" storage degenerates to per-thread for
+    #     ``block_dim=1``.
     r"\bvar_(\w+)\s*=\s*wp::tile_load\s*<\s*wp::(\w+)\s*,\s*\w+\s*,\s*\w+\s*,\s*(\d+)\s*(?:,\s*(\d+)\s*)?>\s*\(([^)]*)\)"
 )
 _TILE_STORE_PAT = re.compile(
@@ -1473,6 +1482,17 @@ def _translate_tile_intrinsics(line: str, tile_var_dims: dict[str, tuple[int, in
         helper = f"wp_tile_{n}x{n}_{msl_scalar}_cholesky_solve_{k}"
         return f"var_{lhs} = {helper}({L_arg}, {b_arg})"
 
+    # ``wp::tuple(a, b, ...)`` — Warp emits tuple constructions when a
+    # value-returning builtin "returns" multiple values (e.g. ``range``)
+    # or when shapes/offsets are passed as composite args to tile
+    # primitives. In the blocked-cholesky pattern the tuples are
+    # created but never read — the consumer (``tile_load``,
+    # ``tile_view``) takes the scalar args directly. We elide the
+    # tuple-construction line by lowering to an empty no-op statement;
+    # the var declaration emitted earlier just goes unused. If an
+    # actual use survives downstream, it will trip the unsupported-
+    # intrinsic guard with the still-prefixed ``wp::`` name.
+    line = re.sub(r"\bvar_(\w+)\s*=\s*wp::tuple\s*\([^)]*\)\s*;?", r"// (elided tuple ctor for var_\1)", line)
     # Block-dim=1 register-tile reductions to plain scalar / vec values.
     # ``var_X = wp::tile<dtype>(var_x)``  →  ``var_X = var_x``
     line = _TILE_BUILTIN_TILE_PAT.sub(r"var_\1 = var_\2", line)
