@@ -624,6 +624,128 @@ def _emit_tile_cholesky(n: int, msl_scalar: str) -> str:
     return "\n".join(parts)
 
 
+def _emit_tile_cholesky_inplace(n: int, msl_scalar: str) -> str:
+    """Emit ``wp_tile_NxN_<scalar>_cholesky_inplace`` — same body as
+    :func:`_emit_tile_cholesky` but mutates the input tile in place
+    (no ``L = A`` copy, no return value).
+    """
+    name = f"wp_tile_{n}x{n}_{msl_scalar}"
+    parts: list[str] = [f"inline void {name}_cholesky_inplace(thread {name}& L) {{"]
+    parts.append("    #pragma clang loop unroll(disable)")
+    parts.append(f"    for (int j = 0; j < {n}; ++j) {{")
+    parts.append(f"        {msl_scalar} d = L.c[j*{n} + j];")
+    parts.append("        for (int k = 0; k < j; ++k) {")
+    parts.append(f"            {msl_scalar} ljk = L.c[j*{n} + k];")
+    parts.append("            d -= ljk * ljk;")
+    parts.append("        }")
+    parts.append(f"        d = metal::max(d, ({msl_scalar})1e-30);")
+    parts.append(f"        {msl_scalar} ljj = metal::precise::sqrt(d);")
+    parts.append(f"        L.c[j*{n} + j] = ljj;")
+    parts.append(f"        {msl_scalar} inv = ({msl_scalar})1.0 / ljj;")
+    parts.append(f"        for (int i = j + 1; i < {n}; ++i) {{")
+    parts.append(f"            {msl_scalar} s = L.c[i*{n} + j];")
+    parts.append(f"            for (int k = 0; k < j; ++k) s -= L.c[i*{n} + k] * L.c[j*{n} + k];")
+    parts.append(f"            L.c[i*{n} + j] = s * inv;")
+    parts.append(f"            L.c[j*{n} + i] = ({msl_scalar})0.0;")
+    parts.append("        }")
+    parts.append("    }")
+    parts.append("}")
+    return "\n".join(parts)
+
+
+def _emit_tile_lower_solve_inplace(n: int, k: int, msl_scalar: str) -> str:
+    """Emit ``wp_tile_lower_solve_<N>x<K>_<scalar>_inplace``: solve
+    ``L * X = B`` in place, where ``L`` is NxN lower-triangular and
+    ``B`` is NxK. ``B`` is mutated to hold ``X``.
+    """
+    L_name = f"wp_tile_{n}x{n}_{msl_scalar}"
+    B_name = f"wp_tile_{n}x{k}_{msl_scalar}"
+    name = f"wp_tile_lower_solve_{n}x{k}_{msl_scalar}_inplace"
+    parts: list[str] = [f"inline void {name}({L_name} L, thread {B_name}& B) {{"]
+    parts.append("    #pragma clang loop unroll(disable)")
+    parts.append(f"    for (int i = 0; i < {n}; ++i) {{")
+    parts.append(f"        for (int col = 0; col < {k}; ++col) {{")
+    parts.append(f"            {msl_scalar} s = B.c[i*{k} + col];")
+    parts.append(f"            for (int kk = 0; kk < i; ++kk) s -= L.c[i*{n} + kk] * B.c[kk*{k} + col];")
+    parts.append(f"            B.c[i*{k} + col] = s / L.c[i*{n} + i];")
+    parts.append("        }")
+    parts.append("    }")
+    parts.append("}")
+    return "\n".join(parts)
+
+
+def _emit_tile_upper_solve_inplace(n: int, k: int, msl_scalar: str) -> str:
+    """Emit ``wp_tile_upper_solve_<N>x<K>_<scalar>_inplace``: solve
+    ``U * X = B`` where ``U`` is upper-triangular. The blocked Cholesky
+    solver passes ``transpose(L)`` as ``U`` so we read above the
+    diagonal — i.e. column k > i — and use ``L.c[i*N + i]`` (the
+    diagonal stays where it is on transposition).
+    """
+    L_name = f"wp_tile_{n}x{n}_{msl_scalar}"
+    B_name = f"wp_tile_{n}x{k}_{msl_scalar}"
+    name = f"wp_tile_upper_solve_{n}x{k}_{msl_scalar}_inplace"
+    parts: list[str] = [f"inline void {name}({L_name} U, thread {B_name}& B) {{"]
+    parts.append("    #pragma clang loop unroll(disable)")
+    parts.append(f"    for (int i = {n} - 1; i >= 0; --i) {{")
+    parts.append(f"        for (int col = 0; col < {k}; ++col) {{")
+    parts.append(f"            {msl_scalar} s = B.c[i*{k} + col];")
+    parts.append(f"            for (int kk = i + 1; kk < {n}; ++kk) s -= U.c[i*{n} + kk] * B.c[kk*{k} + col];")
+    parts.append(f"            B.c[i*{k} + col] = s / U.c[i*{n} + i];")
+    parts.append("        }")
+    parts.append("    }")
+    parts.append("}")
+    return "\n".join(parts)
+
+
+def _emit_tile_matmul(r: int, k: int, n: int, msl_scalar: str) -> str:
+    """Emit ``wp_tile_matmul_RxKxN_<scalar>`` — ``C = beta*C + alpha*A*B``.
+
+    A is RxK, B is KxN, C is RxN. All three are passed as struct values
+    (C by reference so writes propagate). Used as ``tile_matmul_acc``'s
+    backing helper at single-thread block_dim=1; cooperative parallelism
+    is task #19 follow-up.
+    """
+    A = f"wp_tile_{r}x{k}_{msl_scalar}"
+    B = f"wp_tile_{k}x{n}_{msl_scalar}"
+    C = f"wp_tile_{r}x{n}_{msl_scalar}"
+    name = f"wp_tile_matmul_{r}x{k}x{n}_{msl_scalar}"
+    parts: list[str] = [
+        f"inline void {name}({A} A, {B} B, thread {C}& C, {msl_scalar} alpha, {msl_scalar} beta) {{"
+    ]
+    parts.append(f"    for (int i = 0; i < {r}; ++i) {{")
+    parts.append(f"        for (int j = 0; j < {n}; ++j) {{")
+    parts.append(f"            {msl_scalar} s = ({msl_scalar})0;")
+    parts.append(f"            for (int kk = 0; kk < {k}; ++kk) {{")
+    parts.append(f"                s += A.c[i*{k} + kk] * B.c[kk*{n} + j];")
+    parts.append("            }")
+    parts.append(f"            C.c[i*{n} + j] = beta * C.c[i*{n} + j] + alpha * s;")
+    parts.append("        }")
+    parts.append("    }")
+    parts.append("}")
+    return "\n".join(parts)
+
+
+def _emit_tile_transpose(rows: int, cols: int, msl_scalar: str) -> str:
+    """Emit ``wp_tile_RxC_<scalar>_transpose`` returning a ``CxR`` tile.
+
+    Single-thread copy with swapped indices. The blocked-Cholesky
+    pattern in mujoco_warp transposes a 16x16 L-block (square — same
+    output struct as input). Handle the rectangular case too.
+    """
+    in_name = f"wp_tile_{rows}x{cols}_{msl_scalar}"
+    out_name = f"wp_tile_{cols}x{rows}_{msl_scalar}"
+    parts: list[str] = [f"inline {out_name} {in_name}_transpose({in_name} A) {{"]
+    parts.append(f"    {out_name} R;")
+    parts.append(f"    for (int i = 0; i < {rows}; ++i) {{")
+    parts.append(f"        for (int j = 0; j < {cols}; ++j) {{")
+    parts.append(f"            R.c[j*{rows} + i] = A.c[i*{cols} + j];")
+    parts.append("        }")
+    parts.append("    }")
+    parts.append("    return R;")
+    parts.append("}")
+    return "\n".join(parts)
+
+
 def _emit_tile_cholesky_solve(n: int, k: int, msl_scalar: str) -> str:
     """Emit ``wp_tile_NxN_<scalar>_cholesky_solve_K`` — solve ``L L^T X = B``.
 
@@ -726,9 +848,51 @@ def _build_kernel_header(source: str) -> str:
     seen_tile: set[tuple[int, int, str]] = set()
     for m in _TILE_NAME_PAT.finditer(source):
         seen_tile.add((int(m.group(1)), int(m.group(2)), m.group(3)))
+    # ``wp_tile_RxC_<scalar>_transpose`` returns a ``CxR`` struct, so we
+    # need both struct shapes declared even if the transposed shape
+    # never appears in a load/store call site (it lives only in the
+    # function-return type).
+    transpose_pat = re.compile(r"\bwp_tile_(\d+)x(\d+)_(\w+)_transpose\b")
+    transpose_seen: set[tuple[int, int, str]] = set()
+    for m in transpose_pat.finditer(source):
+        rows, cols = int(m.group(1)), int(m.group(2))
+        scalar = m.group(3)
+        transpose_seen.add((rows, cols, scalar))
+        seen_tile.add((rows, cols, scalar))
+        seen_tile.add((cols, rows, scalar))
     for rows, cols, scalar in sorted(seen_tile):
         parts.append(_emit_tile_struct(rows, cols, scalar))
-    cholesky_pat = re.compile(r"\bwp_tile_(\d+)x(\d+)_(\w+)_cholesky\b(?!_solve)")
+    for rows, cols, scalar in sorted(transpose_seen):
+        parts.append(_emit_tile_transpose(rows, cols, scalar))
+    matmul_pat = re.compile(r"\bwp_tile_matmul_(\d+)x(\d+)x(\d+)_(\w+)\b")
+    matmul_seen: set[tuple[int, int, int, str]] = set()
+    for m in matmul_pat.finditer(source):
+        r_, k_, n_ = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        sc_ = m.group(4)
+        matmul_seen.add((r_, k_, n_, sc_))
+    for r_, k_, n_, sc_ in sorted(matmul_seen):
+        parts.append(_emit_tile_matmul(r_, k_, n_, sc_))
+    chol_inplace_pat = re.compile(r"\bwp_tile_(\d+)x(\d+)_(\w+)_cholesky_inplace\b")
+    chol_inplace_seen: set[tuple[int, str]] = set()
+    for m in chol_inplace_pat.finditer(source):
+        r_, c_ = int(m.group(1)), int(m.group(2))
+        if r_ == c_:
+            chol_inplace_seen.add((r_, m.group(3)))
+    for n_, sc_ in sorted(chol_inplace_seen):
+        parts.append(_emit_tile_cholesky_inplace(n_, sc_))
+    lsolve_pat = re.compile(r"\bwp_tile_lower_solve_(\d+)x(\d+)_(\w+)_inplace\b")
+    usolve_pat = re.compile(r"\bwp_tile_upper_solve_(\d+)x(\d+)_(\w+)_inplace\b")
+    lsolve_seen: set[tuple[int, int, str]] = set()
+    usolve_seen: set[tuple[int, int, str]] = set()
+    for m in lsolve_pat.finditer(source):
+        lsolve_seen.add((int(m.group(1)), int(m.group(2)), m.group(3)))
+    for m in usolve_pat.finditer(source):
+        usolve_seen.add((int(m.group(1)), int(m.group(2)), m.group(3)))
+    for n_, k_, sc_ in sorted(lsolve_seen):
+        parts.append(_emit_tile_lower_solve_inplace(n_, k_, sc_))
+    for n_, k_, sc_ in sorted(usolve_seen):
+        parts.append(_emit_tile_upper_solve_inplace(n_, k_, sc_))
+    cholesky_pat = re.compile(r"\bwp_tile_(\d+)x(\d+)_(\w+)_cholesky\b(?!_solve|_inplace)")
     cholesky_solve_pat = re.compile(r"\bwp_tile_(\d+)x(\d+)_(\w+)_cholesky_solve_(\d+)\b")
     seen_cholesky: set[tuple[int, str]] = set()
     for m in cholesky_pat.finditer(source):
@@ -1303,8 +1467,33 @@ _TILE_EXTRACT_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_extract\s*\(\s*var_(
 # at ``offset``. With single-element tiles ``offset=(0,0)`` and the call
 # is just ``dst = src``.
 _TILE_ASSIGN_PAT = re.compile(r"\bwp::tile_assign\s*\(([^)]*)\)")
-# ``wp::tile_transpose<...>(t)`` — for shape (1,1) it's a no-op.
+# ``wp::tile_transpose<...>(t)`` — at shape (1,1) the templated form is
+# a no-op. The non-templated form ``wp::tile_transpose(t)`` (emitted by
+# the blocked-Cholesky factory funcs) needs the input tile's actual
+# shape to materialise a transposed copy; it's lowered separately via
+# ``repl_transpose_notpl`` using ``tile_var_dims``.
 _TILE_TRANSPOSE_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_transpose\s*<[^()]*>\s*\(\s*var_(\w+)\s*\)")
+_TILE_TRANSPOSE_NOTPL_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_transpose\s*\(\s*var_(\w+)\s*\)")
+# ``wp::tile_matmul_acc(0, 0, 0, A, B, C, alpha, beta)`` — eight args
+# from the cuBLASDx-LTO calling convention. Three leading ints are
+# placeholder LTO ptr/seg args, then A (RxK), B (KxN), C (RxN), then
+# scalar alpha and beta. ``C = beta*C + alpha*A*B``.
+_TILE_MATMUL_ACC_PAT = re.compile(r"\bwp::tile_matmul_acc\s*\(([^)]*)\)")
+# ``wp::tile_cholesky_inplace<upper>(0, var_X)`` — single tile, in-place
+# factorization. Two args after the LTO seg pad: the placeholder and the
+# tile to factor. ``upper`` template arg selects upper- vs lower-fill.
+_TILE_CHOLESKY_INPLACE_PAT = re.compile(
+    r"\bwp::tile_cholesky_inplace\s*<[^()]*>\s*\(([^)]*)\)"
+)
+# ``wp::tile_lower_solve_inplace<...>(0, L_tile, B_tile)`` — solve
+# ``L X = B`` for X, mutating B. The cuBLASDx LTO calling convention
+# inserts one leading placeholder arg. Same shape for the upper variant.
+_TILE_LOWER_SOLVE_INPLACE_PAT = re.compile(
+    r"\bwp::tile_lower_solve_inplace\s*<[^()]*>\s*\(([^)]*)\)"
+)
+_TILE_UPPER_SOLVE_INPLACE_PAT = re.compile(
+    r"\bwp::tile_upper_solve_inplace\s*<[^()]*>\s*\(([^)]*)\)"
+)
 # ``wp::tile_broadcast<dtype, ...>(t)`` — broadcasting a single value
 # back to a single value is a copy.
 _TILE_BROADCAST_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_broadcast\s*<[^()]*>\s*\(\s*var_(\w+)\s*\)")
@@ -1547,6 +1736,92 @@ def _translate_tile_intrinsics(line: str, tile_var_dims: dict[str, tuple[int, in
 
     line = _TILE_ASSIGN_PAT.sub(repl_assign, line)
     line = _TILE_TRANSPOSE_PAT.sub(r"var_\1 = var_\2", line)
+
+    def repl_transpose_notpl(m: re.Match[str]) -> str:
+        # ``var_X = wp::tile_transpose(var_Y)`` (no template arg) is
+        # emitted by the blocked-Cholesky factory funcs. Lower it to
+        # the helper ``wp_tile_RxC_<scalar>_transpose(var_Y)`` keyed on
+        # the *input*'s shape; the helper returns a CxR tile.
+        lhs = m.group(1)
+        in_label = m.group(2)
+        dims = tile_var_dims.get(in_label)
+        if dims is None:
+            return m.group(0)
+        rows, cols, msl_scalar = dims
+        # (1,1) collapses to a scalar — no transpose needed; the assign
+        # is simply identity.
+        if rows == 1 and cols == 1:
+            return f"var_{lhs} = var_{in_label}"
+        helper = f"wp_tile_{rows}x{cols}_{msl_scalar}_transpose"
+        return f"var_{lhs} = {helper}(var_{in_label})"
+
+    line = _TILE_TRANSPOSE_NOTPL_PAT.sub(repl_transpose_notpl, line)
+
+    def repl_matmul_acc(m: re.Match[str]) -> str:
+        # ``wp::tile_matmul_acc(0, 0, 0, A, B, C, alpha, beta)``
+        args = [a.strip() for a in m.group(1).split(",")]
+        if len(args) < 8:
+            return m.group(0)
+        a_arg, b_arg, c_arg, alpha_arg, beta_arg = args[3], args[4], args[5], args[6], args[7]
+        a_label = a_arg[len("var_"):] if a_arg.startswith("var_") else a_arg
+        b_label = b_arg[len("var_"):] if b_arg.startswith("var_") else b_arg
+        c_label = c_arg[len("var_"):] if c_arg.startswith("var_") else c_arg
+        a_dims = tile_var_dims.get(a_label)
+        b_dims = tile_var_dims.get(b_label)
+        c_dims = tile_var_dims.get(c_label)
+        if a_dims is None or b_dims is None or c_dims is None:
+            return m.group(0)
+        rA, kA, scalar = a_dims
+        kB, nB, _ = b_dims
+        rC, nC, _ = c_dims
+        if kA != kB or rA != rC or nB != nC:
+            return m.group(0)
+        helper = f"wp_tile_matmul_{rA}x{kA}x{nB}_{scalar}"
+        return f"{helper}({a_arg}, {b_arg}, {c_arg}, {alpha_arg}, {beta_arg})"
+
+    line = _TILE_MATMUL_ACC_PAT.sub(repl_matmul_acc, line)
+
+    def repl_cholesky_inplace(m: re.Match[str]) -> str:
+        args = [a.strip() for a in m.group(1).split(",")]
+        if len(args) < 2:
+            return m.group(0)
+        tile_arg = args[1]
+        tile_label = tile_arg[len("var_"):] if tile_arg.startswith("var_") else tile_arg
+        dims = tile_var_dims.get(tile_label)
+        if dims is None:
+            return m.group(0)
+        rows, cols, scalar = dims
+        if rows != cols:
+            return m.group(0)
+        if rows == 1:
+            return (
+                f"{tile_arg} = metal::precise::sqrt(metal::max({tile_arg}, ({scalar})1e-30))"
+            )
+        helper = f"wp_tile_{rows}x{cols}_{scalar}_cholesky_inplace"
+        return f"{helper}({tile_arg})"
+
+    line = _TILE_CHOLESKY_INPLACE_PAT.sub(repl_cholesky_inplace, line)
+
+    def _repl_solve_inplace(kind: str, m: re.Match[str]) -> str:
+        # Args: leading LTO seg, then L tile, then B tile.
+        args = [a.strip() for a in m.group(1).split(",")]
+        if len(args) < 3:
+            return m.group(0)
+        L_arg, B_arg = args[1], args[2]
+        L_label = L_arg[len("var_"):] if L_arg.startswith("var_") else L_arg
+        B_label = B_arg[len("var_"):] if B_arg.startswith("var_") else B_arg
+        L_dims = tile_var_dims.get(L_label)
+        B_dims = tile_var_dims.get(B_label)
+        if L_dims is None or B_dims is None:
+            return m.group(0)
+        n = L_dims[0]
+        k_cols = B_dims[1]
+        scalar = L_dims[2]
+        helper = f"wp_tile_{kind}_solve_{n}x{k_cols}_{scalar}_inplace"
+        return f"{helper}({L_arg}, {B_arg})"
+
+    line = _TILE_LOWER_SOLVE_INPLACE_PAT.sub(lambda m: _repl_solve_inplace("lower", m), line)
+    line = _TILE_UPPER_SOLVE_INPLACE_PAT.sub(lambda m: _repl_solve_inplace("upper", m), line)
     line = _TILE_BROADCAST_PAT.sub(r"var_\1 = var_\2", line)
     # ``var_X = wp::tile_extract(var_t, idx)`` with shape (1,) → ``var_X = var_t``.
     line = _TILE_EXTRACT_PAT.sub(r"var_\1 = var_\2", line)
@@ -1792,7 +2067,7 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
     # surfaces inlined int-constants and inlined struct locals so the
     # downstream slice-step recogniser and field-pointer pass can treat
     # them the same as kernel-level ones.
-    _ast_nodes, _inlined_const_ints, _inlined_struct_locals = _ast_inline(_ast_nodes, adj)
+    _ast_nodes, _inlined_const_ints, _inlined_struct_locals, _inlined_var_ctypes = _ast_inline(_ast_nodes, adj)
     _ast_nodes, _drop_skip = _ast_fold_drop(_ast_nodes, adj)
     _ast_nodes, _view_skip = _ast_fold_views(_ast_nodes, adj, extra_const_ints=_inlined_const_ints)
     _ast_nodes, _indexref_skip = _ast_fold_indexref(_ast_nodes, adj, _early_vec_arr_info)
@@ -2220,6 +2495,20 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
         if dtype_ctype not in _SCALAR_CTYPE_TO_MSL:
             continue
         tile_var_dims[var.label] = (rows, cols, _SCALAR_CTYPE_TO_MSL[dtype_ctype])
+    # Inlined-function tile locals — the inliner records every spliced
+    # local's ctype keyed by its mangled label (e.g. ``136__17``); add
+    # the tile-typed ones here so the regex translators can resolve
+    # ``var_136__17``-style references to the right ``RxC`` shape.
+    for label, ctype in _inlined_var_ctypes.items():
+        if label in tile_var_dims:
+            continue
+        parsed = _parse_tile_ctype(ctype)
+        if parsed is None:
+            continue
+        _kind, dtype_ctype, rows, cols = parsed
+        if dtype_ctype not in _SCALAR_CTYPE_TO_MSL:
+            continue
+        tile_var_dims[label] = (rows, cols, _SCALAR_CTYPE_TO_MSL[dtype_ctype])
 
     # When ``atomic_outputs=True`` is passed to ``mx.fast.metal_kernel``,
     # *every* output buffer comes through as ``device atomic<T>*``. Reads
