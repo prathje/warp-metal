@@ -1033,13 +1033,18 @@ def _substitute_var_refs(line: str, subs: dict[str, str]) -> str:
     return re.sub(r"\b(?:var_|ret_)\w+\b", repl, line)
 
 
-def _build_function_overload_table(adj) -> dict[str, Any]:
-    """Map mangled call-site names (e.g. ``"_write_scalar_0"``) back to the
-    specialized ``Function`` overload whose adj we can build and inline.
+def _build_function_overload_table(adj) -> dict[str, list[Any]]:
+    """Map mangled call-site names back to the specialized ``Function``
+    overload(s) whose adj we can build and inline.
 
-    Each overload exposes its full mangled name as ``native_func`` (set
-    when the overload is registered). The IR call-site name comes from
-    that field directly, so we use it as the lookup key.
+    Generic ``@wp.func``s (e.g. ``def safe_div(x: Any, y: Any)``) get
+    one Function per (input-type) specialization, all created via
+    ``shallowcopy(parent_func)`` — which means *every* specialization
+    shares the parent's ``native_func`` name. The IR call site uses that
+    same name, so a single ``native_func`` may correspond to multiple
+    distinct overloads, each with its own typed adj. We therefore return
+    a list per native_func and let the call-site disambiguate by
+    matching parameter types to caller-argument types.
 
     Pulls candidates from two sources:
       1. ``adj.get_references()[2]`` — Warp's own table of directly-
@@ -1052,15 +1057,24 @@ def _build_function_overload_table(adj) -> dict[str, Any]:
     """
     from warp._src.context import Function  # noqa: PLC0415
 
-    out: dict[str, Any] = {}
+    out: dict[str, list[Any]] = {}
+    seen_overloads: set[int] = set()  # id() of overloads already added
+
+    def _add(overload):
+        native = getattr(overload, "native_func", None)
+        if native is None:
+            return
+        oid = id(overload)
+        if oid in seen_overloads:
+            return
+        seen_overloads.add(oid)
+        out.setdefault(native, []).append(overload)
 
     refs = adj.get_references()
     fn_table = refs[2]
     for fn in fn_table:
         for overload in fn.user_overloads.values():
-            native = getattr(overload, "native_func", None)
-            if native is not None:
-                out[native] = overload
+            _add(overload)
 
     func = getattr(adj, "func", None)
     globals_dict = getattr(func, "__globals__", None) if func is not None else None
@@ -1069,11 +1083,52 @@ def _build_function_overload_table(adj) -> dict[str, Any]:
             if not isinstance(value, Function):
                 continue
             for overload in value.user_overloads.values():
-                native = getattr(overload, "native_func", None)
-                if native is not None and native not in out:
-                    out[native] = overload
+                _add(overload)
 
     return out
+
+
+def _pick_overload(overloads: list[Any], caller_args: tuple[str, ...], var_types: dict[str, str]) -> Any:
+    """Select the overload whose parameter types match ``caller_args``.
+
+    ``caller_args`` is a tuple of textual expressions; only the bare
+    ``var_<label>`` forms participate in type matching (literals and
+    other expressions are ignored — they're treated as wildcards).
+    Falls back to ``overloads[0]`` if no positive match is found, which
+    matches the previous (pre-list) behaviour for the single-overload
+    case.
+    """
+    if len(overloads) == 1:
+        return overloads[0]
+
+    # Resolve the ctype of each caller-arg that we can; leave the rest
+    # as ``None`` (wildcard).
+    arg_ctypes: list[str | None] = []
+    for arg in caller_args:
+        m = re.match(r"^\s*var_(\w+)\s*$", arg)
+        if m and m.group(1) in var_types:
+            arg_ctypes.append(var_types[m.group(1)])
+        else:
+            arg_ctypes.append(None)
+
+    for ovl in overloads:
+        params = ovl.adj.args
+        # Only the leading args correspond to inputs; trailing entries
+        # in caller_args are return-value slots (extra outputs) which
+        # don't appear in ``ovl.adj.args``.
+        if len(arg_ctypes) < len(params):
+            continue
+        match = True
+        for p, ct in zip(params, arg_ctypes[: len(params)]):
+            if ct is None:
+                continue  # wildcard
+            if p.ctype() != ct:
+                match = False
+                break
+        if match:
+            return ovl
+
+    return overloads[0]
 
 
 def _has_return(nodes: tuple[Node, ...] | list[Node]) -> bool:
@@ -1146,11 +1201,12 @@ def _rewrite_returns_to_breaks(
 def _inline_one_call(
     fn_overload,
     caller_args: tuple[str, ...],
-    fn_map: dict[str, Any],
+    fn_map: dict[str, list[Any]],
     depth: int,
     max_depth: int,
     const_ints_out: dict[str, int],
     struct_locals_out: dict[str, Any],
+    var_types: dict[str, str],
     return_value_dst: str | None = None,
 ) -> list[Node]:
     """Inline a single user-function call. Returns the spliced node list.
@@ -1242,8 +1298,28 @@ def _inline_one_call(
     # — before recursing.
     callee_fn_map = _build_function_overload_table(fn_overload.adj)
     if callee_fn_map:
-        fn_map = {**fn_map, **callee_fn_map}
-    fn_folded = _inline_walk(fn_folded, fn_map, depth + 1, max_depth, const_ints_out, struct_locals_out)
+        merged: dict[str, list[Any]] = {k: list(v) for k, v in fn_map.items()}
+        for k, v in callee_fn_map.items():
+            existing = merged.get(k, [])
+            seen = {id(o) for o in existing}
+            merged[k] = existing + [o for o in v if id(o) not in seen]
+        fn_map = merged
+
+    # Extend var_types with this overload's mangled local labels so any
+    # nested user call inside the callee body can resolve its caller-arg
+    # types correctly when picking among multi-overload native_funcs.
+    inlined_var_types = dict(var_types)
+    for var in fn_overload.adj.variables:
+        if var.label in fn_param_set:
+            continue
+        try:
+            inlined_var_types[f"{inline_id}__{var.label}"] = var.ctype()
+        except Exception:
+            pass
+
+    fn_folded = _inline_walk(
+        fn_folded, fn_map, depth + 1, max_depth, const_ints_out, struct_locals_out, inlined_var_types
+    )
 
     # Record any Struct-typed locals so the kernel-level field-pointer
     # pass can resolve field accesses on inlined struct instances.
@@ -1304,11 +1380,12 @@ def _inline_one_call(
 
 def _inline_walk(
     nodes: tuple[Node, ...] | list[Node],
-    fn_map: dict[str, Any],
+    fn_map: dict[str, list[Any]],
     depth: int,
     max_depth: int,
     const_ints_out: dict[str, int],
     struct_locals_out: dict[str, Any],
+    var_types: dict[str, str],
 ) -> list[Node]:
     out: list[Node] = []
     for n in nodes:
@@ -1316,14 +1393,16 @@ def _inline_walk(
         if isinstance(n, VoidCall) and n.op == "user_call":
             name = dict(n.extra).get("name")
             if name in fn_map:
+                ovl = _pick_overload(fn_map[name], n.args, var_types)
                 spliced = _inline_one_call(
-                    fn_map[name],
+                    ovl,
                     n.args,
                     fn_map,
                     depth,
                     max_depth,
                     const_ints_out,
                     struct_locals_out,
+                    var_types,
                 )
                 out.extend(spliced)
                 continue
@@ -1334,14 +1413,16 @@ def _inline_walk(
         # wrapping the body in ``do { ... } while (0);``.
         if isinstance(n, Assign) and isinstance(n.expr, UserCall) and n.expr.name in fn_map:
             name = n.expr.name
+            ovl = _pick_overload(fn_map[name], n.expr.args, var_types)
             spliced = _inline_one_call(
-                fn_map[name],
+                ovl,
                 n.expr.args,
                 fn_map,
                 depth,
                 max_depth,
                 const_ints_out,
                 struct_locals_out,
+                var_types,
                 return_value_dst=n.lhs,
             )
             out.extend(spliced)
@@ -1353,7 +1434,7 @@ def _inline_walk(
                 If(
                     raw=n.raw,
                     cond=n.cond,
-                    body=tuple(_inline_walk(n.body, fn_map, depth, max_depth, const_ints_out, struct_locals_out)),
+                    body=tuple(_inline_walk(n.body, fn_map, depth, max_depth, const_ints_out, struct_locals_out, var_types)),
                     raw_open=n.raw_open,
                     raw_close=n.raw_close,
                 )
@@ -1367,7 +1448,7 @@ def _inline_walk(
                     range_var=n.range_var,
                     start=n.start,
                     stop=n.stop,
-                    body=tuple(_inline_walk(n.body, fn_map, depth, max_depth, const_ints_out, struct_locals_out)),
+                    body=tuple(_inline_walk(n.body, fn_map, depth, max_depth, const_ints_out, struct_locals_out, var_types)),
                     step=n.step,
                 )
             )
@@ -1377,7 +1458,7 @@ def _inline_walk(
                 While(
                     raw=n.raw,
                     label_k=n.label_k,
-                    body=tuple(_inline_walk(n.body, fn_map, depth, max_depth, const_ints_out, struct_locals_out)),
+                    body=tuple(_inline_walk(n.body, fn_map, depth, max_depth, const_ints_out, struct_locals_out, var_types)),
                 )
             )
             continue
@@ -1385,7 +1466,7 @@ def _inline_walk(
             out.append(
                 _DoWhileZero(
                     raw=n.raw,
-                    body=tuple(_inline_walk(n.body, fn_map, depth, max_depth, const_ints_out, struct_locals_out)),
+                    body=tuple(_inline_walk(n.body, fn_map, depth, max_depth, const_ints_out, struct_locals_out, var_types)),
                 )
             )
             continue
@@ -1419,6 +1500,15 @@ def inline_user_calls(
         return list(nodes), {}, {}
     inlined_const_ints: dict[str, int] = {}
     inlined_struct_locals: dict[str, Any] = {}
+    # Seed var_types with the kernel's own locals so generic-overload
+    # selection at each call site can match parameter types against
+    # caller-argument types.
+    var_types: dict[str, str] = {}
+    for var in kernel_adj.variables:
+        try:
+            var_types[var.label] = var.ctype()
+        except Exception:
+            pass
     out = _inline_walk(
         nodes,
         fn_map,
@@ -1426,6 +1516,7 @@ def inline_user_calls(
         max_depth=max_depth,
         const_ints_out=inlined_const_ints,
         struct_locals_out=inlined_struct_locals,
+        var_types=var_types,
     )
     return out, inlined_const_ints, inlined_struct_locals
 
