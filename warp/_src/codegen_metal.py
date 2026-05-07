@@ -2141,6 +2141,16 @@ class MetalKernelArtifact:
     # array offsets). Bool scalars are lifted to int32 in the buffer and
     # cast back at the access site.
     ints_packed_scalars: tuple[str, ...] = ()
+    # Names of read-only float-element input args packed into a single
+    # ``__floats_packed`` MLX buffer. Includes scalar-float arrays
+    # (``wp.array2d[float]``, ``wp.array3d[float]``) and vec/mat-element
+    # arrays whose inner scalar is float (``wp.array2d[wp.vec3]``).
+    # Layout: ``[data_arr0..., data_arr1..., ...]``. The per-array start
+    # offsets live in ``__ints_packed`` after the int-array offsets and
+    # int/bool scalars (so a single packing buffer of integer offsets
+    # serves both the int and float packers). Codegen rewrites:
+    #   - ``arr_k[expr]`` -> ``__floats_packed[__ints_packed[Ki + S + k] + (expr)]``
+    floats_packed_arrs: tuple[str, ...] = ()
     # ``True`` if the kernel emits an output-init prologue and therefore
     # needs every body thread that shares a worldid to be in the same
     # threadgroup so the post-prologue ``threadgroup_barrier`` actually
@@ -3278,33 +3288,48 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
     # Saves ``(K + S) - 1`` slots when activated.
     ints_packed_arrs: list[str] = []
     ints_packed_scalars: list[str] = []
+    floats_packed_arrs: list[str] = []
     shapes_buf_count = 1 if _shape_arrs_seen else 0
     total_slots = len(input_args) + len(output_args) + len(init_input_names) + shapes_buf_count
     if total_slots > 30:
         packable_arrs = [a for a in input_args if _is_int32_1d_array_arg(a)]
         packable_scalars = [a for a in input_args if _is_int_or_bool_scalar_arg(a)]
-        # Packing K arrays + S scalars saves (K + S - 1) slots. Only
-        # activate when that's a net win, i.e. K + S >= 2.
-        if len(packable_arrs) + len(packable_scalars) >= 2:
-            ints_packed_arrs = [a.label for a in packable_arrs]
-            ints_packed_scalars = [a.label for a in packable_scalars]
-            packed_set = set(ints_packed_arrs) | set(ints_packed_scalars)
-            # Map scalar arg label -> (offset_in_packed_buffer, is_bool).
-            from warp._src.types import int32 as _int32  # noqa: PLC0415
+        # Pack int32-1D arrays + int/bool scalars into ``__ints_packed``
+        # only when there's a net win: K + S >= 2 saves slots.
+        do_int_pack = (len(packable_arrs) + len(packable_scalars)) >= 2
+        # Float-element arrays go into ``__floats_packed``. The float
+        # data lives in a separate buffer (different element type) but
+        # the per-array offsets share ``__ints_packed`` so we only spend
+        # one slot for the offset machinery regardless of how many
+        # arrays we pack. Activate if packing recovers any slot — F >= 2
+        # is the floor, but also needed when do_int_pack already pays
+        # the slot for ``__ints_packed`` (any F >= 1 then is free).
+        packable_floats = [a for a in input_args if _is_float_packable_array_arg(a)]
+        do_float_pack = len(packable_floats) >= (1 if do_int_pack else 2)
 
+        if do_int_pack or do_float_pack:
+            ints_packed_arrs = [a.label for a in packable_arrs] if do_int_pack else []
+            ints_packed_scalars = [a.label for a in packable_scalars] if do_int_pack else []
+            floats_packed_arrs = [a.label for a in packable_floats] if do_float_pack else []
+            packed_set = set(ints_packed_arrs) | set(ints_packed_scalars) | set(floats_packed_arrs)
             K = len(ints_packed_arrs)
+            S = len(ints_packed_scalars)
             scalar_info: dict[str, tuple[int, bool]] = {}
-            for s_idx, sa in enumerate(packable_scalars):
+            for s_idx, sa in enumerate(packable_scalars if do_int_pack else []):
                 scalar_info[sa.label] = (K + s_idx, sa.type is bool)
             # Rewrite every access of a packed array, then every read of
             # a packed scalar.
             new_src_lines = []
             for line in source.splitlines(keepends=True):
-                for k, name in enumerate(ints_packed_arrs):
-                    line = _replace_packed_int_array_access(line, name, k)
-                for s_label, (off, is_bool) in scalar_info.items():
-                    repl = f"((bool)__ints_packed[{off}])" if is_bool else f"__ints_packed[{off}]"
-                    line = re.sub(rf"\b{re.escape(s_label)}\b", repl, line)
+                if do_int_pack:
+                    for k, name in enumerate(ints_packed_arrs):
+                        line = _replace_packed_int_array_access(line, name, k)
+                    for s_label, (off, is_bool) in scalar_info.items():
+                        repl = f"((bool)__ints_packed[{off}])" if is_bool else f"__ints_packed[{off}]"
+                        line = re.sub(rf"\b{re.escape(s_label)}\b", repl, line)
+                if do_float_pack:
+                    for k, name in enumerate(floats_packed_arrs):
+                        line = _replace_packed_float_array_access(line, name, K + S + k)
                 new_src_lines.append(line)
             source = "".join(new_src_lines)
             input_args = [a for a in input_args if a.label not in packed_set]
@@ -3313,8 +3338,10 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
     # Synthetic packed-buffer inputs the launcher fills at dispatch time.
     # Order matters — must match the input-build order in the launcher.
     extra_input_names: list[str] = []
-    if ints_packed_arrs:
+    if ints_packed_arrs or ints_packed_scalars or floats_packed_arrs:
         extra_input_names.append("__ints_packed")
+    if floats_packed_arrs:
+        extra_input_names.append("__floats_packed")
     if _shape_arrs_seen:
         extra_input_names.append("__shapes_packed")
 
@@ -3333,6 +3360,7 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
         shape_packed_slot=_SHAPE_SLOT,
         ints_packed_arrs=tuple(ints_packed_arrs),
         ints_packed_scalars=tuple(ints_packed_scalars),
+        floats_packed_arrs=tuple(floats_packed_arrs),
         needs_init_barrier=bool(init_outputs),
         header=header,
     )
@@ -3361,6 +3389,43 @@ def _is_array_arg(var) -> bool:
         carries).
     """
     return _is_array_arg_type(var.type)
+
+
+def _replace_packed_float_array_access(src: str, name: str, idx: int) -> str:
+    """Rewrite every ``name[expr]`` to
+    ``__floats_packed[__ints_packed[idx] + (expr)]``.
+
+    Same bracket-balancing scanner as the int version. The float
+    array data lives in ``__floats_packed`` (a flat float32 buffer);
+    the per-array start offset shares ``__ints_packed`` (which is
+    already int-typed) so we pay only one slot for the offset
+    machinery regardless of how many float arrays we pack.
+    """
+    pat = re.compile(rf"\b{re.escape(name)}\s*\[")
+    out: list[str] = []
+    i = 0
+    while i < len(src):
+        m = pat.search(src, i)
+        if m is None:
+            out.append(src[i:])
+            break
+        out.append(src[i : m.start()])
+        j = m.end()
+        depth = 1
+        while j < len(src) and depth > 0:
+            ch = src[j]
+            if ch == "[":
+                depth += 1
+            elif ch == "]":
+                depth -= 1
+            j += 1
+        if depth != 0:
+            out.append(src[m.start() :])
+            break
+        expr = src[m.end() : j - 1]
+        out.append(f"__floats_packed[__ints_packed[{idx}] + ({expr})]")
+        i = j
+    return "".join(out)
 
 
 def _replace_packed_int_array_access(src: str, name: str, idx: int) -> str:
@@ -3416,6 +3481,32 @@ def _is_int32_1d_array_arg(arg) -> bool:
     dtype = getattr(arg.type, "dtype", None)
     ndim = getattr(arg.type, "ndim", None)
     return dtype is int32 and ndim == 1
+
+
+def _is_float_packable_array_arg(arg) -> bool:
+    """True if ``arg`` is a ``wp.array`` whose MLX-level storage is a
+    flat ``float32`` buffer — i.e. eligible for ``__floats_packed``.
+
+    Includes scalar-float arrays of any rank (``wp.array2d[float]``,
+    ``wp.array3d[float]``) and vec/mat-element arrays whose inner type
+    is float32-based (``vec3``, ``vec5``, ``mat33``, ...). MLX exposes
+    these as ``(*shape, *inner_shape)`` flat ``float32`` views, so the
+    kernel-side accesses already produce flat indices that the packed
+    buffer can serve directly.
+
+    Excludes int/bool element arrays (those route through the int
+    packer if 1-D) and any non-array args.
+    """
+    if not _is_array_arg(arg):
+        return False
+    from warp._src.types import float32  # noqa: PLC0415
+
+    dtype = getattr(arg.type, "dtype", None)
+    if dtype is float32:
+        return True
+    # Vec / mat / quat element type — check the inner scalar.
+    scalar_cls = getattr(dtype, "_wp_scalar_type_", None)
+    return scalar_cls is float32
 
 
 def _is_int_or_bool_scalar_arg(arg) -> bool:
@@ -3874,12 +3965,28 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim: int = 2
     # — first K entries are the start offset of each packed array's data,
     # next S entries are the int/bool scalar values (bool lifted to int),
     # then the concatenated data.
-    if artifact.ints_packed_arrs or artifact.ints_packed_scalars:
+    # Append the packed-int buffer when any int / scalar / float-array
+    # offset entries need to live there. Layout:
+    #   ``[ints_off_0, ..., ints_off_{K-1},
+    #      scalar_0, ..., scalar_{S-1},
+    #      floats_off_0, ..., floats_off_{F-1},
+    #      ints_data_arr0..., ints_data_arr1..., ...]``
+    # First K entries are the int-array data start offsets within
+    # ``__ints_packed``; next S entries are the int/bool scalar values
+    # (bool lifted to int); next F entries are the float-array data
+    # start offsets within the *separate* ``__floats_packed`` buffer
+    # built below; then the concatenated int-array data.
+    if (
+        artifact.ints_packed_arrs
+        or artifact.ints_packed_scalars
+        or artifact.floats_packed_arrs
+    ):
         K = len(artifact.ints_packed_arrs)
         S = len(artifact.ints_packed_scalars)
-        header_np = np.zeros(K + S, dtype=np.int32)
+        F = len(artifact.floats_packed_arrs)
+        header_np = np.zeros(K + S + F, dtype=np.int32)
         data_parts: list = []
-        running = K + S
+        running = K + S + F
         for i, arr_name in enumerate(artifact.ints_packed_arrs):
             header_np[i] = running
             idx, _ = arg_by_name[arr_name]
@@ -3899,11 +4006,42 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim: int = 2
             idx, _ = arg_by_name[scalar_name]
             value = fwd_args[idx]
             header_np[K + j] = int(value)
+        # Compute per-float-array offsets — values populated below.
+        float_running = 0
+        float_data_parts: list = []
+        for k, arr_name in enumerate(artifact.floats_packed_arrs):
+            header_np[K + S + k] = float_running
+            idx, _ = arg_by_name[arr_name]
+            value = fwd_args[idx]
+            mx_dtype, view_shape = _array_view_dtype_and_shape(value)
+            sz = int(np.prod(view_shape)) if view_shape else 0
+            if value.ptr is None or sz == 0:
+                continue
+            mx_buf = _metal_get_buffer(value.ptr)
+            if mx_buf is None:
+                raise RuntimeError(
+                    f"Kernel '{kernel.key}' packed-float array '{arr_name}' has no registered MLX buffer "
+                    f"(ptr={value.ptr}). Was it allocated by Warp's Metal allocator?"
+                )
+            float_data_parts.append(mx_buf.view(mx_dtype).reshape((sz,)))
+            float_running += sz
         header_mx = mx.array(header_np, dtype=mx.int32)
         if data_parts:
             mlx_inputs.append(mx.concatenate([header_mx, *data_parts], axis=0))
         else:
             mlx_inputs.append(header_mx)
+        # Append the packed-float buffer separately. MLX inputs of
+        # different dtypes can't share a buffer, so we keep ints in
+        # ``__ints_packed`` and floats in ``__floats_packed`` — the
+        # offset table in ``__ints_packed`` (slots K+S..K+S+F-1) tells
+        # the kernel where each float array begins inside
+        # ``__floats_packed``.
+        if artifact.floats_packed_arrs:
+            if float_data_parts:
+                mlx_inputs.append(mx.concatenate(float_data_parts, axis=0))
+            else:
+                # Empty placeholder so MLX has a buffer to bind.
+                mlx_inputs.append(mx.zeros((1,), dtype=mx.float32))
 
     # Append the packed shape buffer if the kernel needs any ``arr.shape``
     # access. ``__shapes_packed`` is a single flat int32 array containing
