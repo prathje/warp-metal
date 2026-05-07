@@ -1328,14 +1328,17 @@ def _inline_one_call(
     # Extend var_types with this overload's mangled local labels so any
     # nested user call inside the callee body can resolve its caller-arg
     # types correctly when picking among multi-overload native_funcs.
-    inlined_var_types = dict(var_types)
+    # Mutates the shared dict so the kernel-level codegen can read the
+    # full ctype map after inlining (used by translators that need
+    # inlined tile-local shapes — ``tile_transpose`` / ``tile_view``).
     for var in fn_overload.adj.variables:
         if var.label in fn_param_set:
             continue
         try:
-            inlined_var_types[f"{inline_id}__{var.label}"] = var.ctype()
+            var_types[f"{inline_id}__{var.label}"] = var.ctype()
         except Exception:
             pass
+    inlined_var_types = var_types
 
     fn_folded = _inline_walk(
         fn_folded, fn_map, depth + 1, max_depth, const_ints_out, struct_locals_out, inlined_var_types
@@ -1496,10 +1499,11 @@ def _inline_walk(
 
 def inline_user_calls(
     nodes: list[Node], kernel_adj, max_depth: int = 8
-) -> tuple[list[Node], dict[str, int], dict[str, Any]]:
+) -> tuple[list[Node], dict[str, int], dict[str, Any], dict[str, str]]:
     """Splice every user-``@wp.func`` call into the AST tree.
 
-    Returns ``(inlined_nodes, inlined_const_ints, inlined_struct_locals)``:
+    Returns ``(inlined_nodes, inlined_const_ints, inlined_struct_locals,
+    inlined_var_ctypes)``:
 
     - ``inlined_const_ints``: mangled label → int value for each
       inlined const-int local. Lets ``fold_views`` recognise slice-step
@@ -1511,13 +1515,20 @@ def inline_user_calls(
       inlined helper bodies (e.g. the ``Geom`` struct built by
       ``geom_collision_pair`` for primitive narrowphase).
 
+    - ``inlined_var_ctypes``: mangled label → ctype string. Surfaces
+      every inlined local's type to the kernel-level codegen so passes
+      that need shape info on inlined tile vars (e.g. the
+      ``tile_transpose`` / ``tile_view`` translators) can look it up.
+      Includes the kernel's own ``var.ctype()`` entries by virtue of
+      seeding ``var_types`` with them.
+
     ``kernel_adj`` is the top-level kernel's ``Adjoint`` object — used
     for the references table that resolves call-site mangled names
     back to Function overloads.
     """
     fn_map = _build_function_overload_table(kernel_adj)
     if not fn_map:
-        return list(nodes), {}, {}
+        return list(nodes), {}, {}, {}
     inlined_const_ints: dict[str, int] = {}
     inlined_struct_locals: dict[str, Any] = {}
     # Seed var_types with the kernel's own locals so generic-overload
@@ -1538,7 +1549,7 @@ def inline_user_calls(
         struct_locals_out=inlined_struct_locals,
         var_types=var_types,
     )
-    return out, inlined_const_ints, inlined_struct_locals
+    return out, inlined_const_ints, inlined_struct_locals, var_types
 
 
 _UNSUPPORTED_CTYPE_PREFIXES = ("wp::str", "wp::tuple_t")
