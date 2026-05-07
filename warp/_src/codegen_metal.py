@@ -255,10 +255,17 @@ def _vec_t_to_msl(n: int, scalar_ctype: str) -> str:
 def _msl_mat_name(rows: int, cols: int, msl_scalar: str) -> str:
     """Return the MSL type name for ``mat_t<R, C, T>``.
 
-    Native ``floatRxC`` for R, C in {2, 3, 4}; ``wp_matRxC_<scalar>`` for
-    larger sizes (custom struct emitted in the kernel header).
+    Native ``floatRxC`` only for *square* sizes — MSL's row-vs-column
+    access semantics (``m[i]`` returns the i-th *MSL column*, which is
+    Warp's "row i" only when the matrix is square — otherwise the
+    shape doesn't even match). Non-square sizes route through our
+    custom ``wp_mat{R}x{C}_<scalar>`` struct (row-major ``c[R*C]``)
+    so reads and writes via ``m[i]`` go through the proxy that
+    returns a Warp-row-shaped vector. Cartpole's ``mat_t<2, 3>``
+    surfaced this — we now emit ``wp_mat2x3_float`` instead of MSL
+    native ``float2x3``.
     """
-    if rows in _MSL_VEC_NATIVE_N and cols in _MSL_VEC_NATIVE_N:
+    if rows == cols and rows in _MSL_VEC_NATIVE_N:
         return f"{msl_scalar}{rows}x{cols}"
     return f"wp_mat{rows}x{cols}_{msl_scalar}"
 
@@ -351,6 +358,15 @@ def _emit_big_vec_struct(name: str, n: int, msl_scalar: str) -> str:
     body_lines.append(f"    {name} r;")
     for i in range(n):
         body_lines.append(f"    r.c[{i}] = v{i};")
+    body_lines.append("    return r;")
+    body_lines.append("}")
+    # Single-scalar broadcast overload: Warp's IR emits
+    # ``wp_vecN_<scalar>_make(scalar)`` for ``vec_t<N>(s)`` patterns
+    # (e.g. ``wp.vec8(0.0)`` to zero-init or fill).
+    body_lines.append(f"inline {name} {name}_make({msl_scalar} v) {{")
+    body_lines.append(f"    {name} r;")
+    for i in range(n):
+        body_lines.append(f"    r.c[{i}] = v;")
     body_lines.append("    return r;")
     body_lines.append("}")
     # Operator overloads. Component-wise unrolled for clarity and so MSL's
@@ -854,7 +870,9 @@ def _build_kernel_header(source: str) -> str:
         scalar = m.group(3)
         if scalar not in _MSL_PREFIX_TO_SAME:
             continue
-        if rows in _MSL_VEC_NATIVE_N and cols in _MSL_VEC_NATIVE_N:
+        # Skip only *square* native sizes — non-square small mats use
+        # our custom struct (see ``_msl_mat_name``).
+        if rows == cols and rows in _MSL_VEC_NATIVE_N:
             continue
         seen_mat.add((rows, cols, scalar))
     parts: list[str] = []
@@ -1015,17 +1033,17 @@ def _rewrite_mat_t_constructor(text: str) -> str:
         if full_ctype not in _MSL_VEC_SCALAR_PREFIX or rows < 2 or cols < 2:
             return m.group(0)
         msl_scalar = _MSL_VEC_SCALAR_PREFIX[full_ctype]
-        # Empty-args ``wp::mat_t<R,C,T>()`` — value-initialisation. MSL
-        # native ``floatRxC()`` (no args) doesn't compile (no default
-        # constructor); ``floatRxC(0)`` broadcasts zero. For our custom
-        # big-mat structs we use ``T()`` (aggregate init zeros ``c[]``).
+        # Native MSL matrix only for *square* sizes (``_msl_mat_name``).
+        # Non-square goes through the custom ``wp_mat{R}x{C}_<scalar>``
+        # struct so the row-access proxy works; ``mat_t<2, 3>(args)``
+        # routes to ``wp_mat2x3_float_make(args...)``.
         if not args:
-            if rows in _MSL_VEC_NATIVE_N and cols in _MSL_VEC_NATIVE_N:
+            if rows == cols and rows in _MSL_VEC_NATIVE_N:
                 return f"{msl_scalar}{rows}x{cols}(0)"
             return f"wp_mat{rows}x{cols}_{msl_scalar}()"
         if len(args) != rows * cols:
             return m.group(0)
-        if rows in _MSL_VEC_NATIVE_N and cols in _MSL_VEC_NATIVE_N:
+        if rows == cols and rows in _MSL_VEC_NATIVE_N:
             msl_vec = f"{msl_scalar}{rows}"
             msl_mat = f"{msl_scalar}{rows}x{cols}"
             col_strs: list[str] = []
@@ -2736,12 +2754,49 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
         # Some IR paths emit the CPU-side native ``floatRxC()`` directly
         # (skipping the ``wp::mat_t<R,C,T>()`` form the rewriter above
         # expects). Native MSL matrix types reject the no-arg form;
-        # ``floatRxC(0)`` zero-broadcasts. Rewrite locally.
+        # for *square* sizes ``floatRxR(0)`` constructs an identity-
+        # scaled diagonal (zero diag → zero mat), but ``floatRxC(0)``
+        # for non-square sizes is also a compile error — MSL only
+        # supports the diagonal-broadcast form on square matrices.
+        # Rewrite empty constructors to an explicit "zero columns"
+        # form: ``floatNxM(floatM(0), floatM(0), ...)`` with N copies
+        # of a zero column. The MSL convention is ``floatNxM`` has
+        # N columns of M rows (per the spec), so column type is
+        # ``floatM``.
+        def _zero_native_mat(m: re.Match[str]) -> str:
+            scalar = m.group(1)
+            n_cols = int(m.group(2))
+            n_rows = int(m.group(3))
+            col_type = f"{scalar}{n_rows}"
+            zeros = ", ".join([f"{col_type}(0)"] * n_cols)
+            return f"{scalar}{n_cols}x{n_rows}({zeros})"
+
         translated = re.sub(
-            r"\b((?:float|half|int|uint)\d+x\d+)\s*\(\s*\)",
-            r"\1(0)",
+            r"\b((?:float|half|int|uint))(\d+)x(\d+)\s*\(\s*\)",
+            _zero_native_mat,
             translated,
         )
+        # Same for ``floatRxC(0)`` — the diagonal-scalar form. MSL only
+        # accepts it on *square* matrices; non-square needs explicit
+        # zero columns.
+        def _zero_scalar_mat(m: re.Match[str]) -> str:
+            scalar = m.group(1)
+            n_cols = int(m.group(2))
+            n_rows = int(m.group(3))
+            if n_cols == n_rows:
+                return m.group(0)  # square: ``floatNxN(0)`` works
+            col_type = f"{scalar}{n_rows}"
+            zeros = ", ".join([f"{col_type}(0)"] * n_cols)
+            return f"{scalar}{n_cols}x{n_rows}({zeros})"
+
+        translated = re.sub(
+            r"\b((?:float|half|int|uint))(\d+)x(\d+)\s*\(\s*0\s*\)",
+            _zero_scalar_mat,
+            translated,
+        )
+        # ``inff`` is Warp's IR float-infinity literal. MSL has
+        # ``INFINITY`` (float) but not ``inff``; substitute.
+        translated = re.sub(r"\binff\b", "INFINITY", translated)
         translated = _rewrite_vec_t_brace_constructor(translated)
         # Bare ``wp::vec_t<N, ...>`` and ``wp::mat_t<R, C, ...>`` type
         # references (in declarations etc.) get renamed to the MSL native
@@ -2809,6 +2864,32 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
         # call has no args.
         m_ctor = re.match(r"^\s*var_(\w+)\s*=\s*\w+\s*\(\s*\)\s*;\s*$", raw)
         if m_ctor and m_ctor.group(1) in struct_local_layouts:
+            continue
+        # Struct-to-struct local copy ``var_X = var_Y;``. Both X and Y
+        # have already been split into per-field locals; expand the
+        # whole-struct copy into one per-field assignment per non-array
+        # field. Inliner-emitted return-value writes for struct-typed
+        # ``@wp.func`` calls land here (e.g. ``var_19 = var_37__0;``
+        # from cartpole's ``geom_collision_pair`` -> ``Geom`` chain).
+        m_struct_copy = re.match(r"^(?P<indent>\s*)var_(\w+)\s*=\s*var_(\w+)\s*;\s*$", raw)
+        if (
+            m_struct_copy
+            and m_struct_copy.group(2) in struct_local_layouts
+            and m_struct_copy.group(3) in struct_local_layouts
+        ):
+            indent = m_struct_copy.group("indent")
+            dst = m_struct_copy.group(2)
+            src = m_struct_copy.group(3)
+            dst_layout = struct_local_layouts[dst]
+            src_layout = struct_local_layouts[src]
+            for fname, finfo in dst_layout.fields.items():
+                if finfo.kind == _STRUCT_FIELD_KIND_ARRAY_UNUSED:
+                    continue
+                if fname not in src_layout.fields:
+                    continue  # different layouts; nothing sensible to copy
+                dst_local = _per_field_local(dst, fname)
+                src_local = _per_field_local(src, fname)
+                body_lines.append(f"{indent}{dst_local} = {src_local};")
             continue
         # ``wp::store(addr_var, value);`` — write through a field pointer.
         # We translate by looking up the LHS expression we recorded in
