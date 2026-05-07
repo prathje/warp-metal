@@ -329,8 +329,11 @@ class TestMetalASTFold(unittest.TestCase):
         for_nodes = [n for n in folded if isinstance(n, For)]
         self.assertEqual(len(for_nodes), 1)
         self.assertEqual(for_nodes[0].start, "0")
-        # The for opener's range and iter vars are flagged as decl-skipped.
-        self.assertEqual(len(skip), 2)
+        # Only the range_t opaque iter object is decl-skipped; the loop
+        # induction variable's decl is kept so post-loop reads still see
+        # it (the synthetic ``for (var_iv = start; ...)`` only assigns,
+        # doesn't declare).
+        self.assertEqual(len(skip), 1)
 
     def test_dynamic_for_loop_two_arg_range(self):
         @wp.kernel
