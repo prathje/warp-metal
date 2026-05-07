@@ -1719,7 +1719,15 @@ class Adjoint:
                 if adj.used_by_backward_kernel:
                     func_arg_var.adj.used_by_backward_kernel = True
 
-                adj.builder.build_function(func_arg_var)
+                if adj.builder is None:
+                    # Same propagation as the user-call site at line 1646:
+                    # the Metal backend builds without a registered module
+                    # (``builder=None``); build the function-argument's IR
+                    # directly with the parent kernel's options instead of
+                    # routing through ``adj.builder.build_function``.
+                    func_arg_var.build(None, default_builder_options=adj.builder_options)
+                else:
+                    adj.builder.build_function(func_arg_var)
 
             fwd_args.append(strip_reference(func_arg_var))
 

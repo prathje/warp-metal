@@ -493,7 +493,13 @@ def _emit_wp_dot_overloads(source: str) -> str:
     for m in _NATIVE_VEC_NAME_PAT.finditer(source):
         seen_native.add((m.group(1), int(m.group(2))))
     for scalar, n in sorted(seen_native):
-        parts.append(f"inline {scalar} wp_dot({scalar}{n} a, {scalar}{n} b) {{ return metal::dot(a, b); }}")
+        # ``metal::dot`` is float/half-only; integer overloads have to be
+        # hand-rolled as a sum-of-products.
+        if scalar in ("int", "uint"):
+            body_terms = " + ".join(f"a[{i}] * b[{i}]" for i in range(n))
+            parts.append(f"inline {scalar} wp_dot({scalar}{n} a, {scalar}{n} b) {{ return {body_terms}; }}")
+        else:
+            parts.append(f"inline {scalar} wp_dot({scalar}{n} a, {scalar}{n} b) {{ return metal::dot(a, b); }}")
 
     seen_big: set[tuple[int, str]] = set()
     for m in _BIG_VEC_NAME_PAT.finditer(source):
@@ -1359,7 +1365,6 @@ def _translate_tile_intrinsics(line: str, tile_var_dims: dict[str, tuple[int, in
         offsets = args[-n_off:]
         arr_name = arr[len("var_"):] if arr.startswith("var_") else arr
         base_expr = _build_flat_base_expr(arr_name, lead_idx_args, inner_dims=2 if cols > 1 else 1)
-        helper = f"wp_tile_{rows}x{cols}_{msl_scalar}_load"
         if cols > 1:
             row_stride = f"{arr_name}_shape[{len(lead_idx_args) + 1}]"
             row_off, col_off = offsets
@@ -1368,6 +1373,11 @@ def _translate_tile_intrinsics(line: str, tile_var_dims: dict[str, tuple[int, in
             # Treat the 1-D tile load as a degenerate ``Rx1`` load with
             # ``col_off=0`` so the same helper signature works.
             row_off, col_off = offsets[0], "0"
+        # Shape (1,1) collapses to a scalar local (see ``_msl_var_type``);
+        # there's no wp_tile_1x1 struct/helper, so emit a direct subscript.
+        if rows == 1 and cols == 1:
+            return f"var_{lhs} = {arr}[{base_expr} + ({row_off}) * ({row_stride}) + ({col_off})]"
+        helper = f"wp_tile_{rows}x{cols}_{msl_scalar}_load"
         return f"var_{lhs} = {helper}({arr}, {base_expr}, {row_stride}, {row_off}, {col_off})"
 
     def repl_store(m: re.Match[str]) -> str:
@@ -1391,13 +1401,16 @@ def _translate_tile_intrinsics(line: str, tile_var_dims: dict[str, tuple[int, in
         offsets = middle[-n_off:]
         arr_name = arr[len("var_"):] if arr.startswith("var_") else arr
         base_expr = _build_flat_base_expr(arr_name, lead_idx_args, inner_dims=2 if cols > 1 else 1)
-        helper = f"wp_tile_{rows}x{cols}_{msl_scalar}_store"
         if cols > 1:
             row_stride = f"{arr_name}_shape[{len(lead_idx_args) + 1}]"
             row_off, col_off = offsets
         else:
             row_stride = "1"
             row_off, col_off = offsets[0], "0"
+        # Shape (1,1) tile is a scalar local — store with a direct subscript.
+        if rows == 1 and cols == 1:
+            return f"{arr}[{base_expr} + ({row_off}) * ({row_stride}) + ({col_off})] = {tile_var}"
+        helper = f"wp_tile_{rows}x{cols}_{msl_scalar}_store"
         return f"{helper}({arr}, {base_expr}, {row_stride}, {row_off}, {col_off}, {tile_var})"
 
     def repl_cholesky(m: re.Match[str]) -> str:
@@ -1414,6 +1427,11 @@ def _translate_tile_intrinsics(line: str, tile_var_dims: dict[str, tuple[int, in
         rows, cols, msl_scalar = dims
         if rows != cols:
             return m.group(0)
+        # Shape (1,1) collapses to a scalar local: the factor is just
+        # sqrt(max(a, eps)). The clamp matches the wp_tile_NxN cholesky
+        # helper's near-singular guard.
+        if rows == 1:
+            return f"var_{lhs} = metal::precise::sqrt(metal::max({in_arg}, ({msl_scalar})1e-30))"
         helper = f"wp_tile_{rows}x{cols}_{msl_scalar}_cholesky"
         return f"var_{lhs} = {helper}({in_arg})"
 
@@ -1436,6 +1454,10 @@ def _translate_tile_intrinsics(line: str, tile_var_dims: dict[str, tuple[int, in
         n = L_dims[0]
         k = b_dims[1]
         msl_scalar = L_dims[2]
+        # Shape (1,1) L with K=1 b collapses to scalar division: solving
+        # L*L^T*x = b with scalar L is x = b / (L*L).
+        if n == 1 and k == 1:
+            return f"var_{lhs} = {b_arg} / ({L_arg} * {L_arg})"
         helper = f"wp_tile_{n}x{n}_{msl_scalar}_cholesky_solve_{k}"
         return f"var_{lhs} = {helper}({L_arg}, {b_arg})"
 
@@ -1621,6 +1643,13 @@ class MetalKernelArtifact:
     # ``shape_packed_slot`` int32s, padded with zeros). Warp arrays cap
     # at 4 dims so 4 is plenty.
     shape_packed_slot: int = 4
+    # Names of read-only int32-1D input args packed into a single
+    # ``__ints_packed`` MLX buffer to stay under Metal's 31-slot kernel-
+    # arg limit. The buffer's layout is ``[off_0, off_1, ..., off_{K-1},
+    # data_arr0..., data_arr1..., ...]`` where ``off_i`` is the start
+    # index of array ``i``'s data within ``__ints_packed``. Empty when
+    # the kernel fits without packing.
+    ints_packed_arrs: tuple[str, ...] = ()
     # MSL declarations to inject before the kernel function body — used for
     # custom big-vec structs (vec5, vec6 = spatial_vector, vec8) that don't
     # have native MSL ``floatN`` equivalents. Empty for kernels that only
@@ -2128,9 +2157,9 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
     # Map tile-typed locals to ``(rows, cols, msl_scalar)`` for the tile-
     # intrinsic translator (it needs the result-tile shape for cholesky /
     # cholesky_solve, where dimensions don't appear in the call's template
-    # args). Only scalar-element shared tiles get an entry — register
-    # tiles of shape (1,1) collapse to plain values via ``_msl_var_type``
-    # and don't need a struct shape in this map.
+    # args). Shape (1,1) entries are kept so the translator can short-
+    # circuit cholesky / cholesky_solve to scalar ops even though the
+    # local itself collapsed to a plain value via ``_msl_var_type``.
     tile_var_dims: dict[str, tuple[int, int, str]] = {}
     for var in adj.variables:
         parsed = _parse_tile_ctype(var.ctype())
@@ -2138,8 +2167,6 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
             continue
         _kind, dtype_ctype, rows, cols = parsed
         if dtype_ctype not in _SCALAR_CTYPE_TO_MSL:
-            continue
-        if rows == 1 and cols == 1:
             continue
         tile_var_dims[var.label] = (rows, cols, _SCALAR_CTYPE_TO_MSL[dtype_ctype])
 
@@ -2451,26 +2478,58 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
         translated = _translate_intrinsics(line.strip())
         body_lines.append(f"    {_finalize(translated)}")
 
-    # ---- Atomic-output init prologue --------------------------------
-    # MLX's ``mx.fast.metal_kernel`` zero-initialises every output buffer
-    # when ``atomic_outputs=True``, which wipes data the kernel expects
-    # to read back from a previous launch (mujoco_warp's iterative
-    # linesearch reads ``efc_Ma_out`` to compute residuals). For each
-    # atomic output we accept a synthetic ``<name>__init`` input carrying
-    # the user's current array contents and prepend a per-thread copy so
-    # the buffer is seeded before the kernel's compute runs. Partition
-    # is by ``thread_position_in_grid.x`` (worldid) — fits 1-D launches
-    # and mujoco_warp's ``dim=nworld`` pattern.
-    atomic_init_outputs: list[str] = []
+    # ---- Output-init prologue ----------------------------------------
+    # MLX recycles output buffers from a pool, so any output element a
+    # kernel leaves *unwritten* surfaces stale data from a previous
+    # tenant — observed as ``_kinematics_branch`` skipping body 0
+    # (worldbody, not in ``body_branches``) and the corresponding
+    # ``xpos[0]`` slot ending up with the gravity vector that
+    # ``_cacc_world`` left behind in the recycled buffer. The fix:
+    # seed each affected output from the user's wp.array data before
+    # the kernel body runs.
+    #
+    # We seed in two cases:
+    #   1. The kernel uses ``wp.atomic_*`` on the output. The output is
+    #      atomic-typed (``atomic_outputs=True``); we need atomic_store
+    #      to seed and the user's previous values to accumulate from.
+    #   2. The kernel reads the output back during compute (e.g.
+    #      kinematics's ``xpos_out[parent]`` chain) — though for
+    #      partially-written stateless outputs (``xpos`` skipping
+    #      worldbody) the same seeding fixes both. Detected by scanning
+    #      the IR for ``wp::address(var_<out>, ...)`` (the read
+    #      pattern Warp emits before ``wp::load``) and by looking for
+    #      ``wp::view`` of the output (``arr[w]`` slicing).
+    #
+    # Partition is by ``thread_position_in_grid.x`` (worldid).
+    output_label_set = {a.label for a in output_args}
+    addr_read_pat = re.compile(r"wp::address\s*\(\s*var_([A-Za-z_]\w*)\s*,")
+    view_read_pat = re.compile(r"wp::view\s*\(\s*var_([A-Za-z_]\w*)\s*,")
+    read_outputs: set[str] = set()
+    for raw in forward_lines:
+        for m in addr_read_pat.finditer(raw):
+            if m.group(1) in output_label_set:
+                read_outputs.add(m.group(1))
+        for m in view_read_pat.finditer(raw):
+            if m.group(1) in output_label_set:
+                read_outputs.add(m.group(1))
+    init_outputs: list[str] = []
     if has_atomic:
-        atomic_init_outputs = [a.label for a in output_args if a.label in atomic_arg_names]
-    if atomic_init_outputs:
+        # Every atomic output gets seeded so atomic_add accumulates from
+        # the user's previous value (else MLX zero-init wipes it).
+        init_outputs.extend(a.label for a in output_args if a.label in atomic_arg_names)
+    # Plus any output the kernel reads back from — preserves elements
+    # the kernel doesn't write (kinematics_branch / sensor partial
+    # writes) and lets read-then-write patterns see real prior values.
+    for a in output_args:
+        if a.label in read_outputs and a.label not in init_outputs:
+            init_outputs.append(a.label)
+    if init_outputs:
         prologue: list[str] = [
-            "    // -- Atomic-output init prologue (seed from user wp.array data) --",
+            "    // -- Output init prologue (seed from user wp.array data) --",
             "    {",
             "        int _init_w = (int)thread_position_in_grid.x;",
         ]
-        for out_name in atomic_init_outputs:
+        for out_name in init_outputs:
             arg_var = next(a for a in output_args if a.label == out_name)
             ndim = getattr(arg_var.type, "ndim", 1)
             v_info = _vec_dtype_info(arg_var)
@@ -2478,13 +2537,19 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
             inner_extra = 1 if v_info is not None else (2 if m_info is not None else 0)
             stride_terms = [f"{out_name}_shape[{k}]" for k in range(1, ndim + inner_extra)]
             stride_expr = " * ".join(stride_terms) if stride_terms else "1"
+            if has_atomic:
+                store_stmt = (
+                    f"            atomic_store_explicit(&{out_name}[_init_flat], "
+                    f"{out_name}__init[_init_flat], memory_order_relaxed);"
+                )
+            else:
+                store_stmt = f"            {out_name}[_init_flat] = {out_name}__init[_init_flat];"
             prologue.extend(
                 [
                     f"        int _init_stride_{out_name} = {stride_expr};",
                     f"        for (int _init_i = 0; _init_i < _init_stride_{out_name}; ++_init_i) {{",
                     f"            int _init_flat = _init_w * _init_stride_{out_name} + _init_i;",
-                    f"            atomic_store_explicit(&{out_name}[_init_flat], "
-                    f"{out_name}__init[_init_flat], memory_order_relaxed);",
+                    store_stmt,
                     "        }",
                 ]
             )
@@ -2492,6 +2557,9 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
         # Prepend before the body so the shape-pack rewrite below picks up
         # the prologue's ``arr_shape[k]`` references.
         body_lines = prologue + body_lines
+    # Track for the launcher: which outputs need an ``<name>__init``
+    # shadow input to be bound. Same name list the artifact uses.
+    atomic_init_outputs = init_outputs
 
     source = "\n".join(body_lines) + "\n"
 
@@ -2564,13 +2632,43 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
             header="",
         )
 
-    base_input_names = [a.label for a in input_args]
-    # ``__shapes_packed`` is a synthetic input the launcher fills with
-    # the concatenated shapes of every multi-dim array referenced via
-    # ``arr.shape[k]`` in the kernel. Empty when no kernel arr uses
-    # ``.shape``.
-    extra_input_names = ["__shapes_packed"] if _shape_arrs_seen else []
     init_input_names = [f"{n}__init" for n in atomic_init_outputs]
+
+    # ---- Pack int32-1D inputs into one buffer when over the slot cap --
+    # Metal kernels are HW-capped at 31 buffer parameters (slots 0..30).
+    # When ``input_args + output_args + init_shadows + __shapes_packed``
+    # exceeds 30 we'd fail to compile. Pack every read-only 1-D int32
+    # input into a single ``__ints_packed`` buffer instead — its layout
+    # is ``[off_0, off_1, ..., off_{K-1}, data_arr0..., data_arr1..., ...]``
+    # so each access ``arr[i]`` becomes ``__ints_packed[__ints_packed[k] + i]``
+    # at the cost of one extra int load per access. Saves ``K - 1`` slots.
+    ints_packed_arrs: list[str] = []
+    shapes_buf_count = 1 if _shape_arrs_seen else 0
+    total_slots = len(input_args) + len(output_args) + len(init_input_names) + shapes_buf_count
+    if total_slots > 30:
+        packable = [a for a in input_args if _is_int32_1d_array_arg(a)]
+        # Packing K arrays into one buffer saves K-1 slots; only do it
+        # if there's a net win (>= 2 packable arrays).
+        if len(packable) >= 2:
+            ints_packed_arrs = [a.label for a in packable]
+            packed_set = set(ints_packed_arrs)
+            # Rewrite every access of a packed array.
+            new_src_lines = []
+            for line in source.splitlines(keepends=True):
+                for k, name in enumerate(ints_packed_arrs):
+                    line = _replace_packed_int_array_access(line, name, k)
+                new_src_lines.append(line)
+            source = "".join(new_src_lines)
+            input_args = [a for a in input_args if a.label not in packed_set]
+
+    base_input_names = [a.label for a in input_args]
+    # Synthetic packed-buffer inputs the launcher fills at dispatch time.
+    # Order matters — must match the input-build order in the launcher.
+    extra_input_names: list[str] = []
+    if ints_packed_arrs:
+        extra_input_names.append("__ints_packed")
+    if _shape_arrs_seen:
+        extra_input_names.append("__shapes_packed")
 
     header = _build_kernel_header(source)
 
@@ -2585,6 +2683,7 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
         output_shape_inputs=[],
         shape_packed_arrs=tuple(_shape_arrs_seen),
         shape_packed_slot=_SHAPE_SLOT,
+        ints_packed_arrs=tuple(ints_packed_arrs),
         header=header,
     )
 
@@ -2612,6 +2711,61 @@ def _is_array_arg(var) -> bool:
         carries).
     """
     return _is_array_arg_type(var.type)
+
+
+def _replace_packed_int_array_access(src: str, name: str, idx: int) -> str:
+    """Rewrite every ``name[expr]`` to ``__ints_packed[__ints_packed[idx] + (expr)]``.
+
+    Walks forward balancing brackets so a nested access like
+    ``name[other_arr[i]]`` is handled correctly. Doesn't touch
+    ``name_shape[...]`` since the leading word boundary requires the
+    next non-word char after ``name`` to be the open bracket (with only
+    whitespace allowed between).
+    """
+    pat = re.compile(rf"\b{re.escape(name)}\s*\[")
+    out: list[str] = []
+    i = 0
+    while i < len(src):
+        m = pat.search(src, i)
+        if m is None:
+            out.append(src[i:])
+            break
+        out.append(src[i : m.start()])
+        # Walk forward from just after the ``[`` to find the matching ``]``,
+        # tracking depth so nested ``[...]`` doesn't terminate the scan.
+        j = m.end()
+        depth = 1
+        while j < len(src) and depth > 0:
+            ch = src[j]
+            if ch == "[":
+                depth += 1
+            elif ch == "]":
+                depth -= 1
+            j += 1
+        if depth != 0:
+            out.append(src[m.start() :])
+            break
+        expr = src[m.end() : j - 1]
+        out.append(f"__ints_packed[__ints_packed[{idx}] + ({expr})]")
+        i = j
+    return "".join(out)
+
+
+def _is_int32_1d_array_arg(arg) -> bool:
+    """True if ``arg`` is a ``wp.array(dtype=wp.int32)`` of rank 1.
+
+    Used to pick read-only int arrays for packing into ``__ints_packed``
+    when a kernel exceeds Metal's 31-buffer limit. Excludes vec/mat/
+    struct-element arrays (they need larger per-element strides) and
+    multi-dim arrays (they need separate offset-and-stride machinery).
+    """
+    if not _is_array_arg(arg):
+        return False
+    from warp._src.types import int32  # noqa: PLC0415
+
+    dtype = getattr(arg.type, "dtype", None)
+    ndim = getattr(arg.type, "ndim", None)
+    return dtype is int32 and ndim == 1
 
 
 def _vec_dtype_info(arg) -> tuple[int, str] | None:
@@ -3044,6 +3198,37 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim: int = 2
         typed = mx_buf.view(mx_dtype).reshape(view_shape)
         mlx_inputs.append(typed)
 
+    # Append the packed int buffer if the kernel exceeded the 31-slot
+    # limit and the codegen pulled int32-1D inputs into ``__ints_packed``.
+    # Layout: ``[off_0, ..., off_{K-1}, data_arr0..., data_arr1..., ...]``
+    # — first K entries are the start offset of each packed array's data
+    # within the same buffer, followed by the concatenated data.
+    if artifact.ints_packed_arrs:
+        K = len(artifact.ints_packed_arrs)
+        offsets_np = np.zeros(K, dtype=np.int32)
+        data_parts: list = []
+        running = K
+        for i, arr_name in enumerate(artifact.ints_packed_arrs):
+            offsets_np[i] = running
+            idx, _ = arg_by_name[arr_name]
+            value = fwd_args[idx]
+            sz = int(getattr(value, "size", 0) or 0)
+            if value.ptr is None or sz == 0:
+                continue
+            mx_buf = _metal_get_buffer(value.ptr)
+            if mx_buf is None:
+                raise RuntimeError(
+                    f"Kernel '{kernel.key}' packed-int array '{arr_name}' has no registered MLX buffer "
+                    f"(ptr={value.ptr}). Was it allocated by Warp's Metal allocator?"
+                )
+            data_parts.append(mx_buf.view(mx.int32).reshape((sz,)))
+            running += sz
+        offsets_mx = mx.array(offsets_np, dtype=mx.int32)
+        if data_parts:
+            mlx_inputs.append(mx.concatenate([offsets_mx, *data_parts], axis=0))
+        else:
+            mlx_inputs.append(offsets_mx)
+
     # Append the packed shape buffer if the kernel needs any ``arr.shape``
     # access. ``__shapes_packed`` is a single flat int32 array containing
     # the runtime shape of every multi-dim array referenced from the
@@ -3083,6 +3268,15 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim: int = 2
                 f"device; got {getattr(value, 'device', '?')}"
             )
         out_mx_dtype, out_view_shape = _array_view_dtype_and_shape(value)
+        # MLX rejects zero-element outputs (Apple's Metal API can't bind
+        # a zero-size MTLBuffer). For kernels with conditionally-unused
+        # outputs (e.g. sparse-only arrays in dense mode where the
+        # ``if (is_sparse)`` branch never fires), we replace any zero-
+        # element output shape with a 1-element placeholder so MLX has
+        # something to bind. The kernel won't actually write through the
+        # placeholder, and we skip the output's memcpy below.
+        if out_view_shape and any(d == 0 for d in out_view_shape):
+            out_view_shape = tuple(d if d > 0 else 1 for d in out_view_shape)
         output_shapes.append(out_view_shape)
         output_dtypes.append(out_mx_dtype)
         output_dest_arrays.append(value)
@@ -3135,13 +3329,19 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim: int = 2
     else:
         tg = (min(64, grid_x), 1, 1)
 
-    # MLX outputs are uninitialized by default. For atomic-output kernels
-    # we *must* zero-initialize so the first ``atomic_fetch_add`` accumulates
-    # from a defined zero rather than stale buffer contents (verified
-    # empirically in the step-2 atomic probe). Note: this means atomic
-    # kernels always start their accumulators at zero — pre-existing values
-    # in the user's ``wp.array`` are not preserved across the launch. Most
-    # atomic-accumulator usage zeroes the buffer beforehand anyway.
+    # MLX outputs come from a buffer pool — successive launches may receive
+    # buffers that previously held a different kernel's output, so any
+    # output element a kernel leaves *unwritten* surfaces stale data. For
+    # atomic-output kernels we seed each atomic output from the user
+    # wp.array via the init prologue above. For non-atomic kernels we
+    # zero-init via MLX's scalar ``init_value`` (passed below). Stateful
+    # non-atomic kernels — those that read an output back to compute a new
+    # value (Euler integration's ``qvel = qvel + qacc * dt``) — still need
+    # init from user data; that's tracked by extending the per-output
+    # init-shadow generation (see ``_init_outputs`` plumbing) once we add
+    # it. For now, every output that's *only written* zero-inits, which
+    # matches the CUDA backend's "fresh-launch" semantics for
+    # write-everything kernels (kinematics, sensor outputs, etc.).
     init_value = 0.0 if artifact.atomic_outputs else None
 
     out_mx_list = mlx_kernel(
@@ -3174,6 +3374,12 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim: int = 2
 
     # ---- Copy MLX outputs into the user's wp.array buffers ----
     for o_mx, dest in zip(out_mx_list, output_dest_arrays, strict=True):
+        # Skip zero-element user buffers — they hit the placeholder path
+        # above (we ran the kernel with a 1-element MLX buffer to satisfy
+        # Apple's MTLBuffer API, but the user's wp.array is genuinely
+        # zero-sized and there's nothing to copy back).
+        if dest.ptr is None or dest.size == 0:
+            continue
         np_view = np.array(o_mx, copy=False)
         src_ptr = int(np_view.__array_interface__["data"][0])
         nbytes = np_view.nbytes
