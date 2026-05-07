@@ -1645,11 +1645,30 @@ class MetalKernelArtifact:
     shape_packed_slot: int = 4
     # Names of read-only int32-1D input args packed into a single
     # ``__ints_packed`` MLX buffer to stay under Metal's 31-slot kernel-
-    # arg limit. The buffer's layout is ``[off_0, off_1, ..., off_{K-1},
-    # data_arr0..., data_arr1..., ...]`` where ``off_i`` is the start
-    # index of array ``i``'s data within ``__ints_packed``. Empty when
-    # the kernel fits without packing.
+    # arg limit. Layout:
+    #   ``[off_0, ..., off_{K-1}, scalar_0, ..., scalar_{S-1}, data_arr0..., ...]``
+    # where ``off_i`` is the start index of array ``i``'s data within
+    # ``__ints_packed``, ``scalar_j`` is the value of the j-th packed
+    # scalar (int32 or bool, lifted to int32), and the array data
+    # follows. Codegen rewrites:
+    #   - ``arr_k[expr]``     -> ``__ints_packed[__ints_packed[k] + (expr)]``
+    #   - ``int_scalar_j``    -> ``__ints_packed[K + j]``
+    #   - ``bool_scalar_j``   -> ``(bool)__ints_packed[K + j]``
+    # Empty when the kernel fits without packing.
     ints_packed_arrs: tuple[str, ...] = ()
+    # Names of int32/bool scalar inputs packed into ``__ints_packed``.
+    # Stored at slots ``K..K+S-1`` of the buffer (immediately after the
+    # array offsets). Bool scalars are lifted to int32 in the buffer and
+    # cast back at the access site.
+    ints_packed_scalars: tuple[str, ...] = ()
+    # ``True`` if the kernel emits an output-init prologue and therefore
+    # needs every body thread that shares a worldid to be in the same
+    # threadgroup so the post-prologue ``threadgroup_barrier`` actually
+    # synchronises them. The launcher inflates ``threadgroup`` to
+    # ``(1, grid_y, grid_z)`` (capped at the device limit) when this is
+    # set; with the default per-thread threadgroup the barrier degenerates
+    # to a no-op and the prologue races the body.
+    needs_init_barrier: bool = False
     # MSL declarations to inject before the kernel function body — used for
     # custom big-vec structs (vec5, vec6 = spatial_vector, vec8) that don't
     # have native MSL ``floatN`` equivalents. Empty for kernels that only
@@ -2524,9 +2543,16 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
         if a.label in read_outputs and a.label not in init_outputs:
             init_outputs.append(a.label)
     if init_outputs:
+        # The init prologue must run before any thread executes the body,
+        # otherwise its (idempotent) atomic_stores can clobber a sibling
+        # thread's body writes when threads race. We gate the prologue on
+        # the leading thread-of-threadgroup (y==0, z==0) and follow it
+        # with a device-memory threadgroup barrier — the launcher pairs
+        # this with a threadgroup that spans every non-x grid dim so
+        # every body thread for the same worldid waits behind the barrier.
         prologue: list[str] = [
             "    // -- Output init prologue (seed from user wp.array data) --",
-            "    {",
+            "    if (thread_position_in_threadgroup.y == 0 && thread_position_in_threadgroup.z == 0) {",
             "        int _init_w = (int)thread_position_in_grid.x;",
         ]
         for out_name in init_outputs:
@@ -2554,6 +2580,7 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
                 ]
             )
         prologue.append("    }")
+        prologue.append("    threadgroup_barrier(metal::mem_flags::mem_device);")
         # Prepend before the body so the shape-pack rewrite below picks up
         # the prologue's ``arr_shape[k]`` references.
         body_lines = prologue + body_lines
@@ -2638,25 +2665,41 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
     # Metal kernels are HW-capped at 31 buffer parameters (slots 0..30).
     # When ``input_args + output_args + init_shadows + __shapes_packed``
     # exceeds 30 we'd fail to compile. Pack every read-only 1-D int32
-    # input into a single ``__ints_packed`` buffer instead — its layout
-    # is ``[off_0, off_1, ..., off_{K-1}, data_arr0..., data_arr1..., ...]``
-    # so each access ``arr[i]`` becomes ``__ints_packed[__ints_packed[k] + i]``
-    # at the cost of one extra int load per access. Saves ``K - 1`` slots.
+    # input — and every int/bool scalar input — into a single
+    # ``__ints_packed`` buffer instead. Layout:
+    #   [off_0, ..., off_{K-1}, scalar_0, ..., scalar_{S-1},
+    #    data_arr0..., data_arr1..., ...]
+    # ``off_k`` points at the start of array k's data in the buffer.
+    # Saves ``(K + S) - 1`` slots when activated.
     ints_packed_arrs: list[str] = []
+    ints_packed_scalars: list[str] = []
     shapes_buf_count = 1 if _shape_arrs_seen else 0
     total_slots = len(input_args) + len(output_args) + len(init_input_names) + shapes_buf_count
     if total_slots > 30:
-        packable = [a for a in input_args if _is_int32_1d_array_arg(a)]
-        # Packing K arrays into one buffer saves K-1 slots; only do it
-        # if there's a net win (>= 2 packable arrays).
-        if len(packable) >= 2:
-            ints_packed_arrs = [a.label for a in packable]
-            packed_set = set(ints_packed_arrs)
-            # Rewrite every access of a packed array.
+        packable_arrs = [a for a in input_args if _is_int32_1d_array_arg(a)]
+        packable_scalars = [a for a in input_args if _is_int_or_bool_scalar_arg(a)]
+        # Packing K arrays + S scalars saves (K + S - 1) slots. Only
+        # activate when that's a net win, i.e. K + S >= 2.
+        if len(packable_arrs) + len(packable_scalars) >= 2:
+            ints_packed_arrs = [a.label for a in packable_arrs]
+            ints_packed_scalars = [a.label for a in packable_scalars]
+            packed_set = set(ints_packed_arrs) | set(ints_packed_scalars)
+            # Map scalar arg label -> (offset_in_packed_buffer, is_bool).
+            from warp._src.types import int32 as _int32  # noqa: PLC0415
+
+            K = len(ints_packed_arrs)
+            scalar_info: dict[str, tuple[int, bool]] = {}
+            for s_idx, sa in enumerate(packable_scalars):
+                scalar_info[sa.label] = (K + s_idx, sa.type is bool)
+            # Rewrite every access of a packed array, then every read of
+            # a packed scalar.
             new_src_lines = []
             for line in source.splitlines(keepends=True):
                 for k, name in enumerate(ints_packed_arrs):
                     line = _replace_packed_int_array_access(line, name, k)
+                for s_label, (off, is_bool) in scalar_info.items():
+                    repl = f"((bool)__ints_packed[{off}])" if is_bool else f"__ints_packed[{off}]"
+                    line = re.sub(rf"\b{re.escape(s_label)}\b", repl, line)
                 new_src_lines.append(line)
             source = "".join(new_src_lines)
             input_args = [a for a in input_args if a.label not in packed_set]
@@ -2684,6 +2727,8 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
         shape_packed_arrs=tuple(_shape_arrs_seen),
         shape_packed_slot=_SHAPE_SLOT,
         ints_packed_arrs=tuple(ints_packed_arrs),
+        ints_packed_scalars=tuple(ints_packed_scalars),
+        needs_init_barrier=bool(init_outputs),
         header=header,
     )
 
@@ -2766,6 +2811,24 @@ def _is_int32_1d_array_arg(arg) -> bool:
     dtype = getattr(arg.type, "dtype", None)
     ndim = getattr(arg.type, "ndim", None)
     return dtype is int32 and ndim == 1
+
+
+def _is_int_or_bool_scalar_arg(arg) -> bool:
+    """True if ``arg`` is a 0-D scalar of ``int32`` or ``bool`` type.
+
+    Each scalar input becomes its own ``constant int& <name>`` MLX
+    parameter at one buffer slot apiece. When a kernel exceeds the
+    31-slot cap, packing these into ``__ints_packed`` recovers one slot
+    per scalar (minus the one slot the packed buffer itself takes).
+    """
+    if _is_array_arg(arg):
+        return False
+    from warp._src.types import int32  # noqa: PLC0415
+
+    t = arg.type
+    if t is int32 or t is bool:
+        return True
+    return False
 
 
 def _vec_dtype_info(arg) -> tuple[int, str] | None:
@@ -3199,17 +3262,21 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim: int = 2
         mlx_inputs.append(typed)
 
     # Append the packed int buffer if the kernel exceeded the 31-slot
-    # limit and the codegen pulled int32-1D inputs into ``__ints_packed``.
-    # Layout: ``[off_0, ..., off_{K-1}, data_arr0..., data_arr1..., ...]``
-    # — first K entries are the start offset of each packed array's data
-    # within the same buffer, followed by the concatenated data.
-    if artifact.ints_packed_arrs:
+    # limit and the codegen pulled inputs into ``__ints_packed``.
+    # Layout:
+    #   ``[off_0, ..., off_{K-1}, scalar_0, ..., scalar_{S-1},
+    #     data_arr0..., data_arr1..., ...]``
+    # — first K entries are the start offset of each packed array's data,
+    # next S entries are the int/bool scalar values (bool lifted to int),
+    # then the concatenated data.
+    if artifact.ints_packed_arrs or artifact.ints_packed_scalars:
         K = len(artifact.ints_packed_arrs)
-        offsets_np = np.zeros(K, dtype=np.int32)
+        S = len(artifact.ints_packed_scalars)
+        header_np = np.zeros(K + S, dtype=np.int32)
         data_parts: list = []
-        running = K
+        running = K + S
         for i, arr_name in enumerate(artifact.ints_packed_arrs):
-            offsets_np[i] = running
+            header_np[i] = running
             idx, _ = arg_by_name[arr_name]
             value = fwd_args[idx]
             sz = int(getattr(value, "size", 0) or 0)
@@ -3223,11 +3290,15 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim: int = 2
                 )
             data_parts.append(mx_buf.view(mx.int32).reshape((sz,)))
             running += sz
-        offsets_mx = mx.array(offsets_np, dtype=mx.int32)
+        for j, scalar_name in enumerate(artifact.ints_packed_scalars):
+            idx, _ = arg_by_name[scalar_name]
+            value = fwd_args[idx]
+            header_np[K + j] = int(value)
+        header_mx = mx.array(header_np, dtype=mx.int32)
         if data_parts:
-            mlx_inputs.append(mx.concatenate([offsets_mx, *data_parts], axis=0))
+            mlx_inputs.append(mx.concatenate([header_mx, *data_parts], axis=0))
         else:
-            mlx_inputs.append(offsets_mx)
+            mlx_inputs.append(header_mx)
 
     # Append the packed shape buffer if the kernel needs any ``arr.shape``
     # access. ``__shapes_packed`` is a single flat int32 array containing
@@ -3328,6 +3399,25 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim: int = 2
         tg = (min(256, grid_x), 1, 1)
     else:
         tg = (min(64, grid_x), 1, 1)
+
+    # Kernels with an output-init prologue need every thread that shares
+    # a worldid (the y/z grid axes) to be in the same threadgroup so the
+    # post-prologue ``threadgroup_barrier`` actually waits for the
+    # init-store-issuing thread. Use ``(1, grid_y, grid_z)`` per
+    # threadgroup, capped at the Apple GPU's 1024 max-threads-per-
+    # threadgroup limit. Falls back to the default tg (with a logged
+    # warning) when the per-world thread count exceeds the limit.
+    if artifact.needs_init_barrier and grid_y * grid_z > 1:
+        if grid_y * grid_z <= 1024:
+            tg = (1, grid_y, grid_z)
+        else:
+            from warp._src.utils import warn  # noqa: PLC0415
+            warn(
+                f"Kernel '{kernel.key}' needs an init barrier but grid_y*grid_z="
+                f"{grid_y * grid_z} exceeds Metal's 1024-threads-per-threadgroup "
+                "cap; init prologue may race with body. Output may be incorrect.",
+                stacklevel=2,
+            )
 
     # MLX outputs come from a buffer pool — successive launches may receive
     # buffers that previously held a different kernel's output, so any
