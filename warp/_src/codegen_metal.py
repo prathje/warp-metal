@@ -1485,14 +1485,33 @@ _TILE_MATMUL_ACC_PAT = re.compile(r"\bwp::tile_matmul_acc\s*\(([^)]*)\)")
 _TILE_CHOLESKY_INPLACE_PAT = re.compile(
     r"\bwp::tile_cholesky_inplace\s*<[^()]*>\s*\(([^)]*)\)"
 )
-# ``wp::tile_lower_solve_inplace<...>(0, L_tile, B_tile)`` — solve
-# ``L X = B`` for X, mutating B. The cuBLASDx LTO calling convention
-# inserts one leading placeholder arg. Same shape for the upper variant.
+# ``tile_lower_solve_inplace(0, L_tile, B_tile)`` — solve ``L X = B``
+# for X, mutating B. The CPU/no-MathDx dispatch returns
+# ``(0, L, y)`` with empty templates, so the IR emits this builtin
+# *without* the ``wp::`` prefix and without ``<...>`` template args
+# (unlike ``tile_cholesky_inplace`` which keeps a ``<upper>`` flag).
+# Match the bare form. Same shape for the upper variant.
 _TILE_LOWER_SOLVE_INPLACE_PAT = re.compile(
-    r"\bwp::tile_lower_solve_inplace\s*<[^()]*>\s*\(([^)]*)\)"
+    r"\btile_lower_solve_inplace\s*\(([^)]*)\)"
 )
 _TILE_UPPER_SOLVE_INPLACE_PAT = re.compile(
-    r"\bwp::tile_upper_solve_inplace\s*<[^()]*>\s*\(([^)]*)\)"
+    r"\btile_upper_solve_inplace\s*\(([^)]*)\)"
+)
+# ``var_X = wp::tile_view<wp::tile_shared_t<dtype, layout<shape<R,C>,
+# stride<...>>, ...>>(parent, row_off, col_off)``. The template arg
+# carries the view's output shape; the function args are the parent
+# tile and offsets. We materialise the view as a copy via tile_load
+# at construction time and then emit a writeback after every mutating
+# op (tile_matmul_acc target, tile_*_solve_inplace second arg).
+_TILE_VIEW_PAT = re.compile(
+    # Match ``var_X = wp::tile_view<wp::tile_shared_t<wp::SCALAR, ...
+    # wp::tile_shape_t<R, C>, ...>>(parent, row_off, col_off)`` with a
+    # lenient body for the nested template noise. Captures: lhs label,
+    # scalar, R, C (optional), parent label, row_off, col_off (optional).
+    r"\bvar_(\w+)\s*=\s*wp::tile_view\s*<\s*wp::tile_shared_t\s*<\s*"
+    r"wp::(\w+)\s*,.*?wp::tile_shape_t\s*<\s*(\d+)\s*"
+    r"(?:,\s*(\d+)\s*)?>.*?>\s*>\s*\(\s*var_(\w+)\s*,"
+    r"\s*([^,)]+)\s*(?:,\s*([^,)]+)\s*)?\)"
 )
 # ``wp::tile_broadcast<dtype, ...>(t)`` — broadcasting a single value
 # back to a single value is a copy.
@@ -1548,7 +1567,42 @@ def _build_flat_base_expr(arr_name: str, lead_idx_args: list[str], inner_dims: i
     return " + ".join(terms)
 
 
-def _translate_tile_intrinsics(line: str, tile_var_dims: dict[str, tuple[int, int, str]]) -> str:
+def _emit_tile_writeback(
+    parent_label: str,
+    parent_rows: int,
+    parent_cols: int,
+    view_rows: int,
+    view_cols: int,
+    msl_scalar: str,
+    row_off_expr: str,
+    col_off_expr: str,
+    src_var_expr: str,
+) -> str:
+    """Emit MSL that copies a view's mutated contents back to its parent
+    tile struct's ``c[]`` buffer.
+
+    Used after every mutating call on a view (matmul accumulator,
+    *_solve_inplace's RHS) so writes propagate.
+    """
+    parts: list[str] = []
+    parts.append("    do {")
+    parts.append(f"        for (int _vb_i = 0; _vb_i < {view_rows}; ++_vb_i) {{")
+    parts.append(f"            for (int _vb_j = 0; _vb_j < {view_cols}; ++_vb_j) {{")
+    parts.append(
+        f"                var_{parent_label}.c[(({row_off_expr}) + _vb_i) * {parent_cols} + "
+        f"(({col_off_expr}) + _vb_j)] = {src_var_expr}.c[_vb_i * {view_cols} + _vb_j];"
+    )
+    parts.append("            }")
+    parts.append("        }")
+    parts.append("    } while (0)")
+    return "\n".join(parts)
+
+
+def _translate_tile_intrinsics(
+    line: str,
+    tile_var_dims: dict[str, tuple[int, int, str]],
+    view_aliases: dict[str, tuple[str, int, int, int, int, str, str, str]] | None = None,
+) -> str:
     """Lower ``wp::tile_*`` calls to ``wp_tile_RxC_<scalar>_*`` helper calls.
 
     ``tile_var_dims`` maps each tile local label to ``(rows, cols, msl_scalar)``
@@ -1777,7 +1831,15 @@ def _translate_tile_intrinsics(line: str, tile_var_dims: dict[str, tuple[int, in
         if kA != kB or rA != rC or nB != nC:
             return m.group(0)
         helper = f"wp_tile_matmul_{rA}x{kA}x{nB}_{scalar}"
-        return f"{helper}({a_arg}, {b_arg}, {c_arg}, {alpha_arg}, {beta_arg})"
+        call = f"{helper}({a_arg}, {b_arg}, {c_arg}, {alpha_arg}, {beta_arg})"
+        # If C is a view, write its mutated contents back to the parent.
+        if view_aliases is not None and c_label in view_aliases:
+            parent_label, prows, pcols, vrows, vcols, vscalar, row_off, col_off = view_aliases[c_label]
+            wb = _emit_tile_writeback(
+                parent_label, prows, pcols, vrows, vcols, vscalar, row_off, col_off, c_arg
+            )
+            return f"{call};\n{wb}"
+        return call
 
     line = _TILE_MATMUL_ACC_PAT.sub(repl_matmul_acc, line)
 
@@ -1818,13 +1880,65 @@ def _translate_tile_intrinsics(line: str, tile_var_dims: dict[str, tuple[int, in
         k_cols = B_dims[1]
         scalar = L_dims[2]
         helper = f"wp_tile_{kind}_solve_{n}x{k_cols}_{scalar}_inplace"
-        return f"{helper}({L_arg}, {B_arg})"
+        call = f"{helper}({L_arg}, {B_arg})"
+        if view_aliases is not None and B_label in view_aliases:
+            parent_label, prows, pcols, vrows, vcols, vscalar, row_off, col_off = view_aliases[B_label]
+            wb = _emit_tile_writeback(
+                parent_label, prows, pcols, vrows, vcols, vscalar, row_off, col_off, B_arg
+            )
+            return f"{call};\n{wb}"
+        return call
 
     line = _TILE_LOWER_SOLVE_INPLACE_PAT.sub(lambda m: _repl_solve_inplace("lower", m), line)
     line = _TILE_UPPER_SOLVE_INPLACE_PAT.sub(lambda m: _repl_solve_inplace("upper", m), line)
     line = _TILE_BROADCAST_PAT.sub(r"var_\1 = var_\2", line)
     # ``var_X = wp::tile_extract(var_t, idx)`` with shape (1,) → ``var_X = var_t``.
     line = _TILE_EXTRACT_PAT.sub(r"var_\1 = var_\2", line)
+
+    def repl_view(m: re.Match[str]) -> str:
+        # ``var_X = wp::tile_view<wp::tile_shared_t<dtype, layout<shape<R,C>, ...>>, ...>>(parent, row_off, col_off)``
+        # On single-thread Metal we materialise the view as a struct
+        # copy via ``tile_load`` from the parent's ``c[]`` buffer at
+        # the given offset. The accompanying ``view_aliases`` entry
+        # lets matmul / *_solve_inplace translators emit a writeback
+        # that copies the (possibly-mutated) view back to the parent
+        # after the call. Cooperative parallelism (sharing memory with
+        # the parent via threadgroup pointers) is task #19's next step.
+        lhs = m.group(1)
+        scalar_ctype = f"wp::{m.group(2)}"
+        msl_scalar = _SCALAR_CTYPE_TO_MSL.get(scalar_ctype)
+        if msl_scalar is None:
+            return m.group(0)
+        rows = int(m.group(3))
+        cols = int(m.group(4)) if m.group(4) else 1
+        parent_label = m.group(5)
+        row_off = m.group(6).strip()
+        col_off = (m.group(7) or "0").strip()
+        parent_dims = tile_var_dims.get(parent_label)
+        if parent_dims is None:
+            return m.group(0)
+        prows, pcols, _ = parent_dims
+        if view_aliases is not None:
+            view_aliases[lhs] = (parent_label, prows, pcols, rows, cols, msl_scalar, row_off, col_off)
+        # Materialise as a struct copy using direct indexing into the
+        # parent's ``c[]`` buffer. Avoids a per-shape helper since the
+        # dimensions are already known here.
+        result_lines: list[str] = []
+        result_lines.append(f"wp_tile_{rows}x{cols}_{msl_scalar} var_{lhs}")
+        result_lines.append(";")
+        result_lines.append("    do {")
+        result_lines.append(f"        for (int _vl_i = 0; _vl_i < {rows}; ++_vl_i) {{")
+        result_lines.append(f"            for (int _vl_j = 0; _vl_j < {cols}; ++_vl_j) {{")
+        result_lines.append(
+            f"                var_{lhs}.c[_vl_i * {cols} + _vl_j] = "
+            f"var_{parent_label}.c[(({row_off}) + _vl_i) * {pcols} + (({col_off}) + _vl_j)];"
+        )
+        result_lines.append("            }")
+        result_lines.append("        }")
+        result_lines.append("    } while (0)")
+        return "".join(result_lines)
+
+    line = _TILE_VIEW_PAT.sub(repl_view, line)
 
     line = _TILE_LOAD_PAT.sub(repl_load, line)
     line = _TILE_STORE_PAT.sub(repl_store, line)
@@ -2088,6 +2202,14 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
     array_store_pat = re.compile(r"\s*wp::array_store\s*\(\s*var_([A-Za-z_]\w*)")
     atomic_pat = re.compile(r"wp::atomic_(?:add|sub|min|max)\s*\(\s*var_([A-Za-z_]\w*)")
     scalar_store_pat = re.compile(r"\s*wp::__metal_scalar_store__\s*\(\s*var_([A-Za-z_]\w*)")
+    # ``wp::tile_store<...>(arr, tile, off...)`` — the blocked-Cholesky
+    # path writes through tile_store directly (no array_store wrapper).
+    tile_store_pat = re.compile(r"wp::tile_store\s*<[^()]*>\s*\(\s*var_([A-Za-z_]\w*)")
+    # ``wp::view(arr, slice)`` — slicing an array. The slice can be the
+    # target of a downstream tile_store, but the IR loses the connection
+    # back to the underlying array after the slice is taken. Treat any
+    # array referenced by ``wp::view`` as potentially written.
+    view_pat = re.compile(r"wp::view\s*\(\s*var_([A-Za-z_]\w*)")
     # Per-component atomics emitted by the multi-dim atomic fold use raw
     # ``atomic_fetch_<op>_explicit(&arr[...], val, ...)`` lines (no
     # ``wp::`` prefix and no ``var_`` on the array name — the var prefix
@@ -2104,6 +2226,12 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
             written_arg_names.add(m.group(1))
             atomic_arg_names.add(m.group(1))
         m = scalar_store_pat.match(raw)
+        if m:
+            written_arg_names.add(m.group(1))
+        m = tile_store_pat.search(raw)
+        if m:
+            written_arg_names.add(m.group(1))
+        m = view_pat.search(raw)
         if m:
             written_arg_names.add(m.group(1))
         m = raw_atomic_pat.search(raw)
@@ -2516,13 +2644,21 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
     # ``atomic_load_explicit`` inside ``_finalize``.
     atomic_output_names: set[str] = {a.label for a in output_args} if has_atomic else set()
 
+    # ``tile_view`` materialisation registry: view local label →
+    # (parent_label, parent_rows, parent_cols, view_rows, view_cols,
+    # scalar, row_off_expr, col_off_expr). Populated by the
+    # ``repl_view`` translator and read by mutating-op translators
+    # (matmul_acc, *_solve_inplace) so writes to the view propagate
+    # back to the parent tile struct via an explicit copy.
+    view_aliases: dict[str, tuple[str, int, int, int, int, str, str, str]] = {}
+
     # --- Forward statements --------------------------------------------
     def _finalize(translated: str) -> str:
         # Lower tile intrinsics *before* the subscript-substitute pass —
         # the tile pattern matches on the raw ``wp::tile_*<...>`` shape,
         # which contains ``var_X`` operands that the substitute would
         # otherwise rewrite to expressions and break the parse.
-        translated = _translate_tile_intrinsics(translated, tile_var_dims)
+        translated = _translate_tile_intrinsics(translated, tile_var_dims, view_aliases)
         # Inline subscripts that the address-collapse produced.
         for local_label, subscript in subscript_map.items():
             translated = re.sub(rf"\bvar_{re.escape(local_label)}\b", subscript, translated)
