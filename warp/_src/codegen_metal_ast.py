@@ -1085,6 +1085,26 @@ def _build_function_overload_table(adj) -> dict[str, list[Any]]:
             for overload in value.user_overloads.values():
                 _add(overload)
 
+    # Sweep every registered Warp module for user functions. Functions
+    # produced by ``wp.static(factory(...))(...)`` (the blocked-cholesky
+    # pattern in mujoco_warp) live in their own ``module="unique"`` module
+    # and aren't visible from the calling kernel's globals or its
+    # ``get_references`` table — so without this sweep their ``native_func``
+    # never makes it into ``fn_map`` and the inliner leaves the user_call
+    # un-expanded, which silently zeros the kernel's output (the call's
+    # output args show as ``var_X`` aliases that the kernel-level scan
+    # doesn't recognise as writes).
+    from warp._src.context import user_modules  # noqa: PLC0415
+
+    for mod in user_modules.values():
+        for fn in mod.functions.values():
+            if not isinstance(fn, Function):
+                continue
+            for overload in fn.user_overloads.values():
+                _add(overload)
+            # Top-level fn (without overloads, e.g. concrete @wp.func)
+            _add(fn)
+
     return out
 
 
