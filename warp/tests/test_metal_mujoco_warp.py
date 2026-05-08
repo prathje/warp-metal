@@ -199,6 +199,42 @@ class TestMetalMujocoWarp(unittest.TestCase):
         """
         self._run(xml, nsteps=10)
 
+    def test_cartpole_with_contact_geoms(self):
+        # mjlab's cartpole model. Exercises the full contact pipeline
+        # because there are static (worldbody-attached) geoms — floor
+        # + 2 rails — alongside the cart and pole bodies. Regression
+        # for the early-return seed bug: ``_geom_local_to_global``
+        # returns early for static geoms, so their ``geom_xpos`` /
+        # ``geom_xmat`` slots have to be seeded from the user's
+        # ``put_data`` values rather than left zero/stale.
+        xml = """
+        <mujoco>
+          <option gravity="0 0 -9.81"/>
+          <worldbody>
+            <geom name="floor" type="plane" size="2 2 0.1"/>
+            <geom name="rail1" type="capsule" size="0.02"
+                  fromto="-1 0.07 1   1 0.07 1"/>
+            <geom name="rail2" type="capsule" size="0.02"
+                  fromto="-1 -0.07 1   1 -0.07 1"/>
+            <body name="cart" pos="0 0 1">
+              <joint name="slider" type="slide" axis="1 0 0"
+                     range="-1 1" damping="0.1"/>
+              <geom name="cart_geom" type="box" size="0.1 0.05 0.05"/>
+              <body name="pole" euler="180 0 0">
+                <joint name="hinge" type="hinge" axis="0 1 0"
+                       damping="0.05"/>
+                <geom name="pole_geom" type="capsule" size="0.02"
+                      fromto="0 0 0  0 0 0.5"/>
+              </body>
+            </body>
+          </worldbody>
+          <actuator>
+            <motor joint="slider" gear="1" ctrlrange="-1 1"/>
+          </actuator>
+        </mujoco>
+        """
+        self._run(xml, nsteps=5)
+
     def test_two_bodies_with_actuator(self):
         # Two-link arm with position actuators. End-to-end actuation.
         xml = """
