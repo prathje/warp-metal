@@ -1171,6 +1171,266 @@ class TestMetalLaunch(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet)
 
+    def test_vec_mat_element_array_access_matches_cpu(self):
+        # vec3-element and mat33-element 2-D arrays go through the
+        # ``__floats_packed`` packer when the kernel exceeds the 31-
+        # buffer slot cap. This test runs them in a small kernel where
+        # packing isn't activated, so it pins the *unpacked* path.
+        # The packed path is exercised by the larger mujoco_warp
+        # integration tests.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k_mat33(mats: wp.array2d(dtype=wp.mat33),
+                        out: wp.array2d(dtype=float)):
+                tid = wp.tid()
+                m = mats[0, tid]
+                for r in range(3):
+                    for c in range(3):
+                        out[tid, r * 3 + c] = m[r, c]
+
+            @wp.kernel
+            def k_vec3(vecs: wp.array2d(dtype=wp.vec3),
+                       out: wp.array2d(dtype=float)):
+                tid = wp.tid()
+                v = vecs[0, tid]
+                out[tid, 0] = v[0]
+                out[tid, 1] = v[1]
+                out[tid, 2] = v[2]
+
+            N = 4
+            mats_np = np.arange(N * 9, dtype=np.float32).reshape(1, N, 3, 3)
+            vecs_np = np.arange(N * 3, dtype=np.float32).reshape(1, N, 3)
+            for label, kernel, in_arr, in_dt, out_shape, expected in (
+                ('mat33', k_mat33, mats_np, wp.mat33, (N, 9),
+                    np.arange(N * 9, dtype=np.float32).reshape(N, 9)),
+                ('vec3', k_vec3, vecs_np, wp.vec3, (N, 3),
+                    np.arange(N * 3, dtype=np.float32).reshape(N, 3)),
+            ):
+                results = {}
+                for dev in ('cpu', 'metal:0'):
+                    a_in = wp.zeros((1, N), dtype=in_dt, device=dev)
+                    a_in.assign(in_arr)
+                    out = wp.zeros(out_shape, dtype=float, device=dev)
+                    wp.launch(kernel, dim=N, inputs=[a_in], outputs=[out], device=dev)
+                    results[dev] = out.numpy()
+                np.testing.assert_array_equal(results['cpu'], results['metal:0'],
+                    err_msg=f'{label}: cpu vs metal mismatch')
+                np.testing.assert_array_equal(results['cpu'], expected,
+                    err_msg=f'{label}: cpu vs expected mismatch')
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_vec2_conditional_element_write_matches_cpu(self):
+        # ``wp::assign_inplace(vec, idx, val)`` (3-arg form) for
+        # ``vec[i] = val`` inside an ``if`` branch. The OBB SAT loop
+        # in mujoco_warp's broadphase uses ``proj[i] = ...`` and
+        # ``radius[i] = ...`` repeatedly. This test pins the simpler
+        # case of conditional element writes and verifies that the
+        # ``thread vec_t&`` returned by our op[] proxy works in a
+        # branched context.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(flags: wp.array(dtype=int),
+                  out: wp.array(dtype=wp.vec2)):
+                tid = wp.tid()
+                v = wp.vec2(0.0)
+                if flags[tid] == 0:
+                    v[0] = 10.0
+                else:
+                    v[1] = 20.0
+                out[tid] = v
+
+            N = 4
+            flags_np = np.array([0, 1, 0, 1], dtype=np.int32)
+            results = {}
+            for dev in ('cpu', 'metal:0'):
+                a_flags = wp.zeros(N, dtype=int, device=dev); a_flags.assign(flags_np)
+                out = wp.zeros(N, dtype=wp.vec2, device=dev)
+                wp.launch(k, dim=N, inputs=[a_flags], outputs=[out], device=dev)
+                results[dev] = out.numpy()
+            expected = np.array([[10.0, 0.0], [0.0, 20.0],
+                                 [10.0, 0.0], [0.0, 20.0]], dtype=np.float32)
+            np.testing.assert_array_equal(results['cpu'], results['metal:0'])
+            np.testing.assert_array_equal(results['cpu'], expected)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_obb_full_broadphase_clone_matches_cpu(self):
+        # End-to-end clone of mujoco_warp's broadphase OBB filter on
+        # cartpole geometry: 2-D tid (worldid, elementid), read
+        # ``wp.vec2i`` from ``nxn_geom_pair[elementid]``, dispatch
+        # PLANE / SPHERE / OBB filter via wrapper @wp.func returning
+        # bool, write per-pair pass/reject to a flat int array.
+        # Mirrors the actual ``_nxn_broadphase`` kernel structure
+        # closely enough that it would catch this kind of broadphase
+        # codegen regression.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            mat23 = wp.types.matrix(shape=(2, 3), dtype=float)
+            mat63 = wp.types.matrix(shape=(6, 3), dtype=float)
+
+            @wp.func
+            def plane_filter(s1: float, s2: float, m1: float, m2: float,
+                             xp1: wp.vec3, xp2: wp.vec3,
+                             xm1: wp.mat33, xm2: wp.mat33) -> bool:
+                if s1 == 0.0:
+                    d = wp.dot(xp2 - xp1, wp.vec3(xm1[0, 2], xm1[1, 2], xm1[2, 2]))
+                    return d <= s2 + m1 + m2
+                elif s2 == 0.0:
+                    d = wp.dot(xp1 - xp2, wp.vec3(xm2[0, 2], xm2[1, 2], xm2[2, 2]))
+                    return d <= s1 + m1 + m2
+                return True
+
+            @wp.func
+            def sphere_filter(rb1: float, rb2: float, m1: float, m2: float,
+                              xp1: wp.vec3, xp2: wp.vec3) -> bool:
+                d = xp2 - xp1
+                threshold = rb1 + rb2 + m1 + m2
+                return wp.dot(d, d) <= threshold * threshold
+
+            @wp.func
+            def obb_filter(c1: wp.vec3, c2: wp.vec3, s1: wp.vec3, s2: wp.vec3,
+                           m1: float, m2: float, xp1: wp.vec3, xp2: wp.vec3,
+                           xm1: wp.mat33, xm2: wp.mat33) -> bool:
+                margin = m1 + m2
+                xc = mat23(0.0)
+                nrm = mat63(0.0)
+                proj = wp.vec2(0.0)
+                radius = wp.vec2(0.0)
+                xc[0] = xm1 @ c1 + xp1
+                xc[1] = xm2 @ c2 + xp2
+                nrm[0] = wp.vec3(xm1[0, 0], xm1[1, 0], xm1[2, 0])
+                nrm[1] = wp.vec3(xm1[0, 1], xm1[1, 1], xm1[2, 1])
+                nrm[2] = wp.vec3(xm1[0, 2], xm1[1, 2], xm1[2, 2])
+                nrm[3] = wp.vec3(xm2[0, 0], xm2[1, 0], xm2[2, 0])
+                nrm[4] = wp.vec3(xm2[0, 1], xm2[1, 1], xm2[2, 1])
+                nrm[5] = wp.vec3(xm2[0, 2], xm2[1, 2], xm2[2, 2])
+                for j in range(2):
+                    for k in range(3):
+                        for i in range(2):
+                            proj[i] = wp.dot(xc[i], nrm[3*j + k])
+                            if i == 0:
+                                sz = s1
+                            else:
+                                sz = s2
+                            radius[i] = (
+                                wp.abs(sz[0] * wp.dot(nrm[3*i + 0], nrm[3*j + k]))
+                                + wp.abs(sz[1] * wp.dot(nrm[3*i + 1], nrm[3*j + k]))
+                                + wp.abs(sz[2] * wp.dot(nrm[3*i + 2], nrm[3*j + k]))
+                            )
+                        if radius[0] + radius[1] + margin < wp.abs(proj[1] - proj[0]):
+                            return False
+                return True
+
+            @wp.func
+            def broadphase_filter(centers: wp.array2d(dtype=wp.vec3),
+                                  sizes: wp.array2d(dtype=wp.vec3),
+                                  rbounds: wp.array(dtype=float),
+                                  margins: wp.array(dtype=float),
+                                  xpos: wp.array2d(dtype=wp.vec3),
+                                  xmat: wp.array2d(dtype=wp.mat33),
+                                  g1: int, g2: int, w: int) -> bool:
+                rb1 = rbounds[g1]; rb2 = rbounds[g2]
+                m1 = margins[g1]; m2 = margins[g2]
+                if rb1 == 0.0 or rb2 == 0.0:
+                    return plane_filter(rb1, rb2, m1, m2,
+                                        xpos[w, g1], xpos[w, g2],
+                                        xmat[w, g1], xmat[w, g2])
+                if not sphere_filter(rb1, rb2, m1, m2,
+                                     xpos[w, g1], xpos[w, g2]):
+                    return False
+                if not obb_filter(centers[w, g1], centers[w, g2],
+                                  sizes[w, g1], sizes[w, g2],
+                                  m1, m2,
+                                  xpos[w, g1], xpos[w, g2],
+                                  xmat[w, g1], xmat[w, g2]):
+                    return False
+                return True
+
+            @wp.kernel
+            def kernel(
+                pairs: wp.array(dtype=wp.vec2i),
+                centers: wp.array2d(dtype=wp.vec3),
+                sizes: wp.array2d(dtype=wp.vec3),
+                rbounds: wp.array(dtype=float),
+                margins: wp.array(dtype=float),
+                xpos: wp.array2d(dtype=wp.vec3),
+                xmat: wp.array2d(dtype=wp.mat33),
+                out: wp.array(dtype=int),
+            ):
+                worldid, elementid = wp.tid()
+                pair = pairs[elementid]
+                g1 = pair[0]; g2 = pair[1]
+                out[elementid] = int(broadphase_filter(
+                    centers, sizes, rbounds, margins, xpos, xmat,
+                    g1, g2, worldid))
+
+            # Cartpole-equivalent geometry: floor (plane), 2 rails,
+            # 1 cart, 1 pole. Candidate pairs are the cross-product of
+            # rails and bodies (after ``conaffinity`` filtering at model
+            # build time would prune sibling-body pairs in mjlab).
+            NGEOMS = 5
+            xpos_np = np.array([
+                [0, 0, -0.05], [0, 0.07, 1], [0, -0.07, 1],
+                [0, 0, 1], [0, 0, 1.5],
+            ], dtype=np.float32)
+            xmat_np = np.zeros((NGEOMS, 9), dtype=np.float32)
+            xmat_np[0] = np.eye(3).flatten()
+            xmat_np[1] = np.array([[2.22e-16, 0, 1], [0, 1, 0], [-1, 0, 2.22e-16]]).flatten()
+            xmat_np[2] = xmat_np[1]
+            xmat_np[3] = np.eye(3).flatten()
+            xmat_np[4] = np.array([[1, 0, 0], [0, -1, -1.22e-16], [0, 1.22e-16, -1]]).flatten()
+            centers_np = np.zeros((NGEOMS, 3), dtype=np.float32)
+            sizes_np = np.array([
+                [4, 4, 0.2], [0.02, 0.02, 2.02], [0.02, 0.02, 2.02],
+                [0.2, 0.15, 0.1], [0.045, 0.045, 0.545],
+            ], dtype=np.float32)
+            rbounds_np = np.array([0.0, 2.02, 2.02, 0.27, 0.545], dtype=np.float32)
+            margins_np = np.zeros(NGEOMS, dtype=np.float32)
+            pairs_np = np.array([[0, 3], [0, 4], [1, 3], [1, 4],
+                                 [2, 3], [2, 4]], dtype=np.int32)
+            N_PAIRS = 6
+
+            results = {}
+            for dev in ('cpu', 'metal:0'):
+                a_pairs = wp.zeros(N_PAIRS, dtype=wp.vec2i, device=dev); a_pairs.assign(pairs_np)
+                a_c = wp.zeros((1, NGEOMS), dtype=wp.vec3, device=dev); a_c.assign(centers_np.reshape(1, NGEOMS, 3))
+                a_s = wp.zeros((1, NGEOMS), dtype=wp.vec3, device=dev); a_s.assign(sizes_np.reshape(1, NGEOMS, 3))
+                a_rb = wp.zeros(NGEOMS, dtype=float, device=dev); a_rb.assign(rbounds_np)
+                a_m = wp.zeros(NGEOMS, dtype=float, device=dev); a_m.assign(margins_np)
+                a_xp = wp.zeros((1, NGEOMS), dtype=wp.vec3, device=dev); a_xp.assign(xpos_np.reshape(1, NGEOMS, 3))
+                a_xm = wp.zeros((1, NGEOMS), dtype=wp.mat33, device=dev); a_xm.assign(xmat_np.reshape(1, NGEOMS, 9))
+                out = wp.zeros(N_PAIRS, dtype=int, device=dev)
+                wp.launch(kernel, dim=(1, N_PAIRS),
+                          inputs=[a_pairs, a_c, a_s, a_rb, a_m, a_xp, a_xm],
+                          outputs=[out], device=dev)
+                results[dev] = out.numpy()
+
+            # Pairs: floor-cart (PLANE rejects), floor-pole (PLANE rejects),
+            # rail1-cart (passes), rail1-pole (OBB rejects),
+            # rail2-cart (passes), rail2-pole (OBB rejects).
+            expected = np.array([0, 0, 1, 0, 1, 0], dtype=np.int32)
+            np.testing.assert_array_equal(results['cpu'], expected,
+                err_msg='cpu got wrong broadphase result')
+            np.testing.assert_array_equal(results['cpu'], results['metal:0'],
+                err_msg='broadphase clone cpu vs metal mismatch')
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
     def test_printf_and_dead_tuples_codegen(self):
         # ``wp.printf`` calls and ``wp.matrix(..., shape=(R, C))`` sugar
         # emit ``wp::str`` constants and ``wp::tuple_t`` locals in the IR
