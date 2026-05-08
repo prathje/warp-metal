@@ -2689,6 +2689,18 @@ class MetalKernelArtifact:
     # wp_tile_chol_smem[N*N]`` scratch at top scope. Zero means
     # single-thread (legacy) tile primitives only.
     coop_chol_n: int = 0
+    # Init-shadow packing: when an atomic kernel has too many init
+    # outputs to fit per-output ``__init`` shadow buffers under
+    # Metal's 31-buffer cap, we pack them into one float buffer
+    # (``__init_shadows_floats``) plus one int buffer
+    # (``__init_shadows_ints``). The two tuples below list the output
+    # names whose data goes into each packed buffer (in pack order).
+    # ``init_shadow_packed_outputs`` lists ALL packed outputs in the
+    # same order as the kernel's ``__init_shadow_offsets`` array so
+    # the launcher can store the right offset per output.
+    init_shadow_packed_outputs: tuple[str, ...] = ()
+    init_shadow_floats: tuple[str, ...] = ()
+    init_shadow_ints: tuple[str, ...] = ()
     # MSL declarations to inject before the kernel function body — used for
     # custom big-vec structs (vec5, vec6 = spatial_vector, vec8) that don't
     # have native MSL ``floatN`` equivalents. Empty for kernels that only
@@ -3849,6 +3861,20 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
         # Every atomic output gets seeded so atomic_add accumulates from
         # the user's previous value (else MLX zero-init wipes it).
         init_outputs.extend(a.label for a in output_args if a.label in atomic_arg_names)
+        # Atomic kernels also typically share their non-atomic outputs
+        # with sibling kernels — mujoco_warp's constraint pipeline has
+        # ``_equality_connect``, ``_limit_slide_hinge``, ``_limit_ball``,
+        # etc. each writing CONDITIONALLY to different rows of ``d.efc.J``
+        # / ``d.efc.aref`` / etc. with their own atomic-allocated row
+        # offsets. MLX gives each launch a fresh output buffer, so
+        # without seeding, each kernel overwrites the *whole* array —
+        # losing every other kernel's writes. Seed every non-atomic
+        # output too. Below, the init shadows are packed into
+        # ``__init_shadows_floats`` / ``__init_shadows_ints`` buffers
+        # to keep the kernel under Metal's 31-buffer cap.
+        for a in output_args:
+            if a.label not in init_outputs:
+                init_outputs.append(a.label)
     # Plus any output the kernel reads back from — preserves elements
     # the kernel doesn't write (kinematics_branch / sensor partial
     # writes) and lets read-then-write patterns see real prior values.
@@ -3910,6 +3936,33 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
             )
             if slots_after <= 30:
                 init_outputs = tentative
+    # ---- Decide between per-output __init shadows and packed shadows --
+    # When the kernel has many init outputs (e.g. mujoco_warp's
+    # 15-output ``_limit_slide_hinge`` / ``_equality_connect``), per-
+    # output ``<name>__init`` MLX inputs would push the buffer count
+    # past Metal's 31-slot cap. Pack init shadows into one float +
+    # one int buffer instead. The choice is per-kernel.
+    use_packed_init_shadows = False
+    if init_outputs:
+        # Conservative: assume ``__shapes_packed`` is needed (it's
+        # cheap to over-estimate by 1 here; the real check happens
+        # at artifact-build time).
+        per_output_slots = (
+            len(input_args) + len(output_args) + len(init_outputs) + 1
+        )
+        if per_output_slots > 30:
+            use_packed_init_shadows = True
+    init_shadow_floats: list[str] = []  # float-typed init outputs (in pack order)
+    init_shadow_ints: list[str] = []    # int/bool-typed init outputs (in pack order)
+    if use_packed_init_shadows:
+        for out_name in init_outputs:
+            arg_var = next(a for a in output_args if a.label == out_name)
+            inner_msl = _msl_array_inner_msl_type(arg_var)
+            if inner_msl in ("int", "uint", "bool"):
+                init_shadow_ints.append(out_name)
+            else:
+                init_shadow_floats.append(out_name)
+
     if init_outputs:
         # The init prologue must run before any thread executes the body,
         # otherwise its (idempotent) atomic_stores can clobber a sibling
@@ -3923,6 +3976,11 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
             "    if (thread_position_in_threadgroup.y == 0 && thread_position_in_threadgroup.z == 0) {",
             "        int _init_w = (int)thread_position_in_grid.x;",
         ]
+        # Compute per-output offsets within the packed buffers (only
+        # used when ``use_packed_init_shadows`` is set). Each output's
+        # data is stored as ``world_count * stride`` scalars at the
+        # offset; offsets are passed to the kernel via
+        # ``__init_shadow_offsets[i]`` (an extension to ``__ints_packed``).
         for out_name in init_outputs:
             arg_var = next(a for a in output_args if a.label == out_name)
             ndim = getattr(arg_var.type, "ndim", 1)
@@ -3938,13 +3996,30 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
             inner_extra = 1 if (v_info is not None or m_info is not None) else 0
             stride_terms = [f"{out_name}_shape[{k}]" for k in range(1, ndim + inner_extra)]
             stride_expr = " * ".join(stride_terms) if stride_terms else "1"
+            if use_packed_init_shadows:
+                # Pick the packed buffer + per-output index.
+                if out_name in init_shadow_floats:
+                    pack_buf = "__init_shadows_floats"
+                    pack_idx = init_shadow_floats.index(out_name)
+                else:
+                    pack_buf = "__init_shadows_ints"
+                    pack_idx = init_shadow_ints.index(out_name)
+                # Offset constant lives in ``__init_shadow_offsets`` —
+                # appended to ``__ints_packed`` by the launcher. The
+                # offset position depends on whether float/int packing
+                # is active for this kernel; simpler to use one combined
+                # offsets table indexed by global init-shadow ordinal.
+                init_idx = init_outputs.index(out_name)
+                src_expr = f"{pack_buf}[__init_shadow_offsets[{init_idx}] + _init_flat]"
+            else:
+                src_expr = f"{out_name}__init[_init_flat]"
             if has_atomic:
                 store_stmt = (
                     f"            atomic_store_explicit(&{out_name}[_init_flat], "
-                    f"{out_name}__init[_init_flat], memory_order_relaxed);"
+                    f"{src_expr}, memory_order_relaxed);"
                 )
             else:
-                store_stmt = f"            {out_name}[_init_flat] = {out_name}__init[_init_flat];"
+                store_stmt = f"            {out_name}[_init_flat] = {src_expr};"
             prologue.extend(
                 [
                     f"        int _init_stride_{out_name} = {stride_expr};",
@@ -3961,7 +4036,7 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
         body_lines = prologue + body_lines
     # Track for the launcher: which outputs need an ``<name>__init``
     # shadow input to be bound. Same name list the artifact uses.
-    atomic_init_outputs = init_outputs
+    atomic_init_outputs = init_outputs if not use_packed_init_shadows else []
 
     # ---- Cooperative tile_cholesky prelude ---------------------------
     # If ``_translate_tile_intrinsics`` rewrote any ``tile_cholesky``
@@ -4127,14 +4202,40 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
             source = "".join(new_src_lines)
             input_args = [a for a in input_args if a.label not in packed_set]
 
+    # Rewrite ``__init_shadow_offsets[i]`` (synthetic placeholder used
+    # in the prologue) to its concrete address inside ``__ints_packed``.
+    # The header layout is ``[ints_off, scalars, floats_off,
+    # init_shadow_off, ...data]`` — init shadow offsets sit right after
+    # the float-array offsets at slot ``K + S + F + i``.
+    if use_packed_init_shadows:
+        K_now = len(ints_packed_arrs)
+        S_now = len(ints_packed_scalars)
+        F_now = len(floats_packed_arrs)
+        base_idx = K_now + S_now + F_now
+        source = re.sub(
+            r"__init_shadow_offsets\[(\d+)\]",
+            lambda m: f"__ints_packed[{base_idx + int(m.group(1))}]",
+            source,
+        )
+
     base_input_names = [a.label for a in input_args]
     # Synthetic packed-buffer inputs the launcher fills at dispatch time.
     # Order matters — must match the input-build order in the launcher.
     extra_input_names: list[str] = []
-    if ints_packed_arrs or ints_packed_scalars or floats_packed_arrs:
+    needs_ints_packed = (
+        bool(ints_packed_arrs)
+        or bool(ints_packed_scalars)
+        or bool(floats_packed_arrs)
+        or use_packed_init_shadows  # init_shadow_offsets live in __ints_packed
+    )
+    if needs_ints_packed:
         extra_input_names.append("__ints_packed")
     if floats_packed_arrs:
         extra_input_names.append("__floats_packed")
+    if init_shadow_floats:
+        extra_input_names.append("__init_shadows_floats")
+    if init_shadow_ints:
+        extra_input_names.append("__init_shadows_ints")
     if _shape_arrs_seen:
         extra_input_names.append("__shapes_packed")
 
@@ -4156,6 +4257,9 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
         floats_packed_arrs=tuple(floats_packed_arrs),
         needs_init_barrier=bool(init_outputs),
         coop_chol_n=coop_chol_n,
+        init_shadow_packed_outputs=tuple(init_outputs) if use_packed_init_shadows else (),
+        init_shadow_floats=tuple(init_shadow_floats),
+        init_shadow_ints=tuple(init_shadow_ints),
         header=header,
     )
 
@@ -4319,6 +4423,43 @@ def _is_int_or_bool_scalar_arg(arg) -> bool:
     if t is int32 or t is bool:
         return True
     return False
+
+
+def _msl_array_inner_msl_type(arg) -> str:
+    """Return the MSL scalar name (``"float"``, ``"int"``, ``"bool"``,
+    ``"uint"``) for the *inner element* of a wp.array.
+
+    For ``wp.array(dtype=wp.float32)`` returns ``"float"``.
+    For ``wp.array(dtype=wp.vec3)`` returns ``"float"`` (vec3's
+    inner scalar). For ``wp.array(dtype=wp.int32)`` returns ``"int"``.
+    For ``wp.array(dtype=SomeStruct)`` returns ``"float"`` (struct
+    storage is float32 in our backing layout).
+
+    Used to route init-shadow data into the right packed buffer
+    (``__init_shadows_floats`` vs ``__init_shadows_ints``).
+    """
+    v = _vec_dtype_info(arg)
+    if v is not None:
+        return v[1]
+    m = _mat_dtype_info(arg)
+    if m is not None:
+        return m[2]
+    dtype = getattr(arg.type, "dtype", None)
+    if dtype is None:
+        return "float"
+    # Struct dtypes: backing storage is float32 (see
+    # ``_array_view_dtype_and_shape``).
+    from warp._src.codegen import Struct  # noqa: PLC0415
+    if isinstance(dtype, Struct):
+        return "float"
+    # Scalar dtypes — map via ``_SCALAR_CTYPE_TO_MSL``.
+    ctype = getattr(dtype, "_type_", None)
+    if ctype is not None:
+        full = f"wp::{dtype.__name__}"
+        return _SCALAR_CTYPE_TO_MSL.get(full, "float")
+    name = getattr(dtype, "__name__", "")
+    full = f"wp::{name}"
+    return _SCALAR_CTYPE_TO_MSL.get(full, "float")
 
 
 def _vec_dtype_info(arg) -> tuple[int, str] | None:
@@ -4770,17 +4911,27 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim: int = 2
     # (bool lifted to int); next F entries are the float-array data
     # start offsets within the *separate* ``__floats_packed`` buffer
     # built below; then the concatenated int-array data.
+    has_packed_init = bool(artifact.init_shadow_packed_outputs)
     if (
         artifact.ints_packed_arrs
         or artifact.ints_packed_scalars
         or artifact.floats_packed_arrs
+        or has_packed_init
     ):
         K = len(artifact.ints_packed_arrs)
         S = len(artifact.ints_packed_scalars)
         F = len(artifact.floats_packed_arrs)
-        header_np = np.zeros(K + S + F, dtype=np.int32)
+        # Init-shadow offsets sit after the float-arr offsets in the
+        # header. ``__init_shadow_offsets[i]`` is the start position
+        # (in scalars) of init shadow ``i`` within its packed buffer
+        # (``__init_shadows_floats`` for float outputs,
+        # ``__init_shadows_ints`` for int/bool outputs). The kernel
+        # accesses it as ``__init_shadow_offsets`` in the prologue —
+        # remap to ``__ints_packed[K+S+F + i]``.
+        N = len(artifact.init_shadow_packed_outputs)
+        header_np = np.zeros(K + S + F + N, dtype=np.int32)
         data_parts: list = []
-        running = K + S + F
+        running = K + S + F + N
         for i, arr_name in enumerate(artifact.ints_packed_arrs):
             header_np[i] = running
             idx, _ = arg_by_name[arr_name]
@@ -4819,6 +4970,40 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim: int = 2
                 )
             float_data_parts.append(mx_buf.view(mx_dtype).reshape((sz,)))
             float_running += sz
+        # Compute per-init-shadow offsets within the appropriate
+        # packed buffer (``__init_shadows_floats`` or
+        # ``__init_shadows_ints``).
+        init_floats_running = 0
+        init_ints_running = 0
+        init_floats_parts: list = []
+        init_ints_parts: list = []
+        if has_packed_init:
+            for i, out_name in enumerate(artifact.init_shadow_packed_outputs):
+                idx, _ = arg_by_name[out_name]
+                value = fwd_args[idx]
+                mx_dtype, view_shape = _array_view_dtype_and_shape(value)
+                sz = int(np.prod(view_shape)) if view_shape else 0
+                is_float_pack = out_name in artifact.init_shadow_floats
+                if is_float_pack:
+                    header_np[K + S + F + i] = init_floats_running
+                else:
+                    header_np[K + S + F + i] = init_ints_running
+                if value.ptr is None or sz == 0:
+                    # No data to seed; the offset stays valid (no-op
+                    # writes by the prologue's stride loop, since size=0).
+                    continue
+                mx_buf = _metal_get_buffer(value.ptr)
+                if mx_buf is None:
+                    raise RuntimeError(
+                        f"Kernel '{kernel.key}' init-shadow output '{out_name}' has no "
+                        f"registered MLX buffer (ptr={value.ptr})"
+                    )
+                if is_float_pack:
+                    init_floats_parts.append(mx_buf.view(mx_dtype).reshape((sz,)))
+                    init_floats_running += sz
+                else:
+                    init_ints_parts.append(mx_buf.view(mx_dtype).reshape((sz,)))
+                    init_ints_running += sz
         header_mx = mx.array(header_np, dtype=mx.int32)
         if data_parts:
             mlx_inputs.append(mx.concatenate([header_mx, *data_parts], axis=0))
@@ -4836,6 +5021,17 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim: int = 2
             else:
                 # Empty placeholder so MLX has a buffer to bind.
                 mlx_inputs.append(mx.zeros((1,), dtype=mx.float32))
+        # Append packed init-shadow buffers if present.
+        if artifact.init_shadow_floats:
+            if init_floats_parts:
+                mlx_inputs.append(mx.concatenate(init_floats_parts, axis=0))
+            else:
+                mlx_inputs.append(mx.zeros((1,), dtype=mx.float32))
+        if artifact.init_shadow_ints:
+            if init_ints_parts:
+                mlx_inputs.append(mx.concatenate(init_ints_parts, axis=0))
+            else:
+                mlx_inputs.append(mx.zeros((1,), dtype=mx.int32))
 
     # Append the packed shape buffer if the kernel needs any ``arr.shape``
     # access. ``__shapes_packed`` is a single flat int32 array containing
