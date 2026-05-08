@@ -652,6 +652,61 @@ def _emit_tile_struct(rows: int, cols: int, msl_scalar: str) -> str:
     return "\n".join(parts)
 
 
+def _emit_tile_struct_vec(rows: int, cols: int, n_elem: int, msl_scalar: str) -> str:
+    """Emit ``wp_tile_RxC_vec<N>_<scalar>`` — a tile of ``vec_t<N, scalar>``.
+
+    Storage is flat ``c[rows*cols*n_elem]`` in element-major,
+    component-minor layout: ``c[(i*cols + j)*N + k]`` is the k-th
+    component of the (i, j) element. Used by the dense-Jacobian path
+    where tiles of ``vec3`` / ``spatial_vector`` (``vec6``) flow
+    through ``tile_load`` / ``tile_map`` / ``tile_store``.
+
+    Element accessors emit as inline lambdas to keep the call sites
+    typed (the compiler folds them at -O2).
+    """
+    name = f"wp_tile_{rows}x{cols}_vec{n_elem}_{msl_scalar}"
+    flat_n = rows * cols * n_elem
+    parts: list[str] = []
+    parts.append(f"struct {name} {{")
+    parts.append(f"    {msl_scalar} c[{flat_n}];")
+    parts.append("};")
+    # Load: read ``rows × cols`` elements from a device array of
+    # ``vec_t<n_elem, scalar>``, exposed by MLX as a flat scalar buffer
+    # of shape ``(*array_shape, n_elem)``. ``row_stride`` is the inner-
+    # *element* stride (inner scalar count = n_elem * array.shape[-1]
+    # already folded by the caller via ``__shapes_packed``).
+    parts.append(f"template <typename T>")
+    parts.append(
+        f"inline {name} {name}_load(T arr, "
+        "int base, int row_stride, int row_off, int col_off) {"
+    )
+    parts.append(f"    {name} t;")
+    parts.append(f"    for (int i = 0; i < {rows}; ++i) {{")
+    parts.append(f"        for (int j = 0; j < {cols}; ++j) {{")
+    parts.append(f"            int elem_off = ((row_off + i) * row_stride + (col_off + j)) * {n_elem};")
+    parts.append(f"            for (int k = 0; k < {n_elem}; ++k) {{")
+    parts.append(f"                t.c[(i * {cols} + j) * {n_elem} + k] = arr[base + elem_off + k];")
+    parts.append("            }")
+    parts.append("        }")
+    parts.append("    }")
+    parts.append("    return t;")
+    parts.append("}")
+    parts.append(
+        f"inline void {name}_store(device {msl_scalar}* arr, "
+        f"int base, int row_stride, int row_off, int col_off, {name} t) {{"
+    )
+    parts.append(f"    for (int i = 0; i < {rows}; ++i) {{")
+    parts.append(f"        for (int j = 0; j < {cols}; ++j) {{")
+    parts.append(f"            int elem_off = ((row_off + i) * row_stride + (col_off + j)) * {n_elem};")
+    parts.append(f"            for (int k = 0; k < {n_elem}; ++k) {{")
+    parts.append(f"                arr[base + elem_off + k] = t.c[(i * {cols} + j) * {n_elem} + k];")
+    parts.append("            }")
+    parts.append("        }")
+    parts.append("    }")
+    parts.append("}")
+    return "\n".join(parts)
+
+
 def _emit_tile_cholesky(n: int, msl_scalar: str) -> str:
     """Emit ``wp_tile_NxN_<scalar>_cholesky`` — in-place lower Cholesky.
 
@@ -1133,6 +1188,20 @@ def _build_kernel_header(source: str) -> str:
         seen_tile.add((cols, rows, scalar))
     for rows, cols, scalar in sorted(seen_tile):
         parts.append(_emit_tile_struct(rows, cols, scalar))
+    # Vec-element tiles (``wp_tile_RxC_vec<N>_<scalar>``) — used by the
+    # dense-Jacobian path with ``vec3`` / ``spatial_vector`` (vec6)
+    # element types.
+    vec_tile_pat = re.compile(r"\bwp_tile_(\d+)x(\d+)_vec(\d+)_(\w+)(?![\w])")
+    seen_vec_tile: set[tuple[int, int, int, str]] = set()
+    for m in vec_tile_pat.finditer(source):
+        rows = int(m.group(1))
+        cols = int(m.group(2))
+        n_elem = int(m.group(3))
+        scalar = m.group(4)
+        if scalar in _MSL_PREFIX_TO_SAME:
+            seen_vec_tile.add((rows, cols, n_elem, scalar))
+    for rows, cols, n_elem, scalar in sorted(seen_vec_tile):
+        parts.append(_emit_tile_struct_vec(rows, cols, n_elem, scalar))
     # Cooperative load/store variants — scan for ``..._load_coop`` /
     # ``..._store_coop`` references and emit their definitions
     # alongside the single-thread ones.
@@ -1349,6 +1418,22 @@ _TILE_CTYPE_HEAD_PAT = re.compile(r"wp::tile_(shared|register)_t<\s*(.+)$")
 _TILE_SHAPE_PAT = re.compile(r"wp::tile_shape_t<\s*(\d+)\s*(?:,\s*(\d+))?\s*>")
 
 
+_VEC_T_INNER_PAT = re.compile(r"wp::vec_t<\s*(\d+)\s*,\s*([\w:]+)\s*>")
+
+
+def _vec_dtype_inner(ctype: str) -> tuple[int, str] | None:
+    """Parse a ``wp::vec_t<N, wp::scalar>`` ctype to ``(N, inner_ctype)``.
+
+    Returns ``None`` if ``ctype`` is not a vec_t. Strips any trailing
+    qualifiers (``const``, ``&``, ``*``) to keep the parser tolerant of
+    parameter-position decorations.
+    """
+    m = _VEC_T_INNER_PAT.search(ctype)
+    if m is None:
+        return None
+    return int(m.group(1)), m.group(2)
+
+
 def _parse_tile_ctype(ctype: str) -> tuple[str, str, int, int] | None:
     """Parse ``wp::tile_(shared|register)_t<dtype, layout<shape<R[, C]>, ...>, ...>``.
 
@@ -1404,13 +1489,26 @@ def _msl_var_type(ctype: str) -> str:
         kind, dtype_ctype, rows, cols = parsed
         if rows == 1 and cols == 1:
             return _msl_scalar_type(dtype_ctype)
-        # Larger tiles use scalar-only struct emission for now.
-        if dtype_ctype not in _SCALAR_CTYPE_TO_MSL:
-            raise MetalCodegenError(
-                f"MSL codegen: tile of {dtype_ctype!r} (shape {rows}x{cols}) not yet supported "
-                "(only scalar-element tiles with R*C > 1 emit a struct)"
-            )
-        return f"wp_tile_{rows}x{cols}_{_SCALAR_CTYPE_TO_MSL[dtype_ctype]}"
+        # Scalar-element tile: ``wp_tile_RxC_<scalar>``.
+        if dtype_ctype in _SCALAR_CTYPE_TO_MSL:
+            return f"wp_tile_{rows}x{cols}_{_SCALAR_CTYPE_TO_MSL[dtype_ctype]}"
+        # Vec-element tile (``wp::vec_t<N, scalar>``): emit a struct
+        # holding ``R*C*N`` flat scalars. ``vec3`` / ``spatial_vector``
+        # tiles in mujoco_warp's dense-Jacobian path go through here.
+        v = _vec_dtype_inner(dtype_ctype)
+        if v is not None:
+            n_elem, inner_scalar_ctype = v
+            inner_scalar = _SCALAR_CTYPE_TO_MSL.get(inner_scalar_ctype)
+            if inner_scalar is None:
+                raise MetalCodegenError(
+                    f"MSL codegen: tile of {dtype_ctype!r} not supported "
+                    f"(unsupported inner scalar {inner_scalar_ctype!r})"
+                )
+            return f"wp_tile_{rows}x{cols}_vec{n_elem}_{inner_scalar}"
+        raise MetalCodegenError(
+            f"MSL codegen: tile of {dtype_ctype!r} (shape {rows}x{cols}) not yet supported "
+            "(only scalar-element and vec-element tiles emit a struct)"
+        )
     return _msl_scalar_type(ctype)
 
 
@@ -1841,10 +1939,17 @@ _TILE_LOAD_PAT = re.compile(
     #     bounds checks (we're loading a fixed (R, C) into a fixed-sized
     #     local), and "shared" storage degenerates to per-thread for
     #     ``block_dim=1``.
-    r"\bvar_(\w+)\s*=\s*wp::tile_load\s*<\s*wp::(\w+)\s*,\s*\w+\s*,\s*\w+\s*,\s*(\d+)\s*(?:,\s*(\d+)\s*)?>\s*\(([^)]*)\)"
+    # ``dtype`` can be a scalar (``wp::float32``), a vec-type
+    # (``wp::vec_t<N, wp::SCALAR>``), or — after the inliner has
+    # already rewritten — a big-vec struct name (``wp_vec6_float``).
+    r"\bvar_(\w+)\s*=\s*wp::tile_load\s*<\s*"
+    r"(wp::vec_t<\d+,\s*wp::\w+>|wp::\w+|wp_vec\d+_\w+|wp_mat\d+x\d+_\w+)"
+    r"\s*,\s*\w+\s*,\s*\w+\s*,\s*(\d+)\s*(?:,\s*(\d+)\s*)?>\s*\(([^)]*)\)"
 )
 _TILE_STORE_PAT = re.compile(
-    r"\bwp::tile_store\s*<\s*wp::(\w+)\s*,\s*\w+\s*,\s*\w+\s*>\s*\(([^)]*)\)"
+    r"\bwp::tile_store\s*<\s*"
+    r"(wp::vec_t<\d+,\s*wp::\w+>|wp::\w+|wp_vec\d+_\w+|wp_mat\d+x\d+_\w+)"
+    r"\s*,\s*\w+\s*,\s*\w+\s*>\s*\(([^)]*)\)"
 )
 _TILE_CHOLESKY_PAT = re.compile(
     r"\bvar_(\w+)\s*=\s*wp::tile_cholesky\s*<[^()]*>\s*\(([^)]*)\)"
@@ -1935,10 +2040,27 @@ def _translate_tile_intrinsics(
 
     def repl_load(m: re.Match[str]) -> str:
         lhs = m.group(1)
-        scalar_ctype = f"wp::{m.group(2)}"
+        dtype_token = m.group(2)
         rows = int(m.group(3))
         cols = int(m.group(4)) if m.group(4) else 1
-        msl_scalar = _SCALAR_CTYPE_TO_MSL.get(scalar_ctype)
+        # Resolve the element type. Three cases:
+        #  - scalar: ``wp::float32`` -> msl_scalar=``float``
+        #  - vec_t (Warp form): ``wp::vec_t<N, wp::SCALAR>``
+        #  - big-vec alias: ``wp_vec<N>_<scalar>`` (post-inliner form)
+        msl_scalar = None
+        vec_n_elem = 0
+        m_vec_t = re.match(r"wp::vec_t<(\d+),\s*wp::(\w+)>", dtype_token)
+        if m_vec_t is not None:
+            vec_n_elem = int(m_vec_t.group(1))
+            inner_ctype = f"wp::{m_vec_t.group(2)}"
+            msl_scalar = _SCALAR_CTYPE_TO_MSL.get(inner_ctype)
+        elif dtype_token.startswith("wp_vec"):
+            mvec = re.match(r"wp_vec(\d+)_(\w+)", dtype_token)
+            if mvec is not None:
+                vec_n_elem = int(mvec.group(1))
+                msl_scalar = mvec.group(2)
+        elif dtype_token.startswith("wp::"):
+            msl_scalar = _SCALAR_CTYPE_TO_MSL.get(dtype_token)
         if msl_scalar is None:
             return m.group(0)
         args = [a.strip() for a in m.group(5).split(",")]
@@ -1950,7 +2072,13 @@ def _translate_tile_intrinsics(
         lead_idx_args = args[1:-n_off] if len(args) > 1 + n_off else []
         offsets = args[-n_off:]
         arr_name = arr[len("var_"):] if arr.startswith("var_") else arr
-        base_expr = _build_flat_base_expr(arr_name, lead_idx_args, inner_dims=2 if cols > 1 else 1)
+        # Vec-element arrays expose an extra inner scalar dim in MLX
+        # (``(*shape, n_elem)``); add it to ``inner_dims`` so the base
+        # expression includes the element-size stride.
+        scalar_inner_dims = 2 if cols > 1 else 1
+        if vec_n_elem > 0:
+            scalar_inner_dims += 1
+        base_expr = _build_flat_base_expr(arr_name, lead_idx_args, inner_dims=scalar_inner_dims)
         if cols > 1:
             row_stride = f"{arr_name}_shape[{len(lead_idx_args) + 1}]"
             row_off, col_off = offsets
@@ -1963,6 +2091,13 @@ def _translate_tile_intrinsics(
         # there's no wp_tile_1x1 struct/helper, so emit a direct subscript.
         if rows == 1 and cols == 1:
             return f"var_{lhs} = {arr}[{base_expr} + ({row_off}) * ({row_stride}) + ({col_off})]"
+        # Vec-element tile: route to the vec-element helper. The
+        # helper folds the ``n_elem`` scaling into its inner index, so
+        # ``row_stride`` here is in ELEMENTS (1 for a 1-D tile of
+        # ``vec_t<n_elem, scalar>`` over a 1-D backing array).
+        if vec_n_elem > 0:
+            helper = f"wp_tile_{rows}x{cols}_vec{vec_n_elem}_{msl_scalar}_load"
+            return f"var_{lhs} = {helper}({arr}, {base_expr}, {row_stride}, {row_off}, {col_off})"
         # NB: cooperative tile_load was tried but a SIMD-cooperative
         # threadgroup-memory round-trip (write smem → barrier → read
         # smem into each thread's private struct) ran *slower* than
@@ -1974,8 +2109,24 @@ def _translate_tile_intrinsics(
         return f"var_{lhs} = {helper}({arr}, {base_expr}, {row_stride}, {row_off}, {col_off})"
 
     def repl_store(m: re.Match[str]) -> str:
-        scalar_ctype = f"wp::{m.group(1)}"
-        msl_scalar = _SCALAR_CTYPE_TO_MSL.get(scalar_ctype)
+        # Group 1 is the full dtype string after the regex update —
+        # could be ``wp::SCALAR``, ``wp::vec_t<N, wp::SCALAR>``, or a
+        # post-inliner alias (``wp_vec<N>_<scalar>``).
+        dtype_token = m.group(1)
+        msl_scalar = None
+        vec_n_elem = 0
+        m_vec_t = re.match(r"wp::vec_t<(\d+),\s*wp::(\w+)>", dtype_token)
+        if m_vec_t is not None:
+            vec_n_elem = int(m_vec_t.group(1))
+            inner_ctype = f"wp::{m_vec_t.group(2)}"
+            msl_scalar = _SCALAR_CTYPE_TO_MSL.get(inner_ctype)
+        elif dtype_token.startswith("wp_vec"):
+            mvec = re.match(r"wp_vec(\d+)_(\w+)", dtype_token)
+            if mvec is not None:
+                vec_n_elem = int(mvec.group(1))
+                msl_scalar = mvec.group(2)
+        elif dtype_token.startswith("wp::"):
+            msl_scalar = _SCALAR_CTYPE_TO_MSL.get(dtype_token)
         if msl_scalar is None:
             return m.group(0)
         args = [a.strip() for a in m.group(2).split(",")]
@@ -1993,7 +2144,10 @@ def _translate_tile_intrinsics(
         lead_idx_args = middle[:-n_off] if len(middle) > n_off else []
         offsets = middle[-n_off:]
         arr_name = arr[len("var_"):] if arr.startswith("var_") else arr
-        base_expr = _build_flat_base_expr(arr_name, lead_idx_args, inner_dims=2 if cols > 1 else 1)
+        scalar_inner_dims = 2 if cols > 1 else 1
+        if vec_n_elem > 0:
+            scalar_inner_dims += 1
+        base_expr = _build_flat_base_expr(arr_name, lead_idx_args, inner_dims=scalar_inner_dims)
         if cols > 1:
             row_stride = f"{arr_name}_shape[{len(lead_idx_args) + 1}]"
             row_off, col_off = offsets
@@ -2003,6 +2157,9 @@ def _translate_tile_intrinsics(
         # Shape (1,1) tile is a scalar local — store with a direct subscript.
         if rows == 1 and cols == 1:
             return f"{arr}[{base_expr} + ({row_off}) * ({row_stride}) + ({col_off})] = {tile_var}"
+        if vec_n_elem > 0:
+            helper = f"wp_tile_{rows}x{cols}_vec{vec_n_elem}_{msl_scalar}_store"
+            return f"{helper}({arr}, {base_expr}, {row_stride}, {row_off}, {col_off}, {tile_var})"
         # NB: cooperative tile_store (each lane writes its strided
         # slice with no smem) was tried but added latency without
         # measurable bandwidth savings — Metal's SIMD-group write
@@ -3122,14 +3279,31 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
     # circuit cholesky / cholesky_solve to scalar ops even though the
     # local itself collapsed to a plain value via ``_msl_var_type``.
     tile_var_dims: dict[str, tuple[int, int, str]] = {}
+    # Parallel map: var label → vec element count (0 for scalar tiles).
+    # Lets ``tile_map`` / ``tile_reduce`` / ``tile_extract`` lower
+    # element-typed tiles correctly without changing every consumer
+    # of ``tile_var_dims``.
+    tile_var_vec_n: dict[str, int] = {}
+
+    def _record_tile(label: str, dtype_ctype: str, rows: int, cols: int) -> None:
+        if dtype_ctype in _SCALAR_CTYPE_TO_MSL:
+            tile_var_dims[label] = (rows, cols, _SCALAR_CTYPE_TO_MSL[dtype_ctype])
+            tile_var_vec_n[label] = 0
+            return
+        v = _vec_dtype_inner(dtype_ctype)
+        if v is not None:
+            n_elem, inner_ctype = v
+            inner_msl = _SCALAR_CTYPE_TO_MSL.get(inner_ctype)
+            if inner_msl is not None:
+                tile_var_dims[label] = (rows, cols, inner_msl)
+                tile_var_vec_n[label] = n_elem
+
     for var in adj.variables:
         parsed = _parse_tile_ctype(var.ctype())
         if parsed is None:
             continue
         _kind, dtype_ctype, rows, cols = parsed
-        if dtype_ctype not in _SCALAR_CTYPE_TO_MSL:
-            continue
-        tile_var_dims[var.label] = (rows, cols, _SCALAR_CTYPE_TO_MSL[dtype_ctype])
+        _record_tile(var.label, dtype_ctype, rows, cols)
     # Inlined-function tile locals — the inliner records every spliced
     # local's ctype keyed by its mangled label (e.g. ``136__17``); add
     # the tile-typed ones here so the regex translators can resolve
@@ -3141,9 +3315,7 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
         if parsed is None:
             continue
         _kind, dtype_ctype, rows, cols = parsed
-        if dtype_ctype not in _SCALAR_CTYPE_TO_MSL:
-            continue
-        tile_var_dims[label] = (rows, cols, _SCALAR_CTYPE_TO_MSL[dtype_ctype])
+        _record_tile(label, dtype_ctype, rows, cols)
 
     # When ``atomic_outputs=True`` is passed to ``mx.fast.metal_kernel``,
     # *every* output buffer comes through as ``device atomic<T>*``. Reads
