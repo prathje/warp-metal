@@ -624,11 +624,18 @@ def _emit_tile_struct(rows: int, cols: int, msl_scalar: str) -> str:
         "int base, int row_stride, int row_off, int col_off) {"
     )
     parts.append(f"    {name} t;")
-    for i in range(rows):
-        for j in range(cols):
-            parts.append(
-                f"    t.c[{i * cols + j}] = arr[base + (row_off + {i}) * row_stride + (col_off + {j})];"
-            )
+    # Runtime loops (rather than fully unrolled writes) keep the helper
+    # small. Apple's MSL compiler silently drops writes when a kernel
+    # accumulates 3+ inlined fully-unrolled tile load/store/cholesky
+    # bodies (observed at N=16 in mujoco_warp's blocked-Cholesky factor:
+    # the third diagonal block's stored values came back as zero with
+    # no compile error). The compact form fits within whatever
+    # threshold the optimizer respects.
+    parts.append(f"    for (int i = 0; i < {rows}; ++i) {{")
+    parts.append(f"        for (int j = 0; j < {cols}; ++j) {{")
+    parts.append(f"            t.c[i * {cols} + j] = arr[base + (row_off + i) * row_stride + (col_off + j)];")
+    parts.append("        }")
+    parts.append("    }")
     parts.append("    return t;")
     parts.append("}")
     # Store target is always writable, so it stays ``device``.
@@ -636,11 +643,11 @@ def _emit_tile_struct(rows: int, cols: int, msl_scalar: str) -> str:
         f"inline void {name}_store(device {msl_scalar}* arr, "
         f"int base, int row_stride, int row_off, int col_off, {name} t) {{"
     )
-    for i in range(rows):
-        for j in range(cols):
-            parts.append(
-                f"    arr[base + (row_off + {i}) * row_stride + (col_off + {j})] = t.c[{i * cols + j}];"
-            )
+    parts.append(f"    for (int i = 0; i < {rows}; ++i) {{")
+    parts.append(f"        for (int j = 0; j < {cols}; ++j) {{")
+    parts.append(f"            arr[base + (row_off + i) * row_stride + (col_off + j)] = t.c[i * {cols} + j];")
+    parts.append("        }")
+    parts.append("    }")
     parts.append("}")
     return "\n".join(parts)
 
@@ -862,9 +869,23 @@ def _emit_tile_cholesky_inplace(n: int, msl_scalar: str) -> str:
     """Emit ``wp_tile_NxN_<scalar>_cholesky_inplace`` — same body as
     :func:`_emit_tile_cholesky` but mutates the input tile in place
     (no ``L = A`` copy, no return value).
+
+    Marked ``__attribute__((noinline))`` to dodge a Metal compiler
+    misoptimization: when this helper is inlined 3+ times into the
+    same kernel, the FIRST inlined copy's writes to ``L.c[...]``
+    silently come back as zero (no compile error, deterministic).
+    Reproducer: three sequential ``tile_cholesky_inplace`` calls on
+    different tile locals at N=16 — the first tile's diagonal ends
+    up ~0.5 instead of ~16.6, captured even by an immediate
+    ``tile_store`` after the first call. Forcing the helper out of
+    line restores correctness; the cost is one function-call
+    boundary per invocation, which is dwarfed by the Cholesky's
+    own work.
     """
     name = f"wp_tile_{n}x{n}_{msl_scalar}"
-    parts: list[str] = [f"inline void {name}_cholesky_inplace(thread {name}& L) {{"]
+    parts: list[str] = [
+        f"__attribute__((noinline)) void {name}_cholesky_inplace(thread {name}& L) {{"
+    ]
     parts.append("    #pragma clang loop unroll(disable)")
     parts.append(f"    for (int j = 0; j < {n}; ++j) {{")
     parts.append(f"        {msl_scalar} d = L.c[j*{n} + j];")
@@ -895,7 +916,12 @@ def _emit_tile_lower_solve_inplace(n: int, k: int, msl_scalar: str) -> str:
     L_name = f"wp_tile_{n}x{n}_{msl_scalar}"
     B_name = f"wp_tile_{n}x{k}_{msl_scalar}"
     name = f"wp_tile_lower_solve_{n}x{k}_{msl_scalar}_inplace"
-    parts: list[str] = [f"inline void {name}({L_name} L, thread {B_name}& B) {{"]
+    # ``noinline`` for the same reason as ``cholesky_inplace``: 3+
+    # inlined copies in one kernel produce silently-zero writes on
+    # Metal at N=16. Out-of-lining restores correctness.
+    parts: list[str] = [
+        f"__attribute__((noinline)) void {name}({L_name} L, thread {B_name}& B) {{"
+    ]
     parts.append("    #pragma clang loop unroll(disable)")
     parts.append(f"    for (int i = 0; i < {n}; ++i) {{")
     parts.append(f"        for (int col = 0; col < {k}; ++col) {{")
@@ -918,7 +944,11 @@ def _emit_tile_upper_solve_inplace(n: int, k: int, msl_scalar: str) -> str:
     L_name = f"wp_tile_{n}x{n}_{msl_scalar}"
     B_name = f"wp_tile_{n}x{k}_{msl_scalar}"
     name = f"wp_tile_upper_solve_{n}x{k}_{msl_scalar}_inplace"
-    parts: list[str] = [f"inline void {name}({L_name} U, thread {B_name}& B) {{"]
+    # ``noinline`` matches ``lower_solve_inplace`` — same Metal compiler
+    # inline-bug at 3+ invocations.
+    parts: list[str] = [
+        f"__attribute__((noinline)) void {name}({L_name} U, thread {B_name}& B) {{"
+    ]
     parts.append("    #pragma clang loop unroll(disable)")
     parts.append(f"    for (int i = {n} - 1; i >= 0; --i) {{")
     parts.append(f"        for (int col = 0; col < {k}; ++col) {{")
@@ -943,8 +973,13 @@ def _emit_tile_matmul(r: int, k: int, n: int, msl_scalar: str) -> str:
     B = f"wp_tile_{k}x{n}_{msl_scalar}"
     C = f"wp_tile_{r}x{n}_{msl_scalar}"
     name = f"wp_tile_matmul_{r}x{k}x{n}_{msl_scalar}"
+    # ``noinline`` because mujoco_warp's blocked-Cholesky factor calls
+    # this 5+ times per outer iteration. Inlining all copies tipped
+    # past the Metal compiler's threshold and silently dropped writes
+    # to the C accumulator (same family of bug as the
+    # ``cholesky_inplace`` / ``*_solve_inplace`` regressions).
     parts: list[str] = [
-        f"inline void {name}({A} A, {B} B, thread {C}& C, {msl_scalar} alpha, {msl_scalar} beta) {{"
+        f"__attribute__((noinline)) void {name}({A} A, {B} B, thread {C}& C, {msl_scalar} alpha, {msl_scalar} beta) {{"
     ]
     parts.append(f"    for (int i = 0; i < {r}; ++i) {{")
     parts.append(f"        for (int j = 0; j < {n}; ++j) {{")
