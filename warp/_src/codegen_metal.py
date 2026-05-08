@@ -3204,6 +3204,60 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
         for a in output_args:
             if a.label in read_outputs and a.label not in init_outputs:
                 init_outputs.append(a.label)
+    # Detect kernels with an early ``return;`` at function scope —
+    # they have a guarded write path where some thread invocations
+    # skip writing their output slot entirely. ``_geom_local_to_global``
+    # is the canonical case: ``if body_weldid == 0 and not_mocap:
+    # return`` skips the write for static (worldbody-attached) geoms.
+    # Without this seed, ``geom_xpos[floor]/[rail1]/[rail2]`` ends up
+    # MLX-stale on Metal even though ``put_data`` populated them, which
+    # wrecks the broadphase OBB filter for any pair with a static geom.
+    #
+    # We can't tell at codegen which kernels rely on prior user values
+    # vs. which ones expect caller-zeroed outputs (``_friction_dof``
+    # has the same early-return pattern but its callers do
+    # ``d.nf.zero_()`` etc. and depend on MLX's zero-init). To avoid
+    # blanket-seeding, we apply the heuristic only when:
+    #   1. The kernel has a top-level ``return;``, AND
+    #   2. Adding init shadows for *all* non-atomic outputs would still
+    #      fit under Metal's 31-buffer limit. This catches the
+    #      ``_geom_local_to_global`` shape (4 outputs, well under)
+    #      while leaving ``_friction_dof`` (15 outputs) on MLX's
+    #      zero-init path that its callers already expect.
+    #
+    # The signal is a top-level ``return;`` (not nested inside a
+    # ``do { ... } while (0);`` block — those are the inliner's
+    # break-as-return wrappers, not actual conditional skips).
+    if not non_standard_launch:
+        depth = 0
+        has_early_return = False
+        for raw in forward_lines:
+            stripped = raw.strip()
+            if stripped.startswith("do "):
+                depth += 1
+            elif stripped.startswith("} while"):
+                depth = max(0, depth - 1)
+            elif stripped == "return;" and depth == 0:
+                has_early_return = True
+                break
+        if has_early_return:
+            # Tentatively add every output not already seeded.
+            tentative = list(init_outputs)
+            for a in output_args:
+                if a.label not in tentative:
+                    tentative.append(a.label)
+            # Estimate buffer-slot cost. Each new init shadow is one
+            # extra MLX input. ``__shapes_packed`` may add one more
+            # slot — be conservative and always reserve it.
+            tentative_seeds = len(tentative)
+            slots_after = (
+                len(input_args)
+                + len(output_args)
+                + tentative_seeds
+                + 1  # __shapes_packed (may or may not be present)
+            )
+            if slots_after <= 30:
+                init_outputs = tentative
     if init_outputs:
         # The init prologue must run before any thread executes the body,
         # otherwise its (idempotent) atomic_stores can clobber a sibling
