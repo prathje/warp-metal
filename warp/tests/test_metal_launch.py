@@ -3179,6 +3179,62 @@ class TestMetalLaunch(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet, timeout=180)
 
+    def test_three_tile_cholesky_inplace_calls_match_cpu(self):
+        # Regression for the Metal-compiler inline bug: when the
+        # ``cholesky_inplace`` (or ``lower_solve_inplace`` /
+        # ``upper_solve_inplace`` / ``matmul``) helper is inlined 3+
+        # times into the same kernel, the FIRST inlined copy's writes
+        # to the tile struct silently come back as zero — no compile
+        # error, deterministic. We work around it by emitting these
+        # helpers with ``__attribute__((noinline))``.
+        #
+        # The bug is the root cause of mujoco_warp's blocked-Cholesky
+        # factor returning NaN/zero on Metal: every block writes to a
+        # different tile local, but Apple's MSL compiler conflates
+        # the writes when too many copies are inlined.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            N = 16
+
+            @wp.kernel
+            def k(A: wp.array2d(dtype=float), L: wp.array2d(dtype=float)):
+                A0 = wp.tile_load(A, shape=(N, N), offset=(0, 0))
+                wp.tile_cholesky_inplace(A0)
+                wp.tile_store(L, A0, offset=(0, 0))
+                A1 = wp.tile_load(A, shape=(N, N), offset=(16, 16))
+                wp.tile_cholesky_inplace(A1)
+                wp.tile_store(L, A1, offset=(16, 16))
+                A2 = wp.tile_load(A, shape=(N, N), offset=(32, 32))
+                wp.tile_cholesky_inplace(A2)
+                wp.tile_store(L, A2, offset=(32, 32))
+
+            rng = np.random.default_rng(0)
+            M = rng.standard_normal((48, 48)).astype(np.float32)
+            H = (M @ M.T + 5.0 * 48 * np.eye(48)).astype(np.float32)
+            results = {}
+            for dev in ("cpu", "metal:0"):
+                A_d = wp.array(H, dtype=wp.float32, device=dev)
+                L_d = wp.zeros((48, 48), dtype=wp.float32, device=dev)
+                wp.launch_tiled(k, dim=1, inputs=[A_d], outputs=[L_d],
+                                block_dim=32, device=dev)
+                results[dev] = L_d.numpy()
+            # Each diagonal block is the cholesky of the corresponding
+            # 16x16 sub-block of H. If the inline bug returns, the
+            # first block (L[0,0] etc.) zeros out.
+            for i in (0, 16, 32):
+                np.testing.assert_allclose(
+                    results['metal:0'][i, i],
+                    np.sqrt(H[i, i]), atol=1e-4,
+                    err_msg=f'L[{i},{i}] off — inline bug regression?')
+            np.testing.assert_allclose(
+                results['cpu'], results['metal:0'], atol=1e-5)
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
     def test_simd_cooperative_cholesky_msl_prototype(self):
         # Standalone validation that a SIMD-cooperative right-looking
         # Cholesky compiles and runs correctly on Apple GPU. This is
