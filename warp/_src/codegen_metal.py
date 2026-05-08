@@ -496,6 +496,13 @@ def _emit_big_mat_struct(name: str, rows: int, cols: int, msl_scalar: str) -> st
         body.append(f"    r.c[{i}] = v{i};")
     body.append("    return r;")
     body.append("}")
+    # Single-scalar broadcast: ``mat23(0.0)`` zero-fills.
+    body.append(f"inline {name} {name}_make({msl_scalar} v) {{")
+    body.append(f"    {name} r;")
+    for i in range(n):
+        body.append(f"    r.c[{i}] = v;")
+    body.append("    return r;")
+    body.append("}")
     body.append(f"inline {msl_scalar} wp_mat_extract({name} m, int row, int col) {{ return m.c[row * {cols} + col]; }}")
     return "\n".join(body)
 
@@ -1041,6 +1048,15 @@ def _rewrite_mat_t_constructor(text: str) -> str:
             if rows == cols and rows in _MSL_VEC_NATIVE_N:
                 return f"{msl_scalar}{rows}x{cols}(0)"
             return f"wp_mat{rows}x{cols}_{msl_scalar}()"
+        # Single-scalar broadcast: ``mat_t<R,C,T>(scalar)``.
+        if len(args) == 1:
+            scalar_arg = args[0]
+            if rows == cols and rows in _MSL_VEC_NATIVE_N:
+                # Square native mat: ``floatNxN(scalar)`` is the diagonal-
+                # broadcast form and does fill-from-scalar in MSL when N==M.
+                return f"{msl_scalar}{rows}x{cols}({scalar_arg})"
+            # Non-square or big sizes go through the broadcast factory.
+            return f"wp_mat{rows}x{cols}_{msl_scalar}_make({scalar_arg})"
         if len(args) != rows * cols:
             return m.group(0)
         if rows == cols and rows in _MSL_VEC_NATIVE_N:
