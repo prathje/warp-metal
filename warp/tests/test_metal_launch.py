@@ -3075,6 +3075,110 @@ class TestMetalLaunch(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet, timeout=60)
 
+    def test_tile_cholesky_solve_n32_matches_cpu(self):
+        # 32-DOF Cholesky — well above the unroll-bug threshold and
+        # at the compile-cost knee of the single-thread path. Verifies
+        # the emitted MSL stays numerically stable as N grows: the
+        # outer ``j`` loop accumulates ~N² fmas which compound into
+        # the diagonal pivot, and ``precise::sqrt`` is the only
+        # protection against the resulting reassociation drift.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            N = wp.constant(32)
+
+            @wp.kernel
+            def k(A: wp.array2d(dtype=wp.float32),
+                  y: wp.array(dtype=wp.float32),
+                  L_out: wp.array2d(dtype=wp.float32),
+                  x_out: wp.array(dtype=wp.float32)):
+                a = wp.tile_load(A, shape=(N, N), storage="shared")
+                rhs = wp.tile_load(y, shape=N, storage="shared")
+                L = wp.tile_cholesky(a)
+                x = wp.tile_cholesky_solve(L, rhs)
+                wp.tile_store(L_out, L)
+                wp.tile_store(x_out, x)
+
+            rng = np.random.default_rng(32)
+            M = rng.standard_normal((32, 32)).astype(np.float32)
+            A_h = (M @ M.T + 32.0 * np.eye(32, dtype=np.float32))
+            y_h = rng.standard_normal(32).astype(np.float32)
+            x_np = np.linalg.solve(A_h.astype(np.float64),
+                                   y_h.astype(np.float64)).astype(np.float32)
+            results = {}
+            for dev in ("cpu", "metal:0"):
+                A = wp.array(A_h, dtype=wp.float32, device=dev)
+                y = wp.array(y_h, dtype=wp.float32, device=dev)
+                Lo = wp.zeros((32, 32), dtype=wp.float32, device=dev)
+                xo = wp.zeros(32, dtype=wp.float32, device=dev)
+                wp.launch_tiled(k, dim=[1], inputs=[A, y], outputs=[Lo, xo],
+                                block_dim=1, device=dev)
+                results[dev] = (Lo.numpy(), xo.numpy())
+            # Reconstruction L L^T == A is the cleanest correctness
+            # signal — independent of any reference solver and tight
+            # to ~N * eps_f32 ≈ 4e-6 in absolute terms.
+            Lm = results['metal:0'][0]
+            recon = Lm.astype(np.float64) @ Lm.T.astype(np.float64)
+            np.testing.assert_allclose(recon, A_h.astype(np.float64), atol=1e-4)
+            np.testing.assert_allclose(results['metal:0'][1], x_np, atol=1e-4)
+            np.testing.assert_allclose(results['cpu'][0], results['metal:0'][0], atol=1e-5)
+            np.testing.assert_allclose(results['cpu'][1], results['metal:0'][1], atol=1e-5)
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
+    def test_tile_cholesky_solve_n64_matches_cpu(self):
+        # 64-DOF Cholesky — top end of the simple (non-blocked) path.
+        # mujoco_warp's ``_BLOCK_CHOLESKY_DIM`` bumps to 64 on Metal
+        # so any model with nv ≤ 64 stays on this codegen branch.
+        # Runs in ~80ms launch + ~7ms steady on M3, well within
+        # CI bounds.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            N = wp.constant(64)
+
+            @wp.kernel
+            def k(A: wp.array2d(dtype=wp.float32),
+                  y: wp.array(dtype=wp.float32),
+                  L_out: wp.array2d(dtype=wp.float32),
+                  x_out: wp.array(dtype=wp.float32)):
+                a = wp.tile_load(A, shape=(N, N), storage="shared")
+                rhs = wp.tile_load(y, shape=N, storage="shared")
+                L = wp.tile_cholesky(a)
+                x = wp.tile_cholesky_solve(L, rhs)
+                wp.tile_store(L_out, L)
+                wp.tile_store(x_out, x)
+
+            rng = np.random.default_rng(64)
+            M = rng.standard_normal((64, 64)).astype(np.float32)
+            A_h = (M @ M.T + 64.0 * np.eye(64, dtype=np.float32))
+            y_h = rng.standard_normal(64).astype(np.float32)
+            x_np = np.linalg.solve(A_h.astype(np.float64),
+                                   y_h.astype(np.float64)).astype(np.float32)
+            results = {}
+            for dev in ("cpu", "metal:0"):
+                A = wp.array(A_h, dtype=wp.float32, device=dev)
+                y = wp.array(y_h, dtype=wp.float32, device=dev)
+                Lo = wp.zeros((64, 64), dtype=wp.float32, device=dev)
+                xo = wp.zeros(64, dtype=wp.float32, device=dev)
+                wp.launch_tiled(k, dim=[1], inputs=[A, y], outputs=[Lo, xo],
+                                block_dim=1, device=dev)
+                results[dev] = (Lo.numpy(), xo.numpy())
+            Lm = results['metal:0'][0]
+            recon = Lm.astype(np.float64) @ Lm.T.astype(np.float64)
+            np.testing.assert_allclose(recon, A_h.astype(np.float64), atol=5e-4)
+            np.testing.assert_allclose(results['metal:0'][1], x_np, atol=1e-4)
+            np.testing.assert_allclose(results['cpu'][0], results['metal:0'][0], atol=1e-5)
+            np.testing.assert_allclose(results['cpu'][1], results['metal:0'][1], atol=1e-5)
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=180)
+
     def test_tile_cholesky_inplace_matches_cpu(self):
         # Inplace variant — used by mujoco_warp's blocked Cholesky
         # path. Reuses the storage of A as the factor L, so any
