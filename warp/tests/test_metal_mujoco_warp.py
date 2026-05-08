@@ -231,6 +231,67 @@ class TestMetalMujocoWarp(unittest.TestCase):
         # but stays at ~1e-4 over this horizon.
         self._run(xml, nsteps=5)
 
+    def test_pendula_multi_step_warmstart_drift(self):
+        # Regression for the packed init-shadows fix: mujoco_warp's
+        # constraint pipeline writes ``d.efc.J`` / ``d.efc.aref`` etc.
+        # via multiple atomic kernels per step, each with conditional
+        # writes. Without seeding the non-atomic outputs from prior
+        # values, every kernel's fresh MLX output buffer overwrote the
+        # rest of the array with zeros. The iterative solver then saw
+        # ``ctx.cost ≈ 0`` and stopped after iter 0, leaving a
+        # near-trivial ``qacc`` that drifted from CPU by ~17 per step.
+        #
+        # Pre-fix: pendula step 1 qacc diff 1.7e+01, step 10 ≈ 4e+01.
+        # Post-fix: step 1 qacc diff < 5e-2, step 10 < 5e-1.
+        #
+        # 10 steps with atol large enough to cover float32 drift over
+        # the iterative-solver linesearch but tight enough to catch a
+        # regression to the broken behavior.
+        snippet = textwrap.dedent(
+            """
+            import os
+            import warp as wp
+            import mujoco
+            import mujoco_warp as mjw
+            import mujoco_warp._src.solver as _solver
+            import numpy as np
+
+            xml_path = os.path.join(
+                os.path.dirname(os.path.abspath(mjw.__file__)),
+                "test_data", "pendula.xml")
+            mjm = mujoco.MjModel.from_xml_path(xml_path)
+            mjm.opt.jacobian = mujoco.mjtJacobian.mjJAC_SPARSE
+            _solver._BLOCK_CHOLESKY_DIM = 64
+            mjd = mujoco.MjData(mjm)
+            mujoco.mj_resetData(mjm, mjd)
+            mujoco.mj_forward(mjm, mjd)
+
+            results = {}
+            for dev in ("cpu", "metal:0"):
+                with wp.ScopedDevice(dev):
+                    m = mjw.put_model(mjm)
+                    d = mjw.put_data(mjm, mjd)
+                    for _ in range(10):
+                        mjw.step(m, d)
+                    wp.synchronize_device()
+                    results[dev] = (
+                        d.qpos.numpy().copy(),
+                        d.qvel.numpy().copy(),
+                        d.qacc.numpy().copy(),
+                    )
+            qpos_d = float(np.max(np.abs(results['cpu'][0] - results['metal:0'][0])))
+            qvel_d = float(np.max(np.abs(results['cpu'][1] - results['metal:0'][1])))
+            qacc_d = float(np.max(np.abs(results['cpu'][2] - results['metal:0'][2])))
+            print(f'qpos diff: {qpos_d:.4e}')
+            print(f'qvel diff: {qvel_d:.4e}')
+            print(f'qacc diff: {qacc_d:.4e}')
+            assert qpos_d < 1e-3, f'qpos drift too large: {qpos_d}'
+            assert qvel_d < 5e-2, f'qvel drift too large: {qvel_d}'
+            assert qacc_d < 1.0,  f'qacc drift too large: {qacc_d}'
+            """
+        )
+        _run_subprocess(self, snippet, timeout=180)
+
     def test_atomic_output_read_in_expression(self):
         # Regression for the atomic-load wrapper: reads of an
         # atomic-typed output that appear *inside* an expression
