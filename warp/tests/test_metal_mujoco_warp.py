@@ -1,0 +1,226 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""End-to-end CPU vs Metal physics integration via mujoco_warp.
+
+These tests run ``mujoco_warp.step()`` on small MuJoCo models on both
+``cpu`` and ``metal:0`` and assert agreement between the resulting
+dynamics state arrays. They protect the Metal backend's high-level
+codegen against regressions that only surface when many kernels
+interact (smooth dynamics, constraint solver, contact pipeline).
+
+Skipped when:
+  - Not on Apple Silicon (no Metal device)
+  - MLX not installed
+  - mujoco_warp not on the import path
+  - Stock ``warp-lang`` (no ``enable_metal`` config flag)
+
+Each test runs in a fresh subprocess because ``warp.config.enable_metal``
+must be set BEFORE ``wp.init()`` runs, and ``wp.init()`` is process-
+global.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import os
+import platform
+import subprocess
+import sys
+import tempfile
+import textwrap
+import unittest
+
+
+def _is_apple_silicon() -> bool:
+    return sys.platform == "darwin" and platform.machine() == "arm64"
+
+
+def _has_mlx() -> bool:
+    try:
+        import mlx.core as mx  # noqa: PLC0415
+
+        return mx.metal.is_available()
+    except Exception:
+        return False
+
+
+def _has_metal_warp() -> bool:
+    try:
+        import warp.config  # noqa: PLC0415
+
+        return hasattr(warp.config, "enable_metal")
+    except Exception:
+        return False
+
+
+def _has_mujoco_warp() -> bool:
+    return importlib.util.find_spec("mujoco_warp") is not None
+
+
+def _run_subprocess(test_case: unittest.TestCase, snippet: str, timeout: int = 240) -> None:
+    """Run ``snippet`` with ``enable_metal=True``; fail if exit != 0."""
+    code = (
+        "import warp as wp\n"
+        "wp.config.enable_metal = True\n"
+        "wp.init()\n"
+    ) + snippet
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, prefix="warp_mjw_test_") as f:
+        f.write(code)
+        path = f.name
+    try:
+        result = subprocess.run(
+            [sys.executable, path],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    test_case.assertEqual(
+        result.returncode,
+        0,
+        f"subprocess exited with {result.returncode}\n--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}",
+    )
+
+
+_COMPARE_FIELDS = ("qpos", "qvel", "qacc", "act", "time", "xpos", "xquat")
+
+
+_COMPARE_SNIPPET = textwrap.dedent(
+    """
+    import mujoco
+    import numpy as np
+    import warp as wp
+    import mujoco_warp as mjw
+
+    # The simple-vs-blocked Cholesky threshold: bump it past nv so models
+    # with nv up to 64 use the (now correct) single-tile path on Metal,
+    # avoiding the cooperative blocked-Cholesky kernels which still need
+    # follow-up parallelism work to be efficient.
+    if _BUMP_CHOLESKY_THRESHOLD:
+        import mujoco_warp._src.solver as _mjw_solver
+        _mjw_solver._BLOCK_CHOLESKY_DIM = 64
+
+    mjm = mujoco.MjModel.from_xml_string(_XML)
+    # Force sparse Jacobian — the dense path uses cooperative tiles of
+    # ``vec_t<6, float>`` (spatial vectors) which the Metal backend
+    # doesn't lower yet (see project task list).
+    mjm.opt.jacobian = mujoco.mjtJacobian.mjJAC_SPARSE
+    mjd = mujoco.MjData(mjm)
+    mujoco.mj_resetData(mjm, mjd)
+    mujoco.mj_forward(mjm, mjd)
+
+    with wp.ScopedDevice('cpu'):
+        m_cpu = mjw.put_model(mjm)
+        d_cpu = mjw.put_data(mjm, mjd)
+        for _ in range(_NSTEPS):
+            mjw.step(m_cpu, d_cpu)
+        cpu_state = {f: getattr(d_cpu, f).numpy().copy() for f in _COMPARE_FIELDS if hasattr(d_cpu, f)}
+
+    with wp.ScopedDevice('metal:0'):
+        m_metal = mjw.put_model(mjm)
+        d_metal = mjw.put_data(mjm, mjd)
+        for _ in range(_NSTEPS):
+            mjw.step(m_metal, d_metal)
+        metal_state = {f: getattr(d_metal, f).numpy().copy() for f in _COMPARE_FIELDS if hasattr(d_metal, f)}
+
+    for f in cpu_state:
+        a = cpu_state[f]
+        b = metal_state[f]
+        np.testing.assert_allclose(
+            a, b,
+            atol=_ATOL, rtol=_RTOL,
+            err_msg=f'{f} differs between cpu and metal:0 (shape={a.shape})',
+        )
+    print('OK')
+    """
+)
+
+
+@unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
+@unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
+@unittest.skipUnless(_has_metal_warp(), "Warp build does not expose enable_metal — using stock warp-lang?")
+@unittest.skipUnless(_has_mujoco_warp(), "mujoco_warp is not installed; skipping integration tests")
+class TestMetalMujocoWarp(unittest.TestCase):
+    """End-to-end mujoco_warp.step() agreement between CPU and Metal."""
+
+    def _run(
+        self,
+        xml: str,
+        nsteps: int = 1,
+        atol: float = 1e-4,
+        rtol: float = 1e-4,
+        bump_cholesky_threshold: bool = False,
+    ) -> None:
+        snippet = textwrap.dedent(
+            f"""
+            _XML = {xml!r}
+            _NSTEPS = {nsteps}
+            _ATOL = {atol}
+            _RTOL = {rtol}
+            _COMPARE_FIELDS = {_COMPARE_FIELDS!r}
+            _BUMP_CHOLESKY_THRESHOLD = {bump_cholesky_threshold}
+            """
+        ) + _COMPARE_SNIPPET
+        _run_subprocess(self, snippet)
+
+    def test_freejoint_sphere_drops_under_gravity(self):
+        # Simplest model: one body, free joint, sphere geom. Tests
+        # gravity, integration, kinematics; no contact.
+        xml = """
+        <mujoco>
+          <worldbody>
+            <body name="b" pos="0 0 1">
+              <freejoint/>
+              <geom size="0.1"/>
+            </body>
+          </worldbody>
+        </mujoco>
+        """
+        self._run(xml, nsteps=5)
+
+    def test_pendulum_swings(self):
+        # Single hinge pendulum. Exercises the constraint solver
+        # minimally and a non-trivial kinematic chain.
+        xml = """
+        <mujoco>
+          <worldbody>
+            <body name="link" pos="0 0 1">
+              <joint type="hinge" axis="0 1 0"/>
+              <geom type="capsule" size="0.05" fromto="0 0 0  0 0 -0.5"/>
+            </body>
+          </worldbody>
+        </mujoco>
+        """
+        self._run(xml, nsteps=10)
+
+    def test_two_bodies_with_actuator(self):
+        # Two-link arm with position actuators. End-to-end actuation.
+        xml = """
+        <mujoco>
+          <worldbody>
+            <body name="link1" pos="0 0 1">
+              <joint name="j1" type="hinge" axis="0 1 0"/>
+              <geom type="capsule" size="0.05" fromto="0 0 0  0 0 -0.4"/>
+              <body name="link2" pos="0 0 -0.4">
+                <joint name="j2" type="hinge" axis="0 1 0"/>
+                <geom type="capsule" size="0.05" fromto="0 0 0  0 0 -0.4"/>
+              </body>
+            </body>
+          </worldbody>
+          <actuator>
+            <position joint="j1" kp="50" ctrlrange="-1 1"/>
+            <position joint="j2" kp="50" ctrlrange="-1 1"/>
+          </actuator>
+        </mujoco>
+        """
+        self._run(xml, nsteps=5)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
