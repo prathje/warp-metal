@@ -1523,6 +1523,13 @@ def _msl_constant_str(value) -> str:
         # MSL accepts the same syntax as C++; ``f`` suffix marks single
         # precision so the literal stays in fp32 register pressure.
         return f"{value!r}f"
+    # Warp's ``uint32`` / ``int32`` etc. wrap into typed-int classes
+    # whose ``int(...)`` works. mujoco_warp's solver passes these as
+    # bitmask constants (``DisableBit.WARMSTART`` = ``uint32(2)``).
+    try:
+        return str(int(value))
+    except (TypeError, ValueError):
+        pass
     raise MetalCodegenError(f"MSL codegen does not yet support constant values of type {type(value).__name__}")
 
 
