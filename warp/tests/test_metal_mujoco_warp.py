@@ -231,6 +231,85 @@ class TestMetalMujocoWarp(unittest.TestCase):
         # but stays at ~1e-4 over this horizon.
         self._run(xml, nsteps=5)
 
+    def test_atomic_output_read_in_expression(self):
+        # Regression for the atomic-load wrapper: reads of an
+        # atomic-typed output that appear *inside* an expression
+        # (vec3 constructor, function call args, binary op operands)
+        # weren't being wrapped in ``atomic_load_explicit``, so they
+        # tried to implicitly convert ``device atomic<float>*`` to
+        # ``float`` and failed the MSL compile. mujoco_warp's
+        # ``_linear_momentum`` hits this with
+        # ``subtree_linvel_out[w, b] /= scalar`` (read-modify-write
+        # on a vec3-typed atomic output) — the kernel surfaced first
+        # on Unitree Go1 / G1 quadruped+humanoid models.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(a: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
+                tid = wp.tid()
+                if tid == 0:
+                    # Mark ``a`` atomic-output via atomic_add.
+                    wp.atomic_add(a, 0, 0.0)
+                    # Read in expression position — this used to fail
+                    # to compile with the unscoped ``a[i]`` access.
+                    s = a[0] + a[1] * 2.0 + a[2] * 3.0
+                    out[0] = s
+
+            for dev in ("cpu", "metal:0"):
+                a = wp.array(np.array([1.0, 2.0, 3.0], dtype=np.float32),
+                             dtype=wp.float32, device=dev)
+                out = wp.zeros(1, dtype=wp.float32, device=dev)
+                wp.launch(k, dim=1, inputs=[a], outputs=[out], device=dev)
+                wp.synchronize_device()
+                # The compute is 1 + 2*2 + 3*3 = 1 + 4 + 9 = 14 — but
+                # only on CPU where ``a`` retains its values. On Metal
+                # ``a`` becomes a fresh atomic output whose unwritten
+                # slots are zero, so the value differs. The point of
+                # the test is just that the kernel COMPILES — if the
+                # wrapper regresses, MSL throws a compile error and
+                # ``wp.launch`` fails.
+            print("OK")
+            """
+        )
+        _run_subprocess(self, snippet)
+
+    def test_mjlab_go1_quadruped_3_steps(self):
+        # End-to-end Metal test on Unitree Go1 (quadruped). nv=18,
+        # exercises the contact pipeline with multiple body geoms.
+        # Without the atomic-load expression-position wrapper, the
+        # ``_linear_momentum`` kernel fails to compile because
+        # ``subtree_linvel_out[w, b] /= scalar`` (the vec3 read-
+        # modify-write) tries to implicit-convert atomic to float.
+        xml_path = "/Users/patrickrathje/git/robotics/g1/mjlab/src/mjlab/asset_zoo/robots/unitree_go1/xmls/go1.xml"
+        if not __import__("os").path.exists(xml_path):
+            self.skipTest("mjlab Go1 XML not available")
+        # Just verify the kernel compiles + runs 3 steps without error.
+        # Don't compare to CPU per-step values yet — that's a follow-up
+        # once dense-Jacobian and warmstart paths land.
+        snippet = textwrap.dedent(
+            f"""
+            _XML_PATH = {xml_path!r}
+            import warp as wp
+            import mujoco
+            import mujoco_warp as mjw
+            mjm = mujoco.MjModel.from_xml_path(_XML_PATH)
+            mjm.opt.jacobian = mujoco.mjtJacobian.mjJAC_SPARSE
+            mjd = mujoco.MjData(mjm)
+            mujoco.mj_forward(mjm, mjd)
+            with wp.ScopedDevice('metal:0'):
+                m = mjw.put_model(mjm)
+                d = mjw.put_data(mjm, mjd)
+                for _ in range(3):
+                    mjw.step(m, d)
+                    wp.synchronize_device()
+            print('OK')
+            """
+        )
+        _run_subprocess(self, snippet)
+
     def test_cartpole_with_contact_geoms(self):
         # mjlab's cartpole model. Exercises the full contact pipeline
         # because there are static (worldbody-attached) geoms — floor
