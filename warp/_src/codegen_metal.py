@@ -611,11 +611,16 @@ def _emit_tile_struct(rows: int, cols: int, msl_scalar: str) -> str:
     parts.append(f"struct {name} {{")
     parts.append(f"    {msl_scalar} c[{n}];")
     parts.append("};")
-    # Load: read an ``rows × cols`` sub-block from a row-major device array
-    # whose row stride is ``row_stride``. ``base`` is the flat offset of the
-    # 2-D slice (e.g. ``worldid * shape[1] * shape[2]`` for a 3-D array).
+    # Load: read an ``rows × cols`` sub-block from a row-major array. MLX
+    # selects the address space (``device`` vs ``constant``) per kernel
+    # argument based on size — small read-only buffers (e.g. a 6-element
+    # RHS vector) land in ``constant``. We template the load helper on
+    # the pointer type so the same call site works for either: the MSL
+    # compiler instantiates one body per (address-space) flavor and
+    # deduplicates at link time.
+    parts.append(f"template <typename T>")
     parts.append(
-        f"inline {name} {name}_load(device const {msl_scalar}* arr, "
+        f"inline {name} {name}_load(T arr, "
         "int base, int row_stride, int row_off, int col_off) {"
     )
     parts.append(f"    {name} t;")
@@ -626,6 +631,7 @@ def _emit_tile_struct(rows: int, cols: int, msl_scalar: str) -> str:
             )
     parts.append("    return t;")
     parts.append("}")
+    # Store target is always writable, so it stays ``device``.
     parts.append(
         f"inline void {name}_store(device {msl_scalar}* arr, "
         f"int base, int row_stride, int row_off, int col_off, {name} t) {{"
@@ -1616,6 +1622,14 @@ _TILE_CHOLESKY_PAT = re.compile(
 _TILE_CHOLESKY_SOLVE_PAT = re.compile(
     r"\bvar_(\w+)\s*=\s*wp::tile_cholesky_solve\s*<[^()]*>\s*\(([^)]*)\)"
 )
+# ``wp::tile_cholesky_solve_inplace<upper>(0, var_L, var_b);`` — solves
+# ``L L^T x = b`` and mutates ``b`` to hold ``x``. Three args after the
+# template arg: the LTO seg pad, the factor tile, and the RHS. Lowers
+# to a self-assigning call into the existing non-inplace helper —
+# ``var_b = helper(var_L, var_b)``.
+_TILE_CHOLESKY_SOLVE_INPLACE_PAT = re.compile(
+    r"\bwp::tile_cholesky_solve_inplace\s*<[^()]*>\s*\(([^)]*)\)"
+)
 
 
 def _build_flat_base_expr(arr_name: str, lead_idx_args: list[str], inner_dims: int) -> str:
@@ -2019,6 +2033,35 @@ def _translate_tile_intrinsics(
     line = _TILE_STORE_PAT.sub(repl_store, line)
     line = _TILE_CHOLESKY_PAT.sub(repl_cholesky, line)
     line = _TILE_CHOLESKY_SOLVE_PAT.sub(repl_cholesky_solve, line)
+
+    def repl_cholesky_solve_inplace(m: re.Match[str]) -> str:
+        # Args: leading LTO seg, L tile (NxN), b tile (NxK).
+        args = [a.strip() for a in m.group(1).split(",")]
+        if len(args) < 3:
+            return m.group(0)
+        L_arg, b_arg = args[1], args[2]
+        L_label = L_arg[len("var_"):] if L_arg.startswith("var_") else L_arg
+        b_label = b_arg[len("var_"):] if b_arg.startswith("var_") else b_arg
+        L_dims = tile_var_dims.get(L_label)
+        b_dims = tile_var_dims.get(b_label)
+        if L_dims is None or b_dims is None:
+            return m.group(0)
+        n = L_dims[0]
+        k_cols = b_dims[1]
+        scalar = L_dims[2]
+        if n == 1 and k_cols == 1:
+            return f"{b_arg} = {b_arg} / ({L_arg} * {L_arg})"
+        helper = f"wp_tile_{n}x{n}_{scalar}_cholesky_solve_{k_cols}"
+        call = f"{b_arg} = {helper}({L_arg}, {b_arg})"
+        if view_aliases is not None and b_label in view_aliases:
+            parent_label, prows, pcols, vrows, vcols, vscalar, row_off, col_off = view_aliases[b_label]
+            wb = _emit_tile_writeback(
+                parent_label, prows, pcols, vrows, vcols, vscalar, row_off, col_off, b_arg
+            )
+            return f"{call};\n{wb}"
+        return call
+
+    line = _TILE_CHOLESKY_SOLVE_INPLACE_PAT.sub(repl_cholesky_solve_inplace, line)
     return line
 
 

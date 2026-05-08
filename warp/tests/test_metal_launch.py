@@ -2840,6 +2840,215 @@ class TestMetalLaunch(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet)
 
+    def test_tile_load_store_round_trip_matches_cpu(self):
+        # Smallest tile primitive case: load a 6x6 sub-block and store
+        # it back. Exercises ``_emit_tile_struct`` and confirms the
+        # template-on-address-space load helper works for both
+        # ``device`` and ``constant`` MLX argument bindings (small
+        # read-only buffers like the 6-element RHS land in the
+        # constant pool, which used to break the type-monomorphic
+        # signature).
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(A: wp.array2d(dtype=wp.float32),
+                  out: wp.array2d(dtype=wp.float32)):
+                a = wp.tile_load(A, shape=(6, 6), offset=(0, 0), storage="shared")
+                wp.tile_store(out, a, offset=(0, 0))
+
+            rng = np.random.default_rng(0)
+            A_h = rng.standard_normal((6, 6)).astype(np.float32)
+            results = {}
+            for dev in ("cpu", "metal:0"):
+                A = wp.array(A_h, dtype=wp.float32, device=dev)
+                out = wp.zeros((6, 6), dtype=wp.float32, device=dev)
+                wp.launch_tiled(k, dim=[1], inputs=[A], outputs=[out],
+                                block_dim=1, device=dev)
+                results[dev] = out.numpy()
+            np.testing.assert_array_equal(results['cpu'], A_h)
+            np.testing.assert_array_equal(results['metal:0'], A_h)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_tile_load_with_offset_matches_cpu(self):
+        # Non-zero offset path: pulls a 4x3 sub-block from the middle
+        # of an 8x6 backing array, exercising the row-stride and
+        # row-offset arithmetic that the OBB / contact_jac kernels
+        # rely on.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(A: wp.array2d(dtype=wp.float32),
+                  out: wp.array2d(dtype=wp.float32)):
+                a = wp.tile_load(A, shape=(4, 3), offset=(2, 1), storage="shared")
+                wp.tile_store(out, a, offset=(0, 0))
+
+            rng = np.random.default_rng(42)
+            A_h = rng.standard_normal((8, 6)).astype(np.float32)
+            ref = A_h[2:6, 1:4]
+            for dev in ("cpu", "metal:0"):
+                A = wp.array(A_h, dtype=wp.float32, device=dev)
+                out = wp.zeros((4, 3), dtype=wp.float32, device=dev)
+                wp.launch_tiled(k, dim=[1], inputs=[A], outputs=[out],
+                                block_dim=1, device=dev)
+                np.testing.assert_array_equal(out.numpy(), ref)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_tile_cholesky_solve_n6_matches_cpu(self):
+        # Freejoint mass-matrix size: N=6 SPD with a vector RHS.
+        # mujoco_warp's simple (non-blocked) path goes through this
+        # exact shape for any single-freejoint body.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            N = wp.constant(6)
+
+            @wp.kernel
+            def k(A: wp.array2d(dtype=wp.float32),
+                  y: wp.array(dtype=wp.float32),
+                  L_out: wp.array2d(dtype=wp.float32),
+                  x_out: wp.array(dtype=wp.float32)):
+                a = wp.tile_load(A, shape=(N, N), storage="shared")
+                rhs = wp.tile_load(y, shape=N, storage="shared")
+                L = wp.tile_cholesky(a)
+                x = wp.tile_cholesky_solve(L, rhs)
+                wp.tile_store(L_out, L)
+                wp.tile_store(x_out, x)
+
+            rng = np.random.default_rng(7)
+            M = rng.standard_normal((6, 6)).astype(np.float32)
+            A_h = (M @ M.T + 6.0 * np.eye(6, dtype=np.float32))
+            y_h = rng.standard_normal(6).astype(np.float32)
+            L_np = np.linalg.cholesky(A_h.astype(np.float64)).astype(np.float32)
+            x_np = np.linalg.solve(A_h.astype(np.float64),
+                                   y_h.astype(np.float64)).astype(np.float32)
+            results = {}
+            for dev in ("cpu", "metal:0"):
+                A = wp.array(A_h, dtype=wp.float32, device=dev)
+                y = wp.array(y_h, dtype=wp.float32, device=dev)
+                Lo = wp.zeros((6, 6), dtype=wp.float32, device=dev)
+                xo = wp.zeros(6, dtype=wp.float32, device=dev)
+                wp.launch_tiled(k, dim=[1], inputs=[A, y], outputs=[Lo, xo],
+                                block_dim=1, device=dev)
+                results[dev] = (Lo.numpy(), xo.numpy())
+            # L is bit-exact between CPU and Metal; x can drift by ~1e-9
+            # from the float32 precision of the two solver paths.
+            np.testing.assert_array_equal(results['cpu'][0], results['metal:0'][0])
+            np.testing.assert_allclose(results['metal:0'][0], L_np, atol=1e-6)
+            np.testing.assert_allclose(results['metal:0'][1], x_np, atol=1e-5)
+            np.testing.assert_allclose(results['cpu'][1], results['metal:0'][1], atol=1e-6)
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=60)
+
+    def test_tile_cholesky_solve_n8_matches_cpu(self):
+        # Eight-DOF block — the size at which the MSL outer-loop unroll
+        # bug surfaces if ``#pragma clang loop unroll(disable)`` is
+        # missing from the Cholesky / triangular solve emitters. This
+        # is the canonical regression for that workaround.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            N = wp.constant(8)
+
+            @wp.kernel
+            def k(A: wp.array2d(dtype=wp.float32),
+                  y: wp.array(dtype=wp.float32),
+                  L_out: wp.array2d(dtype=wp.float32),
+                  x_out: wp.array(dtype=wp.float32)):
+                a = wp.tile_load(A, shape=(N, N), storage="shared")
+                rhs = wp.tile_load(y, shape=N, storage="shared")
+                L = wp.tile_cholesky(a)
+                x = wp.tile_cholesky_solve(L, rhs)
+                wp.tile_store(L_out, L)
+                wp.tile_store(x_out, x)
+
+            rng = np.random.default_rng(11)
+            M = rng.standard_normal((8, 8)).astype(np.float32)
+            A_h = (M @ M.T + 8.0 * np.eye(8, dtype=np.float32))
+            y_h = rng.standard_normal(8).astype(np.float32)
+            L_np = np.linalg.cholesky(A_h.astype(np.float64)).astype(np.float32)
+            x_np = np.linalg.solve(A_h.astype(np.float64),
+                                   y_h.astype(np.float64)).astype(np.float32)
+            results = {}
+            for dev in ("cpu", "metal:0"):
+                A = wp.array(A_h, dtype=wp.float32, device=dev)
+                y = wp.array(y_h, dtype=wp.float32, device=dev)
+                Lo = wp.zeros((8, 8), dtype=wp.float32, device=dev)
+                xo = wp.zeros(8, dtype=wp.float32, device=dev)
+                wp.launch_tiled(k, dim=[1], inputs=[A, y], outputs=[Lo, xo],
+                                block_dim=1, device=dev)
+                results[dev] = (Lo.numpy(), xo.numpy())
+            # Last row of L is the canary — the unroll bug zeroed
+            # ``L[7, 0:6]`` while leaving ``L[7, 6:8]`` correct.
+            np.testing.assert_allclose(results['metal:0'][0], L_np, atol=1e-5)
+            np.testing.assert_allclose(results['metal:0'][1], x_np, atol=1e-4)
+            np.testing.assert_allclose(results['cpu'][0], results['metal:0'][0], atol=1e-6)
+            np.testing.assert_allclose(results['cpu'][1], results['metal:0'][1], atol=1e-6)
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=60)
+
+    def test_tile_cholesky_inplace_matches_cpu(self):
+        # Inplace variant — used by mujoco_warp's blocked Cholesky
+        # path. Reuses the storage of A as the factor L, so any
+        # accidental aliasing or stale-storage bug shows up here.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            N = wp.constant(6)
+
+            @wp.kernel
+            def k(A: wp.array2d(dtype=wp.float32),
+                  y: wp.array(dtype=wp.float32),
+                  L_out: wp.array2d(dtype=wp.float32),
+                  x_out: wp.array(dtype=wp.float32)):
+                a = wp.tile_load(A, shape=(N, N), storage="shared")
+                rhs = wp.tile_load(y, shape=N, storage="shared")
+                wp.tile_cholesky_inplace(a)
+                wp.tile_cholesky_solve_inplace(a, rhs)
+                wp.tile_store(L_out, a)
+                wp.tile_store(x_out, rhs)
+
+            rng = np.random.default_rng(13)
+            M = rng.standard_normal((6, 6)).astype(np.float32)
+            A_h = (M @ M.T + 6.0 * np.eye(6, dtype=np.float32))
+            y_h = rng.standard_normal(6).astype(np.float32)
+            L_np = np.linalg.cholesky(A_h.astype(np.float64)).astype(np.float32)
+            x_np = np.linalg.solve(A_h.astype(np.float64),
+                                   y_h.astype(np.float64)).astype(np.float32)
+            results = {}
+            for dev in ("cpu", "metal:0"):
+                A = wp.array(A_h, dtype=wp.float32, device=dev)
+                y = wp.array(y_h, dtype=wp.float32, device=dev)
+                Lo = wp.zeros((6, 6), dtype=wp.float32, device=dev)
+                xo = wp.zeros(6, dtype=wp.float32, device=dev)
+                wp.launch_tiled(k, dim=[1], inputs=[A, y], outputs=[Lo, xo],
+                                block_dim=1, device=dev)
+                results[dev] = (Lo.numpy(), xo.numpy())
+            np.testing.assert_allclose(results['metal:0'][0], L_np, atol=1e-6)
+            np.testing.assert_allclose(results['metal:0'][1], x_np, atol=1e-5)
+            np.testing.assert_allclose(results['cpu'][0], results['metal:0'][0], atol=1e-6)
+            np.testing.assert_allclose(results['cpu'][1], results['metal:0'][1], atol=1e-6)
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=60)
+
     def test_rejects_adjoint_launch(self):
         snippet = textwrap.dedent(
             """
