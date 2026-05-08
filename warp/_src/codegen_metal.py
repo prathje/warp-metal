@@ -1771,36 +1771,45 @@ del _name
 
 
 def _wrap_atomic_load_reads(text: str, arr_name: str) -> str:
-    """Wrap occurrences of ``= arr_name[<balanced...>]`` in atomic_load.
+    """Wrap any read of ``arr_name[<balanced...>]`` in atomic_load.
 
     A regex won't suffice because the index expression can contain nested
     ``[...]`` (e.g. ``arr[i * shape[k] + j]``). We scan forward, count
     bracket depth, and rewrite the matched span.
+
+    Reads can appear in many syntactic positions:
+      - ``var_X = arr[idx];``                         (plain assign)
+      - ``var_X = float3(arr[i], arr[j], arr[k]);``   (constructor arg)
+      - ``foo(arr[idx], ...)``                        (call arg)
+      - ``var_X = expr op arr[idx];``                 (binary expr operand)
+
+    We exclude WRITE forms by skipping when the next non-space token after
+    the index closes is ``=`` (assignment) or when ``=`` directly precedes
+    the array name (compound ``+=`` / ``-=`` / etc.).
     """
     out_parts: list[str] = []
     i = 0
     n = len(text)
-    needle = f"= {arr_name}["
+    needle = f"{arr_name}["
+    arr_len = len(arr_name)
     while i < n:
         j = text.find(needle, i)
         if j < 0:
             out_parts.append(text[i:])
             break
-        # Verify it's preceded by either ``=`` whitespace or another ``=``
-        # of an assignment (i.e. the ``=`` belongs to ``var_X = arr[...]``,
-        # not to ``... == arr[...]`` or ``+= arr[...]`` etc.). Easiest
-        # filter: the character before the ``=`` must be whitespace or
-        # ``)``; the character before THAT must NOT also be ``=``/``!``/
-        # ``<``/``>``/``+``/``-``/``*``/``/``.
-        prev_eq = j  # index of ``=``
-        prev_ch = text[prev_eq - 1] if prev_eq > 0 else ""
-        prev2 = text[prev_eq - 2] if prev_eq > 1 else ""
-        if prev_ch == "=" or (prev_ch == " " and prev2 in "=!<>+-*/"):
-            # Not a plain assignment.
-            out_parts.append(text[i:j + len(needle)])
-            i = j + len(needle)
+        # Word-boundary check: the char before must not be a name char.
+        prev_ch = text[j - 1] if j > 0 else ""
+        if prev_ch.isalnum() or prev_ch == "_":
+            out_parts.append(text[i:j + 1])
+            i = j + 1
             continue
-        out_parts.append(text[i:j])
+        # Skip address-of forms ``&arr[idx]`` — those feed into atomic
+        # builtins (``atomic_fetch_add_explicit(&arr[i], val, ...)``)
+        # which want the pointer, not the loaded value.
+        if prev_ch == "&":
+            out_parts.append(text[i:j + 1])
+            i = j + 1
+            continue
         # Find the matching close bracket, accounting for nesting.
         bracket_start = j + len(needle)
         depth = 1
@@ -1812,12 +1821,25 @@ def _wrap_atomic_load_reads(text: str, arr_name: str) -> str:
                 depth -= 1
             k += 1
         if depth != 0:
-            # Unbalanced — fall back to no-op for safety.
-            out_parts.append(text[j:k])
+            out_parts.append(text[i:k])
+            i = k
+            continue
+        # Skip if this is a WRITE: ``arr[idx] = ...`` or ``arr[idx] += ...``.
+        # Look at the next non-space char after the closing ``]``.
+        m = k
+        while m < n and text[m] == " ":
+            m += 1
+        is_write = m < n and text[m] == "=" and (m + 1 >= n or text[m + 1] != "=")
+        # Also a WRITE if the op is compound ``+= /= *= -=``.
+        if not is_write and m + 1 < n and text[m + 1] == "=" and text[m] in "+-*/":
+            is_write = True
+        if is_write:
+            out_parts.append(text[i:k])
             i = k
             continue
         idx_expr = text[bracket_start:k - 1]
-        out_parts.append(f"= atomic_load_explicit(&{arr_name}[{idx_expr}], memory_order_relaxed)")
+        out_parts.append(text[i:j])
+        out_parts.append(f"atomic_load_explicit(&{arr_name}[{idx_expr}], memory_order_relaxed)")
         i = k
     return "".join(out_parts)
 
