@@ -1888,6 +1888,7 @@ def _translate_tile_intrinsics(
     view_aliases: dict[str, tuple[str, int, int, int, int, str, str, str]] | None = None,
     coop_chol_seen: set[tuple[int, str]] | None = None,
     is_coop_kernel: bool = False,
+    transpose_aliases: dict[str, str] | None = None,
 ) -> str:
     """Lower ``wp::tile_*`` calls to ``wp_tile_RxC_<scalar>_*`` helper calls.
 
@@ -2115,6 +2116,17 @@ def _translate_tile_intrinsics(
         # is simply identity.
         if rows == 1 and cols == 1:
             return f"var_{lhs} = var_{in_label}"
+        # On the CUDA/cuBLASDx path, ``tile_transpose`` returns a
+        # *layout-only view* over the same shared-memory storage —
+        # mutating the result also mutates the source (via swapped
+        # strides). On Metal we materialize tiles in private structs,
+        # so the helper returns a *copy*. To preserve write-through
+        # semantics, register ``lhs`` as a transpose-alias of
+        # ``in_label`` so mutating ops (``*_solve_inplace``,
+        # ``tile_matmul_acc``'s C target) can emit a transpose-back
+        # writeback into the source.
+        if transpose_aliases is not None:
+            transpose_aliases[lhs] = in_label
         helper = f"wp_tile_{rows}x{cols}_{msl_scalar}_transpose"
         return f"var_{lhs} = {helper}(var_{in_label})"
 
@@ -2196,6 +2208,18 @@ def _translate_tile_intrinsics(
                 parent_label, prows, pcols, vrows, vcols, vscalar, row_off, col_off, B_arg
             )
             return f"{call};\n{wb}"
+        # If B was produced by ``tile_transpose``, the mutation needs to
+        # propagate back to the source so its caller can ``tile_store``
+        # the updated values. Emit ``source = transpose(B)`` after the
+        # solve; the helper's per-(R,C) emit handles the index swap.
+        if transpose_aliases is not None and B_label in transpose_aliases:
+            src_label = transpose_aliases[B_label]
+            src_dims = tile_var_dims.get(src_label)
+            if src_dims is not None:
+                src_rows, src_cols, src_scalar = src_dims
+                back_helper = f"wp_tile_{B_dims[0]}x{B_dims[1]}_{B_dims[2]}_transpose"
+                wb = f"var_{src_label} = {back_helper}({B_arg})"
+                return f"{call};\n{wb}"
         return call
 
     line = _TILE_LOWER_SOLVE_INPLACE_PAT.sub(lambda m: _repl_solve_inplace("lower", m), line)
@@ -2451,6 +2475,73 @@ class MetalKernelArtifact:
     header: str = ""
 
 
+# Match the AST-emitted ``for`` lines so we can flip ``<`` to ``>`` when
+# the step expression resolves to a negative integer. The inner ``inc``
+# capture handles both ``++var_X`` (step 1) and ``var_X += <step>`` forms.
+_FOR_LOOP_LINE_PAT = re.compile(
+    r"^(?P<indent>\s*)for \(var_(?P<iv>\w+) = (?P<start>[^;]+); "
+    r"var_(?P=iv) < (?P<stop>[^;]+); "
+    r"(?P<inc>(?:\+\+var_(?P=iv))|(?:var_(?P=iv) \+= (?P<step>[^)]+)))\) \{$"
+)
+# Matches lines that introduce a compile-time int constant — used to
+# resolve a step expression like ``var_2__49`` to the literal ``-16``.
+_CONST_INT_DECL_PAT = re.compile(r"^\s*const int var_(\w+) = (-?\d+);\s*$")
+
+
+def _fix_negative_step_for_loops(lines: list[str]) -> list[str]:
+    """Rewrite ``for (i = a; i < b; i += step) {`` to use ``>`` when
+    ``step`` resolves to a negative literal.
+
+    Python's ``range(start, stop, step)`` iterates ``i > stop`` for
+    negative steps; the AST emitter writes ``<`` unconditionally, which
+    silently makes the loop run zero iterations when ``start > stop``.
+    This is the codegen bug behind mujoco_warp's blocked-Cholesky
+    failure: the backward-substitution loop ``range(matrix_size -
+    block_size, -1, -block_size)`` was compiled to an empty C-style
+    ``for`` and the upper-triangular solve never ran, leaving the
+    forward-substituted ``y`` as the "answer" instead of computing
+    ``x``.
+
+    Step expressions are resolved via the kernel's ``const int var_X
+    = N;`` declarations (Warp emits one per constant int operand at the
+    top of the body). Non-integer or non-constant steps stay positive
+    by convention — covers ``range(0, n, BLOCK_DIM)`` etc.
+    """
+    const_ints: dict[str, int] = {}
+    for raw in lines:
+        m = _CONST_INT_DECL_PAT.match(raw)
+        if m is not None:
+            const_ints[m.group(1)] = int(m.group(2))
+
+    def _step_is_negative(step_expr: str) -> bool:
+        s = step_expr.strip()
+        if s.startswith("var_"):
+            v = const_ints.get(s[len("var_") :])
+            return v is not None and v < 0
+        try:
+            return int(s) < 0
+        except ValueError:
+            return False
+
+    out: list[str] = []
+    for raw in lines:
+        m = _FOR_LOOP_LINE_PAT.match(raw)
+        if m is None:
+            out.append(raw)
+            continue
+        step = m.group("step")  # ``None`` for the ``++var_X`` form
+        if step is None or not _step_is_negative(step):
+            out.append(raw)
+            continue
+        indent = m.group("indent")
+        iv = m.group("iv")
+        start = m.group("start")
+        stop = m.group("stop")
+        inc = m.group("inc")
+        out.append(f"{indent}for (var_{iv} = {start}; var_{iv} > {stop}; {inc}) {{")
+    return out
+
+
 def _strip_comments_and_directives(line: str) -> str | None:
     s = line.strip()
     if not s:
@@ -2544,6 +2635,16 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
     # atomics for vec-typed arrays.
     _ast_nodes = _ast_fold_multidim_atomics(_ast_nodes, adj, _early_vec_arr_info)
     forward_lines = _ast_emit(_ast_nodes)
+
+    # Negative-step Python ``range`` (e.g. ``range(start, -1, -16)`` in
+    # mujoco_warp's blocked-Cholesky backward sub) emits as
+    # ``for (i = start; i < stop; i += -step)`` from the AST, which
+    # never enters its body when ``start > stop``. Python's intent is to
+    # iterate *down* while ``i > stop``. Fix the comparison direction
+    # here, after we have the flat IR with all ``const int var_X = N;``
+    # declarations visible.
+    forward_lines = _fix_negative_step_for_loops(forward_lines)
+
     vars_to_skip_decl: set[str] = _struct_skip | _drop_skip | _view_skip | _indexref_skip
 
     # Classify each array arg as input or output by scanning the IR strings.
@@ -3027,6 +3128,14 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
     # memory + lane declaration and the launcher's threadgroup-size
     # selection.
     coop_chol_seen: set[tuple[int, str]] = set()
+    # Map ``transpose_result_label`` → ``source_label``. On the
+    # CUDA/cuBLASDx path ``tile_transpose`` returns a layout-only view
+    # over the same shared-memory storage — mutating the result
+    # mutates the source. On Metal we copy into a private struct, so
+    # mutating ops (``*_solve_inplace``) don't propagate back unless
+    # we emit an explicit transpose-back writeback. This map drives
+    # that emission. Populated by ``repl_transpose_notpl``.
+    transpose_aliases: dict[str, str] = {}
     # Pre-scan: a kernel goes "cooperative" when any of its
     # ``tile_cholesky`` / ``tile_cholesky_inplace`` calls applies to a
     # square tile in the cooperative range. Determining this *before*
@@ -3065,7 +3174,8 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
         # which contains ``var_X`` operands that the substitute would
         # otherwise rewrite to expressions and break the parse.
         translated = _translate_tile_intrinsics(
-            translated, tile_var_dims, view_aliases, coop_chol_seen, is_coop_kernel
+            translated, tile_var_dims, view_aliases, coop_chol_seen,
+            is_coop_kernel, transpose_aliases,
         )
         # Inline subscripts that the address-collapse produced.
         for local_label, subscript in subscript_map.items():

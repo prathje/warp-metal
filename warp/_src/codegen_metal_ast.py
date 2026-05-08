@@ -630,6 +630,9 @@ def _emit_into(nodes, out: list[str]) -> None:
                 inc = f"++var_{iv}"
             else:
                 inc = f"var_{iv} += {n.step}"
+            # NB: emits ``<`` regardless of step sign. A post-emit pass
+            # in :mod:`codegen_metal` rewrites ``<`` to ``>`` for
+            # negative-step ranges (see ``_fix_negative_step_for_loops``).
             out.append(f"for (var_{iv} = {n.start}; var_{iv} < {n.stop}; {inc}) {{")
             _emit_into(list(n.body), out)
             out.append("}")
