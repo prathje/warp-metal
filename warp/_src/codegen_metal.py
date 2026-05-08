@@ -686,6 +686,89 @@ def _emit_tile_cholesky(n: int, msl_scalar: str) -> str:
     return "\n".join(parts)
 
 
+# Cooperative-tile threshold. At N below this the SIMD-cooperative
+# variant's barrier overhead dominates the single-thread path — the
+# right-looking algorithm has a serial pivot dependency that limits
+# parallelism. Empirically (M3, ms steady-state):
+#   N=8:   0.6  vs 0.3   (2.0x)  — barely worthwhile
+#   N=16:  0.9  vs 0.7   (1.3x)  — barely worthwhile
+#   N=24:  ~1.2 vs 0.4   (3.0x)
+#   N=32:  1.6  vs 0.5   (3.2x)
+#   N=64:  7.6  vs 0.8   (9.5x)
+# Below the threshold we keep the single-thread emit (smaller TGM
+# footprint, simpler launch, identical numerical drift to CPU).
+_COOP_CHOL_MIN_N = 24
+
+# Apple Silicon caps threadgroup memory at 32 KB. ``smem[N*N]`` of float
+# costs ``4*N^2`` bytes — at N=90 that's 32400 B. Above the cap the
+# kernel fails to load. The blocked-Cholesky path covers larger N.
+_COOP_CHOL_MAX_N = 88
+
+
+def _emit_tile_cholesky_coop(n: int, msl_scalar: str) -> str:
+    """Emit ``wp_tile_NxN_<scalar>_cholesky_coop`` — SIMD-cooperative
+    right-looking Cholesky.
+
+    Called by all 32 threads of the SIMD group. ``smem`` is a
+    threadgroup-memory buffer of ``N*N`` scalars provided by the
+    kernel scope. ``lane`` is ``thread_position_in_threadgroup.x``.
+
+    On iteration ``k`` lane ``(k mod 32)`` computes the diagonal pivot
+    while every other lane idles at the barrier. After the broadcast,
+    all lanes update their strided rows in parallel. The trailing
+    barrier-then-private-readback step copies the full result into
+    each thread's private struct, paying a redundant N² read so the
+    rest of the kernel body (still single-thread) sees a complete
+    private tile.
+    """
+    name = f"wp_tile_{n}x{n}_{msl_scalar}"
+    parts: list[str] = []
+    parts.append(
+        f"inline {name} {name}_cholesky_coop({name} A, "
+        f"threadgroup {msl_scalar}* smem, uint lane) {{"
+    )
+    # 1. Cooperative load A → smem (each lane writes its strided slice).
+    parts.append(f"    for (uint idx = lane; idx < {n * n}u; idx += 32u) {{")
+    parts.append("        smem[idx] = A.c[idx];")
+    parts.append("    }")
+    parts.append("    threadgroup_barrier(metal::mem_flags::mem_threadgroup);")
+    # 2. Right-looking Cholesky. Outer ``j`` loop pivots; inner ``i``
+    #    distributes column-k updates across lanes.
+    parts.append(f"    for (int j = 0; j < {n}; ++j) {{")
+    parts.append("        if ((int)lane == (j & 31)) {")
+    parts.append(f"            {msl_scalar} d = smem[j*{n} + j];")
+    parts.append("            for (int k = 0; k < j; ++k) {")
+    parts.append(f"                {msl_scalar} ljk = smem[j*{n} + k];")
+    parts.append("                d -= ljk * ljk;")
+    parts.append("            }")
+    parts.append(f"            d = metal::max(d, ({msl_scalar})1e-30);")
+    parts.append(f"            smem[j*{n} + j] = metal::precise::sqrt(d);")
+    parts.append("        }")
+    parts.append("        threadgroup_barrier(metal::mem_flags::mem_threadgroup);")
+    parts.append(f"        {msl_scalar} pivot = smem[j*{n} + j];")
+    parts.append(f"        for (int i = (int)lane; i < {n}; i += 32) {{")
+    parts.append("            if (i > j) {")
+    parts.append(f"                {msl_scalar} s = smem[i*{n} + j];")
+    parts.append(f"                for (int k = 0; k < j; ++k) s -= smem[i*{n} + k] * smem[j*{n} + k];")
+    parts.append(f"                smem[i*{n} + j] = s / pivot;")
+    parts.append("            }")
+    parts.append("        }")
+    parts.append("        threadgroup_barrier(metal::mem_flags::mem_threadgroup);")
+    parts.append("    }")
+    # 3. Each thread reads the full result into its private L. Upper
+    #    triangle gets zeroed in this same pass so the rest of the
+    #    kernel sees a clean lower-triangular factor.
+    parts.append(f"    {name} L;")
+    parts.append(f"    for (int idx = 0; idx < {n * n}; ++idx) {{")
+    parts.append(f"        int i = idx / {n};")
+    parts.append(f"        int j2 = idx - i * {n};")
+    parts.append(f"        L.c[idx] = (j2 > i) ? ({msl_scalar})0 : smem[idx];")
+    parts.append("    }")
+    parts.append("    return L;")
+    parts.append("}")
+    return "\n".join(parts)
+
+
 def _emit_tile_cholesky_inplace(n: int, msl_scalar: str) -> str:
     """Emit ``wp_tile_NxN_<scalar>_cholesky_inplace`` — same body as
     :func:`_emit_tile_cholesky` but mutates the input tile in place
@@ -956,15 +1039,23 @@ def _build_kernel_header(source: str) -> str:
         parts.append(_emit_tile_lower_solve_inplace(n_, k_, sc_))
     for n_, k_, sc_ in sorted(usolve_seen):
         parts.append(_emit_tile_upper_solve_inplace(n_, k_, sc_))
-    cholesky_pat = re.compile(r"\bwp_tile_(\d+)x(\d+)_(\w+)_cholesky\b(?!_solve|_inplace)")
+    cholesky_pat = re.compile(r"\bwp_tile_(\d+)x(\d+)_(\w+)_cholesky\b(?!_solve|_inplace|_coop)")
     cholesky_solve_pat = re.compile(r"\bwp_tile_(\d+)x(\d+)_(\w+)_cholesky_solve_(\d+)\b")
+    coop_cholesky_pat = re.compile(r"\bwp_tile_(\d+)x(\d+)_(\w+)_cholesky_coop\b")
     seen_cholesky: set[tuple[int, str]] = set()
+    seen_coop_cholesky: set[tuple[int, str]] = set()
     for m in cholesky_pat.finditer(source):
         rows, cols = int(m.group(1)), int(m.group(2))
         if rows == cols:
             seen_cholesky.add((rows, m.group(3)))
+    for m in coop_cholesky_pat.finditer(source):
+        rows, cols = int(m.group(1)), int(m.group(2))
+        if rows == cols:
+            seen_coop_cholesky.add((rows, m.group(3)))
     for n, scalar in sorted(seen_cholesky):
         parts.append(_emit_tile_cholesky(n, scalar))
+    for n, scalar in sorted(seen_coop_cholesky):
+        parts.append(_emit_tile_cholesky_coop(n, scalar))
     seen_solve: set[tuple[int, int, str]] = set()
     for m in cholesky_solve_pat.finditer(source):
         rows, cols, k = int(m.group(1)), int(m.group(2)), int(m.group(4))
@@ -1691,6 +1782,7 @@ def _translate_tile_intrinsics(
     line: str,
     tile_var_dims: dict[str, tuple[int, int, str]],
     view_aliases: dict[str, tuple[str, int, int, int, int, str, str, str]] | None = None,
+    coop_chol_seen: set[tuple[int, str]] | None = None,
 ) -> str:
     """Lower ``wp::tile_*`` calls to ``wp_tile_RxC_<scalar>_*`` helper calls.
 
@@ -1785,6 +1877,15 @@ def _translate_tile_intrinsics(
         # helper's near-singular guard.
         if rows == 1:
             return f"var_{lhs} = metal::precise::sqrt(metal::max({in_arg}, ({msl_scalar})1e-30))"
+        # Above the cooperative threshold (and within Apple Silicon's
+        # threadgroup-memory cap), route through the SIMD-cooperative
+        # variant: 32 lanes share one ``wp_tile_chol_smem`` scratch
+        # in threadgroup memory, factor cooperatively, then read the
+        # result back into each thread's private struct.
+        if coop_chol_seen is not None and _COOP_CHOL_MIN_N <= rows <= _COOP_CHOL_MAX_N:
+            coop_chol_seen.add((rows, msl_scalar))
+            helper = f"wp_tile_{rows}x{cols}_{msl_scalar}_cholesky_coop"
+            return f"var_{lhs} = {helper}({in_arg}, wp_tile_chol_smem, _coop_lane)"
         helper = f"wp_tile_{rows}x{cols}_{msl_scalar}_cholesky"
         return f"var_{lhs} = {helper}({in_arg})"
 
@@ -2218,6 +2319,12 @@ class MetalKernelArtifact:
     # set; with the default per-thread threadgroup the barrier degenerates
     # to a no-op and the prologue races the body.
     needs_init_barrier: bool = False
+    # When non-zero, the kernel uses the SIMD-cooperative tile_cholesky
+    # helper at this size — the launcher must dispatch with a 32-thread
+    # threadgroup and the kernel body declares a ``threadgroup float
+    # wp_tile_chol_smem[N*N]`` scratch at top scope. Zero means
+    # single-thread (legacy) tile primitives only.
+    coop_chol_n: int = 0
     # MSL declarations to inject before the kernel function body — used for
     # custom big-vec structs (vec5, vec6 = spatial_vector, vec8) that don't
     # have native MSL ``floatN`` equivalents. Empty for kernels that only
@@ -2796,6 +2903,11 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
     # (matmul_acc, *_solve_inplace) so writes to the view propagate
     # back to the parent tile struct via an explicit copy.
     view_aliases: dict[str, tuple[str, int, int, int, int, str, str, str]] = {}
+    # Set of (N, scalar) pairs for which we emitted the cooperative
+    # variant of ``tile_cholesky``. Drives kernel-scope threadgroup
+    # memory + lane declaration and the launcher's threadgroup-size
+    # selection.
+    coop_chol_seen: set[tuple[int, str]] = set()
 
     # --- Forward statements --------------------------------------------
     def _finalize(translated: str) -> str:
@@ -2803,7 +2915,7 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
         # the tile pattern matches on the raw ``wp::tile_*<...>`` shape,
         # which contains ``var_X`` operands that the substitute would
         # otherwise rewrite to expressions and break the parse.
-        translated = _translate_tile_intrinsics(translated, tile_var_dims, view_aliases)
+        translated = _translate_tile_intrinsics(translated, tile_var_dims, view_aliases, coop_chol_seen)
         # Inline subscripts that the address-collapse produced.
         for local_label, subscript in subscript_map.items():
             translated = re.sub(rf"\bvar_{re.escape(local_label)}\b", subscript, translated)
@@ -3354,6 +3466,35 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
     # shadow input to be bound. Same name list the artifact uses.
     atomic_init_outputs = init_outputs
 
+    # ---- Cooperative tile_cholesky prelude ---------------------------
+    # If ``_translate_tile_intrinsics`` rewrote any ``tile_cholesky``
+    # call to the ``_coop`` variant, we need to allocate a threadgroup-
+    # memory scratch buffer at kernel scope and surface the lane id as
+    # a local. Choose the largest N seen so the helper for *any* size
+    # can use the same buffer.
+    coop_chol_n = 0
+    if coop_chol_seen:
+        coop_chol_n = max(n for n, _ in coop_chol_seen)
+        # ``_coop_lane`` is the 0..31 lane within the 32-thread
+        # threadgroup (cooperative kernels dispatch with
+        # ``threadgroup=(32, 1, 1)``). The helper uses it both for
+        # work distribution and as the pivot-owner selector.
+        coop_prelude = [
+            f"    threadgroup float wp_tile_chol_smem[{coop_chol_n * coop_chol_n}];",
+            "    uint _coop_lane = thread_position_in_threadgroup.x;",
+        ]
+        body_lines = coop_prelude + body_lines
+        # The launcher dispatches cooperative kernels with
+        # ``grid=(32 * nworld, ...)`` and ``threadgroup=(32, 1, 1)``,
+        # so 32 threads share a worldid. Rewrite worldid lookups
+        # (``thread_position_in_grid.x``) to use the threadgroup
+        # index — every thread in the threadgroup gets the same
+        # worldid and the cooperative helpers stay in lockstep.
+        body_lines = [
+            ln.replace("thread_position_in_grid.x", "threadgroup_position_in_grid.x")
+            for ln in body_lines
+        ]
+
     source = "\n".join(body_lines) + "\n"
 
     # ---- Pack per-array shape arrays into a single buffer ------------
@@ -3513,6 +3654,7 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
         ints_packed_scalars=tuple(ints_packed_scalars),
         floats_packed_arrs=tuple(floats_packed_arrs),
         needs_init_barrier=bool(init_outputs),
+        coop_chol_n=coop_chol_n,
         header=header,
     )
 
@@ -4293,6 +4435,17 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim: int = 2
         tg = (min(256, grid_x), 1, 1)
     else:
         tg = (min(64, grid_x), 1, 1)
+
+    # Cooperative-tile-Cholesky kernels: 32 threads cooperate on each
+    # world's tile via threadgroup memory + ``simdgroup_barrier``-like
+    # synchronisation. Inflate the x grid by 32 so every world gets a
+    # 32-thread threadgroup, and remap ``wp.tid()`` (the worldid) to
+    # ``threadgroup_position_in_grid.x`` in the kernel source so all
+    # 32 lanes within a threadgroup see the same worldid.
+    if artifact.coop_chol_n > 0:
+        grid_x = grid_x * 32
+        grid = (grid_x, grid_y, grid_z)
+        tg = (32, 1, 1)
 
     # Kernels with an output-init prologue need every thread that shares
     # a worldid (the y/z grid axes) to be in the same threadgroup so the

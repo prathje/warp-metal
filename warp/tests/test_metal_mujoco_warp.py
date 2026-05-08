@@ -199,6 +199,38 @@ class TestMetalMujocoWarp(unittest.TestCase):
         """
         self._run(xml, nsteps=10)
 
+    def test_pendula_chain_exercises_cooperative_cholesky(self):
+        # 30-link hinge chain — nv=30, well above the cooperative
+        # ``_COOP_CHOL_MIN_N=24`` threshold. ``update_gradient_cholesky``
+        # for nv=30 routes through the SIMD-cooperative variant of
+        # ``tile_cholesky``. The 32-thread threadgroup, threadgroup-
+        # memory scratch, and ``threadgroup_position_in_grid`` worldid
+        # remap all participate. This is the primary end-to-end check
+        # that the cooperative codegen produces the same result as
+        # the single-thread path.
+        N = 30
+        # Build a nested chain XML: each link contains the next.
+        opens = "".join(
+            f'<body name="l{i}" pos="0 0 {-0.0 if i == 1 else -0.2}">'
+            f'<joint type="hinge" axis="0 1 0"/>'
+            f'<geom type="capsule" size="0.02" fromto="0 0 0  0 0 -0.2"/>'
+            for i in range(1, N + 1)
+        )
+        closes = "</body>" * N
+        xml = f"""
+        <mujoco>
+          <worldbody>
+            <body name="root" pos="0 0 1">
+              {opens}{closes}
+            </body>
+          </worldbody>
+        </mujoco>
+        """
+        # 5 steps with the standard atol — float32 Cholesky drift
+        # accumulates faintly across the iterative-solver linesearch
+        # but stays at ~1e-4 over this horizon.
+        self._run(xml, nsteps=5)
+
     def test_cartpole_with_contact_geoms(self):
         # mjlab's cartpole model. Exercises the full contact pipeline
         # because there are static (worldbody-attached) geoms — floor
