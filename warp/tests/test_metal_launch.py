@@ -2840,6 +2840,79 @@ class TestMetalLaunch(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet)
 
+    def test_early_return_seeds_mat_output_matches_cpu(self):
+        # Regression for the cartpole bug: a kernel with a top-level
+        # ``return;`` and a ``wp.mat33``-typed output. The seed prologue
+        # used to compute its per-world stride as
+        # ``shape[1] * shape[2] * shape[3]`` (treating mat as two extra
+        # dims), but MLX's view shape collapses ``rows*cols`` into a
+        # single inner dim. ``shape[3]`` was therefore out-of-bounds,
+        # reading garbage from the next array's shape slot. The result:
+        # static-geom ``geom_xmat`` entries got overwritten with the
+        # wrong value, which silently corrupted contact_jac and made
+        # ``qacc`` diverge by ~25 in cartpole.
+        #
+        # The kernel below mirrors the early-return pattern of
+        # ``_geom_local_to_global``: thread 0 keeps its user-provided
+        # value, threads 1+ overwrite. CPU/Metal must agree.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(skip_mask: wp.array(dtype=wp.int32),
+                  pos_out: wp.array2d(dtype=wp.vec3),
+                  mat_out: wp.array2d(dtype=wp.mat33)):
+                w, i = wp.tid()
+                if skip_mask[i] == 1:
+                    return
+                pos_out[w, i] = wp.vec3(float(i), 2.0 * float(i), 3.0 * float(i))
+                mat_out[w, i] = wp.mat33(
+                    float(i + 1), 0.0, 0.0,
+                    0.0, float(i + 2), 0.0,
+                    0.0, 0.0, float(i + 3),
+                )
+
+            NW = 1
+            NG = 5
+            # Geoms 0, 1, 2 are "static" (skipped) — they keep their
+            # user-provided value. Geoms 3, 4 are written by the kernel.
+            mask = np.array([1, 1, 1, 0, 0], dtype=np.int32)
+
+            # Seed values shaped to expose the (rows * cols) flattening
+            # so an off-by-one stride bug shows up across the static-
+            # geom slots, not just at the boundary.
+            rng = np.random.default_rng(0)
+            pos_seed = rng.standard_normal((NW, NG, 3)).astype(np.float32)
+            mat_seed = rng.standard_normal((NW, NG, 3, 3)).astype(np.float32)
+
+            results = {}
+            for dev in ("cpu", "metal:0"):
+                m_arr = wp.array(mask, dtype=wp.int32, device=dev)
+                p = wp.from_numpy(pos_seed, dtype=wp.vec3, device=dev)
+                m = wp.from_numpy(mat_seed, dtype=wp.mat33, device=dev)
+                wp.launch(k, dim=(NW, NG), inputs=[m_arr],
+                          outputs=[p, m], device=dev)
+                results[dev] = (p.numpy(), m.numpy())
+
+            # Static slots (mask==1): equal to seed.
+            np.testing.assert_array_equal(results['metal:0'][0][:, :3], pos_seed[:, :3])
+            np.testing.assert_array_equal(results['metal:0'][1][:, :3], mat_seed[:, :3])
+            # Active slots (mask==0): equal to the kernel's output formula.
+            for i in (3, 4):
+                np.testing.assert_allclose(
+                    results['metal:0'][0][0, i], [i, 2.0 * i, 3.0 * i], atol=0)
+                expected_mat = np.diag([i + 1, i + 2, i + 3]).astype(np.float32)
+                np.testing.assert_allclose(
+                    results['metal:0'][1][0, i], expected_mat, atol=0)
+            # And bit-exact CPU vs Metal for both outputs.
+            np.testing.assert_array_equal(results['cpu'][0], results['metal:0'][0])
+            np.testing.assert_array_equal(results['cpu'][1], results['metal:0'][1])
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=60)
+
     def test_tile_load_store_round_trip_matches_cpu(self):
         # Smallest tile primitive case: load a 6x6 sub-block and store
         # it back. Exercises ``_emit_tile_struct`` and confirms the

@@ -3319,7 +3319,14 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
             ndim = getattr(arg_var.type, "ndim", 1)
             v_info = _vec_dtype_info(arg_var)
             m_info = _mat_dtype_info(arg_var)
-            inner_extra = 1 if v_info is not None else (2 if m_info is not None else 0)
+            # MLX collapses the inner element-dim to ONE per element type
+            # (see ``_array_view_dtype_and_shape``):
+            #   vec3   -> (*shape, 3)
+            #   mat33  -> (*shape, 9)        # rows*cols flattened
+            #   struct -> (*shape, scalars)
+            # So the per-world stride uses one extra dim beyond ``ndim``
+            # for any non-scalar element type — *not* two for mats.
+            inner_extra = 1 if (v_info is not None or m_info is not None) else 0
             stride_terms = [f"{out_name}_shape[{k}]" for k in range(1, ndim + inner_extra)]
             stride_expr = " * ".join(stride_terms) if stride_terms else "1"
             if has_atomic:
