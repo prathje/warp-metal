@@ -2897,7 +2897,20 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
         # field. Inliner-emitted return-value writes for struct-typed
         # ``@wp.func`` calls land here (e.g. ``var_19 = var_37__0;``
         # from cartpole's ``geom_collision_pair`` -> ``Geom`` chain).
+        # Match both the bare ``var_X = var_Y;`` form (after the
+        # ``wp::copy`` strip in ``_translate_intrinsics``) AND the raw
+        # IR form ``var_X = wp::copy(var_Y);``. We have to catch the
+        # raw form here because the body-emission loop runs *before*
+        # ``_finalize`` strips ``wp::copy`` — without that, the line
+        # falls through to the unsupported-intrinsic guard or, worse,
+        # gets emitted as ``var_2 = var_1;`` referencing per-field-
+        # split locals that don't exist in MSL.
         m_struct_copy = re.match(r"^(?P<indent>\s*)var_(\w+)\s*=\s*var_(\w+)\s*;\s*$", raw)
+        if m_struct_copy is None:
+            m_struct_copy = re.match(
+                r"^(?P<indent>\s*)var_(\w+)\s*=\s*wp::copy\s*\(\s*var_(\w+)\s*\)\s*;\s*$",
+                raw,
+            )
         if (
             m_struct_copy
             and m_struct_copy.group(2) in struct_local_layouts

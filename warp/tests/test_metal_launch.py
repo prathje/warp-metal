@@ -866,6 +866,311 @@ class TestMetalLaunch(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet)
 
+    def test_big_mat_row_read_write_matches_cpu(self):
+        # Non-square ``mat<R, C>`` (e.g. ``mat23``, ``mat63``) routes
+        # through the custom ``wp_matRxC_<scalar>`` struct in MSL with
+        # a row-write proxy + value-returning const ``operator[]``.
+        # This test exercises both the write side
+        # (``mat[i] = vec3(...)``) and the read side (``vec3 r =
+        # mat[i]``), then mixes them in a ``wp.dot`` (the OBB SAT
+        # pattern in mujoco_warp's broadphase).
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            mat23 = wp.types.matrix(shape=(2, 3), dtype=float)
+            mat63 = wp.types.matrix(shape=(6, 3), dtype=float)
+
+            @wp.kernel
+            def k_rw(out: wp.array2d(dtype=float)):
+                tid = wp.tid()
+                m = mat23(0.0)
+                m[0] = wp.vec3(1.0, 2.0, 3.0)
+                m[1] = wp.vec3(4.0, 5.0, 6.0)
+                r0 = m[0]
+                r1 = m[1]
+                out[tid, 0] = r0[0]; out[tid, 1] = r0[1]; out[tid, 2] = r0[2]
+                out[tid, 3] = r1[0]; out[tid, 4] = r1[1]; out[tid, 5] = r1[2]
+
+            @wp.kernel
+            def k_dot(out: wp.array(dtype=float)):
+                tid = wp.tid()
+                m = mat23(0.0)
+                m[0] = wp.vec3(1.0, 2.0, 3.0)
+                m[1] = wp.vec3(4.0, 5.0, 6.0)
+                axis = wp.vec3(0.0, 1.0, 0.0)
+                # row-read in dot expression: mat[i] should fall through
+                # the row proxy's float3 conversion path.
+                out[tid] = wp.dot(m[0], axis) + wp.dot(m[1], axis) * 10.0
+
+            @wp.kernel
+            def k_6x3(out: wp.array2d(dtype=float)):
+                tid = wp.tid()
+                n = mat63(0.0)
+                for i in range(6):
+                    n[i] = wp.vec3(float(i), float(i + 10), float(i + 100))
+                for i in range(6):
+                    r = n[i]
+                    out[tid, i*3 + 0] = r[0]
+                    out[tid, i*3 + 1] = r[1]
+                    out[tid, i*3 + 2] = r[2]
+
+            N = 4
+            for label, kernel, shape, expected in (
+                ('rw', k_rw, (N, 6), np.tile([1, 2, 3, 4, 5, 6], (N, 1)).astype(np.float32)),
+                ('dot', k_dot, (N,), np.full(N, 52.0, dtype=np.float32)),
+                ('6x3', k_6x3, (N, 18),
+                    np.tile(
+                        [(i, i + 10, i + 100) for i in range(6)], (N, 1)
+                    ).reshape(N, 18).astype(np.float32)),
+            ):
+                results = {}
+                for dev in ('cpu', 'metal:0'):
+                    out = wp.zeros(shape, dtype=float, device=dev)
+                    wp.launch(kernel, dim=N, inputs=[], outputs=[out], device=dev)
+                    results[dev] = out.numpy()
+                np.testing.assert_array_equal(
+                    results['cpu'], results['metal:0'],
+                    err_msg=f'{label}: cpu vs metal mismatch',
+                )
+                np.testing.assert_allclose(
+                    results['cpu'], expected, atol=1e-6,
+                    err_msg=f'{label}: cpu vs expected mismatch',
+                )
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_obb_sat_pattern_matches_cpu(self):
+        # Reproduces the exact SAT (separating-axis test) pattern from
+        # mujoco_warp's ``_obb_filter``: build a ``mat23`` of world
+        # centers, a ``mat63`` of normals, then iterate axes computing
+        # ``proj[i] = wp.dot(xc[i], nrm[3*j + k])`` and a per-axis
+        # radius. If ``radius_sum + margin < |proj_diff|`` for any
+        # axis, return False (boxes separated). The mujoco_warp
+        # ``_nxn_broadphase`` uses this via ``wp.static(_broadphase_filter)``;
+        # this stripped-down version pins the building block.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            mat23 = wp.types.matrix(shape=(2, 3), dtype=float)
+            mat63 = wp.types.matrix(shape=(6, 3), dtype=float)
+
+            @wp.func
+            def obb_inner(xc: mat23, nrm: mat63,
+                          sa: wp.vec3, sb: wp.vec3, margin: float) -> bool:
+                proj = wp.vec2(0.0)
+                radius = wp.vec2(0.0)
+                for j in range(2):
+                    for k in range(3):
+                        for i in range(2):
+                            proj[i] = wp.dot(xc[i], nrm[3*j + k])
+                            if i == 0:
+                                sz = sa
+                            else:
+                                sz = sb
+                            radius[i] = (
+                                wp.abs(sz[0] * wp.dot(nrm[3*i + 0], nrm[3*j + k]))
+                                + wp.abs(sz[1] * wp.dot(nrm[3*i + 1], nrm[3*j + k]))
+                                + wp.abs(sz[2] * wp.dot(nrm[3*i + 2], nrm[3*j + k]))
+                            )
+                        if radius[0] + radius[1] + margin < wp.abs(proj[1] - proj[0]):
+                            return False
+                return True
+
+            @wp.kernel
+            def k(
+                xc_arr: wp.array2d(dtype=wp.vec3),
+                nrm_arr: wp.array2d(dtype=wp.vec3),
+                sa_arr: wp.array(dtype=wp.vec3),
+                sb_arr: wp.array(dtype=wp.vec3),
+                margin_arr: wp.array(dtype=float),
+                out: wp.array(dtype=int),
+            ):
+                pid = wp.tid()
+                xc = mat23(0.0); xc[0] = xc_arr[pid, 0]; xc[1] = xc_arr[pid, 1]
+                nrm = mat63(0.0)
+                nrm[0] = nrm_arr[pid, 0]; nrm[1] = nrm_arr[pid, 1]; nrm[2] = nrm_arr[pid, 2]
+                nrm[3] = nrm_arr[pid, 3]; nrm[4] = nrm_arr[pid, 4]; nrm[5] = nrm_arr[pid, 5]
+                out[pid] = int(obb_inner(xc, nrm, sa_arr[pid], sb_arr[pid], margin_arr[pid]))
+
+            # 6 test pairs: rail-pole-style (separated along rail.y),
+            # cart-rail (overlapping), distant boxes, overlapping unit
+            # boxes, plus 2 dummy fillers. Same structure as the cartpole
+            # broadphase candidates.
+            N = 6
+            xc = np.zeros((N, 2, 3), dtype=np.float32)
+            nrm = np.zeros((N, 6, 3), dtype=np.float32)
+            sa = np.zeros((N, 3), dtype=np.float32)
+            sb = np.zeros((N, 3), dtype=np.float32)
+            margin = np.zeros(N, dtype=np.float32)
+
+            # Pair 0: rail (long along x, at y=0.07) vs vertical pole
+            xc[0] = [[0, 0.07, 1], [0, 0, 1.5]]
+            xmat1 = np.array([[2.22e-16, 0, 1], [0, 1, 0], [-1, 0, 2.22e-16]])
+            xmat2 = np.array([[1, 0, 0], [0, -1, -1.22e-16], [0, 1.22e-16, -1]])
+            nrm[0] = np.array([xmat1[:, 0], xmat1[:, 1], xmat1[:, 2],
+                               xmat2[:, 0], xmat2[:, 1], xmat2[:, 2]])
+            sa[0] = [0.02, 0.02, 2.02]; sb[0] = [0.045, 0.045, 0.545]
+
+            # Pair 1: cart vs rail (overlapping)
+            xc[1] = [[0, 0, 1], [0, 0.07, 1]]
+            nrm[1] = np.array([[1,0,0],[0,1,0],[0,0,1],
+                               xmat1[:, 0], xmat1[:, 1], xmat1[:, 2]])
+            sa[1] = [0.2, 0.15, 0.1]; sb[1] = [0.02, 0.02, 2.02]
+
+            # Pair 2: distant boxes (separated)
+            xc[2] = [[0, 0, 0], [0, 0, 5]]
+            nrm[2] = np.array([[1,0,0],[0,1,0],[0,0,1],[1,0,0],[0,1,0],[0,0,1]])
+            sa[2] = [1, 1, 1]; sb[2] = [1, 1, 1]
+
+            # Pair 3: overlapping unit boxes
+            xc[3] = [[0, 0, 0], [0, 0, 0]]
+            nrm[3] = np.array([[1,0,0],[0,1,0],[0,0,1],[1,0,0],[0,1,0],[0,0,1]])
+            sa[3] = [1, 1, 1]; sb[3] = [1, 1, 1]
+
+            # Pairs 4 and 5 stay at zeros (overlapping degenerate)
+            nrm[4] = np.array([[1,0,0],[0,1,0],[0,0,1],[1,0,0],[0,1,0],[0,0,1]])
+            nrm[5] = np.array([[1,0,0],[0,1,0],[0,0,1],[1,0,0],[0,1,0],[0,0,1]])
+
+            results = {}
+            for dev in ('cpu', 'metal:0'):
+                a_xc = wp.zeros((N, 2), dtype=wp.vec3, device=dev); a_xc.assign(xc)
+                a_nrm = wp.zeros((N, 6), dtype=wp.vec3, device=dev); a_nrm.assign(nrm)
+                a_sa = wp.zeros(N, dtype=wp.vec3, device=dev); a_sa.assign(sa)
+                a_sb = wp.zeros(N, dtype=wp.vec3, device=dev); a_sb.assign(sb)
+                a_m = wp.zeros(N, dtype=float, device=dev); a_m.assign(margin)
+                out = wp.zeros(N, dtype=int, device=dev)
+                wp.launch(k, dim=N,
+                          inputs=[a_xc, a_nrm, a_sa, a_sb, a_m],
+                          outputs=[out], device=dev)
+                results[dev] = out.numpy()
+
+            # Pair 0 (rail-pole): separated → 0. Pair 1 (cart-rail): not → 1.
+            # Pair 2 (distant): separated → 0. Pair 3 (overlap): not → 1.
+            expected = np.array([0, 1, 0, 1, 1, 1], dtype=np.int32)
+            np.testing.assert_array_equal(results['cpu'], expected,
+                err_msg='cpu got wrong OBB SAT result vs expected')
+            np.testing.assert_array_equal(results['cpu'], results['metal:0'],
+                err_msg='OBB SAT cpu vs metal mismatch')
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_big_mat_broadcast_constructor_matches_cpu(self):
+        # ``mat<R, C>(scalar)`` (single-arg broadcast) emits a one-arg
+        # ``wp_matRxC_<scalar>_make(s)`` factory that fills every
+        # element with ``s``. Used at variable declaration sites
+        # (``m = mat23(0.0)``) throughout the contact pipeline.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            mat23 = wp.types.matrix(shape=(2, 3), dtype=float)
+            mat63 = wp.types.matrix(shape=(6, 3), dtype=float)
+
+            @wp.kernel
+            def k(out2x3: wp.array2d(dtype=float),
+                  out6x3: wp.array2d(dtype=float)):
+                tid = wp.tid()
+                m23 = mat23(7.0)  # broadcast: every element 7
+                m63 = mat63(-3.5)
+                # Read all elements via row access
+                for r in range(2):
+                    row = m23[r]
+                    for c in range(3):
+                        out2x3[tid, r * 3 + c] = row[c]
+                for r in range(6):
+                    row = m63[r]
+                    for c in range(3):
+                        out6x3[tid, r * 3 + c] = row[c]
+
+            N = 4
+            results_2x3 = {}
+            results_6x3 = {}
+            for dev in ('cpu', 'metal:0'):
+                o23 = wp.zeros((N, 6), dtype=float, device=dev)
+                o63 = wp.zeros((N, 18), dtype=float, device=dev)
+                wp.launch(k, dim=N, inputs=[], outputs=[o23, o63], device=dev)
+                results_2x3[dev] = o23.numpy()
+                results_6x3[dev] = o63.numpy()
+
+            np.testing.assert_array_equal(results_2x3['cpu'], results_2x3['metal:0'])
+            np.testing.assert_array_equal(results_6x3['cpu'], results_6x3['metal:0'])
+            np.testing.assert_array_equal(
+                results_2x3['cpu'], np.full((N, 6), 7.0, dtype=np.float32))
+            np.testing.assert_array_equal(
+                results_6x3['cpu'], np.full((N, 18), -3.5, dtype=np.float32))
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_struct_to_struct_local_copy_matches_cpu(self):
+        # ``var_X = var_Y`` where both are struct locals split into per-
+        # field per-element locals. The body emitter expands this into
+        # one ``var_X__field = var_Y__field`` per non-array field.
+        # Pattern used by mujoco_warp when a ``@wp.func`` returns a
+        # ``Struct`` value (e.g. ``geom_collision_pair`` returning
+        # ``Geom``).
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.struct
+            class Geom:
+                pos: wp.vec3
+                size: wp.vec3
+                idx: int
+
+            @wp.func
+            def make_geom(i: int) -> Geom:
+                g = Geom()
+                g.pos = wp.vec3(float(i), float(i*10), float(i*100))
+                g.size = wp.vec3(float(i + 1), float(i + 2), float(i + 3))
+                g.idx = i
+                return g
+
+            @wp.kernel
+            def k(out_pos: wp.array2d(dtype=float),
+                  out_size: wp.array2d(dtype=float),
+                  out_idx: wp.array(dtype=int)):
+                tid = wp.tid()
+                a = make_geom(tid)
+                b = a   # struct-to-struct copy → per-field copies
+                out_pos[tid, 0] = b.pos[0]
+                out_pos[tid, 1] = b.pos[1]
+                out_pos[tid, 2] = b.pos[2]
+                out_size[tid, 0] = b.size[0]
+                out_size[tid, 1] = b.size[1]
+                out_size[tid, 2] = b.size[2]
+                out_idx[tid] = b.idx
+
+            N = 4
+            results = {}
+            for dev in ('cpu', 'metal:0'):
+                op = wp.zeros((N, 3), dtype=float, device=dev)
+                os_ = wp.zeros((N, 3), dtype=float, device=dev)
+                oi = wp.zeros(N, dtype=int, device=dev)
+                wp.launch(k, dim=N, inputs=[], outputs=[op, os_, oi], device=dev)
+                results[dev] = (op.numpy(), os_.numpy(), oi.numpy())
+
+            for j in range(3):
+                np.testing.assert_array_equal(results['cpu'][j], results['metal:0'][j])
+            # Sanity vs expected
+            expected_pos = np.array([[i, i*10, i*100] for i in range(N)], dtype=np.float32)
+            expected_size = np.array([[i+1, i+2, i+3] for i in range(N)], dtype=np.float32)
+            np.testing.assert_array_equal(results['cpu'][0], expected_pos)
+            np.testing.assert_array_equal(results['cpu'][1], expected_size)
+            np.testing.assert_array_equal(results['cpu'][2], np.arange(N, dtype=np.int32))
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
     def test_printf_and_dead_tuples_codegen(self):
         # ``wp.printf`` calls and ``wp.matrix(..., shape=(R, C))`` sugar
         # emit ``wp::str`` constants and ``wp::tuple_t`` locals in the IR
