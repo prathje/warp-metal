@@ -705,6 +705,93 @@ _COOP_CHOL_MIN_N = 24
 _COOP_CHOL_MAX_N = 88
 
 
+# --- Cooperative load/store: kept for future use --------------------
+# Tried in commit 02bfba9e and 38f74e5d. At the sizes we currently
+# ship (N ≤ 88, tile fits in L1 cache), ``_emit_tile_load_coop``'s
+# write-smem → barrier → read-back-to-private round-trip cost more
+# than the device-memory savings — Apple Silicon's unified memory +
+# L1 absorbs 32 redundant identical reads cheaply. The cooperative
+# store version did not measurably reduce latency either, because
+# Metal's SIMD-group write coalescing collapses 32 redundant
+# identical writes into one transaction.
+#
+# Keeping the emitters as callable functions (not invoked anywhere
+# in the current pipeline) so they're easy to re-enable when:
+#   - tile sizes grow past L1 (likely once we add cooperative
+#     contact-jacobian or larger Cholesky factors above N=88), or
+#   - we add multi-SIMD-group cooperation where smem traffic is
+#     unavoidable for the algorithm anyway.
+# Re-enabling requires routing through ``repl_load`` /
+# ``repl_store`` (see commit 02bfba9e for the call-site rewrite).
+
+
+def _emit_tile_load_coop(rows: int, cols: int, msl_scalar: str) -> str:
+    """Emit ``wp_tile_RxC_<scalar>_load_coop`` — 32-lane cooperative
+    load through threadgroup memory.
+
+    Each lane reads ``ceil(R*C / 32)`` elements directly from the
+    device array into a shared threadgroup buffer; after the barrier
+    every lane reads the full ``R*C`` block back into its private
+    struct. Bandwidth into device memory drops from ``32 * R * C``
+    (single-thread emit) to ``R * C`` per call.
+
+    Currently unused — see header comment at the top of the
+    cooperative section.
+    """
+    name = f"wp_tile_{rows}x{cols}_{msl_scalar}"
+    n = rows * cols
+    parts: list[str] = []
+    parts.append(f"template <typename T>")
+    parts.append(
+        f"inline {name} {name}_load_coop(T arr, "
+        f"int base, int row_stride, int row_off, int col_off, "
+        f"threadgroup {msl_scalar}* smem, uint lane) {{"
+    )
+    parts.append("    threadgroup_barrier(metal::mem_flags::mem_threadgroup);")
+    parts.append(f"    for (uint idx = lane; idx < {n}u; idx += 32u) {{")
+    parts.append(f"        int i = (int)(idx / {cols}u);")
+    parts.append(f"        int j = (int)(idx % {cols}u);")
+    parts.append("        smem[idx] = arr[base + (row_off + i) * row_stride + (col_off + j)];")
+    parts.append("    }")
+    parts.append("    threadgroup_barrier(metal::mem_flags::mem_threadgroup);")
+    parts.append(f"    {name} t;")
+    parts.append(f"    for (int idx = 0; idx < {n}; ++idx) t.c[idx] = smem[idx];")
+    parts.append("    return t;")
+    parts.append("}")
+    return "\n".join(parts)
+
+
+def _emit_tile_store_coop(rows: int, cols: int, msl_scalar: str) -> str:
+    """Emit ``wp_tile_RxC_<scalar>_store_coop`` — 32-lane cooperative
+    store.
+
+    Each lane writes its strided slice of the tile to device memory.
+    All 32 lanes hold an identical private copy of ``t`` (every
+    cooperative tile op leaves each lane with the full tile), so
+    writing slice-by-slice with no synchronisation produces the same
+    result as the single-thread emit at 1/32 the device-memory
+    bandwidth — *if* the device's write coalescer can't fold
+    redundant identical writes itself.
+
+    Currently unused — see header comment at the top of the
+    cooperative section.
+    """
+    name = f"wp_tile_{rows}x{cols}_{msl_scalar}"
+    n = rows * cols
+    parts: list[str] = []
+    parts.append(
+        f"inline void {name}_store_coop(device {msl_scalar}* arr, "
+        f"int base, int row_stride, int row_off, int col_off, {name} t, uint lane) {{"
+    )
+    parts.append(f"    for (uint idx = lane; idx < {n}u; idx += 32u) {{")
+    parts.append(f"        int i = (int)(idx / {cols}u);")
+    parts.append(f"        int j = (int)(idx % {cols}u);")
+    parts.append("        arr[base + (row_off + i) * row_stride + (col_off + j)] = t.c[idx];")
+    parts.append("    }")
+    parts.append("}")
+    return "\n".join(parts)
+
+
 def _emit_tile_cholesky_coop(n: int, msl_scalar: str) -> str:
     """Emit ``wp_tile_NxN_<scalar>_cholesky_coop`` — SIMD-cooperative
     right-looking Cholesky.
@@ -727,6 +814,8 @@ def _emit_tile_cholesky_coop(n: int, msl_scalar: str) -> str:
         f"inline {name} {name}_cholesky_coop({name} A, "
         f"threadgroup {msl_scalar}* smem, uint lane) {{"
     )
+    # Start barrier: a previous cooperative op may still be reading smem.
+    parts.append("    threadgroup_barrier(metal::mem_flags::mem_threadgroup);")
     # 1. Cooperative load A → smem (each lane writes its strided slice).
     parts.append(f"    for (uint idx = lane; idx < {n * n}u; idx += 32u) {{")
     parts.append("        smem[idx] = A.c[idx];")
@@ -1009,6 +1098,21 @@ def _build_kernel_header(source: str) -> str:
         seen_tile.add((cols, rows, scalar))
     for rows, cols, scalar in sorted(seen_tile):
         parts.append(_emit_tile_struct(rows, cols, scalar))
+    # Cooperative load/store variants — scan for ``..._load_coop`` /
+    # ``..._store_coop`` references and emit their definitions
+    # alongside the single-thread ones.
+    coop_load_pat = re.compile(r"\bwp_tile_(\d+)x(\d+)_(\w+)_load_coop\b")
+    coop_store_pat = re.compile(r"\bwp_tile_(\d+)x(\d+)_(\w+)_store_coop\b")
+    seen_coop_loads: set[tuple[int, int, str]] = set()
+    seen_coop_stores: set[tuple[int, int, str]] = set()
+    for m in coop_load_pat.finditer(source):
+        seen_coop_loads.add((int(m.group(1)), int(m.group(2)), m.group(3)))
+    for m in coop_store_pat.finditer(source):
+        seen_coop_stores.add((int(m.group(1)), int(m.group(2)), m.group(3)))
+    for rows, cols, scalar in sorted(seen_coop_loads):
+        parts.append(_emit_tile_load_coop(rows, cols, scalar))
+    for rows, cols, scalar in sorted(seen_coop_stores):
+        parts.append(_emit_tile_store_coop(rows, cols, scalar))
     for rows, cols, scalar in sorted(transpose_seen):
         parts.append(_emit_tile_transpose(rows, cols, scalar))
     matmul_pat = re.compile(r"\bwp_tile_matmul_(\d+)x(\d+)x(\d+)_(\w+)\b")
@@ -1783,6 +1887,7 @@ def _translate_tile_intrinsics(
     tile_var_dims: dict[str, tuple[int, int, str]],
     view_aliases: dict[str, tuple[str, int, int, int, int, str, str, str]] | None = None,
     coop_chol_seen: set[tuple[int, str]] | None = None,
+    is_coop_kernel: bool = False,
 ) -> str:
     """Lower ``wp::tile_*`` calls to ``wp_tile_RxC_<scalar>_*`` helper calls.
 
@@ -1822,6 +1927,13 @@ def _translate_tile_intrinsics(
         # there's no wp_tile_1x1 struct/helper, so emit a direct subscript.
         if rows == 1 and cols == 1:
             return f"var_{lhs} = {arr}[{base_expr} + ({row_off}) * ({row_stride}) + ({col_off})]"
+        # NB: cooperative tile_load was tried but a SIMD-cooperative
+        # threadgroup-memory round-trip (write smem → barrier → read
+        # smem into each thread's private struct) ran *slower* than
+        # the single-thread emit at the sizes we ship. The 32-lane
+        # redundant device reads land in L1 (the 16 KB at N=64 fits),
+        # so the barriers + smem traffic of cooperation is pure
+        # overhead. Keeping single-thread emit even in coop kernels.
         helper = f"wp_tile_{rows}x{cols}_{msl_scalar}_load"
         return f"var_{lhs} = {helper}({arr}, {base_expr}, {row_stride}, {row_off}, {col_off})"
 
@@ -1855,6 +1967,13 @@ def _translate_tile_intrinsics(
         # Shape (1,1) tile is a scalar local — store with a direct subscript.
         if rows == 1 and cols == 1:
             return f"{arr}[{base_expr} + ({row_off}) * ({row_stride}) + ({col_off})] = {tile_var}"
+        # NB: cooperative tile_store (each lane writes its strided
+        # slice with no smem) was tried but added latency without
+        # measurable bandwidth savings — Metal's SIMD-group write
+        # coalescing already collapses 32 redundant identical writes
+        # to the same address into a single transaction. Keep single-
+        # thread emit; revisit when we add larger-tile workloads where
+        # write coalescing breaks down.
         helper = f"wp_tile_{rows}x{cols}_{msl_scalar}_store"
         return f"{helper}({arr}, {base_expr}, {row_stride}, {row_off}, {col_off}, {tile_var})"
 
@@ -2908,6 +3027,36 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
     # memory + lane declaration and the launcher's threadgroup-size
     # selection.
     coop_chol_seen: set[tuple[int, str]] = set()
+    # Pre-scan: a kernel goes "cooperative" when any of its
+    # ``tile_cholesky`` / ``tile_cholesky_inplace`` calls applies to a
+    # square tile in the cooperative range. Determining this *before*
+    # emit lets the load/store/etc. translators emit cooperative
+    # variants for every tile op in the kernel — otherwise they'd
+    # only see the cholesky call mid-translation when other ops have
+    # already been lowered to the single-thread form.
+    _chol_pat_pre = re.compile(r"\bwp::tile_cholesky\s*<[^()]*>\s*\(([^)]*)\)")
+    _chol_inplace_pat_pre = re.compile(r"\bwp::tile_cholesky_inplace\s*<[^()]*>\s*\(([^)]*)\)")
+    is_coop_kernel = False
+    pre_coop_chol_n = 0
+    for raw in forward_lines:
+        for m in _chol_pat_pre.finditer(raw):
+            args = [a.strip() for a in m.group(1).split(",")]
+            if len(args) >= 5:
+                in_arg = args[3]
+                in_label = in_arg[len("var_"):] if in_arg.startswith("var_") else in_arg
+                dims = tile_var_dims.get(in_label)
+                if dims and dims[0] == dims[1] and _COOP_CHOL_MIN_N <= dims[0] <= _COOP_CHOL_MAX_N:
+                    is_coop_kernel = True
+                    pre_coop_chol_n = max(pre_coop_chol_n, dims[0])
+        for m in _chol_inplace_pat_pre.finditer(raw):
+            args = [a.strip() for a in m.group(1).split(",")]
+            if len(args) >= 2:
+                in_arg = args[1]
+                in_label = in_arg[len("var_"):] if in_arg.startswith("var_") else in_arg
+                dims = tile_var_dims.get(in_label)
+                if dims and dims[0] == dims[1] and _COOP_CHOL_MIN_N <= dims[0] <= _COOP_CHOL_MAX_N:
+                    is_coop_kernel = True
+                    pre_coop_chol_n = max(pre_coop_chol_n, dims[0])
 
     # --- Forward statements --------------------------------------------
     def _finalize(translated: str) -> str:
@@ -2915,7 +3064,9 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
         # the tile pattern matches on the raw ``wp::tile_*<...>`` shape,
         # which contains ``var_X`` operands that the substitute would
         # otherwise rewrite to expressions and break the parse.
-        translated = _translate_tile_intrinsics(translated, tile_var_dims, view_aliases, coop_chol_seen)
+        translated = _translate_tile_intrinsics(
+            translated, tile_var_dims, view_aliases, coop_chol_seen, is_coop_kernel
+        )
         # Inline subscripts that the address-collapse produced.
         for local_label, subscript in subscript_map.items():
             translated = re.sub(rf"\bvar_{re.escape(local_label)}\b", subscript, translated)
@@ -3472,13 +3623,17 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
     # memory scratch buffer at kernel scope and surface the lane id as
     # a local. Choose the largest N seen so the helper for *any* size
     # can use the same buffer.
-    coop_chol_n = 0
-    if coop_chol_seen:
-        coop_chol_n = max(n for n, _ in coop_chol_seen)
+    coop_chol_n = pre_coop_chol_n if is_coop_kernel else 0
+    if is_coop_kernel:
         # ``_coop_lane`` is the 0..31 lane within the 32-thread
         # threadgroup (cooperative kernels dispatch with
         # ``threadgroup=(32, 1, 1)``). The helper uses it both for
-        # work distribution and as the pivot-owner selector.
+        # work distribution and as the pivot-owner selector. The
+        # ``wp_tile_chol_smem`` scratch is sized for the largest
+        # square tile any cholesky_coop call will need; the
+        # cooperative load/store helpers reuse the same buffer
+        # since their tiles are always ≤ ``coop_chol_n × coop_chol_n``
+        # in any kernel that goes cooperative.
         coop_prelude = [
             f"    threadgroup float wp_tile_chol_smem[{coop_chol_n * coop_chol_n}];",
             "    uint _coop_lane = thread_position_in_threadgroup.x;",
