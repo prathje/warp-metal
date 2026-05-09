@@ -372,6 +372,19 @@ def to_torch(a: warp.array, requires_grad: bool | None = None):
             t.grad = torch.as_tensor(a.grad, device=device_to_torch(a.device))
         return t
 
+    elif a.device.is_metal:
+        # MLX-managed unified memory is host-readable. Round-trip through
+        # numpy and let torch place the result on MPS. NB: this is a
+        # *copy* in both directions — host-side mutations on the torch
+        # tensor will not propagate back to the Warp array. mjlab and
+        # similar host frameworks that round-trip between the two need
+        # an explicit ``wp.from_torch`` writeback.
+        t = torch.as_tensor(a.numpy(), device="mps")
+        t.requires_grad = requires_grad
+        if requires_grad and a.requires_grad:
+            t.grad = torch.as_tensor(a.grad.numpy(), device="mps")
+        return t
+
     else:
         raise RuntimeError("Unsupported device")
 
