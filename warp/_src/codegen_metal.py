@@ -1929,6 +1929,9 @@ _TILE_BINARY_MAP_NOTPL_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_binary_map\
 # ``tile_mul`` / ``tile_add`` / ``tile_sub`` / ``tile_div``. Treated
 # the same as ``tile_binary_map(wp::<op>, args...)``.
 _TILE_OP_NOTPL_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_(add|sub|mul|div)\s*\(([^)]*)\)")
+# In-place compound forms ``wp::tile_add_inplace(dst, src)`` etc. —
+# accumulates ``src`` into ``dst`` element-wise.
+_TILE_OP_INPLACE_PAT = re.compile(r"\bwp::tile_(add|sub|mul|div)_inplace\s*\(([^)]*)\)")
 # ``wp::tile_extract(tile, idx)`` — read the i-th element of a tile. For a
 # 1-element tile the only valid index is 0 and the result is the scalar
 # value itself.
@@ -1949,6 +1952,11 @@ _TILE_TRANSPOSE_NOTPL_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_transpose\s*
 # placeholder LTO ptr/seg args, then A (RxK), B (KxN), C (RxN), then
 # scalar alpha and beta. ``C = beta*C + alpha*A*B``.
 _TILE_MATMUL_ACC_PAT = re.compile(r"\bwp::tile_matmul_acc\s*\(([^)]*)\)")
+# Value-returning ``wp::tile_matmul`` form (no ``_acc`` suffix)
+# emitted by mujoco_warp's dense JTDAJ kernel: ``var_C = wp::tile_matmul(
+# 0, 0, 0, var_A, var_B, var_C, var_alpha, var_beta)``. Same 8-arg
+# semantics as the in-place form — C is mutated AND returned.
+_TILE_MATMUL_ASSIGN_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_matmul\s*\(([^)]*)\)")
 # ``wp::tile_cholesky_inplace<upper>(0, var_X)`` — single tile, in-place
 # factorization. Two args after the LTO seg pad: the placeholder and the
 # tile to factor. ``upper`` template arg selects upper- vs lower-fill.
@@ -2552,6 +2560,38 @@ def _translate_tile_intrinsics(
 
     line = _TILE_OP_NOTPL_PAT.sub(_repl_tile_op, line)
 
+    def _repl_tile_op_inplace(m: re.Match[str]) -> str:
+        # ``wp::tile_<op>_inplace(dst, src)`` — accumulate ``src`` into
+        # ``dst`` element-wise (or ``dst /= src`` for ``div``).
+        op = m.group(1)
+        args = [a.strip() for a in m.group(2).split(",")]
+        if len(args) != 2:
+            return m.group(0)
+        dst, src = args
+        op_sym = {"add": "+", "sub": "-", "mul": "*", "div": "/"}[op]
+        dst_label = dst[len("var_"):] if dst.startswith("var_") else dst
+        src_label = src[len("var_"):] if src.startswith("var_") else src
+        dst_dims = tile_var_dims.get(dst_label)
+        src_dims = tile_var_dims.get(src_label)
+        if dst_dims is None:
+            return m.group(0)
+        rows, cols, _ = dst_dims
+        n = rows * cols
+        if n == 1:
+            return f"{dst} = ({dst} {op_sym} {src})"
+        if src_dims is None:
+            # Scalar broadcast.
+            return (
+                f"{{ for (int _ti_i = 0; _ti_i < {n}; ++_ti_i) "
+                f"{dst}.c[_ti_i] = {dst}.c[_ti_i] {op_sym} ({src}); }}"
+            )
+        return (
+            f"{{ for (int _ti_i = 0; _ti_i < {n}; ++_ti_i) "
+            f"{dst}.c[_ti_i] = {dst}.c[_ti_i] {op_sym} {src}.c[_ti_i]; }}"
+        )
+
+    line = _TILE_OP_INPLACE_PAT.sub(_repl_tile_op_inplace, line)
+
     def repl_assign(m: re.Match[str]) -> str:
         # ``wp::tile_assign(dst, src, offset_tuple)``. With shape (1,1)
         # tiles the offset is always 0 and we drop it. The IR emits the
@@ -2627,6 +2667,19 @@ def _translate_tile_intrinsics(
         return call
 
     line = _TILE_MATMUL_ACC_PAT.sub(repl_matmul_acc, line)
+
+    def _repl_matmul_assign(m: re.Match[str]) -> str:
+        # ``var_X = wp::tile_matmul(0, 0, 0, A, B, C, alpha, beta)``.
+        # Treat as the in-place ``matmul_acc`` form — C IS var_X (the
+        # mutated accumulator). After the call, the value of ``C`` is
+        # the accumulated tile; assignment to var_X is implicit since
+        # the helper mutates C in-place. We emit the matmul call and
+        # let downstream stages treat the result as already in place.
+        # Synthesize the matmul_acc form and re-run that translator.
+        synth = f"wp::tile_matmul_acc({m.group(2)})"
+        return _TILE_MATMUL_ACC_PAT.sub(repl_matmul_acc, synth)
+
+    line = _TILE_MATMUL_ASSIGN_PAT.sub(_repl_matmul_assign, line)
 
     def repl_cholesky_inplace(m: re.Match[str]) -> str:
         args = [a.strip() for a in m.group(1).split(",")]
@@ -2800,9 +2853,21 @@ _USER_FUNC_MSL_DEFS: dict[str, str] = {
         "    return float3(cdof_clip.c[0], cdof_clip.c[1], cdof_clip.c[2]);\n"
         "}"
     ),
+    # mujoco_warp/_src/solver.py:state_check (ConstraintState.QUADRATIC = 1)
+    "state_check_0": (
+        "inline float state_check_0(float D, int state) {\n"
+        "    return state == 1 ? D : 0.0f;\n"
+        "}"
+    ),
+    # mujoco_warp/_src/solver.py:active_check
+    "active_check_0": (
+        "inline float active_check_0(int tid, int threshold) {\n"
+        "    return tid >= threshold ? 0.0f : 1.0f;\n"
+        "}"
+    ),
 }
 
-_USER_FUNC_REF_PAT = re.compile(r"\b(_\w+_\d+)\s*\(")
+_USER_FUNC_REF_PAT = re.compile(r"\b([A-Za-z_]\w*_\d+)\s*\(")
 
 
 def _emit_referenced_user_funcs(source: str) -> str:
