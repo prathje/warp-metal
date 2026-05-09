@@ -231,6 +231,118 @@ class TestMetalMujocoWarp(unittest.TestCase):
         # but stays at ~1e-4 over this horizon.
         self._run(xml, nsteps=5)
 
+    def test_dense_jacobian_pendulum_matches_cpu(self):
+        # mjJAC_DENSE path on Metal — exercises the dense-Jacobian
+        # constraint kernels (``_efc_contact_jac_dense``) and the
+        # dense Euler integrator (``_tile_euler_dense``). Both use
+        # vec-element tiles + ``tile_map`` over user @wp.func helpers
+        # which were previously unsupported on Metal.
+        #
+        # 5 steps with bit-exact tolerance — the dense path produces
+        # identical numerical results to CPU on these small models.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import mujoco
+            import mujoco_warp as mjw
+            import numpy as np
+
+            xml = '''
+            <mujoco>
+              <worldbody>
+                <body name="link" pos="0 0 1">
+                  <joint type="hinge" axis="0 1 0"/>
+                  <geom type="capsule" size="0.05" fromto="0 0 0  0 0 -0.5"/>
+                </body>
+              </worldbody>
+            </mujoco>
+            '''
+            mjm = mujoco.MjModel.from_xml_string(xml)
+            mjm.opt.jacobian = mujoco.mjtJacobian.mjJAC_DENSE
+            mjd = mujoco.MjData(mjm)
+            mujoco.mj_resetData(mjm, mjd)
+            mujoco.mj_forward(mjm, mjd)
+
+            results = {}
+            for dev in ("cpu", "metal:0"):
+                with wp.ScopedDevice(dev):
+                    m = mjw.put_model(mjm)
+                    d = mjw.put_data(mjm, mjd)
+                    for _ in range(5):
+                        mjw.step(m, d)
+                    wp.synchronize_device()
+                    results[dev] = (
+                        d.qpos.numpy().copy(),
+                        d.qvel.numpy().copy(),
+                        d.qacc.numpy().copy(),
+                    )
+            for i, name in enumerate(("qpos", "qvel", "qacc")):
+                d = float(np.max(np.abs(results['cpu'][i] - results['metal:0'][i])))
+                assert d < 1e-5, f"{name} differs: {d}"
+            print("OK")
+            """
+        )
+        _run_subprocess(self, snippet, timeout=180)
+
+    def test_dense_jacobian_cartpole_with_contact_matches_cpu(self):
+        # Dense Jacobian + contact pipeline simultaneously.
+        # ``_efc_contact_jac_dense`` is the entry point for dense
+        # constraints; cartpole-with-contacts adds the static-geom
+        # contact filter exercised by ``test_cartpole_with_contact_geoms``.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import mujoco
+            import mujoco_warp as mjw
+            import numpy as np
+
+            xml = '''
+            <mujoco>
+              <option gravity="0 0 -9.81"/>
+              <worldbody>
+                <geom name="floor" type="plane" size="2 2 0.1"/>
+                <body name="cart" pos="0 0 1">
+                  <joint name="slider" type="slide" axis="1 0 0"
+                         range="-1 1" damping="0.1"/>
+                  <geom name="cart_geom" type="box" size="0.1 0.05 0.05"/>
+                  <body name="pole" euler="180 0 0">
+                    <joint name="hinge" type="hinge" axis="0 1 0" damping="0.05"/>
+                    <geom name="pole_geom" type="capsule"
+                          size="0.02" fromto="0 0 0  0 0 0.5"/>
+                  </body>
+                </body>
+              </worldbody>
+              <actuator>
+                <motor joint="slider" gear="1" ctrlrange="-1 1"/>
+              </actuator>
+            </mujoco>
+            '''
+            mjm = mujoco.MjModel.from_xml_string(xml)
+            mjm.opt.jacobian = mujoco.mjtJacobian.mjJAC_DENSE
+            mjd = mujoco.MjData(mjm)
+            mujoco.mj_forward(mjm, mjd)
+
+            results = {}
+            for dev in ("cpu", "metal:0"):
+                with wp.ScopedDevice(dev):
+                    m = mjw.put_model(mjm)
+                    d = mjw.put_data(mjm, mjd)
+                    for _ in range(5):
+                        mjw.step(m, d)
+                    wp.synchronize_device()
+                    results[dev] = (
+                        d.qpos.numpy().copy(),
+                        d.qvel.numpy().copy(),
+                        d.qacc.numpy().copy(),
+                    )
+            for i, name in enumerate(("qpos", "qvel", "qacc")):
+                d = float(np.max(np.abs(results['cpu'][i] - results['metal:0'][i])))
+                assert d < 1e-3, f"{name} differs: {d}"
+            print("OK")
+            """
+        )
+        _run_subprocess(self, snippet, timeout=180)
+
     def test_pendula_multi_step_warmstart_drift(self):
         # Regression for the packed init-shadows fix: mujoco_warp's
         # constraint pipeline writes ``d.efc.J`` / ``d.efc.aref`` etc.
