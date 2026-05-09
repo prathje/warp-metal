@@ -1932,6 +1932,10 @@ _TILE_OP_NOTPL_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_(add|sub|mul|div)\s
 # In-place compound forms ``wp::tile_add_inplace(dst, src)`` etc. —
 # accumulates ``src`` into ``dst`` element-wise.
 _TILE_OP_INPLACE_PAT = re.compile(r"\bwp::tile_(add|sub|mul|div)_inplace\s*\(([^)]*)\)")
+# ``var_X = wp::tile_diag_add(M_tile, diag_vec, out_tile)`` — adds
+# ``diag_vec`` to the diagonal of ``M_tile``, returning the result.
+# The mujoco_warp dense-Euler kernel uses this for ``qM + dt*damping``.
+_TILE_DIAG_ADD_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_diag_add\s*\(([^)]*)\)")
 # ``wp::tile_extract(tile, idx)`` — read the i-th element of a tile. For a
 # 1-element tile the only valid index is 0 and the result is the scalar
 # value itself.
@@ -2592,6 +2596,36 @@ def _translate_tile_intrinsics(
 
     line = _TILE_OP_INPLACE_PAT.sub(_repl_tile_op_inplace, line)
 
+    def _repl_tile_diag_add(m: re.Match[str]) -> str:
+        # ``var_X = wp::tile_diag_add(M_tile, diag_vec[, out_tile])``.
+        # Result: copy M_tile into var_X, then add diag_vec to the
+        # diagonal entries.
+        lhs = m.group(1)
+        args = [a.strip() for a in m.group(2).split(",")]
+        if len(args) < 2:
+            return m.group(0)
+        m_arg = args[0]
+        v_arg = args[1]
+        m_label = m_arg[len("var_"):] if m_arg.startswith("var_") else m_arg
+        m_dims = tile_var_dims.get(m_label)
+        if m_dims is None:
+            return m.group(0)
+        rows, cols, _ = m_dims
+        if rows != cols:
+            return m.group(0)
+        n = rows
+        if n == 1:
+            # 1x1 tile collapsed to scalar — diag_add is just ``M + v``.
+            return f"var_{lhs} = ({m_arg} + {v_arg})"
+        return (
+            f"{{ for (int _da_i = 0; _da_i < {n}; ++_da_i) "
+            f"for (int _da_j = 0; _da_j < {n}; ++_da_j) "
+            f"var_{lhs}.c[_da_i * {n} + _da_j] = {m_arg}.c[_da_i * {n} + _da_j] "
+            f"+ ((_da_i == _da_j) ? {v_arg}.c[_da_i] : 0.0f); }}"
+        )
+
+    line = _TILE_DIAG_ADD_PAT.sub(_repl_tile_diag_add, line)
+
     def repl_assign(m: re.Match[str]) -> str:
         # ``wp::tile_assign(dst, src, offset_tuple)``. With shape (1,1)
         # tiles the offset is always 0 and we drop it. The IR emits the
@@ -2741,7 +2775,54 @@ def _translate_tile_intrinsics(
 
     line = _TILE_LOWER_SOLVE_INPLACE_PAT.sub(lambda m: _repl_solve_inplace("lower", m), line)
     line = _TILE_UPPER_SOLVE_INPLACE_PAT.sub(lambda m: _repl_solve_inplace("upper", m), line)
-    line = _TILE_BROADCAST_PAT.sub(r"var_\1 = var_\2", line)
+    def _repl_tile_broadcast(m: re.Match[str]) -> str:
+        # ``var_X = wp::tile_broadcast<...>(var_Y)``. Source ``var_Y``
+        # may have a different shape than target ``var_X`` — e.g.
+        # broadcasting a (TILE_SIZE,) tile to (nv_pad, TILE_SIZE) by
+        # repeating the source along the new outer dim. We emit an
+        # element loop that fills each ``var_X`` slot with the
+        # corresponding ``var_Y`` element using row-major indexing.
+        lhs = m.group(1)
+        in_label = m.group(2)
+        lhs_dims = tile_var_dims.get(lhs)
+        in_dims = tile_var_dims.get(in_label)
+        # Same shape (or single-element source) — identity assign.
+        if lhs_dims is None or in_dims is None or lhs_dims == in_dims:
+            return f"var_{lhs} = var_{in_label}"
+        l_rows, l_cols, _ = lhs_dims
+        in_rows, in_cols, _ = in_dims
+        l_n = l_rows * l_cols
+        in_n = in_rows * in_cols
+        if in_n == 1:
+            # Single-element source broadcast across the target tile.
+            return (
+                f"{{ for (int _bc_i = 0; _bc_i < {l_n}; ++_bc_i) "
+                f"var_{lhs}.c[_bc_i] = var_{in_label}.c[0]; }}"
+            )
+        # Cases:
+        #   (a) Source is 1-D (in_cols == 1), target is 2-D — repeat
+        #       source along target's outer dim ``r``: var_X.c[r*l_cols
+        #       + c] = var_Y.c[c].
+        #   (b) Source is 2-D, target is 2-D, target rows == 1 — collapse.
+        # We support (a); fall back to identity for other shapes.
+        if in_cols == 1 and in_rows == l_cols:
+            # Source shape (l_cols, 1) tiled along ``r``.
+            return (
+                f"{{ for (int _bc_r = 0; _bc_r < {l_rows}; ++_bc_r) "
+                f"for (int _bc_c = 0; _bc_c < {l_cols}; ++_bc_c) "
+                f"var_{lhs}.c[_bc_r * {l_cols} + _bc_c] = var_{in_label}.c[_bc_c]; }}"
+            )
+        if in_rows == 1 and in_cols == l_cols:
+            # Source shape (1, l_cols).
+            return (
+                f"{{ for (int _bc_r = 0; _bc_r < {l_rows}; ++_bc_r) "
+                f"for (int _bc_c = 0; _bc_c < {l_cols}; ++_bc_c) "
+                f"var_{lhs}.c[_bc_r * {l_cols} + _bc_c] = var_{in_label}.c[_bc_c]; }}"
+            )
+        # Unrecognised — leave identity as a safe fallback.
+        return f"var_{lhs} = var_{in_label}"
+
+    line = _TILE_BROADCAST_PAT.sub(_repl_tile_broadcast, line)
     # ``var_X = wp::tile_extract(var_t, idx)`` with shape (1,) → ``var_X = var_t``.
     line = _TILE_EXTRACT_PAT.sub(r"var_\1 = var_\2", line)
 
