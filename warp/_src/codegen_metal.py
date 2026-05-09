@@ -1280,6 +1280,10 @@ def _build_kernel_header(source: str) -> str:
             seen_solve.add((rows, k, m.group(3)))
     for n, k, scalar in sorted(seen_solve):
         parts.append(_emit_tile_cholesky_solve(n, k, scalar))
+    # mujoco_warp ``@wp.func`` helpers referenced by ``tile_map``.
+    user_func_defs = _emit_referenced_user_funcs(source)
+    if user_func_defs:
+        parts.append(user_func_defs)
     if not parts:
         return ""
     return "\n".join(parts) + "\n"
@@ -1897,11 +1901,16 @@ _TILE_REDUCE_PAT = re.compile(
 # ``wp::tile_zeros<dtype, ...>()`` / ``wp::tile_ones<dtype, ...>()`` —
 # constant-fill register tile. With block_dim=1 it's the corresponding
 # scalar 0 / 1 (or vec ``T(0)`` / ``T(1)``).
-_TILE_ZEROS_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_zeros\s*<\s*wp::(\w+)\s*[^>]*>\s*\(\s*\)")
-_TILE_ONES_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_ones\s*<\s*wp::(\w+)\s*[^>]*>\s*\(\s*\)")
-# ``wp::tile_arange<int>(N)`` with N=1 → ``var_X = 0``. Larger N would need
-# a struct; not supported yet (and not used at block_dim=1).
+_TILE_ZEROS_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_zeros\s*<\s*(?:wp::)?(\w+)\s*[^>]*>\s*\(\s*\)")
+_TILE_ONES_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_ones\s*<\s*(?:wp::)?(\w+)\s*[^>]*>\s*\(\s*\)")
+# ``wp::tile_arange<int>(N)`` with N=1 → ``var_X = 0``.
 _TILE_ARANGE_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_arange\s*<[^>]*>\s*\(\s*\d+\s*\)")
+# ``wp::tile_arange<dtype, N>(start, stop, step)`` — multi-element form
+# used by mujoco_warp's dense-Jacobian path. Lower to a runtime loop
+# that fills ``var_X.c[i] = start + i * step``.
+_TILE_ARANGE_3ARG_PAT = re.compile(
+    r"\bvar_(\w+)\s*=\s*wp::tile_arange\s*<[^>]*>\s*\(([^)]*)\)"
+)
 # ``wp::tile_map<fn>(args...)`` — element-wise map. With block_dim=1 each
 # tile is a scalar; reduces to a direct call to the target function. The
 # template arg holds the function name (e.g. ``wp_mul`` or a user fn).
@@ -1916,6 +1925,10 @@ _TILE_MAP_NOTPL_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_map\s*\(([^)]*)\)"
 # binary; mujoco_warp's dense-Jacobian path emits this for ``wp::sub``
 # / ``wp::add`` / ``wp::mul`` over two tiles. Lower identically.
 _TILE_BINARY_MAP_NOTPL_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_binary_map\s*\(([^)]*)\)")
+# ``wp::tile_<op>(args...)`` — explicit-op tile builtins like
+# ``tile_mul`` / ``tile_add`` / ``tile_sub`` / ``tile_div``. Treated
+# the same as ``tile_binary_map(wp::<op>, args...)``.
+_TILE_OP_NOTPL_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_(add|sub|mul|div)\s*\(([^)]*)\)")
 # ``wp::tile_extract(tile, idx)`` — read the i-th element of a tile. For a
 # 1-element tile the only valid index is 0 and the result is the scalar
 # value itself.
@@ -2078,9 +2091,12 @@ def _translate_tile_intrinsics(
     is_coop_kernel: bool = False,
     transpose_aliases: dict[str, str] | None = None,
     tile_var_vec_n: dict[str, int] | None = None,
+    atomic_output_names: set[str] | None = None,
 ) -> str:
     if tile_var_vec_n is None:
         tile_var_vec_n = {}
+    if atomic_output_names is None:
+        atomic_output_names = set()
     """Lower ``wp::tile_*`` calls to ``wp_tile_RxC_<scalar>_*`` helper calls.
 
     ``tile_var_dims`` maps each tile local label to ``(rows, cols, msl_scalar)``
@@ -2211,6 +2227,22 @@ def _translate_tile_intrinsics(
         if vec_n_elem > 0:
             helper = f"wp_tile_{rows}x{cols}_vec{vec_n_elem}_{msl_scalar}_store"
             return f"{helper}({arr}, {base_expr}, {row_stride}, {row_off}, {col_off}, {tile_var})"
+        # If the target output is atomic-typed (the kernel uses
+        # ``wp.atomic_*`` somewhere), the helper signature
+        # ``device <scalar>*`` won't accept ``device atomic<scalar>*``.
+        # Emit an inline loop with ``atomic_store_explicit`` per
+        # element instead.
+        arr_name = arr[len("var_"):] if arr.startswith("var_") else arr
+        if arr_name in atomic_output_names:
+            n = rows * cols
+            store = (
+                f"{{ for (int _ts_i = 0; _ts_i < {rows}; ++_ts_i) "
+                f"for (int _ts_j = 0; _ts_j < {cols}; ++_ts_j) "
+                f"atomic_store_explicit("
+                f"&{arr}[{base_expr} + (({row_off}) + _ts_i) * ({row_stride}) + (({col_off}) + _ts_j)], "
+                f"{tile_var}.c[_ts_i * {cols} + _ts_j], memory_order_relaxed); }}"
+            )
+            return store
         # NB: cooperative tile_store (each lane writes its strided
         # slice with no smem) was tried but added latency without
         # measurable bandwidth savings — Metal's SIMD-group write
@@ -2292,22 +2324,105 @@ def _translate_tile_intrinsics(
     # Block-dim=1 register-tile reductions to plain scalar / vec values.
     # ``var_X = wp::tile<dtype>(var_x)``  →  ``var_X = var_x``
     line = _TILE_BUILTIN_TILE_PAT.sub(r"var_\1 = var_\2", line)
-    # ``var_X = wp::tile_reduce<op>(var_t)``  →  ``var_X = var_t``
-    line = _TILE_REDUCE_PAT.sub(r"var_\1 = var_\2", line)
+
+    def repl_tile_reduce(m: re.Match[str]) -> str:
+        # ``var_X = wp::tile_reduce(op_fn, var_t)``. For a multi-element
+        # tile we accumulate across all elements; for a single-element
+        # tile the reduce is identity (the existing assign was correct).
+        lhs = m.group(1)
+        # Recover the op name from the original line text — m.re's
+        # groups don't capture it because the pattern uses ``[\w:]+``
+        # without parens. Re-parse from the raw match.
+        full = m.group(0)
+        # Match ``tile_reduce(op_fn, var_t)`` to pull op_fn out.
+        op_match = re.search(r"wp::tile_reduce\s*\(\s*([\w:]+)\s*,\s*var_\w+\s*\)", full)
+        op_fn = op_match.group(1) if op_match else "wp::add"
+        in_label = m.group(2)
+        dims = tile_var_dims.get(in_label)
+        if dims is None:
+            return f"var_{lhs} = var_{in_label}"
+        rows, cols, _scalar = dims
+        n = rows * cols
+        if n == 1:
+            return f"var_{lhs} = var_{in_label}"
+        # Map known builtin op names to their accumulation expression.
+        if op_fn == "wp::add":
+            op_expr = "_tr_acc + var_{lhs}_in.c[_tr_i]"
+        elif op_fn == "wp::max":
+            op_expr = "metal::max(_tr_acc, var_{lhs}_in.c[_tr_i])"
+        elif op_fn == "wp::min":
+            op_expr = "metal::min(_tr_acc, var_{lhs}_in.c[_tr_i])"
+        elif op_fn == "wp::mul":
+            op_expr = "_tr_acc * var_{lhs}_in.c[_tr_i]"
+        else:
+            # Unknown op — leave the original (will trigger
+            # unsupported-intrinsic error with the function name visible).
+            return m.group(0)
+        # Substitute ``var_{lhs}_in`` placeholder with the actual tile
+        # var name; we don't actually need a separate name, but keeping
+        # the placeholder readable.
+        op_expr = op_expr.replace("{lhs}_in", in_label)
+        return (
+            f"var_{lhs} = ({{ "
+            f"auto _tr_acc = var_{in_label}.c[0]; "
+            f"for (int _tr_i = 1; _tr_i < {n}; ++_tr_i) _tr_acc = {op_expr}; "
+            f"_tr_acc; }})"
+        )
+
+    line = _TILE_REDUCE_PAT.sub(repl_tile_reduce, line)
 
     def repl_zeros(m: re.Match[str]) -> str:
-        scalar_ctype = f"wp::{m.group(2)}"
-        msl = _SCALAR_CTYPE_TO_MSL.get(scalar_ctype, "float")
-        return f"var_{m.group(1)} = ({msl})0"
+        return _emit_tile_const_fill(m.group(1), m.group(2), "0")
 
     def repl_ones(m: re.Match[str]) -> str:
-        scalar_ctype = f"wp::{m.group(2)}"
+        return _emit_tile_const_fill(m.group(1), m.group(2), "1")
+
+    def _emit_tile_const_fill(lhs: str, scalar_token: str, value: str) -> str:
+        # ``wp::tile_zeros`` / ``wp::tile_ones`` may target a single-
+        # element tile (which collapses to a scalar local) or a multi-
+        # element tile. For multi-element, fill all slots.
+        scalar_ctype = (
+            scalar_token if scalar_token.startswith("wp::") else f"wp::{scalar_token}"
+        )
         msl = _SCALAR_CTYPE_TO_MSL.get(scalar_ctype, "float")
-        return f"var_{m.group(1)} = ({msl})1"
+        dims = tile_var_dims.get(lhs)
+        if dims is None:
+            return f"var_{lhs} = ({msl}){value}"
+        rows, cols, _ = dims
+        n = rows * cols
+        if n == 1:
+            return f"var_{lhs} = ({msl}){value}"
+        return (
+            f"{{ for (int _tc_i = 0; _tc_i < {n}; ++_tc_i) "
+            f"var_{lhs}.c[_tc_i] = ({msl}){value}; }}"
+        )
 
     line = _TILE_ZEROS_PAT.sub(repl_zeros, line)
     line = _TILE_ONES_PAT.sub(repl_ones, line)
     line = _TILE_ARANGE_PAT.sub(r"var_\1 = 0", line)
+
+    def repl_tile_arange_3(m: re.Match[str]) -> str:
+        # ``var_X = wp::tile_arange<dtype, N>(start, stop, step)``.
+        # For multi-element tiles, fill ``var_X.c[i] = start + i*step``.
+        lhs = m.group(1)
+        args = [a.strip() for a in m.group(2).split(",")]
+        if len(args) != 3:
+            # 1-arg form already handled above.
+            return m.group(0)
+        start, _stop, step = args
+        dims = tile_var_dims.get(lhs)
+        if dims is None:
+            return m.group(0)
+        rows, cols, _ = dims
+        n = rows * cols
+        if n == 1:
+            return f"var_{lhs} = ({start})"
+        return (
+            f"{{ for (int _ar_i = 0; _ar_i < {n}; ++_ar_i) "
+            f"var_{lhs}.c[_ar_i] = ({start}) + _ar_i * ({step}); }}"
+        )
+
+    line = _TILE_ARANGE_3ARG_PAT.sub(repl_tile_arange_3, line)
 
     def repl_map(m: re.Match[str]) -> str:
         # ``var_X = wp::tile_map<fn>(args...)`` — single-element tile case.
@@ -2428,6 +2543,14 @@ def _translate_tile_intrinsics(
 
     line = _TILE_MAP_NOTPL_PAT.sub(repl_tile_map_notpl, line)
     line = _TILE_BINARY_MAP_NOTPL_PAT.sub(repl_tile_map_notpl, line)
+
+    def _repl_tile_op(m: re.Match[str]) -> str:
+        # Rewrite ``wp::tile_<op>(args)`` to the binary_map form so
+        # ``repl_tile_map_notpl`` produces the element loop.
+        synth = f"var_{m.group(1)} = wp::tile_binary_map(wp::{m.group(2)}, {m.group(3)})"
+        return _TILE_BINARY_MAP_NOTPL_PAT.sub(repl_tile_map_notpl, synth)
+
+    line = _TILE_OP_NOTPL_PAT.sub(_repl_tile_op, line)
 
     def repl_assign(m: re.Match[str]) -> str:
         # ``wp::tile_assign(dst, src, offset_tuple)``. With shape (1,1)
@@ -2648,6 +2771,55 @@ def _translate_tile_intrinsics(
 
     line = _TILE_CHOLESKY_SOLVE_INPLACE_PAT.sub(repl_cholesky_solve_inplace, line)
     return line
+
+
+# ---------------------------------------------------------------------------
+# Hand-written MSL definitions for mujoco_warp ``@wp.func`` helpers
+# that are referenced by ``wp::tile_map`` (which passes them by name —
+# the AST inliner only walks DIRECT calls, so functions passed by
+# reference don't get inlined and the body is left as an unresolved
+# call). The proper fix is a full user-function-emit pipeline that
+# mirrors ``generate_msl_kernel`` for ``@wp.func`` bodies; these
+# hand-emitted entries are a stop-gap to unblock the dense-Jacobian
+# path on Metal until that arrives.
+# ---------------------------------------------------------------------------
+_USER_FUNC_MSL_DEFS: dict[str, str] = {
+    # mujoco_warp/_src/support.py:_compute_jacp
+    "_compute_jacp_0": (
+        "inline float3 _compute_jacp_0(wp_vec6_float cdof_clip, float3 offset, int affect) {\n"
+        "    if (affect == 0) return float3(0.0f);\n"
+        "    float3 cdof_lin = float3(cdof_clip.c[3], cdof_clip.c[4], cdof_clip.c[5]);\n"
+        "    float3 cdof_ang = float3(cdof_clip.c[0], cdof_clip.c[1], cdof_clip.c[2]);\n"
+        "    return cdof_lin + metal::cross(cdof_ang, offset);\n"
+        "}"
+    ),
+    # mujoco_warp/_src/support.py:_compute_jacr
+    "_compute_jacr_0": (
+        "inline float3 _compute_jacr_0(wp_vec6_float cdof_clip, int affect) {\n"
+        "    if (affect == 0) return float3(0.0f);\n"
+        "    return float3(cdof_clip.c[0], cdof_clip.c[1], cdof_clip.c[2]);\n"
+        "}"
+    ),
+}
+
+_USER_FUNC_REF_PAT = re.compile(r"\b(_\w+_\d+)\s*\(")
+
+
+def _emit_referenced_user_funcs(source: str) -> str:
+    """Scan ``source`` for known mujoco_warp helper-function references
+    and return their MSL definitions concatenated. Functions not in the
+    lookup table are skipped — they'll surface as unresolved-symbol MSL
+    compile errors with a meaningful function name, which is still
+    better than the current ``MetalCodegenError`` gate.
+    """
+    seen: set[str] = set()
+    for m in _USER_FUNC_REF_PAT.finditer(source):
+        name = m.group(1)
+        if name in _USER_FUNC_MSL_DEFS:
+            seen.add(name)
+    if not seen:
+        return ""
+    return "\n".join(_USER_FUNC_MSL_DEFS[n] for n in sorted(seen)) + "\n"
 
 
 def _check_no_unsupported_intrinsics(line: str) -> None:
@@ -3544,6 +3716,7 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
         translated = _translate_tile_intrinsics(
             translated, tile_var_dims, view_aliases, coop_chol_seen,
             is_coop_kernel, transpose_aliases, tile_var_vec_n,
+            atomic_output_names,
         )
         # Inline subscripts that the address-collapse produced.
         for local_label, subscript in subscript_map.items():
