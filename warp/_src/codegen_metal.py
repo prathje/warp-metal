@@ -326,7 +326,16 @@ def _translate_vec_t_in(text: str) -> str:
 # ``(N, scalar)`` combination used by the kernel, with operator overloads so
 # the existing ``wp::add(a, b) -> (a + b)`` translations Just Work for the
 # resulting MSL types.
-_BIG_VEC_NAME_PAT = re.compile(r"\bwp_vec(\d+)_(\w+)\b")
+# Match ``wp_vec<N>_<scalar>`` (struct type or factory call). The
+# scalar set is enumerated to anchor the match — a lazy ``(\w+)``
+# would greedily pick up ``float_make`` from ``wp_vec6_float_make``,
+# classifying the scalar as "float_make" and missing the struct
+# emission. The optional ``_make`` suffix lets the same regex match
+# both the bare struct name and the factory call.
+_BIG_VEC_NAME_PAT = re.compile(
+    r"\bwp_vec(\d+)_(half|float|double|int|uint|long|ulong|char|uchar|short|ushort|bool)"
+    r"(?:_make)?\b"
+)
 # Stripped scalar -> MSL scalar prefix lookup. Goes from "float" / "int" etc.
 # back to the same name (it's a no-op convenience map for clarity).
 _MSL_PREFIX_TO_SAME = {prefix: prefix for prefix in _MSL_VEC_SCALAR_PREFIX.values()}
@@ -1897,6 +1906,16 @@ _TILE_ARANGE_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_arange\s*<[^>]*>\s*\(
 # tile is a scalar; reduces to a direct call to the target function. The
 # template arg holds the function name (e.g. ``wp_mul`` or a user fn).
 _TILE_MAP_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_map\s*<\s*([^,>]+?)\s*>\s*\(([^)]*)\)")
+# ``wp::tile_map(fn, args...)`` — no-template form used by the dense-
+# Jacobian path. ``fn`` is a user @wp.func or a wp builtin, and args
+# can mix tiles (scalar- or vec-element) with broadcast scalars. We
+# lower this by emitting an explicit element loop. Distinct from the
+# templated form above.
+_TILE_MAP_NOTPL_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_map\s*\(([^)]*)\)")
+# ``wp::tile_binary_map(fn, a, b)`` — same as tile_map but explicitly
+# binary; mujoco_warp's dense-Jacobian path emits this for ``wp::sub``
+# / ``wp::add`` / ``wp::mul`` over two tiles. Lower identically.
+_TILE_BINARY_MAP_NOTPL_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_binary_map\s*\(([^)]*)\)")
 # ``wp::tile_extract(tile, idx)`` — read the i-th element of a tile. For a
 # 1-element tile the only valid index is 0 and the result is the scalar
 # value itself.
@@ -2058,7 +2077,10 @@ def _translate_tile_intrinsics(
     coop_chol_seen: set[tuple[int, str]] | None = None,
     is_coop_kernel: bool = False,
     transpose_aliases: dict[str, str] | None = None,
+    tile_var_vec_n: dict[str, int] | None = None,
 ) -> str:
+    if tile_var_vec_n is None:
+        tile_var_vec_n = {}
     """Lower ``wp::tile_*`` calls to ``wp_tile_RxC_<scalar>_*`` helper calls.
 
     ``tile_var_dims`` maps each tile local label to ``(rows, cols, msl_scalar)``
@@ -2308,6 +2330,104 @@ def _translate_tile_intrinsics(
         return f"var_{lhs} = {fn}({m.group(3)})"
 
     line = _TILE_MAP_PAT.sub(repl_map, line)
+
+    def repl_tile_map_notpl(m: re.Match[str]) -> str:
+        # ``var_X = wp::tile_map(fn, arg1, arg2, ..., argN)`` — no-template
+        # form (mujoco_warp's dense-Jacobian path uses this with
+        # ``_compute_jacp`` / ``wp.dot`` / ``wp.add`` / etc.). Args can mix
+        # tiles (scalar- or vec-element) with broadcast scalars. We
+        # lower to an explicit element loop, extracting the per-element
+        # values from each tile arg and broadcasting scalars verbatim.
+        lhs = m.group(1)
+        inside = m.group(2)
+        args = [a.strip() for a in inside.split(",")]
+        if len(args) < 2:
+            return m.group(0)
+        fn = args[0]
+        fn_args = args[1:]
+
+        # Determine the tile shape from the first tile-typed arg.
+        def _tile_info(a: str) -> tuple[tuple[int, int, str], int] | None:
+            label = a[len("var_"):] if a.startswith("var_") else a
+            d = tile_var_dims.get(label)
+            if d is None:
+                return None
+            return d, tile_var_vec_n.get(label, 0)
+
+        tile_dims = None
+        for a in fn_args:
+            info = _tile_info(a)
+            if info is not None:
+                tile_dims = info[0]
+                break
+        if tile_dims is None:
+            # No tile args at all — degenerate; fall through to a plain call.
+            return f"var_{lhs} = {fn}({', '.join(fn_args)})"
+        rows, cols, _scalar = tile_dims
+        n_elements = rows * cols
+
+        # Special case: single-element tile collapses to a plain call.
+        # ``tile_map(fn, t1)`` where t1 is 1x1 acts like ``fn(t1)``.
+        if n_elements == 1:
+            return f"var_{lhs} = {fn}({', '.join(fn_args)})"
+
+        # Result tile shape/element type.
+        lhs_dims = tile_var_dims.get(lhs)
+        lhs_vec_n = tile_var_vec_n.get(lhs, 0)
+
+        # Build the per-arg per-element accessor expressions.
+        per_arg_access: list[str] = []
+        for a in fn_args:
+            info = _tile_info(a)
+            if info is None:
+                # Scalar broadcast — use the value verbatim.
+                per_arg_access.append(a)
+                continue
+            (_r, _c, a_scalar), a_vec_n = info
+            if a_vec_n > 0:
+                # Vec-element tile: build vec from ``a_vec_n`` consecutive
+                # scalars at offset ``i * a_vec_n``.
+                comps = [f"{a}.c[_tm_i * {a_vec_n} + {k}]" for k in range(a_vec_n)]
+                if a_vec_n in _MSL_VEC_NATIVE_N:
+                    per_arg_access.append(f"{a_scalar}{a_vec_n}({', '.join(comps)})")
+                else:
+                    per_arg_access.append(f"wp_vec{a_vec_n}_{a_scalar}_make({', '.join(comps)})")
+            else:
+                # Scalar-element tile: read element ``i`` directly.
+                per_arg_access.append(f"{a}.c[_tm_i]")
+
+        # Translate common ``wp::`` builtins to MSL form. The
+        # intrinsic-translation pass runs once before tile_map
+        # lowering, so the ``wp::sub(...)`` etc. we'd emit otherwise
+        # would be left as unsupported.
+        if fn.startswith("wp::"):
+            op = fn[len("wp::"):]
+            arith_ops = {"add": "+", "sub": "-", "mul": "*", "div": "/"}
+            if op in arith_ops and len(per_arg_access) == 2:
+                call = f"({per_arg_access[0]} {arith_ops[op]} {per_arg_access[1]})"
+            elif op == "dot" and len(per_arg_access) == 2:
+                call = f"metal::dot({per_arg_access[0]}, {per_arg_access[1]})"
+            else:
+                call = f"{fn}({', '.join(per_arg_access)})"
+        else:
+            call = f"{fn}({', '.join(per_arg_access)})"
+
+        # Store result: scalar element vs vec element.
+        body: list[str] = ["do {", f"for (int _tm_i = 0; _tm_i < {n_elements}; ++_tm_i) {{"]
+        if lhs_vec_n > 0:
+            # Vec result: store ``lhs_vec_n`` components per element.
+            # ``auto`` keeps us agnostic of the function's exact return type.
+            body.append(f"auto _tm_r = {call};")
+            for k in range(lhs_vec_n):
+                body.append(f"var_{lhs}.c[_tm_i * {lhs_vec_n} + {k}] = _tm_r[{k}];")
+        else:
+            body.append(f"var_{lhs}.c[_tm_i] = {call};")
+        body.append("}")
+        body.append("} while(0)")
+        return f"var_{lhs}; " + " ".join(body)
+
+    line = _TILE_MAP_NOTPL_PAT.sub(repl_tile_map_notpl, line)
+    line = _TILE_BINARY_MAP_NOTPL_PAT.sub(repl_tile_map_notpl, line)
 
     def repl_assign(m: re.Match[str]) -> str:
         # ``wp::tile_assign(dst, src, offset_tuple)``. With shape (1,1)
@@ -3423,7 +3543,7 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
         # otherwise rewrite to expressions and break the parse.
         translated = _translate_tile_intrinsics(
             translated, tile_var_dims, view_aliases, coop_chol_seen,
-            is_coop_kernel, transpose_aliases,
+            is_coop_kernel, transpose_aliases, tile_var_vec_n,
         )
         # Inline subscripts that the address-collapse produced.
         for local_label, subscript in subscript_map.items():
