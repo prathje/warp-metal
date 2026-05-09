@@ -739,7 +739,15 @@ def _emit_tile_cholesky(n: int, msl_scalar: str) -> str:
     parts.append(f"        {msl_scalar} d = L.c[j*{n} + j];")
     parts.append("        for (int k = 0; k < j; ++k) {")
     parts.append(f"            {msl_scalar} ljk = L.c[j*{n} + k];")
-    parts.append("            d -= ljk * ljk;")
+    # Explicit ``fma(-a, a, d)`` instead of ``d -= a * a``: forces the
+    # mul+sub to use the fused-multiply-add path with one rounding
+    # instead of two. With Apple-default ``-ffast-math`` the compiler
+    # is allowed to re-associate the sequence, which on G1's H matrix
+    # (freejoint root + tightly-coupled hinge dofs) accumulates enough
+    # round-off to drive the diagonal pivot below the
+    # ``max(d, 1e-30)`` clamp, then ``inv = 1/sqrt(1e-30) ≈ 1e15``
+    # blows up the rest of the factorization to NaN.
+    parts.append(f"            d = metal::fma(-ljk, ljk, d);")
     parts.append("        }")
     parts.append(f"        d = metal::max(d, ({msl_scalar})1e-30);")
     parts.append(f"        {msl_scalar} ljj = metal::precise::sqrt(d);")
@@ -747,7 +755,7 @@ def _emit_tile_cholesky(n: int, msl_scalar: str) -> str:
     parts.append(f"        {msl_scalar} inv = ({msl_scalar})1.0 / ljj;")
     parts.append(f"        for (int i = j + 1; i < {n}; ++i) {{")
     parts.append(f"            {msl_scalar} s = L.c[i*{n} + j];")
-    parts.append(f"            for (int k = 0; k < j; ++k) s -= L.c[i*{n} + k] * L.c[j*{n} + k];")
+    parts.append(f"            for (int k = 0; k < j; ++k) s = metal::fma(-L.c[i*{n} + k], L.c[j*{n} + k], s);")
     parts.append(f"            L.c[i*{n} + j] = s * inv;")
     parts.append(f"            L.c[j*{n} + i] = ({msl_scalar})0.0;")
     parts.append("        }")
@@ -899,7 +907,8 @@ def _emit_tile_cholesky_coop(n: int, msl_scalar: str) -> str:
     parts.append(f"            {msl_scalar} d = smem[j*{n} + j];")
     parts.append("            for (int k = 0; k < j; ++k) {")
     parts.append(f"                {msl_scalar} ljk = smem[j*{n} + k];")
-    parts.append("                d -= ljk * ljk;")
+    # Explicit fma — see ``_emit_tile_cholesky_inplace`` for rationale.
+    parts.append(f"                d = metal::fma(-ljk, ljk, d);")
     parts.append("            }")
     parts.append(f"            d = metal::max(d, ({msl_scalar})1e-30);")
     parts.append(f"            smem[j*{n} + j] = metal::precise::sqrt(d);")
@@ -909,7 +918,7 @@ def _emit_tile_cholesky_coop(n: int, msl_scalar: str) -> str:
     parts.append(f"        for (int i = (int)lane; i < {n}; i += 32) {{")
     parts.append("            if (i > j) {")
     parts.append(f"                {msl_scalar} s = smem[i*{n} + j];")
-    parts.append(f"                for (int k = 0; k < j; ++k) s -= smem[i*{n} + k] * smem[j*{n} + k];")
+    parts.append(f"                for (int k = 0; k < j; ++k) s = metal::fma(-smem[i*{n} + k], smem[j*{n} + k], s);")
     parts.append(f"                smem[i*{n} + j] = s / pivot;")
     parts.append("            }")
     parts.append("        }")
@@ -955,7 +964,15 @@ def _emit_tile_cholesky_inplace(n: int, msl_scalar: str) -> str:
     parts.append(f"        {msl_scalar} d = L.c[j*{n} + j];")
     parts.append("        for (int k = 0; k < j; ++k) {")
     parts.append(f"            {msl_scalar} ljk = L.c[j*{n} + k];")
-    parts.append("            d -= ljk * ljk;")
+    # Explicit ``fma(-a, a, d)`` instead of ``d -= a * a``: forces the
+    # mul+sub to use the fused-multiply-add path with one rounding
+    # instead of two. With Apple-default ``-ffast-math`` the compiler
+    # is allowed to re-associate the sequence, which on G1's H matrix
+    # (freejoint root + tightly-coupled hinge dofs) accumulates enough
+    # round-off to drive the diagonal pivot below the
+    # ``max(d, 1e-30)`` clamp, then ``inv = 1/sqrt(1e-30) ≈ 1e15``
+    # blows up the rest of the factorization to NaN.
+    parts.append(f"            d = metal::fma(-ljk, ljk, d);")
     parts.append("        }")
     parts.append(f"        d = metal::max(d, ({msl_scalar})1e-30);")
     parts.append(f"        {msl_scalar} ljj = metal::precise::sqrt(d);")
@@ -963,7 +980,7 @@ def _emit_tile_cholesky_inplace(n: int, msl_scalar: str) -> str:
     parts.append(f"        {msl_scalar} inv = ({msl_scalar})1.0 / ljj;")
     parts.append(f"        for (int i = j + 1; i < {n}; ++i) {{")
     parts.append(f"            {msl_scalar} s = L.c[i*{n} + j];")
-    parts.append(f"            for (int k = 0; k < j; ++k) s -= L.c[i*{n} + k] * L.c[j*{n} + k];")
+    parts.append(f"            for (int k = 0; k < j; ++k) s = metal::fma(-L.c[i*{n} + k], L.c[j*{n} + k], s);")
     parts.append(f"            L.c[i*{n} + j] = s * inv;")
     parts.append(f"            L.c[j*{n} + i] = ({msl_scalar})0.0;")
     parts.append("        }")
@@ -990,7 +1007,7 @@ def _emit_tile_lower_solve_inplace(n: int, k: int, msl_scalar: str) -> str:
     parts.append(f"    for (int i = 0; i < {n}; ++i) {{")
     parts.append(f"        for (int col = 0; col < {k}; ++col) {{")
     parts.append(f"            {msl_scalar} s = B.c[i*{k} + col];")
-    parts.append(f"            for (int kk = 0; kk < i; ++kk) s -= L.c[i*{n} + kk] * B.c[kk*{k} + col];")
+    parts.append(f"            for (int kk = 0; kk < i; ++kk) s = metal::fma(-L.c[i*{n} + kk], B.c[kk*{k} + col], s);")
     parts.append(f"            B.c[i*{k} + col] = s / L.c[i*{n} + i];")
     parts.append("        }")
     parts.append("    }")
@@ -1017,8 +1034,65 @@ def _emit_tile_upper_solve_inplace(n: int, k: int, msl_scalar: str) -> str:
     parts.append(f"    for (int i = {n} - 1; i >= 0; --i) {{")
     parts.append(f"        for (int col = 0; col < {k}; ++col) {{")
     parts.append(f"            {msl_scalar} s = B.c[i*{k} + col];")
-    parts.append(f"            for (int kk = i + 1; kk < {n}; ++kk) s -= U.c[i*{n} + kk] * B.c[kk*{k} + col];")
+    parts.append(f"            for (int kk = i + 1; kk < {n}; ++kk) s = metal::fma(-U.c[i*{n} + kk], B.c[kk*{k} + col], s);")
     parts.append(f"            B.c[i*{k} + col] = s / U.c[i*{n} + i];")
+    parts.append("        }")
+    parts.append("    }")
+    parts.append("}")
+    return "\n".join(parts)
+
+
+def _emit_tile_lower_solve_inplace_transposed(n: int, k: int, msl_scalar: str) -> str:
+    """Emit ``wp_tile_lower_solve_<N>x<K>_<scalar>_inplace_transposed``: solve
+    ``L * X = transpose(A)`` and write the result back to ``A`` such that
+    ``A`` ends up holding ``A * L^{-T}``.
+
+    This fuses ``B = transpose(A); lower_solve(L, B); A = transpose(B)``
+    into a single in-place pass. The fused form sidesteps a Metal-compiler
+    miscompile observed when the same solve+writeback pair is emitted
+    twice in one kernel (mujoco_warp's blocked Cholesky i-loop): the
+    second iteration's writeback returns a stale struct and silently
+    zeros out rows.
+
+    ``A`` has shape ``(K, N)``; ``L`` is ``N×N`` lower-triangular. Each
+    row of ``A`` is independently forward-substituted against ``L``.
+    """
+    L_name = f"wp_tile_{n}x{n}_{msl_scalar}"
+    A_name = f"wp_tile_{k}x{n}_{msl_scalar}"
+    name = f"wp_tile_lower_solve_{n}x{k}_{msl_scalar}_inplace_transposed"
+    parts: list[str] = [
+        f"__attribute__((noinline)) void {name}({L_name} L, thread {A_name}& A) {{"
+    ]
+    parts.append("    #pragma clang loop unroll(disable)")
+    parts.append(f"    for (int row = 0; row < {k}; ++row) {{")
+    parts.append(f"        for (int i = 0; i < {n}; ++i) {{")
+    parts.append(f"            {msl_scalar} s = A.c[row*{n} + i];")
+    parts.append(f"            for (int kk = 0; kk < i; ++kk) s = metal::fma(-L.c[i*{n} + kk], A.c[row*{n} + kk], s);")
+    parts.append(f"            A.c[row*{n} + i] = s / L.c[i*{n} + i];")
+    parts.append("        }")
+    parts.append("    }")
+    parts.append("}")
+    return "\n".join(parts)
+
+
+def _emit_tile_upper_solve_inplace_transposed(n: int, k: int, msl_scalar: str) -> str:
+    """Emit ``wp_tile_upper_solve_<N>x<K>_<scalar>_inplace_transposed``: solve
+    ``U * X = transpose(A)`` and write the result back to ``A`` such that
+    ``A`` ends up holding ``A * U^{-T}``. The fused form mirrors the
+    lower-triangular variant; see that function for the rationale.
+    """
+    L_name = f"wp_tile_{n}x{n}_{msl_scalar}"
+    A_name = f"wp_tile_{k}x{n}_{msl_scalar}"
+    name = f"wp_tile_upper_solve_{n}x{k}_{msl_scalar}_inplace_transposed"
+    parts: list[str] = [
+        f"__attribute__((noinline)) void {name}({L_name} U, thread {A_name}& A) {{"
+    ]
+    parts.append("    #pragma clang loop unroll(disable)")
+    parts.append(f"    for (int row = 0; row < {k}; ++row) {{")
+    parts.append(f"        for (int i = {n} - 1; i >= 0; --i) {{")
+    parts.append(f"            {msl_scalar} s = A.c[row*{n} + i];")
+    parts.append(f"            for (int kk = i + 1; kk < {n}; ++kk) s = metal::fma(-U.c[i*{n} + kk], A.c[row*{n} + kk], s);")
+    parts.append(f"            A.c[row*{n} + i] = s / U.c[i*{n} + i];")
     parts.append("        }")
     parts.append("    }")
     parts.append("}")
@@ -1049,9 +1123,13 @@ def _emit_tile_matmul(r: int, k: int, n: int, msl_scalar: str) -> str:
     parts.append(f"        for (int j = 0; j < {n}; ++j) {{")
     parts.append(f"            {msl_scalar} s = ({msl_scalar})0;")
     parts.append(f"            for (int kk = 0; kk < {k}; ++kk) {{")
-    parts.append(f"                s += A.c[i*{k} + kk] * B.c[kk*{n} + j];")
+    # Explicit ``fma`` accumulator: ``-ffast-math`` allows reassociation,
+    # and on G1's H structure the rank-1 updates lose enough precision
+    # in float32 to corrupt the downstream Cholesky pivot.
+    parts.append(f"                s = metal::fma(A.c[i*{k} + kk], B.c[kk*{n} + j], s);")
     parts.append("            }")
-    parts.append(f"            C.c[i*{n} + j] = beta * C.c[i*{n} + j] + alpha * s;")
+    # ``beta * C + alpha * s`` is also a fused-multiply-add candidate.
+    parts.append(f"            C.c[i*{n} + j] = metal::fma(alpha, s, beta * C.c[i*{n} + j]);")
     parts.append("        }")
     parts.append("    }")
     parts.append("}")
@@ -1099,14 +1177,14 @@ def _emit_tile_cholesky_solve(n: int, k: int, msl_scalar: str) -> str:
         parts.append("    #pragma clang loop unroll(disable)")
         parts.append(f"    for (int i = 0; i < {n}; ++i) {{")
         parts.append(f"        {msl_scalar} s = x.c[i];")
-        parts.append(f"        for (int kk = 0; kk < i; ++kk) s -= L.c[i*{n} + kk] * x.c[kk];")
+        parts.append(f"        for (int kk = 0; kk < i; ++kk) s = metal::fma(-L.c[i*{n} + kk], x.c[kk], s);")
         parts.append(f"        x.c[i] = s / L.c[i*{n} + i];")
         parts.append("    }")
         # Backward: L^T x = y
         parts.append("    #pragma clang loop unroll(disable)")
         parts.append(f"    for (int i = {n} - 1; i >= 0; --i) {{")
         parts.append(f"        {msl_scalar} s = x.c[i];")
-        parts.append(f"        for (int kk = i + 1; kk < {n}; ++kk) s -= L.c[kk*{n} + i] * x.c[kk];")
+        parts.append(f"        for (int kk = i + 1; kk < {n}; ++kk) s = metal::fma(-L.c[kk*{n} + i], x.c[kk], s);")
         parts.append(f"        x.c[i] = s / L.c[i*{n} + i];")
         parts.append("    }")
         parts.append("    return x;")
@@ -1119,12 +1197,12 @@ def _emit_tile_cholesky_solve(n: int, k: int, msl_scalar: str) -> str:
     parts.append(f"    for (int col = 0; col < {k}; ++col) {{")
     parts.append(f"        for (int i = 0; i < {n}; ++i) {{")
     parts.append(f"            {msl_scalar} s = x.c[i*{k} + col];")
-    parts.append(f"            for (int kk = 0; kk < i; ++kk) s -= L.c[i*{n} + kk] * x.c[kk*{k} + col];")
+    parts.append(f"            for (int kk = 0; kk < i; ++kk) s = metal::fma(-L.c[i*{n} + kk], x.c[kk*{k} + col], s);")
     parts.append(f"            x.c[i*{k} + col] = s / L.c[i*{n} + i];")
     parts.append("        }")
     parts.append(f"        for (int i = {n} - 1; i >= 0; --i) {{")
     parts.append(f"            {msl_scalar} s = x.c[i*{k} + col];")
-    parts.append(f"            for (int kk = i + 1; kk < {n}; ++kk) s -= L.c[kk*{n} + i] * x.c[kk*{k} + col];")
+    parts.append(f"            for (int kk = i + 1; kk < {n}; ++kk) s = metal::fma(-L.c[kk*{n} + i], x.c[kk*{k} + col], s);")
     parts.append(f"            x.c[i*{k} + col] = s / L.c[i*{n} + i];")
     parts.append("        }")
     parts.append("    }")
@@ -1244,18 +1322,30 @@ def _build_kernel_header(source: str) -> str:
             chol_inplace_seen.add((r_, m.group(3)))
     for n_, sc_ in sorted(chol_inplace_seen):
         parts.append(_emit_tile_cholesky_inplace(n_, sc_))
-    lsolve_pat = re.compile(r"\bwp_tile_lower_solve_(\d+)x(\d+)_(\w+)_inplace\b")
-    usolve_pat = re.compile(r"\bwp_tile_upper_solve_(\d+)x(\d+)_(\w+)_inplace\b")
+    lsolve_pat = re.compile(r"\bwp_tile_lower_solve_(\d+)x(\d+)_(\w+)_inplace\b(?!_transposed)")
+    usolve_pat = re.compile(r"\bwp_tile_upper_solve_(\d+)x(\d+)_(\w+)_inplace\b(?!_transposed)")
+    lsolve_t_pat = re.compile(r"\bwp_tile_lower_solve_(\d+)x(\d+)_(\w+)_inplace_transposed\b")
+    usolve_t_pat = re.compile(r"\bwp_tile_upper_solve_(\d+)x(\d+)_(\w+)_inplace_transposed\b")
     lsolve_seen: set[tuple[int, int, str]] = set()
     usolve_seen: set[tuple[int, int, str]] = set()
+    lsolve_t_seen: set[tuple[int, int, str]] = set()
+    usolve_t_seen: set[tuple[int, int, str]] = set()
     for m in lsolve_pat.finditer(source):
         lsolve_seen.add((int(m.group(1)), int(m.group(2)), m.group(3)))
     for m in usolve_pat.finditer(source):
         usolve_seen.add((int(m.group(1)), int(m.group(2)), m.group(3)))
+    for m in lsolve_t_pat.finditer(source):
+        lsolve_t_seen.add((int(m.group(1)), int(m.group(2)), m.group(3)))
+    for m in usolve_t_pat.finditer(source):
+        usolve_t_seen.add((int(m.group(1)), int(m.group(2)), m.group(3)))
     for n_, k_, sc_ in sorted(lsolve_seen):
         parts.append(_emit_tile_lower_solve_inplace(n_, k_, sc_))
     for n_, k_, sc_ in sorted(usolve_seen):
         parts.append(_emit_tile_upper_solve_inplace(n_, k_, sc_))
+    for n_, k_, sc_ in sorted(lsolve_t_seen):
+        parts.append(_emit_tile_lower_solve_inplace_transposed(n_, k_, sc_))
+    for n_, k_, sc_ in sorted(usolve_t_seen):
+        parts.append(_emit_tile_upper_solve_inplace_transposed(n_, k_, sc_))
     cholesky_pat = re.compile(r"\bwp_tile_(\d+)x(\d+)_(\w+)_cholesky\b(?!_solve|_inplace|_coop)")
     cholesky_solve_pat = re.compile(r"\bwp_tile_(\d+)x(\d+)_(\w+)_cholesky_solve_(\d+)\b")
     coop_cholesky_pat = re.compile(r"\bwp_tile_(\d+)x(\d+)_(\w+)_cholesky_coop\b")
@@ -2761,16 +2851,23 @@ def _translate_tile_intrinsics(
             return f"{call};\n{wb}"
         # If B was produced by ``tile_transpose``, the mutation needs to
         # propagate back to the source so its caller can ``tile_store``
-        # the updated values. Emit ``source = transpose(B)`` after the
-        # solve; the helper's per-(R,C) emit handles the index swap.
+        # the updated values. Rewrite the call to a *transposed* helper
+        # that operates directly on the source tile — this skips the
+        # temporary and the writeback. Emitting ``var_src = transpose(B)``
+        # after the solve triggers a Metal-compiler miscompile when the
+        # same solve+writeback pattern appears twice in one kernel
+        # (mujoco_warp's blocked Cholesky i-loop): the second iteration's
+        # writeback returns a stale struct and the rows silently reset to
+        # zero.
         if transpose_aliases is not None and B_label in transpose_aliases:
             src_label = transpose_aliases[B_label]
             src_dims = tile_var_dims.get(src_label)
             if src_dims is not None:
-                src_rows, src_cols, src_scalar = src_dims
-                back_helper = f"wp_tile_{B_dims[0]}x{B_dims[1]}_{B_dims[2]}_transpose"
-                wb = f"var_{src_label} = {back_helper}({B_arg})"
-                return f"{call};\n{wb}"
+                src_rows, src_cols, _src_scalar = src_dims
+                helper_t = (
+                    f"wp_tile_{kind}_solve_{n}x{k_cols}_{scalar}_inplace_transposed"
+                )
+                return f"{helper_t}({L_arg}, var_{src_label})"
         return call
 
     line = _TILE_LOWER_SOLVE_INPLACE_PAT.sub(lambda m: _repl_solve_inplace("lower", m), line)
@@ -4321,6 +4418,31 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
         for a in output_args:
             if a.label in read_outputs and a.label not in init_outputs:
                 init_outputs.append(a.label)
+    # Plus any output written via ``tile_store(arr, tile, offset=...)``
+    # at a non-zero offset. The write is partial and previous launches'
+    # writes to other slices need to survive. mujoco_warp's
+    # ``_tile_euler_dense`` is the canonical case: dense Euler launches
+    # one kernel per skeleton dof block, each writing
+    # ``qacc[dof_block_offset:dof_block_offset+TILE]``. Without seeding,
+    # MLX's fresh output buffer leaves the OTHER blocks' qacc as zeros.
+    if not non_standard_launch:
+        # Match the helper-call form ``wp_tile_RxC_<scalar>_store(arr,
+        # base, stride, row_off, col_off, tile)`` — six args. When
+        # ``row_off`` or ``col_off`` is anything other than literal
+        # ``0``, the store covers a partial slice.
+        store_call_pat = re.compile(
+            r"\bwp_tile_\d+x\d+(?:_vec\d+)?_\w+_store\s*\(\s*"
+            r"([\w]+)\s*,\s*[^,]+,\s*[^,]+,\s*([^,]+)\s*,\s*([^,]+)\s*,"
+        )
+        for raw in body_lines:
+            for m in store_call_pat.finditer(raw):
+                arr_name = m.group(1)
+                row_off = m.group(2).strip()
+                col_off = m.group(3).strip()
+                if row_off == "0" and col_off == "0":
+                    continue
+                if arr_name in output_label_set and arr_name not in init_outputs:
+                    init_outputs.append(arr_name)
     # Detect kernels with an early ``return;`` at function scope —
     # they have a guarded write path where some thread invocations
     # skip writing their output slot entirely. ``_geom_local_to_global``

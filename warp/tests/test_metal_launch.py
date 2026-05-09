@@ -3235,6 +3235,69 @@ class TestMetalLaunch(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet, timeout=120)
 
+    def test_two_solve_inplace_with_transpose_writeback(self):
+        # Regression for a Metal-compiler miscompile that manifests when
+        # ``tile_lower_solve_inplace(L, tile_transpose(A))`` appears more
+        # than once in the same kernel. The transpose-back writeback
+        # ``var_A = transpose(var_B)`` after the second call returns a
+        # stale struct, leaving rows of ``A`` silently zeroed out. This
+        # was the root cause of G1's blocked-Cholesky producing NaN at
+        # the third diagonal block: the i-loop iterates twice for the
+        # k=0 outer iteration (i=16, i=32) and the i=32 writeback was
+        # corrupted.
+        #
+        # The fix lowers ``solve(L, transpose(A))`` to a fused
+        # ``solve_transposed(L, A)`` helper that operates on ``A``
+        # directly, sidestepping the temporary entirely.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            N = 16
+
+            @wp.kernel
+            def k(L_arr: wp.array2d(dtype=float),
+                  A1_arr: wp.array2d(dtype=float),
+                  A2_arr: wp.array2d(dtype=float),
+                  out1: wp.array2d(dtype=float),
+                  out2: wp.array2d(dtype=float)):
+                L = wp.tile_load(L_arr, shape=(N, N))
+                A1 = wp.tile_load(A1_arr, shape=(N, N))
+                A2 = wp.tile_load(A2_arr, shape=(N, N))
+                wp.tile_lower_solve_inplace(L, wp.tile_transpose(A1))
+                wp.tile_store(out1, A1)
+                wp.tile_lower_solve_inplace(L, wp.tile_transpose(A2))
+                wp.tile_store(out2, A2)
+
+            rng = np.random.default_rng(0)
+            M = rng.standard_normal((N, N)).astype(np.float32)
+            L_np = np.linalg.cholesky((M @ M.T) + np.eye(N) * 0.5).astype(np.float32)
+            A1_np = rng.standard_normal((N, N)).astype(np.float32)
+            A2_np = rng.standard_normal((N, N)).astype(np.float32)
+            # Math: solve(L, transpose(A)) computes X = L^{-1} A^T;
+            # writeback gives A = X^T = A L^{-T}.
+            expected1 = (A1_np.astype(np.float64) @ np.linalg.inv(L_np).T).astype(np.float32)
+            expected2 = (A2_np.astype(np.float64) @ np.linalg.inv(L_np).T).astype(np.float32)
+
+            for dev in ('cpu', 'metal:0'):
+                L_d = wp.array(L_np, dtype=wp.float32, device=dev)
+                A1_d = wp.array(A1_np, dtype=wp.float32, device=dev)
+                A2_d = wp.array(A2_np, dtype=wp.float32, device=dev)
+                o1 = wp.zeros((N, N), dtype=wp.float32, device=dev)
+                o2 = wp.zeros((N, N), dtype=wp.float32, device=dev)
+                wp.launch_tiled(k, dim=1,
+                                inputs=[L_d, A1_d, A2_d],
+                                outputs=[o1, o2],
+                                block_dim=1, device=dev)
+                np.testing.assert_allclose(o1.numpy(), expected1, atol=2e-5,
+                    err_msg=f'first solve on {dev}')
+                np.testing.assert_allclose(o2.numpy(), expected2, atol=2e-5,
+                    err_msg=f'second solve on {dev} — writeback miscompile regression?')
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
     def test_simd_cooperative_cholesky_msl_prototype(self):
         # Standalone validation that a SIMD-cooperative right-looking
         # Cholesky compiles and runs correctly on Apple GPU. This is
