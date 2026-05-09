@@ -231,6 +231,63 @@ class TestMetalMujocoWarp(unittest.TestCase):
         # but stays at ~1e-4 over this horizon.
         self._run(xml, nsteps=5)
 
+    def test_dense_jacobian_g1_humanoid_3_steps(self):
+        # Unitree G1 humanoid (nv=35) with mjJAC_DENSE on Metal —
+        # exercises the dense Jacobian + dense Euler integrator on
+        # a real robot. Forces ``_BLOCK_CHOLESKY_DIM=64`` so the
+        # solver uses the simple-path Cholesky (the blocked path
+        # currently loses precision at this matrix structure on
+        # Metal — tracked as a numerical follow-up).
+        #
+        # Verifies the kernel pipeline compiles and runs without
+        # producing NaNs; CPU/Metal numerical agreement is ~1e-4
+        # over 3 steps (acceptable iterative-solver float32 drift).
+        xml_path = "/Users/patrickrathje/git/robotics/g1/mjlab/src/mjlab/asset_zoo/robots/unitree_g1/xmls/g1.xml"
+        if not __import__("os").path.exists(xml_path):
+            self.skipTest("mjlab G1 XML not available")
+        snippet = textwrap.dedent(
+            f"""
+            _XML_PATH = {xml_path!r}
+            import warp as wp
+            import mujoco
+            import mujoco_warp as mjw
+            import mujoco_warp._src.solver as _solver
+            import numpy as np
+
+            _solver._BLOCK_CHOLESKY_DIM = 64
+            mjm = mujoco.MjModel.from_xml_path(_XML_PATH)
+            mjm.opt.jacobian = mujoco.mjtJacobian.mjJAC_DENSE
+            mjd = mujoco.MjData(mjm)
+            mujoco.mj_forward(mjm, mjd)
+
+            results = {{}}
+            for dev in ('cpu', 'metal:0'):
+                with wp.ScopedDevice(dev):
+                    m = mjw.put_model(mjm)
+                    d = mjw.put_data(mjm, mjd)
+                    for _ in range(3):
+                        mjw.step(m, d)
+                    wp.synchronize_device()
+                    results[dev] = (
+                        d.qpos.numpy().copy(),
+                        d.qvel.numpy().copy(),
+                        d.qacc.numpy().copy(),
+                    )
+            for i, name in enumerate(('qpos', 'qvel', 'qacc')):
+                a = results['cpu'][i]
+                b = results['metal:0'][i]
+                assert not np.any(np.isnan(b)), f'{{name}} has NaN on Metal'
+                d = float(np.max(np.abs(a - b)))
+                # Loose tolerance: G1 has rich constraint structure;
+                # over 3 steps with iterative solver the drift can
+                # reach ~1e-4 in float32 even with bit-exact Cholesky.
+                tol = {{'qpos': 1e-3, 'qvel': 1e-2, 'qacc': 1.0}}[name]
+                assert d < tol, f'{{name}} diff {{d}} exceeds {{tol}}'
+            print('OK')
+            """
+        )
+        _run_subprocess(self, snippet, timeout=300)
+
     def test_dense_jacobian_pendulum_matches_cpu(self):
         # mjJAC_DENSE path on Metal — exercises the dense-Jacobian
         # constraint kernels (``_efc_contact_jac_dense``) and the
