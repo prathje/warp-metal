@@ -2184,6 +2184,43 @@ class TestMetalLaunch(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet)
 
+    def test_mat33_row_col_slice_matches_cpu(self):
+        # ``m[:, c]`` and ``m[r, :]`` lower to ``wp::extract<N>(m, slice, c)``
+        # / ``wp::extract<N>(m, r, slice)`` over a ``wp::slice_t``. Used by
+        # mujoco_warp's BVH bounds kernels (e.g. ``rot[:, 2]`` to extract a
+        # mat33's third column when computing height-field axis-aligned
+        # bounds).
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k_col(a: wp.array(dtype=wp.mat33), out: wp.array(dtype=wp.vec3)):
+                tid = wp.tid()
+                out[tid] = a[tid][:, 2]
+
+            @wp.kernel
+            def k_row(a: wp.array(dtype=wp.mat33), out: wp.array(dtype=wp.vec3)):
+                tid = wp.tid()
+                out[tid] = a[tid][1, :]
+
+            N = 8
+            rng = np.random.default_rng(7)
+            an = rng.standard_normal((N, 3, 3)).astype(np.float32)
+            for kk, expected_axis in ((k_col, 'col2'), (k_row, 'row1')):
+                a_cpu = wp.array(an, dtype=wp.mat33, device='cpu')
+                a_m = wp.array(an, dtype=wp.mat33, device='metal:0')
+                o_cpu = wp.zeros(N, dtype=wp.vec3, device='cpu')
+                o_m = wp.zeros(N, dtype=wp.vec3, device='metal:0')
+                wp.launch(kk, dim=N, inputs=[a_cpu], outputs=[o_cpu], device='cpu')
+                wp.launch(kk, dim=N, inputs=[a_m], outputs=[o_m], device='metal:0')
+                np.testing.assert_array_equal(o_cpu.numpy(), o_m.numpy(),
+                    err_msg=f'{expected_axis} mismatch')
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
     def test_mat33_transpose_matches_cpu(self):
         # ``wp.transpose`` -> ``metal::transpose``. Verifies the row/col
         # convention end-to-end: store a row-major matrix, transpose it on
