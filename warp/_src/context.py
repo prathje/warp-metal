@@ -8441,6 +8441,15 @@ def launch(
             raise RuntimeError("Metal backend does not yet support adjoint launches")
         if record_cmd:
             raise RuntimeError("Metal backend does not yet support record_cmd launches")
+        # Generic kernels (``dtype=Any``) need their concrete overload
+        # resolved before MSL codegen — the type-inference + ``add_overload``
+        # flow normally runs further down the launch path, after the
+        # short-circuit. Mirror it here so the Metal codegen sees a
+        # specialised ``adj.variables`` instead of ``wp::Any`` ctypes.
+        if kernel.is_generic:
+            fwd_args = list(inputs) + list(outputs)
+            fwd_types = kernel.infer_argument_types(fwd_args)
+            kernel = kernel.add_overload(fwd_types)
         from warp._src.codegen_metal import launch_metal_kernel  # noqa: PLC0415
 
         launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim=block_dim)

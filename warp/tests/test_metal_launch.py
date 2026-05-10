@@ -2154,6 +2154,45 @@ class TestMetalLaunch(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet)
 
+    def test_generic_kernel_dtype_any_matches_cpu(self):
+        # Kernels declared with ``dtype=Any`` are specialised at launch
+        # time. The CUDA/CPU launch path resolves the overload via
+        # ``infer_argument_types`` + ``add_overload``; the Metal short-
+        # circuit needs to mirror that or the IR carries through with
+        # ``wp::Any`` ctypes that no codegen path can handle.
+        # mjlab's ``repeat_array_kernel`` (per-world tiling for domain
+        # randomization) hit this.
+        snippet = textwrap.dedent(
+            """
+            from typing import Any
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel(module='unique')
+            def repeat_kernel(
+                src: wp.array(dtype=Any),
+                nelems_per_world: int,
+                dst: wp.array(dtype=Any),
+            ):
+                tid = wp.tid()
+                src[0]
+                src_idx = tid % nelems_per_world
+                dst[tid] = src[src_idx]
+
+            N_PER_WORLD = 4
+            NWORLD = 3
+            src_np = np.arange(N_PER_WORLD, dtype=np.float32)
+            expected = np.tile(src_np, NWORLD)
+            for dev in ('cpu', 'metal:0'):
+                src = wp.array(src_np, dtype=wp.float32, device=dev)
+                dst = wp.zeros(N_PER_WORLD * NWORLD, dtype=wp.float32, device=dev)
+                wp.launch(repeat_kernel, dim=dst.shape[0],
+                          inputs=[src, N_PER_WORLD], outputs=[dst], device=dev)
+                np.testing.assert_array_equal(dst.numpy(), expected)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
     def test_mat33_extract_2d_index_matches_cpu(self):
         # ``m[i, j]`` -> 3-arg ``wp::extract`` -> MSL ``m[j][i]`` (column-then-
         # row). Computes the trace, which uses three diagonal extracts.
