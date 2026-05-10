@@ -6056,6 +6056,11 @@ class Runtime:
             self.metal_devices.append(metal_device)
             self.device_map["metal:0"] = metal_device
             self.device_map["metal"] = metal_device
+            # Accept torch's device names ("mps", "mps:0") as aliases so
+            # frameworks that pass the same device string to torch and
+            # warp don't need a translation layer.
+            self.device_map["mps"] = metal_device
+            self.device_map["mps:0"] = metal_device
 
         # set default device
         if cuda_device_count > 0:

@@ -66,6 +66,9 @@ def device_to_torch(warp_device: warp.DeviceLike) -> str:
     elif device.is_cuda and device.is_uva:
         # it's not a primary context, but torch can access the data ptr directly thanks to UVA
         return f"cuda:{device.ordinal}"
+    elif device.is_metal:
+        # Torch calls Apple's GPU "mps", not "metal".
+        return "mps"
     raise RuntimeError(f"Warp device {device} is not compatible with torch")
 
 
