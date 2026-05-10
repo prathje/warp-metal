@@ -69,12 +69,17 @@ def _run_subprocess(test_case: unittest.TestCase, snippet: str, timeout: int = 2
         f.write(code)
         path = f.name
     try:
+        # Run from a neutral cwd so workspace symlinks (e.g. ``mjlab``,
+        # ``mujoco_warp`` placed alongside the warp checkout for
+        # convenience) don't shadow the editable installs via Python's
+        # namespace-package discovery.
         result = subprocess.run(
             [sys.executable, path],
             check=False,
             capture_output=True,
             text=True,
             timeout=timeout,
+            cwd=tempfile.gettempdir(),
         )
     finally:
         try:
