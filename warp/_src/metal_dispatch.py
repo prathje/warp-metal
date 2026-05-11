@@ -85,12 +85,20 @@ class MetalDispatcher:
         # per unique kernel — so caching is critical.
         self._library_cache: dict[str, Any] = {}
         self._pipeline_cache: dict[tuple[str, str], Any] = {}
-        # Lazily-created command buffer that accumulates dispatches between
-        # sync points. ``None`` means "no work in flight".
+        # Lazily-created command buffer + a single live compute encoder
+        # shared across dispatches between sync points. Many launches
+        # encode through the same encoder; we only call ``endEncoding`` +
+        # ``commit`` at :meth:`flush` / :meth:`sync`. Each ObjC call has
+        # fixed PyObjC overhead, so collapsing encoder lifecycle from
+        # per-dispatch to per-batch is a measurable win.
         self._cmd_buf: Any = None
+        self._encoder: Any = None
         # Refs to MTLBuffers bound to the current cmd buffer — must stay
         # alive until the buffer completes.
         self._inflight_refs: list = []
+        # Cache the NSRange constructor — avoids one PyObjC lookup per
+        # batch-bind.
+        self._NSMakeRange = Metal.NSMakeRange
         self._lock = threading.Lock()
 
     @property
@@ -185,43 +193,80 @@ class MetalDispatcher:
     def dispatch(
         self,
         pso,
-        buffers: list,
+        bindings: list,
         grid: tuple[int, int, int],
         threadgroup: tuple[int, int, int],
     ) -> None:
         """Encode one compute dispatch onto the in-flight command buffer.
 
-        ``buffers`` is a list of ``MTLBuffer``s; each is bound at the
-        corresponding ``setBuffer:offset:atIndex:`` slot. The caller
-        is responsible for ordering arguments to match the kernel's
-        signature.
+        ``bindings`` is a list whose i-th entry becomes argument-slot
+        ``i`` in the kernel. Each entry is either:
+
+        * An ``MTLBuffer`` — bound via ``setBuffer:offset:atIndex:``.
+        * A ``(bytes-like, length)`` tuple — bound via
+          ``setBytes:length:atIndex:`` (cheaper for small const args
+          ≤4KB; avoids a buffer allocation).
+
+        The caller is responsible for ordering bindings to match the
+        kernel's signature.
 
         This does not commit the command buffer — call :meth:`flush`
         to schedule it for execution, or :meth:`sync` to wait for it.
         """
         Metal = self._Metal
-        if self._cmd_buf is None:
-            self._cmd_buf = self._command_queue.commandBuffer()
+        if self._encoder is None:
             if self._cmd_buf is None:
-                raise MetalDispatchError("MTLCommandQueue commandBuffer returned None")
-            self._inflight_refs = []
-        encoder = self._cmd_buf.computeCommandEncoder()
-        if encoder is None:
-            raise MetalDispatchError("MTLCommandBuffer computeCommandEncoder returned None")
+                self._cmd_buf = self._command_queue.commandBuffer()
+                if self._cmd_buf is None:
+                    raise MetalDispatchError("MTLCommandQueue commandBuffer returned None")
+                self._inflight_refs = []
+            self._encoder = self._cmd_buf.computeCommandEncoder()
+            if self._encoder is None:
+                raise MetalDispatchError("MTLCommandBuffer computeCommandEncoder returned None")
+        encoder = self._encoder
         encoder.setComputePipelineState_(pso)
-        for idx, buf in enumerate(buffers):
-            encoder.setBuffer_offset_atIndex_(buf, 0, idx)
-            # Refs must outlive the cmd buffer; the registry usually
-            # holds them, but bind here defensively in case a caller
-            # passes a transient buffer.
-            self._inflight_refs.append(buf)
+        # Batch-bind buffers. ``setBytes`` entries are passed one at a
+        # time (each pushes a separate small allocation into the
+        # encoder's command stream) but consecutive MTLBuffer entries
+        # collapse into a single ``setBuffers:offsets:withRange:`` call
+        # — fewer PyObjC bridge crossings = lower per-launch overhead.
+        run_start = 0
+        run_buffers: list = []
+        run_offsets: list = []
+
+        def _flush_run(end_exclusive: int) -> None:
+            if not run_buffers:
+                return
+            count = len(run_buffers)
+            encoder.setBuffers_offsets_withRange_(
+                run_buffers, run_offsets, self._NSMakeRange(end_exclusive - count, count)
+            )
+            self._inflight_refs.extend(run_buffers)
+            run_buffers.clear()
+            run_offsets.clear()
+
+        for idx, entry in enumerate(bindings):
+            if isinstance(entry, tuple) and len(entry) == 2:
+                _flush_run(idx)
+                data, length = entry
+                encoder.setBytes_length_atIndex_(data, length, idx)
+            else:
+                run_buffers.append(entry)
+                run_offsets.append(0)
+        _flush_run(len(bindings))
+
         gx, gy, gz = grid
         tx, ty, tz = threadgroup
         encoder.dispatchThreads_threadsPerThreadgroup_(
             Metal.MTLSizeMake(gx, gy, gz),
             Metal.MTLSizeMake(tx, ty, tz),
         )
-        encoder.endEncoding()
+
+    def _end_encoder(self) -> None:
+        """Close the live compute encoder, if any."""
+        if self._encoder is not None:
+            self._encoder.endEncoding()
+            self._encoder = None
 
     def flush(self) -> None:
         """Commit the in-flight command buffer (fire and forget).
@@ -232,6 +277,7 @@ class MetalDispatcher:
         """
         if self._cmd_buf is None:
             return
+        self._end_encoder()
         cmd_buf = self._cmd_buf
         refs = self._inflight_refs
         self._cmd_buf = None
@@ -253,6 +299,7 @@ class MetalDispatcher:
         """
         if self._cmd_buf is None:
             return
+        self._end_encoder()
         cmd_buf = self._cmd_buf
         refs = self._inflight_refs
         self._cmd_buf = None
