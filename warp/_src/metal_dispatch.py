@@ -178,6 +178,38 @@ class MetalDispatcher:
     # Buffer allocation
     # ------------------------------------------------------------------
 
+    def fill_zero(self, mtl_buf, nbytes: int) -> None:
+        """Zero a region of an ``MTLBuffer`` via a blit encoder.
+
+        Used by ``launch_metal_kernel_native`` to match MLX's
+        ``init_value=0`` semantics for atomic-output kernels whose
+        outputs would otherwise inherit the user's prior data
+        (because the wp.array's MTLBuffer is bound directly instead
+        of a fresh MLX allocation).
+
+        Reuses the in-flight command buffer so the fill is part of
+        the same async stream as the surrounding launches.
+        """
+        if nbytes <= 0:
+            return
+        Metal = self._Metal
+        # End the live compute encoder, if any, so we can switch to a
+        # blit encoder. Reopen the compute encoder after — minor
+        # ObjC churn but only on atomic-output launches.
+        had_encoder = self._encoder is not None
+        if had_encoder:
+            self._encoder.endEncoding()
+            self._encoder = None
+        if self._cmd_buf is None:
+            self._cmd_buf = self._command_queue.commandBuffer()
+            if self._cmd_buf is None:
+                raise MetalDispatchError("MTLCommandQueue commandBuffer returned None")
+            self._inflight_refs = []
+        blit = self._cmd_buf.blitCommandEncoder()
+        blit.fillBuffer_range_value_(mtl_buf, Metal.NSMakeRange(0, nbytes), 0)
+        blit.endEncoding()
+        self._inflight_refs.append(mtl_buf)
+
     def alloc(self, nbytes: int):
         """Allocate a shared-storage ``MTLBuffer`` of ``nbytes`` bytes.
 
