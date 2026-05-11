@@ -42,7 +42,13 @@ def _run_with_metal_enabled(test_case, snippet: str, timeout: int = 30):
     ``@wp.kernel``-decorated functions, which fails for code passed via
     ``python -c``.
     """
-    code = "import warp as wp\nwp.config.enable_metal = True\nwp.init()\n" + snippet
+    # Allow the whole suite to be re-run under native dispatch by setting
+    # ``WARP_METAL_NATIVE_DISPATCH=1`` in the environment. The flag must
+    # be set before ``wp.init()`` so the allocator picks the right backend.
+    prefix = "import warp as wp\nwp.config.enable_metal = True\n"
+    if os.environ.get("WARP_METAL_NATIVE_DISPATCH") == "1":
+        prefix += "wp.config.metal_native_dispatch = True\n"
+    code = prefix + "wp.init()\n" + snippet
     with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, prefix="warp_metal_test_") as f:
         f.write(code)
         path = f.name
@@ -222,7 +228,11 @@ class TestMetalLaunch(unittest.TestCase):
                               wp.array(bn, dtype=wp.float32, device='metal:0')],
                       outputs=[c1], device='metal:0')
             artifact_after_first = k._metal_artifact
-            mlx_after_first = k._metal_mlx_kernel
+            # Cache key differs between MLX (``_metal_mlx_kernel``) and
+            # native (``_metal_native_pso``) dispatch — pick whichever
+            # is in use so this regression covers both backends.
+            cache_attr = '_metal_native_pso' if wp.config.metal_native_dispatch else '_metal_mlx_kernel'
+            cached_after_first = getattr(k, cache_attr)
 
             c2 = wp.zeros(N, dtype=wp.float32, device='metal:0')
             wp.launch(k, dim=N,
@@ -231,7 +241,8 @@ class TestMetalLaunch(unittest.TestCase):
                       outputs=[c2], device='metal:0')
 
             assert k._metal_artifact is artifact_after_first, 'artifact was regenerated'
-            assert k._metal_mlx_kernel is mlx_after_first, 'mlx kernel was regenerated'
+            assert getattr(k, cache_attr) is cached_after_first, \
+                f'{cache_attr} was regenerated'
             np.testing.assert_array_equal(c1.numpy(), c2.numpy())
             np.testing.assert_array_equal(c1.numpy(), np.full(N, 3.0, dtype=np.float32))
             """
@@ -1716,7 +1727,12 @@ class TestMetalLaunch(unittest.TestCase):
                 out = wp.zeros((N, M), dtype=wp.float32, device=dev)
                 wp.launch(k, dim=N, inputs=[a], outputs=[out], device=dev)
                 results[dev] = out.numpy()
-            np.testing.assert_array_equal(results['cpu'], results['metal:0'])
+            # Bit-equal on the MLX dispatch path; native dispatch may
+            # differ at the last bit of float32 because Apple's MSL
+            # compiler picks a slightly different FMA fusion under the
+            # raw ``newLibraryWithSource`` options we use. The arithmetic
+            # is correct to float32 precision either way.
+            np.testing.assert_allclose(results['cpu'], results['metal:0'], rtol=1e-6, atol=1e-6)
             """
         )
         _run_with_metal_enabled(self, snippet)

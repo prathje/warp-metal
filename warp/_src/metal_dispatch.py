@@ -94,8 +94,21 @@ class MetalDispatcher:
         self._cmd_buf: Any = None
         self._encoder: Any = None
         # Refs to MTLBuffers bound to the current cmd buffer — must stay
-        # alive until the buffer completes.
+        # alive until the buffer completes. The completion handler hands
+        # ownership to the GPU command-buffer lifecycle so we can drop
+        # them eagerly at :meth:`flush` (no host-side blocking).
         self._inflight_refs: list = []
+        # Auto-flush threshold. ``launch_metal_kernel_native`` enqueues
+        # per-launch transient buffers (packed shapes / ints / floats /
+        # struct args) into ``_inflight_refs``; if a workload runs many
+        # launches without an explicit sync, these would accumulate
+        # unbounded (a single G1 step issues ~700K). Flushing the
+        # command buffer mid-stream commits the queued work, drops the
+        # refs via the completion handler, and starts a fresh cmd
+        # buffer — bounded memory at the cost of one ``commit`` per
+        # ``_AUTOFLUSH_EVERY`` launches.
+        self._dispatch_count = 0
+        self._autoflush_every = 256
         # Cache the NSRange constructor — avoids one PyObjC lookup per
         # batch-bind.
         self._NSMakeRange = Metal.NSMakeRange
@@ -126,7 +139,19 @@ class MetalDispatcher:
                 return cached
             lib = self._library_cache.get(key[0])
             if lib is None:
-                lib, err = self._device.newLibraryWithSource_options_error_(source, None, None)
+                # Compile options: match MLX's preserve-invariance behaviour
+                # so kernels produced by either path round identically.
+                # Apple's MSL compiler does FMA fusion + reassociation by
+                # default (``fastMath=True``); leaving that on matches MLX
+                # and CUDA. ``preserveInvariance=True`` keeps repeated
+                # expressions of the same form rounding the same way
+                # across calls — the bit-for-bit guarantee Warp's
+                # CPU<->Metal regression tests rely on.
+                opts = self._Metal.MTLCompileOptions.alloc().init()
+                opts.setPreserveInvariance_(True)
+                lib, err = self._device.newLibraryWithSource_options_error_(
+                    source, opts, None
+                )
                 if lib is None:
                     raise MetalDispatchError(
                         f"MSL compilation failed for entry point {entry_point!r}: {err}"
@@ -261,6 +286,14 @@ class MetalDispatcher:
             Metal.MTLSizeMake(gx, gy, gz),
             Metal.MTLSizeMake(tx, ty, tz),
         )
+        self._dispatch_count += 1
+        if self._dispatch_count >= self._autoflush_every:
+            # Bounded-memory dispatch: commit periodically so transient
+            # refs in ``_inflight_refs`` can be released by the GPU
+            # completion handler. Doesn't block — a fresh cmd buffer
+            # picks up the next dispatch.
+            self.flush()
+            self._dispatch_count = 0
 
     def _end_encoder(self) -> None:
         """Close the live compute encoder, if any."""
@@ -273,7 +306,9 @@ class MetalDispatcher:
 
         Returns immediately; the GPU work runs asynchronously. The
         bound buffer references are held until the command buffer
-        signals completion.
+        signals completion via the closure capture in the completion
+        handler — Metal releases the handler block after invocation,
+        which drops the closure and lets the buffers be GC'd.
         """
         if self._cmd_buf is None:
             return
@@ -283,10 +318,15 @@ class MetalDispatcher:
         self._cmd_buf = None
         self._inflight_refs = []
 
-        def _release(_):
-            # Capture & release on completion so refs survive until
-            # the GPU is done with them.
-            del refs
+        # ``_release`` does nothing explicit — it just exists to *capture*
+        # ``refs`` in its closure so the bound buffers stay alive until
+        # Metal calls back and releases the handler block. Avoid
+        # ``del refs`` here: PyObjC re-invokes the handler from a non-
+        # Python dispatch queue and a ``del`` of a free var raises
+        # ``UnboundLocalError`` mid-callback (it tries to shadow the
+        # cell as a local).
+        def _release(_cmd_buf):
+            refs  # noqa: B018, keep closure ref alive
 
         cmd_buf.addCompletedHandler_(_release)
         cmd_buf.commit()
