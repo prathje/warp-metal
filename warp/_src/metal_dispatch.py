@@ -144,16 +144,13 @@ class MetalDispatcher:
                 return cached
             lib = self._library_cache.get(key[0])
             if lib is None:
-                # Compile options: match MLX's preserve-invariance behaviour
-                # so kernels produced by either path round identically.
-                # Apple's MSL compiler does FMA fusion + reassociation by
-                # default (``fastMath=True``); leaving that on matches MLX
-                # and CUDA. ``preserveInvariance=True`` keeps repeated
-                # expressions of the same form rounding the same way
-                # across calls — the bit-for-bit guarantee Warp's
-                # CPU<->Metal regression tests rely on.
+                # Match MLX's compile options as closely as we can.
+                # MLX disables fast-math by default (so ``normalize((0,0,0))``
+                # returns ``0`` instead of ``NaN`` per IEEE 0/0 rules), which
+                # mujoco_warp's ``quat_integrate`` depends on for the
+                # ``angle = 0`` corner case to integrate cleanly.
                 opts = self._Metal.MTLCompileOptions.alloc().init()
-                opts.setPreserveInvariance_(True)
+                opts.setFastMathEnabled_(False)
                 lib, err = self._device.newLibraryWithSource_options_error_(
                     source, opts, None
                 )

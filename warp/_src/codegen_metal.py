@@ -5448,10 +5448,18 @@ def _wrap_msl_for_native_dispatch(artifact) -> str:
         params.append(f"  {decl} [[buffer({slot})]]")
         slot += 1
 
-    # Real inputs (kernel-signature order). Use ``const constant`` so the
-    # MSL compiler treats them the same way it does in MLX-built kernels
-    # — same address space + qualifier => same FMA / fast-math fusion
-    # decisions => bit-identical results to the MLX path.
+    # Real inputs (kernel-signature order). Array inputs go in
+    # ``const device`` because the same underlying ``MTLBuffer`` may
+    # ALSO be bound at one of the kernel's output slots when the
+    # caller passes the same ``wp.array`` to both (mujoco_warp's
+    # ``_next_position`` passes ``d.qpos`` as both ``qpos_in`` and
+    # ``qpos_out``). Apple's MSL compiler keeps reads and writes
+    # consistent across the same address space but assumes
+    # ``constant`` and ``device`` pointers cannot alias — that
+    # produced NaN-corrupted quaternions at the first integration
+    # step under the previous ``const constant`` declaration.
+    # Scalars / structs that don't share an MTLBuffer with anything
+    # stay in ``constant``.
     for name in artifact.input_names:
         # ``__init`` shadow inputs and packed buffers are not in
         # ``arg_by_name`` — they get handled in their own sections below.
