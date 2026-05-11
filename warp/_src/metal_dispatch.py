@@ -238,7 +238,16 @@ class MetalDispatcher:
             raise ValueError(f"MetalDispatcher.alloc: nbytes must be positive, got {nbytes}")
         import os as _os  # noqa: PLC0415
 
-        guard = int(_os.environ.get("WARP_METAL_ALLOC_GUARD_BYTES", "0") or "0")
+        # Default guard: 4 KiB. Several mujoco_warp kernels (notably
+        # ``_efc_contact_init``, ``_efc_contact_update``,
+        # ``update_constraint_efc``, ``solve_done``, …) write one
+        # element past the end of their nominal output array — confirmed
+        # via the canary sanitiser. MLX's larger memory pool masked the
+        # overshoot; ``MTLDevice newBufferWithLength`` packs allocations
+        # tightly so the OOB writes corrupted adjacent ``wp.array``s.
+        # Padding every allocation pushes the overshoot into a harmless
+        # guard region until the upstream kernels are fixed.
+        guard = int(_os.environ.get("WARP_METAL_ALLOC_GUARD_BYTES", "4096") or "0")
         # ``WARP_METAL_CANARY``: pre-fill the guard region with a sentinel
         # byte (default ``0xAB``). Combined with the dispatcher's
         # post-launch scan (see ``_check_canaries``), this points the
@@ -274,10 +283,11 @@ class MetalDispatcher:
     # Dispatch
     # ------------------------------------------------------------------
 
-    def check_canaries(self, label: str, bindings: list) -> list[tuple]:
+    def check_canaries(self, label: str, bindings: list, slot_names: list | None = None) -> list[tuple]:
         """Scan ``bindings`` for any guard-region bytes that aren't the
-        sentinel. Returns a list of ``(slot_index, data_nbytes, first_bad_offset)``
-        for offenders. Empty if all canaries are intact (or canary mode
+        sentinel. Returns a list of
+        ``(slot_index, slot_name, data_nbytes, first_bad_offset)`` for
+        offenders. Empty if all canaries are intact (or canary mode
         is off).
 
         Use as a post-launch / post-sync diagnostic to identify which
@@ -303,11 +313,12 @@ class MetalDispatcher:
             guard_slice = arr[data_nbytes:]
             if not np.all(guard_slice == 0xAB):
                 first_bad = int(np.argmin(guard_slice == 0xAB))
-                offenders.append((idx, data_nbytes, first_bad))
+                slot_name = slot_names[idx] if slot_names and idx < len(slot_names) else "?"
+                offenders.append((idx, slot_name, data_nbytes, first_bad))
         if offenders:
-            for slot, data_nbytes, first_bad in offenders:
+            for slot, name, data_nbytes, first_bad in offenders:
                 print(
-                    f"[canary] {label}: bound slot {slot} "
+                    f"[canary] {label}: slot {slot} {name!r} "
                     f"(data={data_nbytes}B) clobbered guard at +{first_bad}B",
                     flush=True,
                 )

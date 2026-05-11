@@ -5993,7 +5993,8 @@ def launch_metal_kernel_native(kernel, dim, inputs, outputs, device, block_dim: 
     # ``MetalDispatcher.alloc``); the dispatcher returns an empty
     # list and short-circuits when off.
     if os.environ.get("WARP_METAL_CANARY"):
-        dispatcher.check_canaries(kernel.key, bindings)
+        slot_names = list(artifact.input_names) + list(artifact.output_names)
+        dispatcher.check_canaries(kernel.key, bindings, slot_names=slot_names)
 
     # NB: No mx.eval, no memcpy back. Outputs already live in the user's
     # wp.array MTLBuffers; subsequent kernel launches that read them
