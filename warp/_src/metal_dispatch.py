@@ -250,7 +250,14 @@ class MetalDispatcher:
         # post-launch scan (see ``_check_canaries``), this points the
         # finger at any kernel that wrote past its bound MTLBuffer.
         canary_enabled = bool(int(_os.environ.get("WARP_METAL_CANARY", "0") or "0"))
-        alloc_size = nbytes + guard
+        # Round up to a 4-byte boundary so an atomic store of a 32-bit
+        # type (``atomic_bool`` etc., which MSL implements as a 32-bit
+        # atomic regardless of the logical element size) doesn't write
+        # past the end of a small allocation. The wp.array's reported
+        # size stays at ``nbytes``; the extra bytes only live in the
+        # MTLBuffer to absorb size-mismatched stores.
+        padded = (nbytes + 3) & ~3
+        alloc_size = padded + guard
         buf = self._device.newBufferWithLength_options_(alloc_size, self._shared_storage)
         if buf is None:
             raise MetalDispatchError(
@@ -272,8 +279,10 @@ class MetalDispatcher:
             # Fill the guard region with a recognisable sentinel pattern.
             # ``_check_canaries`` later scans for any byte that isn't the
             # sentinel — that's an OOB write that needs investigation.
-            view[nbytes:].fill(0xAB)
-            self._canaries[buf] = (nbytes, guard)
+            # The 4-byte alignment padding stays out of the canary region
+            # so atomic_bool writes (which span 4 bytes) don't trip it.
+            view[padded:].fill(0xAB)
+            self._canaries[buf] = (padded, alloc_size - padded)
         return buf, addr
 
     # ------------------------------------------------------------------
