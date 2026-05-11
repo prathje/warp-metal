@@ -60,11 +60,10 @@ def _has_mujoco_warp() -> bool:
 
 def _run_subprocess(test_case: unittest.TestCase, snippet: str, timeout: int = 240) -> None:
     """Run ``snippet`` with ``enable_metal=True``; fail if exit != 0."""
-    code = (
-        "import warp as wp\n"
-        "wp.config.enable_metal = True\n"
-        "wp.init()\n"
-    ) + snippet
+    prefix = "import warp as wp\nwp.config.enable_metal = True\n"
+    if os.environ.get("WARP_METAL_NATIVE_DISPATCH") == "1":
+        prefix += "wp.config.metal_native_dispatch = True\n"
+    code = prefix + "wp.init()\n" + snippet
     with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, prefix="warp_mjw_test_") as f:
         f.write(code)
         path = f.name
