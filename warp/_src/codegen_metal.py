@@ -2091,6 +2091,12 @@ _TILE_OP_NOTPL_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_(add|sub|mul|div)\s
 # In-place compound forms ``wp::tile_add_inplace(dst, src)`` etc. —
 # accumulates ``src`` into ``dst`` element-wise.
 _TILE_OP_INPLACE_PAT = re.compile(r"\bwp::tile_(add|sub|mul|div)_inplace\s*\(([^)]*)\)")
+# ``wp::tile_sort(keys, values)`` — cooperative key/value sort, in place,
+# ascending by key. mujoco_warp's ``segmented_sort`` (broadphase contact
+# sort) and ``contact_sensor_sort`` use this. With our default
+# ``block_dim=1`` the cooperative version reduces to a single-thread
+# insertion sort over the tile elements.
+_TILE_SORT_PAT = re.compile(r"\bwp::tile_sort\s*\(\s*var_(\w+)\s*,\s*var_(\w+)\s*\)")
 # ``var_X = wp::tile_diag_add(M_tile, diag_vec, out_tile)`` — adds
 # ``diag_vec`` to the diagonal of ``M_tile``, returning the result.
 # The mujoco_warp dense-Euler kernel uses this for ``qM + dt*damping``.
@@ -2754,6 +2760,37 @@ def _translate_tile_intrinsics(
         )
 
     line = _TILE_OP_INPLACE_PAT.sub(_repl_tile_op_inplace, line)
+
+    def _repl_tile_sort(m: re.Match[str]) -> str:
+        # ``wp::tile_sort(keys, values)`` — sort ``values`` along with
+        # ``keys`` in ascending key order, in-place. Block_dim=1 reduces
+        # the cooperative sort to a single-thread insertion sort.
+        keys_label = m.group(1)
+        vals_label = m.group(2)
+        keys_dims = tile_var_dims.get(keys_label)
+        vals_dims = tile_var_dims.get(vals_label)
+        if keys_dims is None or vals_dims is None:
+            return m.group(0)
+        rows, cols, _ = keys_dims
+        n = rows * cols
+        if n <= 1:
+            return "/* tile_sort: trivial */ (void)0"
+        return (
+            f"{{ for (int _ts_i = 1; _ts_i < {n}; ++_ts_i) {{ "
+            f"auto _ts_k = var_{keys_label}.c[_ts_i]; "
+            f"auto _ts_v = var_{vals_label}.c[_ts_i]; "
+            f"int _ts_j = _ts_i - 1; "
+            f"while (_ts_j >= 0 && var_{keys_label}.c[_ts_j] > _ts_k) {{ "
+            f"var_{keys_label}.c[_ts_j + 1] = var_{keys_label}.c[_ts_j]; "
+            f"var_{vals_label}.c[_ts_j + 1] = var_{vals_label}.c[_ts_j]; "
+            f"--_ts_j; "
+            f"}} "
+            f"var_{keys_label}.c[_ts_j + 1] = _ts_k; "
+            f"var_{vals_label}.c[_ts_j + 1] = _ts_v; "
+            f"}} }}"
+        )
+
+    line = _TILE_SORT_PAT.sub(_repl_tile_sort, line)
 
     def _repl_tile_diag_add(m: re.Match[str]) -> str:
         # ``var_X = wp::tile_diag_add(M_tile, diag_vec[, out_tile])``.
