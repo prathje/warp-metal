@@ -5448,16 +5448,19 @@ def _wrap_msl_for_native_dispatch(artifact) -> str:
         params.append(f"  {decl} [[buffer({slot})]]")
         slot += 1
 
-    # Real inputs (kernel-signature order). Array inputs go in
-    # ``const device`` because the same underlying ``MTLBuffer`` may
-    # ALSO be bound at one of the kernel's output slots when the
-    # caller passes the same ``wp.array`` to both (mujoco_warp's
+    # Real inputs (kernel-signature order). Array inputs stay in
+    # ``const constant`` — same qualifier MLX uses — so Apple's MSL
+    # compiler reaches the same FMA / fast-math fusion decisions and
+    # the dispatcher's outputs are bit-identical to the MLX path. We
+    # tried ``const device`` (commit 7233d9df1's message records the
+    # experiment) to dodge the address-space mismatch when an input
+    # and an output bind the same MTLBuffer (mujoco_warp's
     # ``_next_position`` passes ``d.qpos`` as both ``qpos_in`` and
-    # ``qpos_out``). Apple's MSL compiler keeps reads and writes
-    # consistent across the same address space but assumes
-    # ``constant`` and ``device`` pointers cannot alias — that
-    # produced NaN-corrupted quaternions at the first integration
-    # step under the previous ``const constant`` declaration.
+    # ``qpos_out``) — the resulting ``slice_view_array_store``
+    # regression made the trade-off untenable. The aliasing concern
+    # is handled instead by ``fastMath=False`` in the dispatcher's
+    # compile options (the real fix for the qpos divergence) and
+    # treating actual ``__init`` shadows as ``const device`` below.
     # Scalars / structs that don't share an MTLBuffer with anything
     # stay in ``constant``.
     for name in artifact.input_names:

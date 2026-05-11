@@ -98,6 +98,17 @@ class MetalDispatcher:
         # ownership to the GPU command-buffer lifecycle so we can drop
         # them eagerly at :meth:`flush` (no host-side blocking).
         self._inflight_refs: list = []
+        # All in-flight (fire-and-forget) command buffers committed via
+        # :meth:`flush`. :meth:`sync` must wait on every one of these
+        # before returning. Apple's docs say command buffers on a single
+        # ``MTLCommandQueue`` *commit* in order, but execution can
+        # overlap — waiting on the newest does NOT imply prior ones have
+        # finished writing to shared-storage buffers. Without explicit
+        # waits on each, the host reads land 1-2 steps behind reality
+        # (observed empirically on mujoco_warp's ~683-dispatch step,
+        # which autoflushes ~3x and leaves the older two cmd buffers
+        # in flight at sync time).
+        self._pending_commits: list = []
         # Auto-flush threshold. ``launch_metal_kernel_native`` enqueues
         # per-launch transient buffers (packed shapes / ints / floats /
         # struct args) into ``_inflight_refs``; if a workload runs many
@@ -108,7 +119,12 @@ class MetalDispatcher:
         # buffer — bounded memory at the cost of one ``commit`` per
         # ``_AUTOFLUSH_EVERY`` launches.
         self._dispatch_count = 0
-        self._autoflush_every = 256
+        # Default to per-dispatch commit (effectively no batching). See
+        # the ``dispatch`` method for why batching is unsafe by default
+        # — Metal's automatic hazard tracking is intra-cmd-buffer only,
+        # and we observed non-deterministic mjwa.step outputs whenever
+        # > 1 dispatch shared a command encoder.
+        self._autoflush_every = 1
         # Cache the NSRange constructor — avoids one PyObjC lookup per
         # batch-bind.
         self._NSMakeRange = Metal.NSMakeRange
@@ -402,11 +418,25 @@ class MetalDispatcher:
             Metal.MTLSizeMake(tx, ty, tz),
         )
         self._dispatch_count += 1
+        # Commit one cmd buffer per dispatch. Apple's hazard tracking is
+        # documented to apply *within* a single command buffer; across
+        # cmd buffers it only enforces commit-order scheduling, which is
+        # sufficient when each cmd buffer has exactly one dispatch but
+        # NOT when many dispatches share an encoder. Batching multiple
+        # dispatches into one encoder produced silently non-deterministic
+        # outputs on mujoco_warp's step pipeline (same model, same
+        # steps, different ``qpos`` every run — kernels that read and
+        # write the same MTLBuffer raced their neighbours despite an
+        # ``MTLDispatchTypeSerial`` encoder and explicit
+        # ``memoryBarrierWithScope:`` between launches).
+        #
+        # Empirically per-dispatch commit is also *faster* than the old
+        # 256-dispatch batching (17 ms/step vs 34 ms/step on pendula),
+        # so the trade-off is favourable. If profiling later shows
+        # cmd-buffer-creation overhead dominating a different workload,
+        # ``_autoflush_every`` can be raised for kernels that don't
+        # share buffers.
         if self._dispatch_count >= self._autoflush_every:
-            # Bounded-memory dispatch: commit periodically so transient
-            # refs in ``_inflight_refs`` can be released by the GPU
-            # completion handler. Doesn't block — a fresh cmd buffer
-            # picks up the next dispatch.
             self.flush()
             self._dispatch_count = 0
 
@@ -445,20 +475,38 @@ class MetalDispatcher:
 
         cmd_buf.addCompletedHandler_(_release)
         cmd_buf.commit()
+        # Remember every fire-and-forget commit so :meth:`sync` can
+        # block until *each* one has finished. See ``_pending_commits``
+        # docstring for why a single newest-only tracker is not enough.
+        self._pending_commits.append(cmd_buf)
 
     def sync(self) -> None:
-        """Flush the in-flight command buffer and block until completion.
+        """Block until every committed command buffer is complete.
 
         Call before any host read of buffer contents (``.numpy()``,
         explicit ``wp.synchronize_device``, etc.).
+
+        Must explicitly wait on *each* in-flight commit. Apple's
+        ``MTLCommandQueue`` schedules command buffers in commit order,
+        but execution can overlap — ``waitUntilCompleted`` on a newer
+        buffer does **not** imply earlier ones are also finished, so the
+        host can read stale unified-memory bytes from a still-running
+        prior cmd buffer (observed empirically: 1-2 step lag on mjw step
+        before this loop was added).
         """
-        if self._cmd_buf is None:
-            return
-        self._end_encoder()
-        cmd_buf = self._cmd_buf
-        refs = self._inflight_refs
-        self._cmd_buf = None
-        self._inflight_refs = []
-        cmd_buf.commit()
-        cmd_buf.waitUntilCompleted()
-        del refs
+        if self._cmd_buf is not None:
+            self._end_encoder()
+            cmd_buf = self._cmd_buf
+            refs = self._inflight_refs
+            self._cmd_buf = None
+            self._inflight_refs = []
+            cmd_buf.commit()
+            self._pending_commits.append(cmd_buf)
+            del refs
+        # Drain every fire-and-forget cmd buffer the dispatcher has
+        # outstanding. They were committed to the same queue in commit
+        # order; we wait sequentially so any host read after ``sync()``
+        # sees a consistent post-execution view of every shared buffer.
+        for cb in self._pending_commits:
+            cb.waitUntilCompleted()
+        self._pending_commits = []
