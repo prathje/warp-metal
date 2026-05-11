@@ -236,6 +236,19 @@ intended for inference-only workloads — autograd, graph capture, and most of
 the kernel-builtin surface are not yet wired up.
 """
 
+metal_native_dispatch: bool = False
+"""Route Metal launches through Apple's Metal API directly instead of MLX.
+
+Experimental. When ``True`` (and :data:`enable_metal` is also true), Warp's
+Metal backend bypasses ``mlx.core.fast.metal_kernel`` for dispatch — kernels
+write in-place into Warp-owned ``MTLBuffer``s the same way CUDA kernels
+write into ``cudaMalloc``-allocated memory. This eliminates the per-launch
+``mx.eval`` + host memcpy that the MLX path requires (≈660 µs/launch on M3)
+and is ≈30× faster on dispatch-bound workloads.
+
+Set before :func:`warp.init`. Requires ``pyobjc-framework-metal``.
+"""
+
 track_memory: bool = False
 """Enable tracking of memory allocations at initialization.
 

@@ -4104,6 +4104,14 @@ class array(Array[DType, NDim]):
                 )
 
         if self.ptr:
+            # On Metal with native dispatch, queued GPU work hasn't been
+            # committed yet — flush + wait before the host-side copy
+            # below reads through the unified-memory pointer. The MLX
+            # path is already synchronous so this is a no-op there.
+            if getattr(self.device, "is_metal", False) and warp.config.metal_native_dispatch:
+                from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
+
+                get_dispatcher().sync()
             # use the CUDA default stream for synchronous behaviour with other streams
             with warp.ScopedStream(self.device.null_stream):
                 a = self.to("cpu", requires_grad=False)

@@ -3499,12 +3499,25 @@ def _metal_release_buffer(ptr: int) -> None:
 
 
 class MetalDefaultAllocator:
-    """Allocator backed by ``mlx.core`` arrays on Apple Silicon.
+    """Allocator for Apple-Silicon Metal devices.
 
-    Returns a CPU-addressable pointer into MLX's unified-memory buffer so the
-    existing host-side ``wp_memcpy_h2h`` and ``wp_memset_host`` paths in Warp
-    work unchanged on Metal devices. The MLX array reference is held in
-    ``_metal_buffer_registry`` until ``deallocate`` is called.
+    Two backends, controlled by :data:`warp.config.metal_native_dispatch`:
+
+    * **MLX (default).** ``allocate`` calls ``mx.zeros`` and registers the
+      resulting ``mx.array``. The CPU-addressable pointer goes through
+      ``np.array(buf, copy=False)``. The launch path uses ``mx.fast.metal_kernel``
+      which always allocates fresh outputs + does a per-launch host memcpy.
+
+    * **Native.** ``allocate`` calls
+      :meth:`warp._src.metal_dispatch.MetalDispatcher.alloc` which goes
+      straight to ``MTLDevice newBufferWithLength`` with shared storage.
+      The registered entry is the ``MTLBuffer`` itself — the launch path
+      binds it directly via ``setBuffer:offset:atIndex:``, so kernels write
+      in-place into Warp-owned memory just like CUDA's ``cudaMalloc`` path.
+
+    The CPU pointer semantics are identical in both backends (unified-memory
+    shared-storage), so host-side ``wp_memcpy_h2h`` / ``wp_memset_host``
+    work unchanged either way.
     """
 
     def __init__(self, device):
@@ -3515,10 +3528,24 @@ class MetalDefaultAllocator:
         import mlx.core as mx  # noqa: PLC0415
 
         self._mx = mx
+        # Cache the dispatch-mode flag at allocator construction; flipping
+        # it mid-program would leak the alternative backend's buffers, so
+        # we sample once. Users set ``wp.config.metal_native_dispatch``
+        # before ``wp.init`` (same as ``enable_metal``).
+        self._native = bool(warp.config.metal_native_dispatch)
 
     def allocate(self, size_in_bytes: int) -> int:
         if size_in_bytes <= 0:
             raise ValueError(f"Cannot allocate {size_in_bytes} bytes on '{self.device}'")
+        if self._native:
+            from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
+
+            mtl_buf, ptr = get_dispatcher().alloc(size_in_bytes)
+            if ptr == 0:
+                raise RuntimeError(f"Failed to allocate {size_in_bytes} bytes on '{self.device}'")
+            _metal_register_buffer(ptr, mtl_buf)
+            _set_alloc_tag_if_tracking(ptr)
+            return ptr
         # Allocate a flat byte buffer; ``wp.array`` layers shape/dtype on top.
         buf = self._mx.zeros((size_in_bytes,), dtype=self._mx.uint8)
         self._mx.eval(buf)
@@ -8886,6 +8913,13 @@ def synchronize_device(device: DeviceLike = None):
             raise RuntimeError(f"Cannot synchronize device {device} while graph capture is active")
 
         runtime.core.wp_cuda_context_synchronize(device.context)
+    elif device.is_metal and warp.config.metal_native_dispatch:
+        # Native Metal dispatch batches kernel launches into one
+        # ``MTLCommandBuffer`` until a sync point. ``synchronize_device``
+        # IS that sync point — flush + wait for completion.
+        from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
+
+        get_dispatcher().sync()
 
 
 def synchronize_stream(stream_or_device: Stream | DeviceLike | None = None):
