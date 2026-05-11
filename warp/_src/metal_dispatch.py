@@ -222,13 +222,23 @@ class MetalDispatcher:
         Allocation is uninitialised — callers that need a zero-filled
         buffer should follow up with ``ctypes.memset(cpu_ptr, 0, n)``
         or queue a fill-kernel dispatch.
+
+        ``WARP_METAL_ALLOC_GUARD_BYTES``: add that many extra bytes
+        beyond ``nbytes`` to every allocation (defaults to ``0``).
+        Useful as a diagnostic for out-of-bounds writes — bump it up
+        to e.g. ``4096`` to test whether a numerical regression is
+        masked by Metal's tight unified-memory packing.
         """
         if nbytes <= 0:
             raise ValueError(f"MetalDispatcher.alloc: nbytes must be positive, got {nbytes}")
-        buf = self._device.newBufferWithLength_options_(nbytes, self._shared_storage)
+        import os as _os  # noqa: PLC0415
+
+        guard = int(_os.environ.get("WARP_METAL_ALLOC_GUARD_BYTES", "0") or "0")
+        alloc_size = nbytes + guard
+        buf = self._device.newBufferWithLength_options_(alloc_size, self._shared_storage)
         if buf is None:
             raise MetalDispatchError(
-                f"MTLDevice newBufferWithLength failed for {nbytes} bytes"
+                f"MTLDevice newBufferWithLength failed for {alloc_size} bytes"
             )
         # ``contents()`` returns a PyObjC ``objc.varlist``. ``as_buffer(n)``
         # gives a memoryview of the unified-memory bytes; the address
@@ -237,7 +247,7 @@ class MetalDispatcher:
         import numpy as np  # noqa: PLC0415
 
         contents = buf.contents()
-        mv = contents.as_buffer(nbytes)
+        mv = contents.as_buffer(alloc_size)
         # Resolve to an integer address via numpy's array interface —
         # cheaper than constructing a ctypes type.
         addr = int(np.frombuffer(mv, dtype=np.uint8).__array_interface__["data"][0])
