@@ -5986,6 +5986,15 @@ def launch_metal_kernel_native(kernel, dim, inputs, outputs, device, block_dim: 
             print(f"[warp-metal] kernel '{kernel.key}' failed; dumped to {dump_dir}", flush=True)
         raise
 
+    # Diagnostic: check the guard region of every bound buffer for
+    # the sentinel pattern. If anything got clobbered, that kernel
+    # wrote past one of its arg buffers — first stop on an OOB hunt.
+    # Guard mode is opt-in via ``WARP_METAL_CANARY=1`` (see
+    # ``MetalDispatcher.alloc``); the dispatcher returns an empty
+    # list and short-circuits when off.
+    if os.environ.get("WARP_METAL_CANARY"):
+        dispatcher.check_canaries(kernel.key, bindings)
+
     # NB: No mx.eval, no memcpy back. Outputs already live in the user's
     # wp.array MTLBuffers; subsequent kernel launches that read them
     # will queue dependent work, and the dispatcher batches everything

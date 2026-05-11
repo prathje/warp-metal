@@ -112,6 +112,11 @@ class MetalDispatcher:
         # Cache the NSRange constructor — avoids one PyObjC lookup per
         # batch-bind.
         self._NSMakeRange = Metal.NSMakeRange
+        # ``WARP_METAL_CANARY=1`` enables OOB-write detection: alloc
+        # fills the guard region with a sentinel pattern and stores
+        # ``buf -> (data_nbytes, guard_nbytes)`` here. After a sync we
+        # scan every recorded buffer for sentinel violations.
+        self._canaries: dict = {}
         self._lock = threading.Lock()
 
     @property
@@ -234,6 +239,11 @@ class MetalDispatcher:
         import os as _os  # noqa: PLC0415
 
         guard = int(_os.environ.get("WARP_METAL_ALLOC_GUARD_BYTES", "0") or "0")
+        # ``WARP_METAL_CANARY``: pre-fill the guard region with a sentinel
+        # byte (default ``0xAB``). Combined with the dispatcher's
+        # post-launch scan (see ``_check_canaries``), this points the
+        # finger at any kernel that wrote past its bound MTLBuffer.
+        canary_enabled = bool(int(_os.environ.get("WARP_METAL_CANARY", "0") or "0"))
         alloc_size = nbytes + guard
         buf = self._device.newBufferWithLength_options_(alloc_size, self._shared_storage)
         if buf is None:
@@ -250,12 +260,58 @@ class MetalDispatcher:
         mv = contents.as_buffer(alloc_size)
         # Resolve to an integer address via numpy's array interface —
         # cheaper than constructing a ctypes type.
-        addr = int(np.frombuffer(mv, dtype=np.uint8).__array_interface__["data"][0])
+        view = np.frombuffer(mv, dtype=np.uint8)
+        addr = int(view.__array_interface__["data"][0])
+        if canary_enabled and guard > 0:
+            # Fill the guard region with a recognisable sentinel pattern.
+            # ``_check_canaries`` later scans for any byte that isn't the
+            # sentinel — that's an OOB write that needs investigation.
+            view[nbytes:].fill(0xAB)
+            self._canaries[buf] = (nbytes, guard)
         return buf, addr
 
     # ------------------------------------------------------------------
     # Dispatch
     # ------------------------------------------------------------------
+
+    def check_canaries(self, label: str, bindings: list) -> list[tuple]:
+        """Scan ``bindings`` for any guard-region bytes that aren't the
+        sentinel. Returns a list of ``(slot_index, data_nbytes, first_bad_offset)``
+        for offenders. Empty if all canaries are intact (or canary mode
+        is off).
+
+        Use as a post-launch / post-sync diagnostic to identify which
+        kernel writes past one of its bound ``MTLBuffer``s. The check
+        forces a ``sync()`` because the GPU-side write to the guard
+        region needs to be observable from the host.
+        """
+        if not self._canaries:
+            return []
+        import numpy as np  # noqa: PLC0415
+
+        self.sync()
+        offenders: list[tuple] = []
+        for idx, entry in enumerate(bindings):
+            if isinstance(entry, tuple):
+                continue  # ``setBytes`` payloads carry no guard region.
+            info = self._canaries.get(entry)
+            if info is None:
+                continue
+            data_nbytes, guard_nbytes = info
+            mv = entry.contents().as_buffer(data_nbytes + guard_nbytes)
+            arr = np.frombuffer(mv, dtype=np.uint8)
+            guard_slice = arr[data_nbytes:]
+            if not np.all(guard_slice == 0xAB):
+                first_bad = int(np.argmin(guard_slice == 0xAB))
+                offenders.append((idx, data_nbytes, first_bad))
+        if offenders:
+            for slot, data_nbytes, first_bad in offenders:
+                print(
+                    f"[canary] {label}: bound slot {slot} "
+                    f"(data={data_nbytes}B) clobbered guard at +{first_bad}B",
+                    flush=True,
+                )
+        return offenders
 
     def dispatch(
         self,
