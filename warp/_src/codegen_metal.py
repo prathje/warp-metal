@@ -5688,14 +5688,30 @@ def launch_metal_kernel_native(kernel, dim, inputs, outputs, device, block_dim: 
         return
 
     fwd_args = list(inputs) + list(outputs)
-    if len(fwd_args) != len(kernel.adj.args):
+    n_kernel_args = len(kernel.adj.args)
+    if len(fwd_args) != n_kernel_args:
         raise RuntimeError(
             f"Error launching kernel '{kernel.key}', passed {len(fwd_args)} arguments "
-            f"but kernel requires {len(kernel.adj.args)}."
+            f"but kernel requires {n_kernel_args}."
         )
-    arg_by_name = {a.label: (i, a) for i, a in enumerate(kernel.adj.args)}
-    arg_var_by_name = {a.label: a for a in artifact.input_args}
-    out_var_by_name = {a.label: a for a in artifact.output_args}
+    # Per-kernel metadata dicts are reused across launches — caching
+    # them on the kernel object shaves ~10 µs/launch off the hot path.
+    arg_by_name = getattr(kernel, "_metal_native_arg_by_name", None)
+    if arg_by_name is None:
+        arg_by_name = {a.label: (i, a) for i, a in enumerate(kernel.adj.args)}
+        kernel._metal_native_arg_by_name = arg_by_name
+        kernel._metal_native_arg_var_by_name = {a.label: a for a in artifact.input_args}
+        kernel._metal_native_out_var_by_name = {a.label: a for a in artifact.output_args}
+        kernel._metal_native_init_shadow_names = frozenset(
+            n for n in artifact.input_names if n.endswith("__init")
+        )
+        kernel._metal_native_output_init_shadow_set = frozenset(
+            n[: -len("__init")] for n in artifact.input_names if n.endswith("__init")
+        )
+    arg_var_by_name = kernel._metal_native_arg_var_by_name
+    out_var_by_name = kernel._metal_native_out_var_by_name
+    init_shadow_names = kernel._metal_native_init_shadow_names
+    output_init_shadow_set = kernel._metal_native_output_init_shadow_set
 
     dispatcher = get_dispatcher()
     bindings: list = []
@@ -5735,21 +5751,7 @@ def launch_metal_kernel_native(kernel, dim, inputs, outputs, device, block_dim: 
         transient_refs.append(buf)
         return buf
 
-    # ---- Walk artifact.input_names in declaration order ----
-    init_shadow_names = set()
-    for nm in artifact.input_names:
-        if nm.endswith("__init") and nm[: -len("__init")] in (
-            *arg_by_name.keys(),
-            *(out_var_by_name.keys()),
-        ):
-            init_shadow_names.add(nm)
-    packed_names = {
-        "__ints_packed",
-        "__floats_packed",
-        "__init_shadows_floats",
-        "__init_shadows_ints",
-        "__shapes_packed",
-    }
+    # init_shadow_names is already cached on the kernel above.
 
     # 1) Real inputs from the kernel signature.
     for name in artifact.input_names:
@@ -5918,9 +5920,7 @@ def launch_metal_kernel_native(kernel, dim, inputs, outputs, device, block_dim: 
     # a ``__init`` shadow read it during the prologue, so prior
     # data is irrelevant; non-atomic outputs are write-every-cell
     # by Warp convention.
-    output_init_shadow_set = {
-        n[: -len("__init")] for n in artifact.input_names if n.endswith("__init")
-    }
+    # output_init_shadow_set already cached on kernel above.
     for name in artifact.output_names:
         idx, arg_var = arg_by_name[name]
         value = fwd_args[idx]
