@@ -5853,16 +5853,19 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim: int = 2
         output_dtypes=output_dtypes,
         init_value=init_value,
     )
-    # Force the dispatch to complete so the unified-memory copy below sees
-    # the final results rather than queued operations.
     if isinstance(out_mx_list, mx.array):
         out_mx_list = [out_mx_list]
+    # Kick off MLX's evaluation asynchronously so the host can continue
+    # issuing launches while the previous one's GPU work is still in
+    # flight. The actual materialisation happens at ``np.array`` time
+    # below, where any compile / launch error surfaces (and we dump the
+    # failing MSL source if ``WARP_METAL_DUMP_ON_FAIL`` is set). Switching
+    # from ``mx.eval`` to ``mx.async_eval`` here means consecutive
+    # ``wp.launch`` calls can pipeline through MLX's stream rather than
+    # serializing on per-launch GPU sync.
     try:
-        for o in out_mx_list:
-            mx.eval(o)
+        mx.async_eval(out_mx_list)
     except Exception as e:
-        # Dump the failing MSL source on compile/launch errors to make
-        # codegen bugs debuggable (set WARP_METAL_DUMP_ON_FAIL=1).
         if os.environ.get("WARP_METAL_DUMP_ON_FAIL"):
             import tempfile
             dump_dir = tempfile.mkdtemp(prefix=f"warp_metal_fail_{kernel.key}_")
@@ -5874,15 +5877,30 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim: int = 2
         raise
 
     # ---- Copy MLX outputs into the user's wp.array buffers ----
-    for o_mx, dest in zip(out_mx_list, output_dest_arrays, strict=True):
-        # Skip zero-element user buffers — they hit the placeholder path
-        # above (we ran the kernel with a 1-element MLX buffer to satisfy
-        # Apple's MTLBuffer API, but the user's wp.array is genuinely
-        # zero-sized and there's nothing to copy back).
-        if dest.ptr is None or dest.size == 0:
-            continue
-        np_view = np.array(o_mx, copy=False)
-        src_ptr = int(np_view.__array_interface__["data"][0])
-        nbytes = np_view.nbytes
-        if not runtime.core.wp_memcpy_h2h(dest.ptr, src_ptr, nbytes):
-            raise RuntimeError(f"Failed to copy Metal kernel output back into wp.array (kernel '{kernel.key}')")
+    # ``np.array(o_mx, copy=False)`` materialises through MLX's
+    # ``__array_interface__`` — that's where any pending compile/launch
+    # error will surface, so wrap the loop in the same dump-on-fail
+    # handler.
+    try:
+        for o_mx, dest in zip(out_mx_list, output_dest_arrays, strict=True):
+            # Skip zero-element user buffers — they hit the placeholder path
+            # above (we ran the kernel with a 1-element MLX buffer to satisfy
+            # Apple's MTLBuffer API, but the user's wp.array is genuinely
+            # zero-sized and there's nothing to copy back).
+            if dest.ptr is None or dest.size == 0:
+                continue
+            np_view = np.array(o_mx, copy=False)
+            src_ptr = int(np_view.__array_interface__["data"][0])
+            nbytes = np_view.nbytes
+            if not runtime.core.wp_memcpy_h2h(dest.ptr, src_ptr, nbytes):
+                raise RuntimeError(f"Failed to copy Metal kernel output back into wp.array (kernel '{kernel.key}')")
+    except Exception as e:
+        if os.environ.get("WARP_METAL_DUMP_ON_FAIL"):
+            import tempfile
+            dump_dir = tempfile.mkdtemp(prefix=f"warp_metal_fail_{kernel.key}_")
+            with open(os.path.join(dump_dir, "header.metal"), "w") as f:
+                f.write(artifact.header or "")
+            with open(os.path.join(dump_dir, "source.metal"), "w") as f:
+                f.write(artifact.source or "")
+            print(f"[warp-metal] kernel '{kernel.key}' failed; dumped to {dump_dir}", flush=True)
+        raise
