@@ -2154,6 +2154,49 @@ class TestMetalLaunch(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet)
 
+    def test_tile_sort_matches_cpu(self):
+        # ``wp.tile_sort(keys, values)`` cooperatively sorts both tiles
+        # in ascending key order, in-place. mujoco_warp's broadphase
+        # ``segmented_sort`` and contact-sensor sort both use this. Our
+        # default ``block_dim=1`` reduces the cooperative version to a
+        # single-thread insertion sort.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(keys_in: wp.array(dtype=float),
+                  vals_in: wp.array(dtype=int),
+                  keys_out: wp.array(dtype=float),
+                  vals_out: wp.array(dtype=int)):
+                keys = wp.tile_load(keys_in, shape=(16,), storage='shared')
+                vals = wp.tile_load(vals_in, shape=(16,), storage='shared')
+                wp.tile_sort(keys, vals)
+                wp.tile_store(keys_out, keys)
+                wp.tile_store(vals_out, vals)
+
+            rng = np.random.default_rng(3)
+            keys_np = rng.uniform(-10, 10, size=16).astype(np.float32)
+            vals_np = np.arange(16, dtype=np.int32)
+            order = np.argsort(keys_np, kind='stable')
+            expected_keys = keys_np[order]
+            expected_vals = vals_np[order]
+            for dev in ('cpu', 'metal:0'):
+                ki = wp.array(keys_np, dtype=wp.float32, device=dev)
+                vi = wp.array(vals_np, dtype=wp.int32, device=dev)
+                ko = wp.zeros(16, dtype=wp.float32, device=dev)
+                vo = wp.zeros(16, dtype=wp.int32, device=dev)
+                wp.launch_tiled(k, dim=1, inputs=[ki, vi], outputs=[ko, vo],
+                                block_dim=1, device=dev)
+                np.testing.assert_array_equal(ko.numpy(), expected_keys,
+                    err_msg=f'keys mismatch on {dev}')
+                np.testing.assert_array_equal(vo.numpy(), expected_vals,
+                    err_msg=f'values mismatch on {dev}')
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
     def test_generic_kernel_dtype_any_matches_cpu(self):
         # Kernels declared with ``dtype=Any`` are specialised at launch
         # time. The CUDA/CPU launch path resolves the overload via
