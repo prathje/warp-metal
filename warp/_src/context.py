@@ -10530,6 +10530,21 @@ def copy(
                     src.device.context, dst_ptr, src_ptr, bytes_to_copy, stream.cuda_stream
                 )
             else:
+                # Metal unified memory: ``wp_memcpy_h2h`` is a plain CPU
+                # memcpy, but the source's MTLBuffer may still have
+                # pending GPU writes from a kernel launched earlier in
+                # this step. Drain the dispatcher first so the host
+                # reads land *after* the GPU finishes — without this,
+                # ``wp.copy(d.qacc_warmstart, d.qacc)`` at the end of
+                # ``mjw_step`` snapshots a stale ``qacc`` and the next
+                # step's solver starts from the wrong warmstart.
+                if (
+                    getattr(src.device, "is_metal", False)
+                    and warp.config.metal_native_dispatch
+                ):
+                    from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
+
+                    get_dispatcher().sync()
                 result = runtime.core.wp_memcpy_h2h(dst_ptr, src_ptr, bytes_to_copy)
 
         if not result:
