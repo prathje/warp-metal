@@ -5552,15 +5552,57 @@ def _wrap_msl_for_native_dispatch(artifact) -> str:
         + ",\n".join(params)
         + ")"
     )
+    # Strip the MLX-style output-init prologue from the kernel body.
+    # Under native dispatch the output buffer *is* the user's wp.array,
+    # so the buffer already holds the prior value the prologue would
+    # seed. Worse, our dispatch policy is one thread per threadgroup,
+    # so the prologue's ``thread_position_in_threadgroup.y == 0`` guard
+    # fires in every thread and its ``threadgroup_barrier`` is a no-op
+    # — every thread races to write the seed value while sibling
+    # threads' atomic_adds are in flight. The observed symptom was
+    # ``d.nefc`` resetting to 0 across sibling atomic-output kernels
+    # (``_limit_ball`` → ``_limit_slide_hinge`` → ``_limit_tendon``),
+    # so step 1's solver entered with no constraints and produced
+    # large qpos drift on pendulum joints (the
+    # ``test_pendula_multi_step_warmstart_drift`` failure).
+    body = _strip_init_prologue(artifact.source)
     return (
         "#include <metal_stdlib>\n"
         "#include <metal_atomic>\n"
         "using namespace metal;\n"
         f"{artifact.header}\n"
         f"{signature} {{\n"
-        f"{artifact.source}\n"
+        f"{body}\n"
         "}\n"
     )
+
+
+_PROLOGUE_START = "    // -- Output init prologue (seed from user wp.array data) --"
+_PROLOGUE_END = "    threadgroup_barrier(metal::mem_flags::mem_device);"
+
+
+def _strip_init_prologue(source: str) -> str:
+    """Remove the codegen-emitted output-init prologue.
+
+    The prologue is the contiguous block from the marker comment down
+    to the post-prologue ``threadgroup_barrier``. The native dispatch
+    path doesn't need it (the bound output buffer already aliases the
+    user's wp.array, which carries the prior value) and it actively
+    races with sibling atomic_adds under our single-thread threadgroup
+    launch policy.
+    """
+    start = source.find(_PROLOGUE_START)
+    if start == -1:
+        return source
+    end = source.find(_PROLOGUE_END, start)
+    if end == -1:
+        return source
+    end += len(_PROLOGUE_END)
+    # Drop the trailing newline if present so we don't leave a blank
+    # line where the prologue was.
+    if end < len(source) and source[end] == "\n":
+        end += 1
+    return source[:start] + source[end:]
 
 
 def _get_or_build_metal_kernel_native(kernel):
@@ -5708,9 +5750,20 @@ def launch_metal_kernel_native(kernel, dim, inputs, outputs, device, block_dim: 
         kernel._metal_native_init_shadow_names = frozenset(
             n for n in artifact.input_names if n.endswith("__init")
         )
+        # Outputs whose prior values are preserved by some init-shadow
+        # mechanism — either a per-output ``<name>__init`` input, or a
+        # slot in the packed shadow buffers. Atomic-output kernels that
+        # accumulate across multiple sibling launches (mujoco_warp's
+        # ``_limit_ball`` → ``_limit_slide_hinge`` → ``_limit_tendon``
+        # chain all atomic-adding into ``d.nefc``) rely on this set to
+        # suppress the dispatcher's pre-launch ``fill_zero``; without
+        # the packed outputs being included, every sibling launch
+        # zeroed the accumulator and step-1's solver entered with the
+        # wrong constraint count (``nefc == 0`` instead of 2 for the
+        # pendula limits).
         kernel._metal_native_output_init_shadow_set = frozenset(
             n[: -len("__init")] for n in artifact.input_names if n.endswith("__init")
-        )
+        ) | frozenset(artifact.init_shadow_packed_outputs)
     arg_var_by_name = kernel._metal_native_arg_var_by_name
     out_var_by_name = kernel._metal_native_out_var_by_name
     init_shadow_names = kernel._metal_native_init_shadow_names
