@@ -22,8 +22,10 @@ importable on its own so the standalone tests in
 
 from __future__ import annotations
 
+import atexit
 import ctypes
 import hashlib
+import os
 import threading
 from typing import Any
 
@@ -134,6 +136,44 @@ class MetalDispatcher:
         # scan every recorded buffer for sentinel violations.
         self._canaries: dict = {}
         self._lock = threading.Lock()
+        # ------------------------------------------------------------
+        # MTLBinaryArchive on-disk PSO cache.
+        #
+        # Mirrors Warp's CUDA path: ``warp.config.kernel_cache_dir`` is
+        # a versioned directory; we write one ``metal_pso_archive``
+        # binary archive into it. On first use of each PSO, Apple's
+        # back-end compile populates the archive; subsequent process
+        # starts skip the back-end compile entirely (single-PSO probe
+        # showed ~57 ms cold vs ~0.1 ms warm). Without this every
+        # ``MetalDispatcher`` start re-paid the full PSO build cost
+        # — for mjlab G1 that's ~700 unique kernels × ~50 ms each
+        # = ~40 s of compile time on every process launch.
+        #
+        # The archive holds *compiled* PSOs only — the front-end
+        # ``newLibraryWithSource_options_error_`` still parses MSL each
+        # time. In practice that step is ~25× cheaper than PSO
+        # construction on a real kernel, and Metal's in-process library
+        # cache handles repeated-source compiles within one run.
+        self._archive_url = None
+        self._archive = None
+        self._archive_dirty = False
+        try:
+            self._init_binary_archive()
+        except Exception as exc:  # noqa: BLE001
+            # Don't let cache setup failures take down the dispatcher —
+            # fall back to in-memory only.
+            import warnings  # noqa: PLC0415
+            warnings.warn(
+                f"MetalDispatcher: binary archive disabled ({exc!r}); "
+                f"PSOs will be re-compiled every run.",
+                stacklevel=2,
+            )
+        if self._archive is not None:
+            # Persist on interpreter shutdown so the next process gets a
+            # warm cache. ``atexit`` runs handlers in LIFO order, after
+            # the main script returns but before Python tears down
+            # extension state, so PyObjC bridges are still alive.
+            atexit.register(self._serialize_archive_if_dirty)
 
     @property
     def device(self):
@@ -149,6 +189,11 @@ class MetalDispatcher:
 
         Caches the compiled library and pipeline state — subsequent
         compiles with the same source are O(dict lookup).
+
+        Builds the PSO via ``MTLComputePipelineDescriptor`` so we can
+        attach the on-disk binary archive: PSOs already serialized into
+        the archive reload in ~0.1 ms instead of paying ~20 ms back-end
+        compile each time.
         """
         key = (self._hash(source), entry_point)
         cached = self._pipeline_cache.get(key)
@@ -158,6 +203,7 @@ class MetalDispatcher:
             cached = self._pipeline_cache.get(key)
             if cached is not None:
                 return cached
+            Metal = self._Metal
             lib = self._library_cache.get(key[0])
             if lib is None:
                 # Match MLX's compile options as closely as we can.
@@ -165,7 +211,7 @@ class MetalDispatcher:
                 # returns ``0`` instead of ``NaN`` per IEEE 0/0 rules), which
                 # mujoco_warp's ``quat_integrate`` depends on for the
                 # ``angle = 0`` corner case to integrate cleanly.
-                opts = self._Metal.MTLCompileOptions.alloc().init()
+                opts = Metal.MTLCompileOptions.alloc().init()
                 opts.setFastMathEnabled_(False)
                 lib, err = self._device.newLibraryWithSource_options_error_(
                     source, opts, None
@@ -180,13 +226,106 @@ class MetalDispatcher:
                 raise MetalDispatchError(
                     f"MSL library has no function named {entry_point!r}"
                 )
-            pso, err = self._device.newComputePipelineStateWithFunction_error_(fn, None)
+            pso_desc = Metal.MTLComputePipelineDescriptor.alloc().init()
+            pso_desc.setComputeFunction_(fn)
+            if self._archive is not None:
+                pso_desc.setBinaryArchives_([self._archive])
+            pso, err = self._device.newComputePipelineStateWithDescriptor_error_(
+                pso_desc, None
+            )
             if pso is None:
                 raise MetalDispatchError(
-                    f"newComputePipelineStateWithFunction failed for {entry_point!r}: {err}"
+                    f"newComputePipelineStateWithDescriptor failed for {entry_point!r}: {err}"
                 )
+            if self._archive is not None:
+                # If this PSO wasn't already in the archive, add it so the
+                # next process start can reload it without a back-end
+                # compile. ``addComputePipelineFunctionsWithDescriptor_``
+                # returns False when the entry is already present — that's
+                # a no-op, not an error, so we just track whether *any*
+                # add succeeded to decide whether to re-serialize.
+                added, _ = (
+                    self._archive.addComputePipelineFunctionsWithDescriptor_error_(
+                        pso_desc, None
+                    )
+                )
+                if added:
+                    self._archive_dirty = True
             self._pipeline_cache[key] = pso
             return pso
+
+    # ------------------------------------------------------------------
+    # MTLBinaryArchive helpers
+    # ------------------------------------------------------------------
+
+    def _init_binary_archive(self) -> None:
+        """Open the on-disk PSO archive, creating one if it doesn't exist.
+
+        Archive lives at ``<warp.config.kernel_cache_dir>/metal_pso_archive``
+        — same versioned cache root the CUDA path uses, so a Warp
+        upgrade naturally invalidates the archive.
+        """
+        import warp.config as _wp_cfg  # noqa: PLC0415
+
+        cache_dir = getattr(_wp_cfg, "kernel_cache_dir", None)
+        if not cache_dir:
+            # ``warp.init()`` not yet called — archive disabled.
+            return
+        archive_path = os.path.join(cache_dir, "metal_pso_archive")
+        os.makedirs(cache_dir, exist_ok=True)
+
+        Metal = self._Metal
+        try:
+            import Foundation  # noqa: PLC0415
+        except ImportError as exc:
+            raise MetalDispatchError(
+                "Foundation unavailable; cannot construct NSURL for archive path"
+            ) from exc
+
+        desc = Metal.MTLBinaryArchiveDescriptor.alloc().init()
+        if os.path.exists(archive_path):
+            # Apple errors if the URL points to a non-existent file, so
+            # only set it when the file is present. On a missing file we
+            # fall through and create an empty archive.
+            url = Foundation.NSURL.fileURLWithPath_(archive_path)
+            desc.setUrl_(url)
+        archive, err = self._device.newBinaryArchiveWithDescriptor_error_(desc, None)
+        if archive is None:
+            # Treat as a soft failure — disable archiving for this run.
+            raise MetalDispatchError(
+                f"newBinaryArchiveWithDescriptor failed for {archive_path!r}: {err}"
+            )
+        self._archive = archive
+        self._archive_url = Foundation.NSURL.fileURLWithPath_(archive_path)
+
+    def _serialize_archive_if_dirty(self) -> None:
+        """Write the archive to disk if any new PSO was added this run.
+
+        Called from ``atexit``; failures are logged but never raised so
+        a stale cache can't crash the interpreter at shutdown.
+        """
+        if (
+            self._archive is None
+            or self._archive_url is None
+            or not self._archive_dirty
+        ):
+            return
+        try:
+            ok, err = self._archive.serializeToURL_error_(self._archive_url, None)
+            if not ok:
+                import warnings  # noqa: PLC0415
+                warnings.warn(
+                    f"MetalDispatcher: failed to serialize binary archive: {err}",
+                    stacklevel=2,
+                )
+            else:
+                self._archive_dirty = False
+        except Exception as exc:  # noqa: BLE001
+            import warnings  # noqa: PLC0415
+            warnings.warn(
+                f"MetalDispatcher: archive serialize raised {exc!r}",
+                stacklevel=2,
+            )
 
     @staticmethod
     def _hash(source: str) -> str:
