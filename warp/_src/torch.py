@@ -383,6 +383,25 @@ def to_torch(a: warp.array, requires_grad: bool | None = None):
         # similar host frameworks that round-trip between the two need
         # an explicit ``wp.from_torch`` writeback.
         t = torch.as_tensor(a.numpy(), device="mps")
+        # ``a.numpy()`` discards Warp's zero strides — the numpy round-
+        # trip produces a contiguous copy with normal strides, even for
+        # arrays whose ``.strides[k] == 0`` (the per-world broadcast
+        # convention mujoco_warp's ``put_model`` uses for fields like
+        # ``jnt_range``). Frameworks built around the DLPack-zero-copy
+        # CUDA path detect "this is per-asset data, expand to num_envs"
+        # via ``tensor.stride(0) == 0`` (e.g. mjlab's ``TorchArray``);
+        # without the stride hint they leave the tensor at shape
+        # ``(1, …)`` and indexing it with ``env_ids = [0, 1, …]``
+        # raises ``index N is out of bounds: 0, range 0 to 1``. Restore
+        # the broadcast by forcing stride 0 on every wp.array dim that
+        # had it. ``as_strided`` is zero-copy and only updates the
+        # tensor's stride metadata.
+        if any(s == 0 for s in a.strides):
+            torch_stride = list(t.stride())
+            for i, wp_s in enumerate(a.strides):
+                if wp_s == 0 and i < len(torch_stride):
+                    torch_stride[i] = 0
+            t = torch.as_strided(t, t.shape, torch_stride)
         t.requires_grad = requires_grad
         if requires_grad and a.requires_grad:
             t.grad = torch.as_tensor(a.grad.numpy(), device="mps")
