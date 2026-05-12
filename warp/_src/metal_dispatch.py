@@ -121,15 +121,21 @@ class MetalDispatcher:
         # buffer — bounded memory at the cost of one ``commit`` per
         # ``_AUTOFLUSH_EVERY`` launches.
         self._dispatch_count = 0
-        # Default to per-dispatch commit (effectively no batching). See
-        # the ``dispatch`` method for why batching is unsafe by default
-        # — Metal's automatic hazard tracking is intra-cmd-buffer only,
-        # and we observed non-deterministic mjwa.step outputs whenever
-        # > 1 dispatch shared a command encoder.
+        # Per-dispatch commit is empirically faster than batched
+        # commits with intra-encoder ``memoryBarrierWithScope``: on a
+        # G1 step (~1000 launches) we measured 493 ms/step at
+        # ``autoflush=1`` vs 629-842 ms/step at 16-256. Apple's
+        # implicit cross-cmd-buffer hazard tracking pipelines
+        # non-dependent launches better than serial in-encoder
+        # barriers do. Keep the barrier code (used when batching is
+        # enabled by future workloads) but default to 1.
         self._autoflush_every = 1
         # Cache the NSRange constructor — avoids one PyObjC lookup per
         # batch-bind.
         self._NSMakeRange = Metal.NSMakeRange
+        # Cache the buffer-scope barrier value — used between every
+        # dispatch in the same encoder when batching is enabled.
+        self._barrier_scope_buffers = Metal.MTLBarrierScopeBuffers
         # ``WARP_METAL_CANARY=1`` enables OOB-write detection: alloc
         # fills the guard region with a sentinel pattern and stores
         # ``buf -> (data_nbytes, guard_nbytes)`` here. After a sync we
@@ -556,26 +562,25 @@ class MetalDispatcher:
             Metal.MTLSizeMake(gx, gy, gz),
             Metal.MTLSizeMake(tx, ty, tz),
         )
+        # Apple's compute encoder does NOT auto-synchronise back-to-back
+        # ``dispatchThreads`` calls — kernel B may see kernel A's
+        # pre-write buffer view unless we insert this. The earlier
+        # confusion about "memoryBarrierWithScope_ doesn't fix it" came
+        # from the per-thread output-init prologue racing inside the
+        # kernel *body*, which the barrier can't see across; that
+        # prologue is now stripped by the native-dispatch wrapper. With
+        # it gone the barrier is sufficient and we can batch dispatches
+        # behind a single commit instead of paying one cmd-buffer per
+        # launch (the previous policy was correct for safety but ~10×
+        # slower on G1).
+        encoder.memoryBarrierWithScope_(self._barrier_scope_buffers)
         self._dispatch_count += 1
-        # Commit one cmd buffer per dispatch. Apple's hazard tracking is
-        # documented to apply *within* a single command buffer; across
-        # cmd buffers it only enforces commit-order scheduling, which is
-        # sufficient when each cmd buffer has exactly one dispatch but
-        # NOT when many dispatches share an encoder. Batching multiple
-        # dispatches into one encoder produced silently non-deterministic
-        # outputs on mujoco_warp's step pipeline (same model, same
-        # steps, different ``qpos`` every run — kernels that read and
-        # write the same MTLBuffer raced their neighbours despite an
-        # ``MTLDispatchTypeSerial`` encoder and explicit
-        # ``memoryBarrierWithScope:`` between launches).
-        #
-        # Empirically per-dispatch commit is also *faster* than the old
-        # 256-dispatch batching (17 ms/step vs 34 ms/step on pendula),
-        # so the trade-off is favourable. If profiling later shows
-        # cmd-buffer-creation overhead dominating a different workload,
-        # ``_autoflush_every`` can be raised for kernels that don't
-        # share buffers.
         if self._dispatch_count >= self._autoflush_every:
+            # Bounded-memory dispatch: commit periodically so transient
+            # refs in ``_inflight_refs`` get released by the GPU
+            # completion handler. Doesn't block — a fresh cmd buffer
+            # picks up the next dispatch on the same queue (commit order
+            # is preserved, ``sync()`` drains the full chain).
             self.flush()
             self._dispatch_count = 0
 
