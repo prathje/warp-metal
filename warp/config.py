@@ -249,6 +249,20 @@ and is ≈30× faster on dispatch-bound workloads.
 Set before :func:`warp.init`. Requires ``pyobjc-framework-metal``.
 """
 
+disable_metal_solver_icb_capture: bool = False
+"""Disable the mujoco_warp solver's MTLIndirectCommandBuffer fast path.
+
+When :data:`metal_native_dispatch` is ``True``, mujoco_warp's
+``_solve`` captures the body of each iteration into a
+:class:`warp._src.metal_dispatch.MetalGraph` and replays it
+``opt.iterations`` times — ~7.5× faster per iteration on G1 than
+the plain Python loop because replay skips Warp's per-launch type
+checks and ObjC encoder calls. Set this knob to ``True`` to fall
+back to the pure-Python ``for _ in range(opt.iterations)`` loop,
+e.g. when debugging a solver kernel whose behavior changes between
+iterations of the same ``_solve()`` call.
+"""
+
 track_memory: bool = False
 """Enable tracking of memory allocations at initialization.
 
