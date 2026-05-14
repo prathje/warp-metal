@@ -263,6 +263,12 @@ class MetalDispatcher:
         # across captures (mutating the slot count per call) to avoid
         # the PyObjC alloc/init overhead on every record session.
         self._icb_desc = None
+        # DEBUG: per-kernel dispatch profiling. Disabled by default
+        # (one branch + dict lookup per dispatch is cheap but not free).
+        self._profile_dispatch = False
+        self._pso_name: dict[int, str] = {}
+        # entry_point -> [count, total_ns, total_grid]
+        self._dispatch_stats: dict[str, list] = {}
 
     @property
     def device(self):
@@ -350,6 +356,7 @@ class MetalDispatcher:
                 if added:
                     self._archive_dirty = True
             self._pipeline_cache[key] = pso
+            self._pso_name[id(pso)] = entry_point
             return pso
 
     # ------------------------------------------------------------------
@@ -612,10 +619,15 @@ class MetalDispatcher:
         and replay via :meth:`replay`.
         """
         Metal = self._Metal
+        if self._profile_dispatch:
+            import time as _time  # noqa: PLC0415
+            _prof_t0 = _time.perf_counter_ns()
         # Recording path: write the dispatch into an ICB slot. No
         # encoder commands hit the live cmd buffer until replay.
         if self._record_state is not None:
             self._record_dispatch(pso, bindings, grid, threadgroup)
+            if self._profile_dispatch:
+                self._bump_stats(pso, grid, _time.perf_counter_ns() - _prof_t0)
             return
         if self._encoder is None:
             if self._cmd_buf is None:
@@ -685,6 +697,40 @@ class MetalDispatcher:
             # is preserved, ``sync()`` drains the full chain).
             self.flush()
             self._dispatch_count = 0
+        if self._profile_dispatch:
+            self._bump_stats(pso, grid, _time.perf_counter_ns() - _prof_t0)
+
+    def _bump_stats(self, pso, grid: tuple[int, int, int], elapsed_ns: int) -> None:
+        """Record one dispatch's wall time into the per-kernel stats dict."""
+        name = self._pso_name.get(id(pso), "<unknown>")
+        slot = self._dispatch_stats.get(name)
+        if slot is None:
+            slot = [0, 0, 0]
+            self._dispatch_stats[name] = slot
+        slot[0] += 1
+        slot[1] += elapsed_ns
+        slot[2] += grid[0] * grid[1] * grid[2]
+
+    def reset_dispatch_stats(self) -> None:
+        """Clear accumulated per-kernel dispatch timings."""
+        self._dispatch_stats.clear()
+
+    def enable_dispatch_profile(self, enabled: bool = True) -> None:
+        """Toggle per-kernel dispatch timing collection."""
+        self._profile_dispatch = bool(enabled)
+
+    def dispatch_stats(self, top: int | None = None) -> list[tuple[str, int, int, int]]:
+        """Return per-kernel stats sorted by total time, descending.
+
+        Each row is ``(name, count, total_ns, total_grid_elems)``.
+        ``top`` truncates to that many rows; ``None`` returns all.
+        """
+        rows = [
+            (name, slot[0], slot[1], slot[2])
+            for name, slot in self._dispatch_stats.items()
+        ]
+        rows.sort(key=lambda r: r[2], reverse=True)
+        return rows if top is None else rows[:top]
 
     def _end_encoder(self) -> None:
         """Close the live compute encoder, if any."""
