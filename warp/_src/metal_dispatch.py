@@ -68,9 +68,18 @@ class MetalGraph:
         "_resources",
         "_owned_buffers",
         "_signature",
+        "_chunks",
     )
 
-    def __init__(self, icb, count: int, resources: list, owned_buffers: list, signature: Any = None):
+    def __init__(
+        self,
+        icb,
+        count: int,
+        resources: list,
+        owned_buffers: list,
+        signature: Any = None,
+        chunks: list[tuple[int, int]] | None = None,
+    ):
         self._icb = icb
         self._count = count
         # MTLBuffers referenced by the recorded commands. The replay
@@ -90,6 +99,14 @@ class MetalGraph:
         # Warp graph wrapper, to invalidate the cache when the source
         # workload changes). Untouched by the dispatcher.
         self._signature = signature
+        # Dependency-aware chunking: each entry is ``(start, length)``
+        # of consecutive ICB commands with no internal R/W dependency
+        # on the same buffer. Replay executes each chunk as a single
+        # concurrent ``executeCommandsInBuffer`` range and only emits
+        # ``memoryBarrierWithScope:`` BETWEEN chunks (not after every
+        # command). When ``chunks`` is ``None`` the replay falls back
+        # to per-command ranges with barriers (safe but slow).
+        self._chunks = chunks
 
     @property
     def count(self) -> int:
@@ -596,6 +613,7 @@ class MetalDispatcher:
         bindings: list,
         grid: tuple[int, int, int],
         threadgroup: tuple[int, int, int],
+        binding_modes: list | None = None,
     ) -> None:
         """Encode one compute dispatch onto the in-flight command buffer.
 
@@ -606,6 +624,12 @@ class MetalDispatcher:
         * A ``(bytes-like, length)`` tuple — bound via
           ``setBytes:length:atIndex:`` (cheaper for small const args
           ≤4KB; avoids a buffer allocation).
+
+        ``binding_modes`` is an optional parallel list of access modes
+        (one per binding) used **only** by ICB recording to compute
+        dependency chunks. Each entry is one of ``None`` /
+        ``"r"`` / ``"w"`` / ``"rw"``. ``None`` (or ``binding_modes``
+        omitted) keeps the safe per-command-barrier replay path.
 
         The caller is responsible for ordering bindings to match the
         kernel's signature.
@@ -625,7 +649,7 @@ class MetalDispatcher:
         # Recording path: write the dispatch into an ICB slot. No
         # encoder commands hit the live cmd buffer until replay.
         if self._record_state is not None:
-            self._record_dispatch(pso, bindings, grid, threadgroup)
+            self._record_dispatch(pso, bindings, grid, threadgroup, binding_modes)
             if self._profile_dispatch:
                 self._bump_stats(pso, grid, _time.perf_counter_ns() - _prof_t0)
             return
@@ -863,6 +887,25 @@ class MetalDispatcher:
             "resources": [],
             "owned_buffers": [],
             "signature": signature,
+            # Dependency-aware chunking. Each closed chunk is a
+            # (start, length) tuple of consecutive command indices
+            # known to have NO read/write conflict on any shared
+            # buffer; commands within a chunk can execute concurrently
+            # at replay time. ``chunk_start`` is the index of the
+            # first command in the still-open chunk; ``chunk_reads``
+            # / ``chunk_writes`` track which buffer pointers the open
+            # chunk's commands have touched so far. The next dispatch
+            # closes the open chunk if it would conflict.
+            "chunks": [],
+            "chunk_start": 0,
+            "chunk_reads": set(),
+            "chunk_writes": set(),
+            # Set to ``True`` the first time a caller passes
+            # ``binding_modes``. When ``False``, we fall back to the
+            # safe per-command-range replay; chunking is meaningless
+            # unless someone actually told us which bindings are
+            # read-only vs written.
+            "has_modes": False,
         }
 
     def end_record(self) -> MetalGraph:
@@ -871,12 +914,24 @@ class MetalDispatcher:
             raise MetalDispatchError("Not currently recording an ICB graph")
         st = self._record_state
         self._record_state = None
+        # Close the still-open chunk. Only emit chunk info if at least
+        # one dispatch passed ``binding_modes``; otherwise the chunks
+        # would all conservatively collapse to length-1 anyway and we
+        # gain nothing -- falling back to the per-command-range replay
+        # is simpler and identical in behaviour.
+        chunks: list[tuple[int, int]] | None
+        if st["has_modes"] and st["count"] > st["chunk_start"]:
+            st["chunks"].append((st["chunk_start"], st["count"] - st["chunk_start"]))
+            chunks = st["chunks"]
+        else:
+            chunks = None
         return MetalGraph(
             icb=st["icb"],
             count=st["count"],
             resources=st["resources"],
             owned_buffers=st["owned_buffers"],
             signature=st["signature"],
+            chunks=chunks,
         )
 
     def replay(self, graph: MetalGraph) -> None:
@@ -925,15 +980,26 @@ class MetalDispatcher:
         self._inflight_refs.append(graph._icb)
         if graph._owned_buffers:
             self._inflight_refs.extend(graph._owned_buffers)
-        # Per-command range execution with a barrier between, so
-        # data-dependent kernel chains still produce correct output
-        # (see :class:`MetalGraph` docstring for why per-range).
+        # Chunked range execution: one ``executeCommandsInBuffer``
+        # per chunk of mutually-independent commands, with a barrier
+        # only BETWEEN chunks. Without chunks (caller never passed
+        # ``binding_modes``), fall back to per-command ranges + per-
+        # command barriers. See :class:`MetalGraph` docstring for the
+        # correctness argument.
         nsrange = self._NSMakeRange
         scope = self._barrier_scope_buffers
         icb = graph._icb
-        for i in range(graph.count):
-            encoder.executeCommandsInBuffer_withRange_(icb, nsrange(i, 1))
-            encoder.memoryBarrierWithScope_(scope)
+        chunks = graph._chunks
+        if chunks is not None:
+            last = len(chunks) - 1
+            for i, (start, length) in enumerate(chunks):
+                encoder.executeCommandsInBuffer_withRange_(icb, nsrange(start, length))
+                if i < last:
+                    encoder.memoryBarrierWithScope_(scope)
+        else:
+            for i in range(graph.count):
+                encoder.executeCommandsInBuffer_withRange_(icb, nsrange(i, 1))
+                encoder.memoryBarrierWithScope_(scope)
         # Count this as ``graph.count`` logical dispatches against
         # the autoflush threshold so the in-flight cmd buffer commits
         # at the same cadence as direct ``dispatch`` use.
@@ -948,6 +1014,7 @@ class MetalDispatcher:
         bindings: list,
         grid: tuple[int, int, int],
         threadgroup: tuple[int, int, int],
+        binding_modes: list | None = None,
     ) -> None:
         """Encode one dispatch into the active recording's next ICB slot.
 
@@ -955,6 +1022,14 @@ class MetalDispatcher:
         materialised as fresh shared-storage MTLBuffers so the ICB
         can reference them via ``setKernelBuffer:offset:atIndex:``.
         Apple's ICB compute commands have no setBytes equivalent.
+
+        ``binding_modes`` -- when non-``None`` -- enables dependency
+        chunking: each entry is ``None`` / ``"r"`` / ``"w"`` / ``"rw"``
+        for the corresponding binding. setBytes args ignore the mode
+        (every setBytes allocates a private MTLBuffer per command, so
+        it can never alias another command's buffer). If this command
+        conflicts on any shared buffer with the still-open chunk, the
+        chunk is closed and a new one starts here.
         """
         st = self._record_state
         assert st is not None  # caller checked
@@ -963,6 +1038,44 @@ class MetalDispatcher:
                 f"ICB recording overflowed allocation of {st['max']} commands — "
                 "raise begin_record(max_commands=...) for this workload."
             )
+        # Compute this command's read/write sets over shared buffers.
+        # Done BEFORE encoding the command so we know whether to close
+        # the open chunk first. We use ``id(entry)`` as the buffer key
+        # -- two ICB commands binding the same Python-level MTLBuffer
+        # object identify aliasing. setBytes args produce a fresh
+        # MTLBuffer per command (see below) so they never alias.
+        cmd_reads: set = set()
+        cmd_writes: set = set()
+        if binding_modes is not None:
+            st["has_modes"] = True
+            for entry, mode in zip(bindings, binding_modes):
+                if mode is None or isinstance(entry, tuple):
+                    continue
+                ptr = id(entry)
+                if mode in ("r", "rw"):
+                    cmd_reads.add(ptr)
+                if mode in ("w", "rw"):
+                    cmd_writes.add(ptr)
+            # Conflict check vs the still-open chunk.
+            chunk_reads = st["chunk_reads"]
+            chunk_writes = st["chunk_writes"]
+            # RAW: this cmd reads something the chunk wrote.
+            # WAR: this cmd writes something the chunk read.
+            # WAW: this cmd writes something the chunk wrote.
+            conflict = (
+                bool(cmd_reads & chunk_writes)
+                or bool(cmd_writes & chunk_reads)
+                or bool(cmd_writes & chunk_writes)
+            )
+            if conflict and st["count"] > st["chunk_start"]:
+                st["chunks"].append((st["chunk_start"], st["count"] - st["chunk_start"]))
+                st["chunk_start"] = st["count"]
+                st["chunk_reads"] = cmd_reads.copy()
+                st["chunk_writes"] = cmd_writes.copy()
+            else:
+                chunk_reads |= cmd_reads
+                chunk_writes |= cmd_writes
+        # Encode the command.
         Metal = self._Metal
         cmd = st["icb"].indirectComputeCommandAtIndex_(st["count"])
         cmd.setComputePipelineState_(pso)

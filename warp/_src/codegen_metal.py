@@ -5771,6 +5771,14 @@ def launch_metal_kernel_native(kernel, dim, inputs, outputs, device, block_dim: 
 
     dispatcher = get_dispatcher()
     bindings: list = []
+    # Per-binding access mode -- used by ``MetalDispatcher`` only in
+    # ICB recording mode to compute dependency chunks. For each binding
+    # we record one of ``None`` (setBytes / scalar), ``"r"``, ``"w"``,
+    # or ``"rw"``. Conservative defaults: real inputs and init shadows
+    # are read-only; output buffers are read-write (kernels may both
+    # read the init value and write, e.g. ``wp.atomic_add``); packed
+    # scalar/int/float allocator slabs are read-only.
+    binding_modes: list = []
     transient_refs: list = []  # MTLBuffers we allocate per-launch.
 
     def _resolve_mtl(value, kernel_name: str, input_name: str):
@@ -5822,6 +5830,7 @@ def launch_metal_kernel_native(kernel, dim, inputs, outputs, device, block_dim: 
                         f"device; got {getattr(value, 'device', '?')}"
                     )
                 bindings.append(_resolve_mtl(value, kernel.key, name))
+                binding_modes.append("r")
             elif isinstance(arg_var.type, Struct):
                 layout = _struct_layout_for(arg_var.type)
                 ctype_inst = getattr(value, "_ctype", None)
@@ -5837,10 +5846,15 @@ def launch_metal_kernel_native(kernel, dim, inputs, outputs, device, block_dim: 
                         f"{np_buf.size} float32s but layout expects {layout.scalars_per_elem}"
                     )
                 bindings.append(_alloc_buffer_with_data(np_buf))
+                # Struct args are read-only constants per-launch but they
+                # live in a transient MTLBuffer that's not shared with
+                # any other binding, so the mode is effectively None.
+                binding_modes.append(None)
             else:
                 # Scalar input — bind via setBytes.
                 data, length = _native_pack_scalar_arg(arg_var, value)
                 bindings.append((data, length))
+                binding_modes.append(None)
 
     # 2) Init shadows — bind the corresponding output's MTLBuffer.
     for name in artifact.input_names:
@@ -5849,6 +5863,11 @@ def launch_metal_kernel_native(kernel, dim, inputs, outputs, device, block_dim: 
             idx, _ = arg_by_name[out_name]
             value = fwd_args[idx]
             bindings.append(_resolve_mtl(value, kernel.key, name))
+            # The init shadow points at the SAME MTLBuffer as the output
+            # below; mark it ``"r"`` so the dependency tracker sees this
+            # command both reads (init load) and writes (output) the
+            # buffer, which correctly aggregates to read-write.
+            binding_modes.append("r")
 
     # 3) Packed buffers. Reuses the MLX path's layout logic, just writes
     # to MTLBuffers instead of mx.arrays.
@@ -5932,24 +5951,28 @@ def launch_metal_kernel_native(kernel, dim, inputs, outputs, device, block_dim: 
         else:
             combined = header_np
         bindings.append(_alloc_buffer_with_data(combined))
+        binding_modes.append(None)  # transient per-launch slab
         # __floats_packed
         if artifact.floats_packed_arrs:
             if float_data_parts:
                 bindings.append(_alloc_buffer_with_data(np.concatenate(float_data_parts)))
             else:
                 bindings.append(_alloc_buffer_with_data(np.zeros(1, dtype=np.float32)))
+            binding_modes.append(None)
         # __init_shadows_floats
         if artifact.init_shadow_floats:
             if init_floats_parts:
                 bindings.append(_alloc_buffer_with_data(np.concatenate(init_floats_parts)))
             else:
                 bindings.append(_alloc_buffer_with_data(np.zeros(1, dtype=np.float32)))
+            binding_modes.append(None)
         # __init_shadows_ints
         if artifact.init_shadow_ints:
             if init_ints_parts:
                 bindings.append(_alloc_buffer_with_data(np.concatenate(init_ints_parts)))
             else:
                 bindings.append(_alloc_buffer_with_data(np.zeros(1, dtype=np.int32)))
+            binding_modes.append(None)
 
     # 4) __shapes_packed.
     if artifact.shape_packed_arrs:
@@ -5962,6 +5985,7 @@ def launch_metal_kernel_native(kernel, dim, inputs, outputs, device, block_dim: 
             for k, dim_k in enumerate(view_shape[:slot]):
                 packed[i * slot + k] = dim_k
         bindings.append(_alloc_buffer_with_data(packed))
+        binding_modes.append(None)
 
     # 5) Outputs (bind each output wp.array's MTLBuffer directly — kernel
     #    writes IN PLACE, no fresh allocation).
@@ -6003,6 +6027,12 @@ def launch_metal_kernel_native(kernel, dim, inputs, outputs, device, block_dim: 
             nbytes = int(value.size) * type_size_in_bytes(value.dtype)
             dispatcher.fill_zero(mtl, nbytes)
         bindings.append(mtl)
+        # Output buffer -- conservative read-write to handle kernels
+        # that both read prior values and write (e.g. ``atomic_add``).
+        # The dependency tracker aggregates ``rw`` correctly with any
+        # other binding's mode on the same MTLBuffer (so this and an
+        # init-shadow ``r`` on the same buffer collapse to RW).
+        binding_modes.append("rw")
 
     # ---- Compute grid + threadgroup (mirrors MLX path's logic) ----
     if isinstance(dim, int):
@@ -6040,7 +6070,7 @@ def launch_metal_kernel_native(kernel, dim, inputs, outputs, device, block_dim: 
 
     # ---- Dispatch (fire and forget) ----
     try:
-        dispatcher.dispatch(pso, bindings, grid, tg)
+        dispatcher.dispatch(pso, bindings, grid, tg, binding_modes=binding_modes)
     except Exception:
         if os.environ.get("WARP_METAL_DUMP_ON_FAIL"):
             import tempfile
