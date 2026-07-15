@@ -680,6 +680,64 @@ class TestMetalLaunch(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet)
 
+    def test_atomic_add_int_scalar_accumulator_stress(self):
+        # Regression test for the output-init prologue race: the prologue's
+        # per-threadgroup seed used ``atomic_store``, which could land AFTER
+        # another threadgroup's ``atomic_add``s and wipe them (observed as
+        # a flaky short-count in ``test_atomic_add_int_matches_cpu_bit_exact``,
+        # ~1 in 5 runs at dim=1<<20). Add/sub-only outputs are now seeded
+        # with ``atomic_fetch_add``, which commutes with the body's adds.
+        # The large dim keeps many threadgroups in flight so a reintroduced
+        # ordering bug fails reliably rather than once in a blue moon.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(a: wp.array(dtype=wp.int32), c: wp.array(dtype=wp.int32)):
+                tid = wp.tid()
+                wp.atomic_add(c, 0, a[tid])
+
+            N = 1 << 20
+            an = np.ones(N, dtype=np.int32)
+            a_m = wp.array(an, dtype=wp.int32, device='metal:0')
+            for trial in range(5):
+                c_m = wp.zeros(1, dtype=wp.int32, device='metal:0')
+                wp.launch(k, dim=N, inputs=[a_m], outputs=[c_m], device='metal:0')
+                got = int(c_m.numpy()[0])
+                assert got == N, f'trial {trial}: lost {N - got} atomic adds'
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_atomic_add_seed_accumulates_from_prior_value(self):
+        # The fetch_add seed must accumulate from the wp.array's prior
+        # contents (CUDA semantics: users seed accumulators themselves),
+        # and repeated launches must keep accumulating.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(a: wp.array(dtype=wp.int32), c: wp.array(dtype=wp.int32)):
+                tid = wp.tid()
+                wp.atomic_add(c, 0, a[tid])
+
+            N = 256
+            an = np.ones(N, dtype=np.int32)
+            a_m = wp.array(an, dtype=wp.int32, device='metal:0')
+            c_m = wp.array(np.array([1000], dtype=np.int32), dtype=wp.int32,
+                           device='metal:0')
+            wp.launch(k, dim=N, inputs=[a_m], outputs=[c_m], device='metal:0')
+            wp.launch(k, dim=N, inputs=[a_m], outputs=[c_m], device='metal:0')
+            got = int(c_m.numpy()[0])
+            assert got == 1000 + 2 * N, f'expected {1000 + 2 * N}, got {got}'
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
     def test_atomic_min_max_int_matches_cpu(self):
         # Integer min/max are deterministic and bit-exact regardless of order.
         snippet = textwrap.dedent(
