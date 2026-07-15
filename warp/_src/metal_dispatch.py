@@ -29,7 +29,6 @@ import os
 import threading
 from typing import Any
 
-
 _dispatcher_singleton: MetalDispatcher | None = None
 _dispatcher_lock = threading.Lock()
 
@@ -63,12 +62,12 @@ class MetalGraph:
     """
 
     __slots__ = (
-        "_icb",
-        "_count",
-        "_resources",
-        "_owned_buffers",
-        "_signature",
         "_chunks",
+        "_count",
+        "_icb",
+        "_owned_buffers",
+        "_resources",
+        "_signature",
     )
 
     def __init__(
@@ -153,9 +152,7 @@ class MetalDispatcher:
             # Warp's Metal path assumes unified memory so the buffer's
             # CPU pointer aliases the GPU view. A discrete Metal device
             # would need an explicit blit pass, which we don't support.
-            raise MetalDispatchError(
-                f"Metal device {device.name()!r} does not have unified memory"
-            )
+            raise MetalDispatchError(f"Metal device {device.name()!r} does not have unified memory")
         self._device = device
         self._command_queue = device.newCommandQueue()
         if self._command_queue is None:
@@ -248,13 +245,13 @@ class MetalDispatcher:
         self._archive_dirty = False
         try:
             self._init_binary_archive()
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             # Don't let cache setup failures take down the dispatcher —
             # fall back to in-memory only.
             import warnings  # noqa: PLC0415
+
             warnings.warn(
-                f"MetalDispatcher: binary archive disabled ({exc!r}); "
-                f"PSOs will be re-compiled every run.",
+                f"MetalDispatcher: binary archive disabled ({exc!r}); PSOs will be re-compiled every run.",
                 stacklevel=2,
             )
         if self._archive is not None:
@@ -282,10 +279,18 @@ class MetalDispatcher:
         self._icb_desc = None
         # DEBUG: per-kernel dispatch profiling. Disabled by default
         # (one branch + dict lookup per dispatch is cheap but not free).
-        self._profile_dispatch = False
+        # ``WARP_METAL_PROFILE_DISPATCH=1`` turns it on from the
+        # environment; ``enable_dispatch_profile()`` toggles at runtime.
+        self._profile_dispatch = bool(int(os.environ.get("WARP_METAL_PROFILE_DISPATCH", "0") or "0"))
         self._pso_name: dict[int, str] = {}
         # entry_point -> [count, total_ns, total_grid]
         self._dispatch_stats: dict[str, list] = {}
+        # Allocation guard / canary settings — read once here rather than
+        # per ``alloc()`` call (os.environ lookups on the hot allocation
+        # path are measurable at mujoco_warp's allocation counts). See
+        # :meth:`alloc` for what they do.
+        self._guard_bytes = int(os.environ.get("WARP_METAL_ALLOC_GUARD_BYTES", "4096") or "0")
+        self._canary_enabled = bool(int(os.environ.get("WARP_METAL_CANARY", "0") or "0"))
 
     @property
     def device(self):
@@ -325,19 +330,13 @@ class MetalDispatcher:
                 # ``angle = 0`` corner case to integrate cleanly.
                 opts = Metal.MTLCompileOptions.alloc().init()
                 opts.setFastMathEnabled_(False)
-                lib, err = self._device.newLibraryWithSource_options_error_(
-                    source, opts, None
-                )
+                lib, err = self._device.newLibraryWithSource_options_error_(source, opts, None)
                 if lib is None:
-                    raise MetalDispatchError(
-                        f"MSL compilation failed for entry point {entry_point!r}: {err}"
-                    )
+                    raise MetalDispatchError(f"MSL compilation failed for entry point {entry_point!r}: {err}")
                 self._library_cache[key[0]] = lib
             fn = lib.newFunctionWithName_(entry_point)
             if fn is None:
-                raise MetalDispatchError(
-                    f"MSL library has no function named {entry_point!r}"
-                )
+                raise MetalDispatchError(f"MSL library has no function named {entry_point!r}")
             pso_desc = Metal.MTLComputePipelineDescriptor.alloc().init()
             pso_desc.setComputeFunction_(fn)
             # Allow the PSO to be encoded into a ``MTLIndirectCommandBuffer``
@@ -351,13 +350,9 @@ class MetalDispatcher:
             pso_desc.setSupportIndirectCommandBuffers_(True)
             if self._archive is not None:
                 pso_desc.setBinaryArchives_([self._archive])
-            pso, err = self._device.newComputePipelineStateWithDescriptor_error_(
-                pso_desc, None
-            )
+            pso, err = self._device.newComputePipelineStateWithDescriptor_error_(pso_desc, None)
             if pso is None:
-                raise MetalDispatchError(
-                    f"newComputePipelineStateWithDescriptor failed for {entry_point!r}: {err}"
-                )
+                raise MetalDispatchError(f"newComputePipelineStateWithDescriptor failed for {entry_point!r}: {err}")
             if self._archive is not None:
                 # If this PSO wasn't already in the archive, add it so the
                 # next process start can reload it without a back-end
@@ -365,11 +360,7 @@ class MetalDispatcher:
                 # returns False when the entry is already present — that's
                 # a no-op, not an error, so we just track whether *any*
                 # add succeeded to decide whether to re-serialize.
-                added, _ = (
-                    self._archive.addComputePipelineFunctionsWithDescriptor_error_(
-                        pso_desc, None
-                    )
-                )
+                added, _ = self._archive.addComputePipelineFunctionsWithDescriptor_error_(pso_desc, None)
                 if added:
                     self._archive_dirty = True
             self._pipeline_cache[key] = pso
@@ -400,9 +391,7 @@ class MetalDispatcher:
         try:
             import Foundation  # noqa: PLC0415
         except ImportError as exc:
-            raise MetalDispatchError(
-                "Foundation unavailable; cannot construct NSURL for archive path"
-            ) from exc
+            raise MetalDispatchError("Foundation unavailable; cannot construct NSURL for archive path") from exc
 
         desc = Metal.MTLBinaryArchiveDescriptor.alloc().init()
         if os.path.exists(archive_path):
@@ -414,9 +403,7 @@ class MetalDispatcher:
         archive, err = self._device.newBinaryArchiveWithDescriptor_error_(desc, None)
         if archive is None:
             # Treat as a soft failure — disable archiving for this run.
-            raise MetalDispatchError(
-                f"newBinaryArchiveWithDescriptor failed for {archive_path!r}: {err}"
-            )
+            raise MetalDispatchError(f"newBinaryArchiveWithDescriptor failed for {archive_path!r}: {err}")
         self._archive = archive
         self._archive_url = Foundation.NSURL.fileURLWithPath_(archive_path)
 
@@ -426,24 +413,22 @@ class MetalDispatcher:
         Called from ``atexit``; failures are logged but never raised so
         a stale cache can't crash the interpreter at shutdown.
         """
-        if (
-            self._archive is None
-            or self._archive_url is None
-            or not self._archive_dirty
-        ):
+        if self._archive is None or self._archive_url is None or not self._archive_dirty:
             return
         try:
             ok, err = self._archive.serializeToURL_error_(self._archive_url, None)
             if not ok:
                 import warnings  # noqa: PLC0415
+
                 warnings.warn(
                     f"MetalDispatcher: failed to serialize binary archive: {err}",
                     stacklevel=2,
                 )
             else:
                 self._archive_dirty = False
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             import warnings  # noqa: PLC0415
+
             warnings.warn(
                 f"MetalDispatcher: archive serialize raised {exc!r}",
                 stacklevel=2,
@@ -503,15 +488,13 @@ class MetalDispatcher:
         or queue a fill-kernel dispatch.
 
         ``WARP_METAL_ALLOC_GUARD_BYTES``: add that many extra bytes
-        beyond ``nbytes`` to every allocation (defaults to ``0``).
-        Useful as a diagnostic for out-of-bounds writes — bump it up
-        to e.g. ``4096`` to test whether a numerical regression is
-        masked by Metal's tight unified-memory packing.
+        beyond ``nbytes`` to every allocation (defaults to ``4096`` —
+        see the guard comment below; set to ``0`` to disable). Useful
+        as a diagnostic for out-of-bounds writes and as protection
+        against known one-element overshoots in upstream kernels.
         """
         if nbytes <= 0:
             raise ValueError(f"MetalDispatcher.alloc: nbytes must be positive, got {nbytes}")
-        import os as _os  # noqa: PLC0415
-
         # Default guard: 4 KiB. Several mujoco_warp kernels (notably
         # ``_efc_contact_init``, ``_efc_contact_update``,
         # ``update_constraint_efc``, ``solve_done``, …) write one
@@ -520,13 +503,14 @@ class MetalDispatcher:
         # overshoot; ``MTLDevice newBufferWithLength`` packs allocations
         # tightly so the OOB writes corrupted adjacent ``wp.array``s.
         # Padding every allocation pushes the overshoot into a harmless
-        # guard region until the upstream kernels are fixed.
-        guard = int(_os.environ.get("WARP_METAL_ALLOC_GUARD_BYTES", "4096") or "0")
+        # guard region until the upstream kernels are fixed. Both settings
+        # are read from the environment once, in ``__init__``.
+        guard = self._guard_bytes
         # ``WARP_METAL_CANARY``: pre-fill the guard region with a sentinel
         # byte (default ``0xAB``). Combined with the dispatcher's
         # post-launch scan (see ``_check_canaries``), this points the
         # finger at any kernel that wrote past its bound MTLBuffer.
-        canary_enabled = bool(int(_os.environ.get("WARP_METAL_CANARY", "0") or "0"))
+        canary_enabled = self._canary_enabled
         # Round up to a 4-byte boundary so an atomic store of a 32-bit
         # type (``atomic_bool`` etc., which MSL implements as a 32-bit
         # atomic regardless of the logical element size) doesn't write
@@ -537,9 +521,7 @@ class MetalDispatcher:
         alloc_size = padded + guard
         buf = self._device.newBufferWithLength_options_(alloc_size, self._shared_storage)
         if buf is None:
-            raise MetalDispatchError(
-                f"MTLDevice newBufferWithLength failed for {alloc_size} bytes"
-            )
+            raise MetalDispatchError(f"MTLDevice newBufferWithLength failed for {alloc_size} bytes")
         # ``contents()`` returns a PyObjC ``objc.varlist``. ``as_buffer(n)``
         # gives a memoryview of the unified-memory bytes; the address
         # is stable for the MTLBuffer's lifetime and is what the GPU
@@ -601,8 +583,7 @@ class MetalDispatcher:
         if offenders:
             for slot, name, data_nbytes, first_bad in offenders:
                 print(
-                    f"[canary] {label}: slot {slot} {name!r} "
-                    f"(data={data_nbytes}B) clobbered guard at +{first_bad}B",
+                    f"[canary] {label}: slot {slot} {name!r} (data={data_nbytes}B) clobbered guard at +{first_bad}B",
                     flush=True,
                 )
         return offenders
@@ -645,6 +626,7 @@ class MetalDispatcher:
         Metal = self._Metal
         if self._profile_dispatch:
             import time as _time  # noqa: PLC0415
+
             _prof_t0 = _time.perf_counter_ns()
         # Recording path: write the dispatch into an ICB slot. No
         # encoder commands hit the live cmd buffer until replay.
@@ -749,10 +731,7 @@ class MetalDispatcher:
         Each row is ``(name, count, total_ns, total_grid_elems)``.
         ``top`` truncates to that many rows; ``None`` returns all.
         """
-        rows = [
-            (name, slot[0], slot[1], slot[2])
-            for name, slot in self._dispatch_stats.items()
-        ]
+        rows = [(name, slot[0], slot[1], slot[2]) for name, slot in self._dispatch_stats.items()]
         rows.sort(key=lambda r: r[2], reverse=True)
         return rows if top is None else rows[:top]
 
@@ -1048,6 +1027,15 @@ class MetalDispatcher:
         cmd_writes: set = set()
         if binding_modes is not None:
             st["has_modes"] = True
+            # A short modes list would silently drop trailing buffers from
+            # the conflict analysis — dependency chunks would then omit
+            # barriers for exactly those buffers. Fail loudly instead.
+            if len(binding_modes) != len(bindings):
+                raise MetalDispatchError(
+                    f"binding_modes length {len(binding_modes)} != bindings length "
+                    f"{len(bindings)} — dependency chunking would silently miss "
+                    "conflicts on the unpaired buffers."
+                )
             for entry, mode in zip(bindings, binding_modes):
                 if mode is None or isinstance(entry, tuple):
                     continue
@@ -1063,9 +1051,7 @@ class MetalDispatcher:
             # WAR: this cmd writes something the chunk read.
             # WAW: this cmd writes something the chunk wrote.
             conflict = (
-                bool(cmd_reads & chunk_writes)
-                or bool(cmd_writes & chunk_reads)
-                or bool(cmd_writes & chunk_writes)
+                bool(cmd_reads & chunk_writes) or bool(cmd_writes & chunk_reads) or bool(cmd_writes & chunk_writes)
             )
             if conflict and st["count"] > st["chunk_start"]:
                 st["chunks"].append((st["chunk_start"], st["count"] - st["chunk_start"]))
