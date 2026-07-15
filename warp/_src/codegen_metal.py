@@ -900,6 +900,153 @@ _MISC_MATH_HELPERS: dict[str, str] = {
         "inline float wp_trace(float3x3 m) { return m[0][0] + m[1][1] + m[2][2]; }\n"
         "inline float wp_trace(float4x4 m) { return m[0][0] + m[1][1] + m[2][2] + m[3][3]; }"
     ),
+    # ``wp.sign(0) == 1`` — do NOT swap in ``metal::sign`` (returns 0 at 0).
+    # The uint instantiation's ``x < 0`` is always false, so it returns 1
+    # like the native uint overloads do.
+    "wp_sign": ("template <typename T>\ninline T wp_sign(T x) { return x < T(0) ? T(-1) : T(1); }"),
+    # Warp's step is 1 for x < 0 — the reverse of GLSL/MSL ``step``.
+    "wp_step": ("template <typename T>\ninline T wp_step(T x) { return x < T(0) ? T(1) : T(0); }"),
+    "wp_nonzero": ("template <typename T>\ninline T wp_nonzero(T x) { return x == T(0) ? T(0) : T(1); }"),
+    # ``%`` is integer-only in MSL; float/half dispatch to ``metal::fmod``
+    # (truncated remainder, matching Warp's native ``mod``).
+    "wp_mod": (
+        "template <typename T>\n"
+        "inline T wp_mod(T a, T b) { return a % b; }\n"
+        "inline float wp_mod(float a, float b) { return metal::fmod(a, b); }\n"
+        "inline half wp_mod(half a, half b) { return metal::fmod(a, b); }\n"
+        "inline float2 wp_mod(float2 a, float2 b) { return metal::fmod(a, b); }\n"
+        "inline float3 wp_mod(float3 a, float3 b) { return metal::fmod(a, b); }\n"
+        "inline float4 wp_mod(float4 a, float4 b) { return metal::fmod(a, b); }"
+    ),
+    # MSL has no cbrt; copysign+pow keeps the sign for negative inputs
+    # like C's ``cbrtf`` (plain ``pow`` of a negative base is NaN).
+    "wp_cbrt": ("inline float wp_cbrt(float x) { return metal::copysign(metal::pow(metal::abs(x), 1.0f / 3.0f), x); }"),
+    # Component-wise multiply / divide. The generic template covers
+    # vectors (MSL floatN ``*`` is already component-wise, and our
+    # big-vec structs overload ``*`` element-wise); native matrix
+    # operands need explicit overloads because MSL's ``matNxN * matNxN``
+    # is a matrix multiply. Matrix columns are vectors, so per-column
+    # vector arithmetic gives the element-wise result.
+    "wp_cw_mul": (
+        "template <typename T>\n"
+        "inline T wp_cw_mul(T a, T b) { return a * b; }\n"
+        "inline float2x2 wp_cw_mul(float2x2 a, float2x2 b) "
+        "{ return float2x2(a[0] * b[0], a[1] * b[1]); }\n"
+        "inline float3x3 wp_cw_mul(float3x3 a, float3x3 b) "
+        "{ return float3x3(a[0] * b[0], a[1] * b[1], a[2] * b[2]); }\n"
+        "inline float4x4 wp_cw_mul(float4x4 a, float4x4 b) "
+        "{ return float4x4(a[0] * b[0], a[1] * b[1], a[2] * b[2], a[3] * b[3]); }"
+    ),
+    "wp_cw_div": (
+        "template <typename T>\n"
+        "inline T wp_cw_div(T a, T b) { return a / b; }\n"
+        "inline float2x2 wp_cw_div(float2x2 a, float2x2 b) "
+        "{ return float2x2(a[0] / b[0], a[1] / b[1]); }\n"
+        "inline float3x3 wp_cw_div(float3x3 a, float3x3 b) "
+        "{ return float3x3(a[0] / b[0], a[1] / b[1], a[2] / b[2]); }\n"
+        "inline float4x4 wp_cw_div(float4x4 a, float4x4 b) "
+        "{ return float4x4(a[0] / b[0], a[1] / b[1], a[2] / b[2], a[3] / b[3]); }"
+    ),
+    "wp_get_diag": (
+        "inline float2 wp_get_diag(float2x2 m) { return float2(m[0][0], m[1][1]); }\n"
+        "inline float3 wp_get_diag(float3x3 m) { return float3(m[0][0], m[1][1], m[2][2]); }\n"
+        "inline float4 wp_get_diag(float4x4 m) { return float4(m[0][0], m[1][1], m[2][2], m[3][3]); }"
+    ),
+    # Matrix inverse — port of warp/native/mat.h ``inverse_impl`` with
+    # kEps == 0.0f (a singular matrix returns the zero matrix, matching
+    # the CPU backend). Native code is row-major ``m.data[r][c]``; MSL is
+    # column-major ``m[c][r]`` — the a{r}{c} locals below re-establish
+    # the native orientation so the cofactor bodies transcribe verbatim.
+    # The 4x4 native version accumulates in double; Apple GPUs have no
+    # fp64, so intermediates stay float here (~1e-6 relative drift on
+    # well-conditioned inputs).
+    "wp_inverse": (
+        "inline float2x2 wp_inverse(float2x2 m) {\n"
+        "    float det = metal::determinant(m);\n"
+        "    if (det == 0.0f) { return float2x2(0.0f); }\n"
+        "    float rcp = 1.0f / det;\n"
+        "    return float2x2(float2(m[1][1], -m[0][1]) * rcp, float2(-m[1][0], m[0][0]) * rcp);\n"
+        "}\n"
+        "inline float3x3 wp_inverse(float3x3 m) {\n"
+        "    float a00 = m[0][0], a01 = m[1][0], a02 = m[2][0];\n"
+        "    float a10 = m[0][1], a11 = m[1][1], a12 = m[2][1];\n"
+        "    float a20 = m[0][2], a21 = m[1][2], a22 = m[2][2];\n"
+        "    float b00 = a11 * a22 - a12 * a21;\n"
+        "    float b10 = a12 * a20 - a10 * a22;\n"
+        "    float b20 = a10 * a21 - a11 * a20;\n"
+        "    float b01 = a02 * a21 - a01 * a22;\n"
+        "    float b11 = a00 * a22 - a02 * a20;\n"
+        "    float b21 = a01 * a20 - a00 * a21;\n"
+        "    float b02 = a01 * a12 - a02 * a11;\n"
+        "    float b12 = a02 * a10 - a00 * a12;\n"
+        "    float b22 = a00 * a11 - a01 * a10;\n"
+        "    float det = a00 * b00 + a01 * b10 + a02 * b20;\n"
+        "    if (det == 0.0f) { return float3x3(0.0f); }\n"
+        "    float rcp = 1.0f / det;\n"
+        "    return float3x3(\n"
+        "        float3(b00, b10, b20) * rcp,\n"
+        "        float3(b01, b11, b21) * rcp,\n"
+        "        float3(b02, b12, b22) * rcp);\n"
+        "}\n"
+        "inline float4x4 wp_inverse(float4x4 m) {\n"
+        "    float x00 = m[0][0], x01 = m[1][0], x02 = m[2][0], x03 = m[3][0];\n"
+        "    float x10 = m[0][1], x11 = m[1][1], x12 = m[2][1], x13 = m[3][1];\n"
+        "    float x20 = m[0][2], x21 = m[1][2], x22 = m[2][2], x23 = m[3][2];\n"
+        "    float x30 = m[0][3], x31 = m[1][3], x32 = m[2][3], x33 = m[3][3];\n"
+        "    float y01 = x00 * x11 - x10 * x01;\n"
+        "    float y02 = x00 * x21 - x20 * x01;\n"
+        "    float y03 = x00 * x31 - x30 * x01;\n"
+        "    float y12 = x10 * x21 - x20 * x11;\n"
+        "    float y13 = x10 * x31 - x30 * x11;\n"
+        "    float y23 = x20 * x31 - x30 * x21;\n"
+        "    float z33 = x02 * y12 - x12 * y02 + x22 * y01;\n"
+        "    float z23 = x12 * y03 - x32 * y01 - x02 * y13;\n"
+        "    float z13 = x02 * y23 - x22 * y03 + x32 * y02;\n"
+        "    float z03 = x22 * y13 - x32 * y12 - x12 * y23;\n"
+        "    float z32 = x13 * y02 - x23 * y01 - x03 * y12;\n"
+        "    float z22 = x03 * y13 - x13 * y03 + x33 * y01;\n"
+        "    float z12 = x23 * y03 - x33 * y02 - x03 * y23;\n"
+        "    float z02 = x13 * y23 - x23 * y13 + x33 * y12;\n"
+        "    y01 = x02 * x13 - x12 * x03;\n"
+        "    y02 = x02 * x23 - x22 * x03;\n"
+        "    y03 = x02 * x33 - x32 * x03;\n"
+        "    y12 = x12 * x23 - x22 * x13;\n"
+        "    y13 = x12 * x33 - x32 * x13;\n"
+        "    y23 = x22 * x33 - x32 * x23;\n"
+        "    float z30 = x11 * y02 - x21 * y01 - x01 * y12;\n"
+        "    float z20 = x01 * y13 - x11 * y03 + x31 * y01;\n"
+        "    float z10 = x21 * y03 - x31 * y02 - x01 * y23;\n"
+        "    float z00 = x11 * y23 - x21 * y13 + x31 * y12;\n"
+        "    float z31 = x00 * y12 - x10 * y02 + x20 * y01;\n"
+        "    float z21 = x10 * y03 - x30 * y01 - x00 * y13;\n"
+        "    float z11 = x00 * y23 - x20 * y03 + x30 * y02;\n"
+        "    float z01 = x20 * y13 - x30 * y12 - x10 * y23;\n"
+        "    float det = x30 * z30 + x20 * z20 + x10 * z10 + x00 * z00;\n"
+        "    if (det == 0.0f) { return float4x4(0.0f); }\n"
+        "    float rcp = 1.0f / det;\n"
+        "    return float4x4(\n"
+        "        float4(z00, z01, z02, z03) * rcp,\n"
+        "        float4(z10, z11, z12, z13) * rcp,\n"
+        "        float4(z20, z21, z22, z23) * rcp,\n"
+        "        float4(z30, z31, z32, z33) * rcp);\n"
+        "}"
+    ),
+    # Binary search over a sorted 1-D span — port of
+    # warp/native/array.h ``lower_bound``. Templated on the pointer type
+    # because MLX kernel inputs land in either ``device`` or ``constant``
+    # address space (non-deterministic; see module docstring).
+    "wp_lower_bound": (
+        "template <typename PtrT, typename T>\n"
+        "inline int wp_lower_bound(PtrT arr, int arr_begin, int arr_end, T value) {\n"
+        "    int lower = arr_begin;\n"
+        "    int upper = arr_end - 1;\n"
+        "    while (lower < upper) {\n"
+        "        int mid = lower + (upper - lower) / 2;\n"
+        "        if (arr[mid] < value) { lower = mid + 1; } else { upper = mid; }\n"
+        "    }\n"
+        "    return lower;\n"
+        "}"
+    ),
 }
 
 
@@ -907,6 +1054,397 @@ def _emit_misc_math_helpers(source: str) -> str:
     """Emit the misc-math helper definitions the source references."""
     parts = [body for name, body in _MISC_MATH_HELPERS.items() if name in source]
     return "\n".join(parts)
+
+
+# Port of ``warp/native/svd.h`` (McAdams et al. branch-free 3x3 SVD via
+# quaternion Jacobi iteration), float instantiation only. The scalar-level
+# helpers transcribe verbatim — only the entry points differ: native code
+# is row-major ``m.data[r][c]``, MSL is column-major ``m[c][r]``, and the
+# wrappers below re-establish the native orientation with a{r}{c} locals.
+# ``JACOBI_ITERATIONS = 4`` and the 1e-6 epsilons match the float config.
+# ``det_sign`` in svd2 inlines Warp's ``sign`` semantics (sign(0) == 1).
+_SVD_HELPERS = """\
+inline float wp_svd_rsqrt(float x) { return 1.0f / metal::sqrt(x); }
+inline void wp_svd_cond_swap(bool c, thread float& X, thread float& Y) {
+    float Z = X;
+    X = c ? Y : X;
+    Y = c ? Z : Y;
+}
+inline void wp_svd_cond_neg_swap(bool c, thread float& X, thread float& Y) {
+    float Z = -X;
+    X = c ? Y : X;
+    Y = c ? Z : Y;
+}
+inline void wp_svd_mult_ab(
+    float a11, float a12, float a13, float a21, float a22, float a23, float a31, float a32, float a33,
+    float b11, float b12, float b13, float b21, float b22, float b23, float b31, float b32, float b33,
+    thread float& m11, thread float& m12, thread float& m13,
+    thread float& m21, thread float& m22, thread float& m23,
+    thread float& m31, thread float& m32, thread float& m33) {
+    m11 = a11 * b11 + a12 * b21 + a13 * b31;
+    m12 = a11 * b12 + a12 * b22 + a13 * b32;
+    m13 = a11 * b13 + a12 * b23 + a13 * b33;
+    m21 = a21 * b11 + a22 * b21 + a23 * b31;
+    m22 = a21 * b12 + a22 * b22 + a23 * b32;
+    m23 = a21 * b13 + a22 * b23 + a23 * b33;
+    m31 = a31 * b11 + a32 * b21 + a33 * b31;
+    m32 = a31 * b12 + a32 * b22 + a33 * b32;
+    m33 = a31 * b13 + a32 * b23 + a33 * b33;
+}
+inline void wp_svd_mult_atb(
+    float a11, float a12, float a13, float a21, float a22, float a23, float a31, float a32, float a33,
+    float b11, float b12, float b13, float b21, float b22, float b23, float b31, float b32, float b33,
+    thread float& m11, thread float& m12, thread float& m13,
+    thread float& m21, thread float& m22, thread float& m23,
+    thread float& m31, thread float& m32, thread float& m33) {
+    m11 = a11 * b11 + a21 * b21 + a31 * b31;
+    m12 = a11 * b12 + a21 * b22 + a31 * b32;
+    m13 = a11 * b13 + a21 * b23 + a31 * b33;
+    m21 = a12 * b11 + a22 * b21 + a32 * b31;
+    m22 = a12 * b12 + a22 * b22 + a32 * b32;
+    m23 = a12 * b13 + a22 * b23 + a32 * b33;
+    m31 = a13 * b11 + a23 * b21 + a33 * b31;
+    m32 = a13 * b12 + a23 * b22 + a33 * b32;
+    m33 = a13 * b13 + a23 * b23 + a33 * b33;
+}
+inline void wp_svd_quat_to_mat3(
+    const thread float* qV,
+    thread float& m11, thread float& m12, thread float& m13,
+    thread float& m21, thread float& m22, thread float& m23,
+    thread float& m31, thread float& m32, thread float& m33) {
+    float w = qV[3];
+    float x = qV[0];
+    float y = qV[1];
+    float z = qV[2];
+    float qxx = x * x;
+    float qyy = y * y;
+    float qzz = z * z;
+    float qxz = x * z;
+    float qxy = x * y;
+    float qyz = y * z;
+    float qwx = w * x;
+    float qwy = w * y;
+    float qwz = w * z;
+    m11 = 1.0f - 2.0f * (qyy + qzz);
+    m12 = 2.0f * (qxy - qwz);
+    m13 = 2.0f * (qxz + qwy);
+    m21 = 2.0f * (qxy + qwz);
+    m22 = 1.0f - 2.0f * (qxx + qzz);
+    m23 = 2.0f * (qyz - qwx);
+    m31 = 2.0f * (qxz - qwy);
+    m32 = 2.0f * (qyz + qwx);
+    m33 = 1.0f - 2.0f * (qxx + qyy);
+}
+inline void wp_svd_approx_givens_quat(float a11, float a12, float a22, thread float& ch, thread float& sh) {
+    const float _gamma = 5.82842712474619f;
+    const float _cstar = 0.9238795325112867f;
+    const float _sstar = 0.3826834323650898f;
+    ch = 2.0f * (a11 - a22);
+    sh = a12;
+    bool b = _gamma * sh * sh < ch * ch;
+    float w = wp_svd_rsqrt(ch * ch + sh * sh);
+    ch = b ? w * ch : _cstar;
+    sh = b ? w * sh : _sstar;
+}
+inline void wp_svd_jacobi_conjugation(
+    const int x, const int y, const int z,
+    thread float& s11, thread float& s21, thread float& s22,
+    thread float& s31, thread float& s32, thread float& s33,
+    thread float* qV) {
+    float ch, sh;
+    wp_svd_approx_givens_quat(s11, s21, s22, ch, sh);
+    float scale = ch * ch + sh * sh;
+    float a = (ch * ch - sh * sh) / scale;
+    float b = (2.0f * sh * ch) / scale;
+    float _s11 = s11;
+    float _s21 = s21;
+    float _s22 = s22;
+    float _s31 = s31;
+    float _s32 = s32;
+    float _s33 = s33;
+    s11 = a * (a * _s11 + b * _s21) + b * (a * _s21 + b * _s22);
+    s21 = a * (-b * _s11 + a * _s21) + b * (-b * _s21 + a * _s22);
+    s22 = -b * (-b * _s11 + a * _s21) + a * (-b * _s21 + a * _s22);
+    s31 = a * _s31 + b * _s32;
+    s32 = -b * _s31 + a * _s32;
+    s33 = _s33;
+    float tmp[3];
+    tmp[0] = qV[0] * sh;
+    tmp[1] = qV[1] * sh;
+    tmp[2] = qV[2] * sh;
+    sh *= qV[3];
+    qV[0] *= ch;
+    qV[1] *= ch;
+    qV[2] *= ch;
+    qV[3] *= ch;
+    qV[z] += sh;
+    qV[3] -= tmp[z];
+    qV[x] += tmp[y];
+    qV[y] -= tmp[x];
+    _s11 = s22;
+    _s21 = s32;
+    _s22 = s33;
+    _s31 = s21;
+    _s32 = s31;
+    _s33 = s11;
+    s11 = _s11;
+    s21 = _s21;
+    s22 = _s22;
+    s31 = _s31;
+    s32 = _s32;
+    s33 = _s33;
+}
+inline float wp_svd_dist2(float x, float y, float z) { return x * x + y * y + z * z; }
+inline void wp_svd_jacobi_eigenanalysis(
+    thread float& s11, thread float& s21, thread float& s22,
+    thread float& s31, thread float& s32, thread float& s33,
+    thread float* qV) {
+    qV[3] = 1.0f;
+    qV[0] = 0.0f;
+    qV[1] = 0.0f;
+    qV[2] = 0.0f;
+    for (int i = 0; i < 4; i++) {
+        wp_svd_jacobi_conjugation(0, 1, 2, s11, s21, s22, s31, s32, s33, qV);
+        wp_svd_jacobi_conjugation(1, 2, 0, s11, s21, s22, s31, s32, s33, qV);
+        wp_svd_jacobi_conjugation(2, 0, 1, s11, s21, s22, s31, s32, s33, qV);
+    }
+}
+inline void wp_svd_sort_singular_values(
+    thread float& b11, thread float& b12, thread float& b13,
+    thread float& b21, thread float& b22, thread float& b23,
+    thread float& b31, thread float& b32, thread float& b33,
+    thread float& v11, thread float& v12, thread float& v13,
+    thread float& v21, thread float& v22, thread float& v23,
+    thread float& v31, thread float& v32, thread float& v33) {
+    float rho1 = wp_svd_dist2(b11, b21, b31);
+    float rho2 = wp_svd_dist2(b12, b22, b32);
+    float rho3 = wp_svd_dist2(b13, b23, b33);
+    bool c;
+    c = rho1 < rho2;
+    wp_svd_cond_neg_swap(c, b11, b12);
+    wp_svd_cond_neg_swap(c, v11, v12);
+    wp_svd_cond_neg_swap(c, b21, b22);
+    wp_svd_cond_neg_swap(c, v21, v22);
+    wp_svd_cond_neg_swap(c, b31, b32);
+    wp_svd_cond_neg_swap(c, v31, v32);
+    wp_svd_cond_swap(c, rho1, rho2);
+    c = rho1 < rho3;
+    wp_svd_cond_neg_swap(c, b11, b13);
+    wp_svd_cond_neg_swap(c, v11, v13);
+    wp_svd_cond_neg_swap(c, b21, b23);
+    wp_svd_cond_neg_swap(c, v21, v23);
+    wp_svd_cond_neg_swap(c, b31, b33);
+    wp_svd_cond_neg_swap(c, v31, v33);
+    wp_svd_cond_swap(c, rho1, rho3);
+    c = rho2 < rho3;
+    wp_svd_cond_neg_swap(c, b12, b13);
+    wp_svd_cond_neg_swap(c, v12, v13);
+    wp_svd_cond_neg_swap(c, b22, b23);
+    wp_svd_cond_neg_swap(c, v22, v23);
+    wp_svd_cond_neg_swap(c, b32, b33);
+    wp_svd_cond_neg_swap(c, v32, v33);
+}
+inline void wp_svd_qr_givens_quat(float a1, float a2, thread float& ch, thread float& sh) {
+    const float epsilon = 1.0e-6f;
+    float rho = metal::sqrt(a1 * a1 + a2 * a2);
+    sh = rho > epsilon ? a2 : 0.0f;
+    ch = metal::abs(a1) + metal::max(rho, epsilon);
+    bool b = a1 < 0.0f;
+    wp_svd_cond_swap(b, sh, ch);
+    float w = wp_svd_rsqrt(ch * ch + sh * sh);
+    ch *= w;
+    sh *= w;
+}
+inline void wp_svd_qr_decomposition(
+    float b11, float b12, float b13, float b21, float b22, float b23, float b31, float b32, float b33,
+    thread float& q11, thread float& q12, thread float& q13,
+    thread float& q21, thread float& q22, thread float& q23,
+    thread float& q31, thread float& q32, thread float& q33,
+    thread float& r11, thread float& r12, thread float& r13,
+    thread float& r21, thread float& r22, thread float& r23,
+    thread float& r31, thread float& r32, thread float& r33) {
+    float ch1, sh1, ch2, sh2, ch3, sh3;
+    float a, b;
+    wp_svd_qr_givens_quat(b11, b21, ch1, sh1);
+    a = 1.0f - 2.0f * sh1 * sh1;
+    b = 2.0f * ch1 * sh1;
+    r11 = a * b11 + b * b21;
+    r12 = a * b12 + b * b22;
+    r13 = a * b13 + b * b23;
+    r21 = -b * b11 + a * b21;
+    r22 = -b * b12 + a * b22;
+    r23 = -b * b13 + a * b23;
+    r31 = b31;
+    r32 = b32;
+    r33 = b33;
+    wp_svd_qr_givens_quat(r11, r31, ch2, sh2);
+    a = 1.0f - 2.0f * sh2 * sh2;
+    b = 2.0f * ch2 * sh2;
+    b11 = a * r11 + b * r31;
+    b12 = a * r12 + b * r32;
+    b13 = a * r13 + b * r33;
+    b21 = r21;
+    b22 = r22;
+    b23 = r23;
+    b31 = -b * r11 + a * r31;
+    b32 = -b * r12 + a * r32;
+    b33 = -b * r13 + a * r33;
+    wp_svd_qr_givens_quat(b22, b32, ch3, sh3);
+    a = 1.0f - 2.0f * sh3 * sh3;
+    b = 2.0f * ch3 * sh3;
+    r11 = b11;
+    r12 = b12;
+    r13 = b13;
+    r21 = a * b21 + b * b31;
+    r22 = a * b22 + b * b32;
+    r23 = a * b23 + b * b33;
+    r31 = -b * b21 + a * b31;
+    r32 = -b * b22 + a * b32;
+    r33 = -b * b23 + a * b33;
+    float sh12 = sh1 * sh1;
+    float sh22 = sh2 * sh2;
+    float sh32 = sh3 * sh3;
+    q11 = (-1.0f + 2.0f * sh12) * (-1.0f + 2.0f * sh22);
+    q12 = 4.0f * ch2 * ch3 * (-1.0f + 2.0f * sh12) * sh2 * sh3
+        + 2.0f * ch1 * sh1 * (-1.0f + 2.0f * sh32);
+    q13 = 4.0f * ch1 * ch3 * sh1 * sh3
+        - 2.0f * ch2 * (-1.0f + 2.0f * sh12) * sh2 * (-1.0f + 2.0f * sh32);
+    q21 = 2.0f * ch1 * sh1 * (1.0f - 2.0f * sh22);
+    q22 = -8.0f * ch1 * ch2 * ch3 * sh1 * sh2 * sh3 + (-1.0f + 2.0f * sh12) * (-1.0f + 2.0f * sh32);
+    q23 = -2.0f * ch3 * sh3 + 4.0f * sh1 * (ch3 * sh1 * sh3 + ch1 * ch2 * sh2 * (-1.0f + 2.0f * sh32));
+    q31 = 2.0f * ch2 * sh2;
+    q32 = 2.0f * ch3 * (1.0f - 2.0f * sh22) * sh3;
+    q33 = (-1.0f + 2.0f * sh22) * (-1.0f + 2.0f * sh32);
+}
+inline void wp_svd3_core(
+    float a11, float a12, float a13, float a21, float a22, float a23, float a31, float a32, float a33,
+    thread float& u11, thread float& u12, thread float& u13,
+    thread float& u21, thread float& u22, thread float& u23,
+    thread float& u31, thread float& u32, thread float& u33,
+    thread float& s11, thread float& s12, thread float& s13,
+    thread float& s21, thread float& s22, thread float& s23,
+    thread float& s31, thread float& s32, thread float& s33,
+    thread float& v11, thread float& v12, thread float& v13,
+    thread float& v21, thread float& v22, thread float& v23,
+    thread float& v31, thread float& v32, thread float& v33) {
+    float ATA11, ATA12, ATA13;
+    float ATA21, ATA22, ATA23;
+    float ATA31, ATA32, ATA33;
+    wp_svd_mult_atb(
+        a11, a12, a13, a21, a22, a23, a31, a32, a33, a11, a12, a13, a21, a22, a23, a31, a32, a33,
+        ATA11, ATA12, ATA13, ATA21, ATA22, ATA23, ATA31, ATA32, ATA33);
+    float qV[4];
+    wp_svd_jacobi_eigenanalysis(ATA11, ATA21, ATA22, ATA31, ATA32, ATA33, qV);
+    wp_svd_quat_to_mat3(qV, v11, v12, v13, v21, v22, v23, v31, v32, v33);
+    float b11, b12, b13;
+    float b21, b22, b23;
+    float b31, b32, b33;
+    wp_svd_mult_ab(
+        a11, a12, a13, a21, a22, a23, a31, a32, a33, v11, v12, v13, v21, v22, v23, v31, v32, v33,
+        b11, b12, b13, b21, b22, b23, b31, b32, b33);
+    wp_svd_sort_singular_values(
+        b11, b12, b13, b21, b22, b23, b31, b32, b33, v11, v12, v13, v21, v22, v23, v31, v32, v33);
+    wp_svd_qr_decomposition(
+        b11, b12, b13, b21, b22, b23, b31, b32, b33, u11, u12, u13, u21, u22, u23, u31, u32, u33,
+        s11, s12, s13, s21, s22, s23, s31, s32, s33);
+}
+inline void wp_svd3(float3x3 A, thread float3x3& U, thread float3& sigma, thread float3x3& V) {
+    float a11 = A[0][0], a12 = A[1][0], a13 = A[2][0];
+    float a21 = A[0][1], a22 = A[1][1], a23 = A[2][1];
+    float a31 = A[0][2], a32 = A[1][2], a33 = A[2][2];
+    float u11, u12, u13, u21, u22, u23, u31, u32, u33;
+    float s11, s12, s13, s21, s22, s23, s31, s32, s33;
+    float v11, v12, v13, v21, v22, v23, v31, v32, v33;
+    wp_svd3_core(
+        a11, a12, a13, a21, a22, a23, a31, a32, a33,
+        u11, u12, u13, u21, u22, u23, u31, u32, u33,
+        s11, s12, s13, s21, s22, s23, s31, s32, s33,
+        v11, v12, v13, v21, v22, v23, v31, v32, v33);
+    U = float3x3(float3(u11, u21, u31), float3(u12, u22, u32), float3(u13, u23, u33));
+    sigma = float3(s11, s22, s33);
+    V = float3x3(float3(v11, v21, v31), float3(v12, v22, v32), float3(v13, v23, v33));
+}
+inline void wp_qr3(float3x3 A, thread float3x3& Q, thread float3x3& R) {
+    float q11, q12, q13, q21, q22, q23, q31, q32, q33;
+    float r11, r12, r13, r21, r22, r23, r31, r32, r33;
+    wp_svd_qr_decomposition(
+        A[0][0], A[1][0], A[2][0], A[0][1], A[1][1], A[2][1], A[0][2], A[1][2], A[2][2],
+        q11, q12, q13, q21, q22, q23, q31, q32, q33,
+        r11, r12, r13, r21, r22, r23, r31, r32, r33);
+    Q = float3x3(float3(q11, q21, q31), float3(q12, q22, q32), float3(q13, q23, q33));
+    R = float3x3(float3(r11, r21, r31), float3(r12, r22, r32), float3(r13, r23, r33));
+}
+inline void wp_eig3(float3x3 A, thread float3x3& Q, thread float3& d) {
+    float qV[4];
+    float s11 = A[0][0];
+    float s21 = A[0][1];
+    float s22 = A[1][1];
+    float s31 = A[0][2];
+    float s32 = A[1][2];
+    float s33 = A[2][2];
+    float q11, q12, q13, q21, q22, q23, q31, q32, q33;
+    wp_svd_jacobi_eigenanalysis(s11, s21, s22, s31, s32, s33, qV);
+    wp_svd_quat_to_mat3(qV, q11, q12, q13, q21, q22, q23, q31, q32, q33);
+    float t11, t12, t13, t21, t22, t23, t31, t32, t33;
+    wp_svd_mult_atb(
+        q11, q12, q13, q21, q22, q23, q31, q32, q33,
+        A[0][0], A[1][0], A[2][0], A[0][1], A[1][1], A[2][1], A[0][2], A[1][2], A[2][2],
+        t11, t12, t13, t21, t22, t23, t31, t32, t33);
+    float u11, u12, u13, u21, u22, u23, u31, u32, u33;
+    wp_svd_mult_ab(
+        t11, t12, t13, t21, t22, t23, t31, t32, t33,
+        q11, q12, q13, q21, q22, q23, q31, q32, q33,
+        u11, u12, u13, u21, u22, u23, u31, u32, u33);
+    Q = float3x3(float3(q11, q21, q31), float3(q12, q22, q32), float3(q13, q23, q33));
+    d = float3(u11, u22, u33);
+}
+inline void wp_svd2(float2x2 A, thread float2x2& U, thread float2& sigma, thread float2x2& V) {
+    float a11 = A[0][0], a12 = A[1][0];
+    float a21 = A[0][1], a22 = A[1][1];
+    float u11, u12, u21, u22, s1, s2, v11, v12, v21, v22;
+    float ATA11 = a11 * a11 + a21 * a21;
+    float ATA12 = a11 * a12 + a21 * a22;
+    float ATA22 = a12 * a12 + a22 * a22;
+    float trace = ATA11 + ATA22;
+    float diff = ATA11 - ATA22;
+    float discriminant = diff * diff + 4.0f * ATA12 * ATA12;
+    if (discriminant == 0.0f) {
+        s1 = s2 = metal::sqrt(0.5f * trace);
+        u11 = v11 = 1.0f;
+        u12 = v12 = 0.0f;
+        u21 = v21 = 0.0f;
+        u22 = v22 = 1.0f;
+    } else {
+        float sqrt_term = metal::sqrt(discriminant);
+        float lambda1 = (trace + sqrt_term) * 0.5f;
+        float lambda2 = (trace - sqrt_term) * 0.5f;
+        float inv_sigma1 = wp_svd_rsqrt(lambda1);
+        float sigma1 = 1.0f / inv_sigma1;
+        float sigma2 = metal::sqrt(lambda2);
+        float v1y = diff - sqrt_term + 2.0f * ATA12, v1x = diff + sqrt_term - 2.0f * ATA12;
+        float len1_sq = v1x * v1x + v1y * v1y;
+        if (len1_sq == 0.0f) {
+            v11 = 0.707106781186547524401f;
+            v21 = v11;
+        } else {
+            float inv_len1 = wp_svd_rsqrt(len1_sq);
+            v11 = v1x * inv_len1;
+            v21 = v1y * inv_len1;
+        }
+        v12 = -v21;
+        v22 = v11;
+        u11 = (a11 * v11 + a12 * v21) * inv_sigma1;
+        u21 = (a21 * v11 + a22 * v21) * inv_sigma1;
+        float det_sign = (a11 * a22 - a12 * a21) < 0.0f ? -1.0f : 1.0f;
+        u12 = -u21 * det_sign;
+        u22 = u11 * det_sign;
+        s1 = sigma1;
+        s2 = sigma2;
+    }
+    U = float2x2(float2(u11, u21), float2(u12, u22));
+    sigma = float2(s1, s2);
+    V = float2x2(float2(v11, v21), float2(v12, v22));
+}"""
 
 
 # ---------------------------------------------------------------------------
@@ -1571,6 +2109,8 @@ def _build_kernel_header(source: str) -> str:
         parts.append(_TRANSFORM_HELPERS)
     if "wp_rand" in source:
         parts.append(_RAND_HELPERS)
+    if "wp_svd" in source or "wp_qr3" in source or "wp_eig3" in source:
+        parts.append(_SVD_HELPERS)
     misc_math = _emit_misc_math_helpers(source)
     if misc_math:
         parts.append(misc_math)
@@ -1980,7 +2520,6 @@ _MATH_BUILTIN_NAMES: tuple[str, ...] = (
     "round",
     "rint",
     "trunc",
-    "sign",
     "exp",
     "exp2",
     "log",
@@ -2058,7 +2597,9 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"wp::sub\s*\(\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)"), r"(\1 - \2)"),
     (re.compile(r"wp::mul\s*\(\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)"), r"(\1 * \2)"),
     (re.compile(r"wp::div\s*\(\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)"), r"(\1 / \2)"),
-    (re.compile(r"wp::mod\s*\(\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)"), r"(\1 % \2)"),
+    # ``wp::mod`` — MSL's ``%`` is integer-only; floats need ``metal::fmod``.
+    # Routed through a ``wp_mod`` overload set so both resolve correctly.
+    (re.compile(r"wp::mod\s*\(\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)"), r"wp_mod(\1, \2)"),
     # Unary negation: ``wp::neg(X)`` -> ``(-X)``. Works for scalar / vec / mat
     # because MSL's ``operator-`` is defined on all of those.
     (re.compile(r"wp::neg\s*\(\s*([^()]+?)\s*\)"), r"(-\1)"),
@@ -2187,6 +2728,7 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bwp::quat_rotate\b"), "wp_quat_rotate"),
     (re.compile(r"\bwp::quat_inverse\b"), "wp_quat_inverse"),
     (re.compile(r"\bwp::quat_from_axis_angle\b"), "wp_quat_from_axis_angle"),
+    (re.compile(r"\bwp::quat_to_axis_angle\b"), "wp_quat_to_axis_angle"),
     (re.compile(r"\bwp::quat_to_matrix\b"), "wp_quat_to_matrix"),
     (re.compile(r"\bwp::quat_from_matrix\s*(?:<[^<>]*>)?"), "wp_quat_from_matrix"),
     (re.compile(r"\bwp::quat_slerp\b"), "wp_quat_slerp"),
@@ -2231,17 +2773,46 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bwp::outer\b"), "wp_outer"),
     (re.compile(r"\bwp::skew\b"), "wp_skew"),
     (re.compile(r"\bwp::trace\b"), "wp_trace"),
-    # ``wp::cw_mul`` / ``wp::cw_div`` — component-wise multiply / divide for
-    # vector operands. MSL's ``vec / vec`` and ``vec * vec`` are already
-    # component-wise.
+    # ``wp::cw_mul`` / ``wp::cw_div`` — component-wise multiply / divide.
+    # MUST go through the ``wp_cw_*`` overload set, not raw ``*`` / ``/``:
+    # MSL's ``matNxN * matNxN`` is a *matrix multiply*, which silently
+    # returned wrong values for matrix operands before the helper existed.
+    # For vector operands the generic template lowers back to ``a * b``
+    # (component-wise on MSL floatN and on our big-vec structs).
     (
-        re.compile(r"wp::cw_mul\s*\(\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)"),
-        r"((\1) * (\2))",
+        re.compile(r"\bwp::cw_mul\b"),
+        "wp_cw_mul",
     ),
     (
-        re.compile(r"wp::cw_div\s*\(\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)"),
-        r"((\1) / (\2))",
+        re.compile(r"\bwp::cw_div\b"),
+        "wp_cw_div",
     ),
+    # Scalar sign/step/nonzero — hand-rolled because Warp's semantics
+    # differ from MSL's: ``wp.sign(0) == 1`` (``metal::sign(0) == 0``),
+    # ``wp.step`` is 1 for x < 0 (GLSL/MSL ``step(edge, x)`` is the
+    # opposite convention and takes two args).
+    (re.compile(r"\bwp::sign\b"), "wp_sign"),
+    (re.compile(r"\bwp::step\b"), "wp_step"),
+    (re.compile(r"\bwp::nonzero\b"), "wp_nonzero"),
+    # ``wp::cbrt`` — MSL has no cbrt; emulate with copysign+pow so
+    # negative inputs keep their sign like C's ``cbrtf``.
+    (re.compile(r"\bwp::cbrt\b"), "wp_cbrt"),
+    # Matrix inverse / diagonal extraction — ``wp_inverse`` overloads for
+    # float2x2/3x3/4x4 are ports of warp/native/mat.h (kEps == 0.0f, so
+    # a singular matrix returns the zero matrix, matching CPU).
+    (re.compile(r"\bwp::inverse\b"), "wp_inverse"),
+    (re.compile(r"\bwp::get_diag\b"), "wp_get_diag"),
+    # Matrix decompositions — output-parameter builtins ported from
+    # warp/native/svd.h (see ``_SVD_HELPERS``).
+    (re.compile(r"\bwp::svd3\b"), "wp_svd3"),
+    (re.compile(r"\bwp::svd2\b"), "wp_svd2"),
+    (re.compile(r"\bwp::qr3\b"), "wp_qr3"),
+    (re.compile(r"\bwp::eig3\b"), "wp_eig3"),
+    # NOTE: ``wp::lower_bound`` is intentionally NOT handled here — its
+    # 2-arg form references the array's ``<argname>_shape`` input, which
+    # requires the *final* parameter name. It's rewritten inside
+    # ``_finalize`` after the ``var_<argname>`` -> ``<argname>`` rename
+    # (see ``_LOWER_BOUND_4ARG_PAT`` / ``_LOWER_BOUND_2ARG_PAT``).
     # Strip Warp scalar-type cast wrappers ``wp::T(x)``. Includes the unsuffixed
     # Python-style names ``wp::float``, ``wp::int``, etc. that Warp emits for
     # ``float(x)`` / ``int(x)`` constructor calls in user code.
@@ -2341,6 +2912,16 @@ def _wrap_atomic_load_reads(text: str, arr_name: str) -> str:
         out_parts.append(f"atomic_load_explicit(&{arr_name}[{idx_expr}], memory_order_relaxed)")
         i = k
     return "".join(out_parts)
+
+
+# ``wp::lower_bound`` — binary search over a sorted 1-D array, rewritten in
+# ``_finalize`` after the arg rename (the 2-arg form needs the final param
+# name to reference the ``<argname>_shape`` input). The 4-arg (arr, begin,
+# end, value) form must match before the 2-arg one.
+_LOWER_BOUND_4ARG_PAT = re.compile(
+    r"wp::lower_bound\s*\(\s*([A-Za-z_]\w*)\s*,\s*([^,()]+?)\s*,\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)"
+)
+_LOWER_BOUND_2ARG_PAT = re.compile(r"wp::lower_bound\s*\(\s*([A-Za-z_]\w*)\s*,\s*([^()]+?)\s*\)")
 
 
 def _translate_intrinsics(line: str) -> str:
@@ -4474,6 +5055,11 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
         # ``input_names``/``output_names`` directly).
         for arg in adj.args:
             translated = re.sub(rf"\bvar_{re.escape(arg.label)}\b", arg.label, translated)
+        # ``wp::lower_bound`` — rewritten here (not in the intrinsic
+        # table) because the 2-arg form references ``<argname>_shape``,
+        # which only exists under the array's final parameter name.
+        translated = _LOWER_BOUND_4ARG_PAT.sub(r"wp_lower_bound(\1, \2, \3, \4)", translated)
+        translated = _LOWER_BOUND_2ARG_PAT.sub(r"wp_lower_bound(\1, 0, (int)\1_shape[0], \2)", translated)
         # When the kernel uses ``wp.atomic_*`` on any output, MLX makes
         # *every* output ``device atomic<T>*``. Plain reads
         # ``var_X = atomic_arr[idx]`` then fail to compile because MSL
