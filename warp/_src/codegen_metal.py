@@ -4287,12 +4287,13 @@ def _strip_comments_and_directives(line: str) -> str | None:
     return line
 
 
-def generate_msl_kernel(kernel) -> MetalKernelArtifact:
-    """Build an MSL artifact for a Warp ``Kernel`` object.
+def _ensure_adj_built(kernel):
+    """Build the kernel's forward IR if it hasn't been already; return the adj.
 
-    The kernel must already have been added to a module so that
-    ``kernel.adj.build()`` can resolve overloads. We invoke ``build()``
-    here defensively in case it hasn't run yet.
+    Split out of ``generate_msl_kernel`` so the artifact-cache wrapper can
+    compute its key (which needs ``adj.blocks``) without duplicating the
+    build policy. Idempotent — safe to call before the uncached generator
+    runs the same block again.
     """
     adj = kernel.adj
 
@@ -4335,6 +4336,17 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
     import warp._src.codegen as _wp_codegen  # noqa: PLC0415
 
     _wp_codegen.options = adj.builder_options
+    return adj
+
+
+def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
+    """Build an MSL artifact for a Warp ``Kernel`` object.
+
+    The kernel must already have been added to a module so that
+    ``kernel.adj.build()`` can resolve overloads. We invoke ``build()``
+    here defensively in case it hasn't run yet.
+    """
+    adj = _ensure_adj_built(kernel)
 
     # Preprocess via the AST pipeline (see ``warp._src.codegen_metal_ast``):
     #   parse → structural fold (for/while/if) → drop unsupported locals
@@ -5862,6 +5874,169 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
         init_shadow_ints=tuple(init_shadow_ints),
         header=header,
     )
+
+
+# ---------------------------------------------------------------------------
+# On-disk artifact cache
+# ---------------------------------------------------------------------------
+# ``_generate_msl_kernel_uncached`` re-runs the whole AST-fold + regex
+# translation pipeline on every process start — measured at ~1 ms for a
+# trivial kernel and ~17 ms for a moderately complex one, and mujoco_warp's
+# solver kernels are far larger. At mjlab-G1's ~700 unique kernels that is
+# tens of seconds of pure Python codegen per process launch, all of it
+# deterministic given the kernel IR. This cache is the Python-side twin of
+# ``MetalDispatcher``'s ``MTLBinaryArchive`` (which only caches the GPU
+# back-end compile): artifacts are pickled into the versioned Warp kernel
+# cache directory, keyed by a hash of the kernel's forward IR, its arg
+# signature, and the codegen sources themselves — editing this file or
+# ``codegen_metal_ast.py`` automatically invalidates every entry.
+#
+# ``input_args`` / ``output_args`` hold Warp ``Var`` objects whose types
+# are dynamically created classes (unpicklable), so they are stored as
+# label lists and reconstructed from ``adj.args`` on load.
+#
+# Kill switch: ``WARP_METAL_DISABLE_ARTIFACT_CACHE=1``.
+
+_ARTIFACT_CACHE_VERSION = 1
+_codegen_source_hash_cached: str | None = None
+
+
+def _codegen_source_hash() -> str:
+    """Hash of the Metal codegen sources — salts every cache key so any
+    change to the translation pipeline invalidates prior artifacts."""
+    global _codegen_source_hash_cached
+    if _codegen_source_hash_cached is None:
+        import hashlib  # noqa: PLC0415
+
+        import warp._src.codegen_metal_ast as _ast_mod  # noqa: PLC0415
+
+        h = hashlib.sha256()
+        for mod_file in (__file__, _ast_mod.__file__):
+            with open(mod_file, "rb") as f:
+                h.update(f.read())
+        _codegen_source_hash_cached = h.hexdigest()
+    return _codegen_source_hash_cached
+
+
+def _artifact_cache_path(key: str) -> str | None:
+    """Directory-qualified path for a cache entry, or ``None`` if caching
+    is unavailable (no kernel cache dir yet) or disabled."""
+    if os.environ.get("WARP_METAL_DISABLE_ARTIFACT_CACHE") == "1":
+        return None
+    import warp.config as _wp_cfg  # noqa: PLC0415
+
+    cache_dir = getattr(_wp_cfg, "kernel_cache_dir", None)
+    if not cache_dir:
+        return None
+    return os.path.join(cache_dir, "metal_artifacts", f"{key}.pkl")
+
+
+def _artifact_cache_key(kernel, adj) -> str | None:
+    """Cache key over everything the generated artifact depends on."""
+    import hashlib  # noqa: PLC0415
+
+    try:
+        body = "\n".join(adj.blocks[0].body_forward)
+        arg_sig = ";".join(f"{a.label}:{a.ctype()}" for a in adj.args)
+    except Exception:
+        return None
+    import warp  # noqa: PLC0415
+
+    opts = getattr(adj, "builder_options", None) or {}
+    h = hashlib.sha256()
+    for part in (
+        str(_ARTIFACT_CACHE_VERSION),
+        warp.config.version,
+        _codegen_source_hash(),
+        kernel.key,
+        arg_sig,
+        str(opts.get("block_dim")),
+        str(opts.get("output_arch")),
+        body,
+    ):
+        h.update(part.encode("utf-8"))
+        h.update(b"\x00")
+    return h.hexdigest()
+
+
+def _load_cached_artifact(key: str, adj) -> MetalKernelArtifact | None:
+    """Return the cached artifact for ``key``, or ``None`` on any miss.
+
+    Every failure mode (missing file, unpickle error, dataclass field
+    drift, unknown arg label) degrades to a regenerate — never an error.
+    """
+    path = _artifact_cache_path(key)
+    if path is None or not os.path.exists(path):
+        return None
+    import pickle  # noqa: PLC0415
+
+    try:
+        with open(path, "rb") as f:
+            payload = pickle.load(f)
+        fields = payload["fields"]
+        by_label = {a.label: a for a in adj.args}
+        input_args = [by_label[label] for label in payload["input_arg_labels"]]
+        output_args = [by_label[label] for label in payload["output_arg_labels"]]
+        artifact = MetalKernelArtifact(**fields)
+        artifact.input_args = input_args
+        artifact.output_args = output_args
+        return artifact
+    except Exception:
+        return None
+
+
+def _store_cached_artifact(key: str, artifact: MetalKernelArtifact) -> None:
+    """Persist ``artifact`` under ``key`` (atomic rename; best-effort)."""
+    path = _artifact_cache_path(key)
+    if path is None:
+        return
+    import pickle  # noqa: PLC0415
+    import tempfile  # noqa: PLC0415
+
+    fields = dict(artifact.__dict__)
+    input_args = fields.pop("input_args")
+    output_args = fields.pop("output_args")
+    payload = {
+        "fields": fields,
+        "input_arg_labels": [a.label for a in input_args],
+        "output_arg_labels": [a.label for a in output_args],
+    }
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(path), suffix=".tmp")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+            os.replace(tmp_path, path)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+    except Exception:
+        # Cache writes are best-effort — a read-only cache dir or a full
+        # disk must not break kernel launches.
+        pass
+
+
+def generate_msl_kernel(kernel) -> MetalKernelArtifact:
+    """Return the MSL artifact for a Warp ``Kernel``, using the on-disk
+    cache when possible.
+
+    See ``_generate_msl_kernel_uncached`` for the actual translation
+    pipeline and ``_artifact_cache_key`` for what invalidates entries.
+    """
+    adj = _ensure_adj_built(kernel)
+    key = _artifact_cache_key(kernel, adj)
+    if key is not None:
+        cached = _load_cached_artifact(key, adj)
+        if cached is not None:
+            return cached
+    artifact = _generate_msl_kernel_uncached(kernel)
+    if key is not None:
+        _store_cached_artifact(key, artifact)
+    return artifact
 
 
 def _is_array_arg_type(t) -> bool:

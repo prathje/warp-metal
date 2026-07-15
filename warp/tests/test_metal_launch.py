@@ -4441,5 +4441,84 @@ class TestMetalArrayBuiltins(unittest.TestCase):
         _run_with_metal_enabled(self, snippet)
 
 
+@unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
+@unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
+class TestMetalArtifactCache(unittest.TestCase):
+    """The on-disk MSL artifact cache must round-trip artifacts exactly and
+    degrade to regeneration on any corruption."""
+
+    def test_artifact_cache_roundtrip(self):
+        snippet = textwrap.dedent(
+            """
+            import os
+            import re
+
+            import numpy as np
+            import warp as wp
+            from warp._src import codegen_metal as cm
+
+            @wp.func
+            def helper(q: wp.quat, v: wp.vec3) -> wp.vec3:
+                return wp.quat_rotate(q, v) + wp.quat_rotate_inv(q, v)
+
+            @wp.kernel
+            def k(q: wp.array(dtype=wp.quat), x: wp.array(dtype=wp.vec3),
+                  out: wp.array(dtype=wp.vec3)):
+                tid = wp.tid()
+                out[tid] = helper(wp.normalize(q[tid]), x[tid])
+
+            adj = cm._ensure_adj_built(k)
+            key = cm._artifact_cache_key(k, adj)
+            assert key is not None, 'cache key must be computable'
+            path = cm._artifact_cache_path(key)
+            if os.path.exists(path):
+                os.unlink(path)
+
+            a1 = cm.generate_msl_kernel(k)  # cold: generate + store
+            assert os.path.exists(path), 'artifact must be stored after cold generate'
+            a2 = cm.generate_msl_kernel(k)  # warm: disk load
+
+            f1 = dict(a1.__dict__)
+            f2 = dict(a2.__dict__)
+            ia1, ia2 = f1.pop('input_args'), f2.pop('input_args')
+            oa1, oa2 = f1.pop('output_args'), f2.pop('output_args')
+            assert f1 == f2, 'cached artifact fields must round-trip exactly'
+            assert all(x is y for x, y in zip(ia1 + oa1, ia2 + oa2)), \\
+                'arg Vars must be reconstructed as the same adj.args objects'
+
+            # Corrupt entry -> silent regenerate. The inliner's var_N__k
+            # suffixes are not stable across repeat generations on the same
+            # adj, so compare with those normalized.
+            with open(path, 'wb') as f:
+                f.write(b'garbage')
+            a3 = cm.generate_msl_kernel(k)
+            norm = lambda s: re.sub(r'var_\\d+__', 'var_X__', s)
+            assert norm(a3.source) == norm(a1.source)
+
+            # Kill switch disables the cache entirely.
+            os.environ['WARP_METAL_DISABLE_ARTIFACT_CACHE'] = '1'
+            assert cm._artifact_cache_path(key) is None
+            del os.environ['WARP_METAL_DISABLE_ARTIFACT_CACHE']
+
+            # End-to-end: a launch that consumes the cache-loaded artifact
+            # must match the CPU backend.
+            N = 32
+            rng = np.random.default_rng(31)
+            qn = rng.standard_normal((N, 4)).astype(np.float32)
+            xn = rng.standard_normal((N, 3)).astype(np.float32)
+            outs = {}
+            for dev in ('cpu', 'metal:0'):
+                out = wp.zeros(N, dtype=wp.vec3, device=dev)
+                wp.launch(k, dim=N,
+                          inputs=[wp.array(qn, dtype=wp.quat, device=dev),
+                                  wp.array(xn, dtype=wp.vec3, device=dev)],
+                          outputs=[out], device=dev)
+                outs[dev] = out.numpy()
+            np.testing.assert_allclose(outs['cpu'], outs['metal:0'], rtol=1e-5, atol=1e-6)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
