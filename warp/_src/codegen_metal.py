@@ -201,15 +201,24 @@ _WP_MAT_T_PAT = re.compile(r"wp::mat_t\s*<\s*(\d+)\s*,\s*(\d+)\s*,\s*wp::(\w+)\s
 # specific operations (``wp.quat_inverse``, ``wp.quat_rotate``, etc.) would
 # need their own translations later.
 _WP_QUAT_T_PAT = re.compile(r"wp::quat_t\s*<\s*wp::(\w+)\s*>")
+# ``wp::transform_t<wp::TYPE>`` — a rigid transform laid out as 7 scalars
+# (px, py, pz, qx, qy, qz, qw). Normalized to ``vec_t<7>`` the same way
+# quats become ``vec_t<4>``; the big-vec struct machinery then covers
+# storage, constructors, and arithmetic, while the ``wp_transform_*``
+# helpers cover the transform-specific operations.
+_WP_TRANSFORM_T_PAT = re.compile(r"wp::transform_t\s*<\s*wp::(\w+)\s*>")
 
 
 def _normalize_quat_t(text: str) -> str:
-    """Rewrite every ``wp::quat_t<wp::T>`` reference as ``wp::vec_t<4, wp::T>``.
+    """Rewrite quat/transform type references to their vec_t equivalents.
 
-    Run before any other vec/mat handling so the existing 4-element vec
-    paths cover quat seamlessly.
+    ``wp::quat_t<wp::T>`` becomes ``wp::vec_t<4, wp::T>`` and
+    ``wp::transform_t<wp::T>`` becomes ``wp::vec_t<7, wp::T>``. Run before
+    any other vec/mat handling so the existing vec paths cover both
+    seamlessly.
     """
-    return _WP_QUAT_T_PAT.sub(lambda m: f"wp::vec_t<4, wp::{m.group(1)}>", text)
+    text = _WP_QUAT_T_PAT.sub(lambda m: f"wp::vec_t<4, wp::{m.group(1)}>", text)
+    return _WP_TRANSFORM_T_PAT.sub(lambda m: f"wp::vec_t<7, wp::{m.group(1)}>", text)
 
 
 _MSL_VEC_NATIVE_N = (2, 3, 4)
@@ -637,6 +646,269 @@ _DIAG_HELPER_FLOAT3 = (
 )
 
 
+# Quaternion helpers. Quats are stored as ``float4`` with (x, y, z, w)
+# layout after the ``vec_t<4>`` normalization; the bodies mirror
+# ``warp/native/quat.h`` exactly (including the ``l > 0`` normalize guard —
+# Warp's ``kEps`` is 0.0f). Row-major ``m.data[r][c]`` accesses from the
+# native code become column-major ``m[c][r]`` here.
+_QUAT_HELPERS = """\
+inline float4 wp_quat_mul(float4 a, float4 b) {
+    return float4(
+        a.w * b.x + b.w * a.x + a.y * b.z - b.y * a.z,
+        a.w * b.y + b.w * a.y + a.z * b.x - b.z * a.x,
+        a.w * b.z + b.w * a.z + a.x * b.y - b.x * a.y,
+        a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z);
+}
+inline float4 wp_quat_inverse(float4 q) {
+    return float4(-q.x, -q.y, -q.z, q.w);
+}
+inline float3 wp_quat_rotate(float4 q, float3 x) {
+    float c = 2.0f * q.w * q.w - 1.0f;
+    float d = 2.0f * (q.x * x.x + q.y * x.y + q.z * x.z);
+    return float3(
+        x.x * c + q.x * d + (q.y * x.z - q.z * x.y) * q.w * 2.0f,
+        x.y * c + q.y * d + (q.z * x.x - q.x * x.z) * q.w * 2.0f,
+        x.z * c + q.z * d + (q.x * x.y - q.y * x.x) * q.w * 2.0f);
+}
+inline float3 wp_quat_rotate_inv(float4 q, float3 x) {
+    float c = 2.0f * q.w * q.w - 1.0f;
+    float d = 2.0f * (q.x * x.x + q.y * x.y + q.z * x.z);
+    return float3(
+        x.x * c + q.x * d - (q.y * x.z - q.z * x.y) * q.w * 2.0f,
+        x.y * c + q.y * d - (q.z * x.x - q.x * x.z) * q.w * 2.0f,
+        x.z * c + q.z * d - (q.x * x.y - q.y * x.x) * q.w * 2.0f);
+}
+inline float4 wp_quat_from_axis_angle(float3 axis, float angle) {
+    float half_angle = angle * 0.5f;
+    float s = metal::sin(half_angle);
+    return float4(axis.x * s, axis.y * s, axis.z * s, metal::cos(half_angle));
+}
+inline void wp_quat_to_axis_angle(float4 q, thread float3& axis, thread float& angle) {
+    float3 v = float3(q.x, q.y, q.z);
+    float l = metal::length(v);
+    float3 n = (l > 0.0f) ? (v / l) : float3(0.0f);
+    axis = (q.w < 0.0f) ? -n : n;
+    angle = 2.0f * metal::atan2(l, metal::abs(q.w));
+}
+inline float4 wp_quat_slerp(float4 q0, float4 q1, float t) {
+    float3 axis;
+    float angle;
+    wp_quat_to_axis_angle(wp_quat_mul(wp_quat_inverse(q0), q1), axis, angle);
+    return wp_quat_mul(q0, wp_quat_from_axis_angle(axis, t * angle));
+}
+inline float3x3 wp_quat_to_matrix(float4 q) {
+    return float3x3(
+        wp_quat_rotate(q, float3(1.0f, 0.0f, 0.0f)),
+        wp_quat_rotate(q, float3(0.0f, 1.0f, 0.0f)),
+        wp_quat_rotate(q, float3(0.0f, 0.0f, 1.0f)));
+}
+inline float4 wp_quat_from_matrix(float3x3 m) {
+    float tr = m[0][0] + m[1][1] + m[2][2];
+    float x, y, z, w, h = 0.0f;
+    if (tr >= 0.0f) {
+        h = metal::sqrt(tr + 1.0f);
+        w = 0.5f * h;
+        h = 0.5f / h;
+        x = (m[1][2] - m[2][1]) * h;
+        y = (m[2][0] - m[0][2]) * h;
+        z = (m[0][1] - m[1][0]) * h;
+    } else {
+        int max_diag = 0;
+        if (m[1][1] > m[0][0]) {
+            max_diag = 1;
+        }
+        if (m[2][2] > m[max_diag][max_diag]) {
+            max_diag = 2;
+        }
+        if (max_diag == 0) {
+            h = metal::sqrt((m[0][0] - (m[1][1] + m[2][2])) + 1.0f);
+            x = 0.5f * h;
+            h = 0.5f / h;
+            y = (m[1][0] + m[0][1]) * h;
+            z = (m[0][2] + m[2][0]) * h;
+            w = (m[1][2] - m[2][1]) * h;
+        } else if (max_diag == 1) {
+            h = metal::sqrt((m[1][1] - (m[2][2] + m[0][0])) + 1.0f);
+            y = 0.5f * h;
+            h = 0.5f / h;
+            z = (m[2][1] + m[1][2]) * h;
+            x = (m[1][0] + m[0][1]) * h;
+            w = (m[2][0] - m[0][2]) * h;
+        }
+        if (max_diag == 2) {
+            h = metal::sqrt((m[2][2] - (m[0][0] + m[1][1])) + 1.0f);
+            z = 0.5f * h;
+            h = 0.5f / h;
+            x = (m[0][2] + m[2][0]) * h;
+            y = (m[2][1] + m[1][2]) * h;
+            w = (m[0][1] - m[1][0]) * h;
+        }
+    }
+    float4 q = float4(x, y, z, w);
+    float l = metal::length(q);
+    return (l > 0.0f) ? (q / l) : float4(0.0f, 0.0f, 0.0f, 1.0f);
+}
+inline float4 wp_quat_rpy(float roll, float pitch, float yaw) {
+    float cy = metal::cos(yaw * 0.5f);
+    float sy = metal::sin(yaw * 0.5f);
+    float cr = metal::cos(roll * 0.5f);
+    float sr = metal::sin(roll * 0.5f);
+    float cp = metal::cos(pitch * 0.5f);
+    float sp = metal::sin(pitch * 0.5f);
+    return float4(
+        cy * sr * cp - sy * cr * sp,
+        cy * cr * sp + sy * sr * cp,
+        sy * cr * cp - cy * sr * sp,
+        cy * cr * cp + sy * sr * sp);
+}"""
+
+
+# Rigid-transform helpers. Transforms are ``wp_vec7_float`` after the
+# ``vec_t<7>`` normalization, laid out (px, py, pz, qx, qy, qz, qw). Bodies
+# mirror ``warp/native/spatial.h``. Depends on ``_QUAT_HELPERS`` and the
+# ``wp_vec7_float`` struct — both emitted whenever this block is (see the
+# header assembly in ``_emit_header_helpers``). The two-arg
+# ``wp_vec7_float_make(float3, float4)`` overload mirrors Warp's
+# ``wp.transform(p, q)`` constructor the same way the spatial helpers
+# overload ``wp_vec6_float_make(float3, float3)``.
+_TRANSFORM_HELPERS = """\
+inline wp_vec7_float wp_vec7_float_make(float3 p, float4 q) {
+    return wp_vec7_float_make(p[0], p[1], p[2], q[0], q[1], q[2], q[3]);
+}
+inline float3 wp_transform_get_translation(wp_vec7_float t) {
+    return float3(t.c[0], t.c[1], t.c[2]);
+}
+inline float4 wp_transform_get_rotation(wp_vec7_float t) {
+    return float4(t.c[3], t.c[4], t.c[5], t.c[6]);
+}
+inline wp_vec7_float wp_transform_identity() {
+    return wp_vec7_float_make(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f);
+}
+inline float3 wp_transform_point(wp_vec7_float t, float3 x) {
+    return wp_transform_get_translation(t) + wp_quat_rotate(wp_transform_get_rotation(t), x);
+}
+inline float3 wp_transform_vector(wp_vec7_float t, float3 x) {
+    return wp_quat_rotate(wp_transform_get_rotation(t), x);
+}
+inline wp_vec7_float wp_transform_multiply(wp_vec7_float a, wp_vec7_float b) {
+    float4 aq = wp_transform_get_rotation(a);
+    return wp_vec7_float_make(
+        wp_quat_rotate(aq, wp_transform_get_translation(b)) + wp_transform_get_translation(a),
+        wp_quat_mul(aq, wp_transform_get_rotation(b)));
+}
+inline wp_vec7_float wp_transform_inverse(wp_vec7_float t) {
+    float4 q_inv = wp_quat_inverse(wp_transform_get_rotation(t));
+    return wp_vec7_float_make(-wp_quat_rotate(q_inv, wp_transform_get_translation(t)), q_inv);
+}"""
+
+
+# Random-number helpers — a port of ``warp/native/rand.h`` (PCG hash from
+# Jarzynski & Olano). All integer ops are uint32 wraparound arithmetic, so
+# the streams are bit-identical to the CPU/CUDA backends. State is passed
+# ``thread uint&`` to mirror the native ``uint32&`` mutation semantics.
+# ``wp_randn`` binds its two ``randf`` draws to explicit temporaries: the
+# native code calls ``randf`` twice inside one expression, whose evaluation
+# order is unspecified in C++ — Clang on both arm64 and MSL evaluates
+# left-to-right today, and the temporaries pin that order permanently.
+_RAND_HELPERS = """\
+inline uint wp_rand_pcg(uint state) {
+    uint b = state * 747796405u + 2891336453u;
+    uint c = ((b >> ((b >> 28u) + 4u)) ^ b) * 277803737u;
+    return (c >> 22u) ^ c;
+}
+inline uint wp_rand_init(int seed) { return wp_rand_pcg(uint(seed)); }
+inline uint wp_rand_init(int seed, int offset) {
+    return wp_rand_pcg(uint(seed) + wp_rand_pcg(uint(offset)));
+}
+inline int wp_randi(thread uint& state) {
+    state = wp_rand_pcg(state);
+    return int(state);
+}
+inline int wp_randi(thread uint& state, int lo, int hi) {
+    state = wp_rand_pcg(state);
+    return int(state % uint(hi - lo) + uint(lo));
+}
+inline uint wp_randu(thread uint& state) {
+    state = wp_rand_pcg(state);
+    return state;
+}
+inline uint wp_randu(thread uint& state, uint lo, uint hi) {
+    state = wp_rand_pcg(state);
+    return state % (hi - lo) + lo;
+}
+inline float wp_randf(thread uint& state) {
+    state = wp_rand_pcg(state);
+    return (state >> 8) * (1.0f / 16777216.0f);
+}
+inline float wp_randf(thread uint& state, float lo, float hi) {
+    return (hi - lo) * wp_randf(state) + lo;
+}
+inline float wp_randn(thread uint& state) {
+    float u = wp_randf(state);
+    float v = wp_randf(state);
+    return metal::sqrt(-2.0f * metal::log(u + 5.96e-8f)) *
+           metal::cos(2.0f * 3.14159265358979323846f * v);
+}"""
+
+
+# Interpolation / misc math / small linear-algebra helpers. Each piece is
+# emitted only when the translated source references it (see
+# ``_emit_misc_math_helpers``). Bodies mirror the Warp native
+# implementations, NOT the closest MSL builtin, where the two differ:
+# ``wp.frac`` truncates toward zero (``metal::fract`` floors — diverges for
+# negative inputs) and ``wp.lerp`` computes ``a*(1-t) + b*t`` (``metal::mix``
+# computes ``a + (b-a)*t`` — different rounding).
+_MISC_MATH_HELPERS: dict[str, str] = {
+    "wp_lerp": (
+        "template <typename T, typename S>\ninline T wp_lerp(T a, T b, S t) { return a * (S(1) - t) + b * t; }"
+    ),
+    "wp_smoothstep": (
+        "template <typename T>\n"
+        "inline T wp_smoothstep(T edge0, T edge1, T x) {\n"
+        "    x = metal::clamp((x - edge0) / (edge1 - edge0), T(0), T(1));\n"
+        "    return x * x * (T(3) - T(2) * x);\n"
+        "}"
+    ),
+    "wp_frac": ("template <typename T>\ninline T wp_frac(T x) { return x - metal::trunc(x); }"),
+    "wp_degrees": ("template <typename T>\ninline T wp_degrees(T x) { return x * T(57.29577951308232087679); }"),
+    "wp_radians": ("template <typename T>\ninline T wp_radians(T x) { return x * T(0.01745329251994329577); }"),
+    # Outer product: element [i][j] = a[i] * b[j]. MSL matrices are
+    # column-major, so column j is ``a * b[j]``.
+    "wp_outer": (
+        "inline float2x2 wp_outer(float2 a, float2 b) {\n"
+        "    return float2x2(a * b.x, a * b.y);\n"
+        "}\n"
+        "inline float3x3 wp_outer(float3 a, float3 b) {\n"
+        "    return float3x3(a * b.x, a * b.y, a * b.z);\n"
+        "}\n"
+        "inline float4x4 wp_outer(float4 a, float4 b) {\n"
+        "    return float4x4(a * b.x, a * b.y, a * b.z, a * b.w);\n"
+        "}"
+    ),
+    # Skew-symmetric cross-product matrix: rows [[0,-z,y],[z,0,-x],[-y,x,0]],
+    # written as columns for MSL.
+    "wp_skew": (
+        "inline float3x3 wp_skew(float3 v) {\n"
+        "    return float3x3(\n"
+        "        float3(0.0f, v.z, -v.y),\n"
+        "        float3(-v.z, 0.0f, v.x),\n"
+        "        float3(v.y, -v.x, 0.0f));\n"
+        "}"
+    ),
+    "wp_trace": (
+        "inline float wp_trace(float2x2 m) { return m[0][0] + m[1][1]; }\n"
+        "inline float wp_trace(float3x3 m) { return m[0][0] + m[1][1] + m[2][2]; }\n"
+        "inline float wp_trace(float4x4 m) { return m[0][0] + m[1][1] + m[2][2] + m[3][3]; }"
+    ),
+}
+
+
+def _emit_misc_math_helpers(source: str) -> str:
+    """Emit the misc-math helper definitions the source references."""
+    parts = [body for name, body in _MISC_MATH_HELPERS.items() if name in source]
+    return "\n".join(parts)
+
+
 # ---------------------------------------------------------------------------
 # Tile primitive emission (Phase 2 — Cholesky path for mujoco_warp)
 # ---------------------------------------------------------------------------
@@ -676,11 +948,8 @@ def _emit_tile_struct(rows: int, cols: int, msl_scalar: str) -> str:
     # the pointer type so the same call site works for either: the MSL
     # compiler instantiates one body per (address-space) flavor and
     # deduplicates at link time.
-    parts.append(f"template <typename T>")
-    parts.append(
-        f"inline {name} {name}_load(T arr, "
-        "int base, int row_stride, int row_off, int col_off) {"
-    )
+    parts.append("template <typename T>")
+    parts.append(f"inline {name} {name}_load(T arr, int base, int row_stride, int row_off, int col_off) {{")
     parts.append(f"    {name} t;")
     # Runtime loops (rather than fully unrolled writes) keep the helper
     # small. Apple's MSL compiler silently drops writes when a kernel
@@ -733,11 +1002,8 @@ def _emit_tile_struct_vec(rows: int, cols: int, n_elem: int, msl_scalar: str) ->
     # of shape ``(*array_shape, n_elem)``. ``row_stride`` is the inner-
     # *element* stride (inner scalar count = n_elem * array.shape[-1]
     # already folded by the caller via ``__shapes_packed``).
-    parts.append(f"template <typename T>")
-    parts.append(
-        f"inline {name} {name}_load(T arr, "
-        "int base, int row_stride, int row_off, int col_off) {"
-    )
+    parts.append("template <typename T>")
+    parts.append(f"inline {name} {name}_load(T arr, int base, int row_stride, int row_off, int col_off) {{")
     parts.append(f"    {name} t;")
     parts.append(f"    for (int i = 0; i < {rows}; ++i) {{")
     parts.append(f"        for (int j = 0; j < {cols}; ++j) {{")
@@ -796,7 +1062,7 @@ def _emit_tile_cholesky(n: int, msl_scalar: str) -> str:
     # round-off to drive the diagonal pivot below the
     # ``max(d, 1e-30)`` clamp, then ``inv = 1/sqrt(1e-30) ≈ 1e15``
     # blows up the rest of the factorization to NaN.
-    parts.append(f"            d = metal::fma(-ljk, ljk, d);")
+    parts.append("            d = metal::fma(-ljk, ljk, d);")
     parts.append("        }")
     parts.append(f"        d = metal::max(d, ({msl_scalar})1e-30);")
     parts.append(f"        {msl_scalar} ljj = metal::precise::sqrt(d);")
@@ -869,7 +1135,7 @@ def _emit_tile_load_coop(rows: int, cols: int, msl_scalar: str) -> str:
     name = f"wp_tile_{rows}x{cols}_{msl_scalar}"
     n = rows * cols
     parts: list[str] = []
-    parts.append(f"template <typename T>")
+    parts.append("template <typename T>")
     parts.append(
         f"inline {name} {name}_load_coop(T arr, "
         f"int base, int row_stride, int row_off, int col_off, "
@@ -938,10 +1204,7 @@ def _emit_tile_cholesky_coop(n: int, msl_scalar: str) -> str:
     """
     name = f"wp_tile_{n}x{n}_{msl_scalar}"
     parts: list[str] = []
-    parts.append(
-        f"inline {name} {name}_cholesky_coop({name} A, "
-        f"threadgroup {msl_scalar}* smem, uint lane) {{"
-    )
+    parts.append(f"inline {name} {name}_cholesky_coop({name} A, threadgroup {msl_scalar}* smem, uint lane) {{")
     # Start barrier: a previous cooperative op may still be reading smem.
     parts.append("    threadgroup_barrier(metal::mem_flags::mem_threadgroup);")
     # 1. Cooperative load A → smem (each lane writes its strided slice).
@@ -957,7 +1220,7 @@ def _emit_tile_cholesky_coop(n: int, msl_scalar: str) -> str:
     parts.append("            for (int k = 0; k < j; ++k) {")
     parts.append(f"                {msl_scalar} ljk = smem[j*{n} + k];")
     # Explicit fma — see ``_emit_tile_cholesky_inplace`` for rationale.
-    parts.append(f"                d = metal::fma(-ljk, ljk, d);")
+    parts.append("                d = metal::fma(-ljk, ljk, d);")
     parts.append("            }")
     parts.append(f"            d = metal::max(d, ({msl_scalar})1e-30);")
     parts.append(f"            smem[j*{n} + j] = metal::precise::sqrt(d);")
@@ -1005,9 +1268,7 @@ def _emit_tile_cholesky_inplace(n: int, msl_scalar: str) -> str:
     own work.
     """
     name = f"wp_tile_{n}x{n}_{msl_scalar}"
-    parts: list[str] = [
-        f"__attribute__((noinline)) void {name}_cholesky_inplace(thread {name}& L) {{"
-    ]
+    parts: list[str] = [f"__attribute__((noinline)) void {name}_cholesky_inplace(thread {name}& L) {{"]
     parts.append("    #pragma clang loop unroll(disable)")
     parts.append(f"    for (int j = 0; j < {n}; ++j) {{")
     parts.append(f"        {msl_scalar} d = L.c[j*{n} + j];")
@@ -1021,7 +1282,7 @@ def _emit_tile_cholesky_inplace(n: int, msl_scalar: str) -> str:
     # round-off to drive the diagonal pivot below the
     # ``max(d, 1e-30)`` clamp, then ``inv = 1/sqrt(1e-30) ≈ 1e15``
     # blows up the rest of the factorization to NaN.
-    parts.append(f"            d = metal::fma(-ljk, ljk, d);")
+    parts.append("            d = metal::fma(-ljk, ljk, d);")
     parts.append("        }")
     parts.append(f"        d = metal::max(d, ({msl_scalar})1e-30);")
     parts.append(f"        {msl_scalar} ljj = metal::precise::sqrt(d);")
@@ -1049,9 +1310,7 @@ def _emit_tile_lower_solve_inplace(n: int, k: int, msl_scalar: str) -> str:
     # ``noinline`` for the same reason as ``cholesky_inplace``: 3+
     # inlined copies in one kernel produce silently-zero writes on
     # Metal at N=16. Out-of-lining restores correctness.
-    parts: list[str] = [
-        f"__attribute__((noinline)) void {name}({L_name} L, thread {B_name}& B) {{"
-    ]
+    parts: list[str] = [f"__attribute__((noinline)) void {name}({L_name} L, thread {B_name}& B) {{"]
     parts.append("    #pragma clang loop unroll(disable)")
     parts.append(f"    for (int i = 0; i < {n}; ++i) {{")
     parts.append(f"        for (int col = 0; col < {k}; ++col) {{")
@@ -1076,14 +1335,14 @@ def _emit_tile_upper_solve_inplace(n: int, k: int, msl_scalar: str) -> str:
     name = f"wp_tile_upper_solve_{n}x{k}_{msl_scalar}_inplace"
     # ``noinline`` matches ``lower_solve_inplace`` — same Metal compiler
     # inline-bug at 3+ invocations.
-    parts: list[str] = [
-        f"__attribute__((noinline)) void {name}({L_name} U, thread {B_name}& B) {{"
-    ]
+    parts: list[str] = [f"__attribute__((noinline)) void {name}({L_name} U, thread {B_name}& B) {{"]
     parts.append("    #pragma clang loop unroll(disable)")
     parts.append(f"    for (int i = {n} - 1; i >= 0; --i) {{")
     parts.append(f"        for (int col = 0; col < {k}; ++col) {{")
     parts.append(f"            {msl_scalar} s = B.c[i*{k} + col];")
-    parts.append(f"            for (int kk = i + 1; kk < {n}; ++kk) s = metal::fma(-U.c[i*{n} + kk], B.c[kk*{k} + col], s);")
+    parts.append(
+        f"            for (int kk = i + 1; kk < {n}; ++kk) s = metal::fma(-U.c[i*{n} + kk], B.c[kk*{k} + col], s);"
+    )
     parts.append(f"            B.c[i*{k} + col] = s / U.c[i*{n} + i];")
     parts.append("        }")
     parts.append("    }")
@@ -1109,9 +1368,7 @@ def _emit_tile_lower_solve_inplace_transposed(n: int, k: int, msl_scalar: str) -
     L_name = f"wp_tile_{n}x{n}_{msl_scalar}"
     A_name = f"wp_tile_{k}x{n}_{msl_scalar}"
     name = f"wp_tile_lower_solve_{n}x{k}_{msl_scalar}_inplace_transposed"
-    parts: list[str] = [
-        f"__attribute__((noinline)) void {name}({L_name} L, thread {A_name}& A) {{"
-    ]
+    parts: list[str] = [f"__attribute__((noinline)) void {name}({L_name} L, thread {A_name}& A) {{"]
     parts.append("    #pragma clang loop unroll(disable)")
     parts.append(f"    for (int row = 0; row < {k}; ++row) {{")
     parts.append(f"        for (int i = 0; i < {n}; ++i) {{")
@@ -1133,14 +1390,14 @@ def _emit_tile_upper_solve_inplace_transposed(n: int, k: int, msl_scalar: str) -
     L_name = f"wp_tile_{n}x{n}_{msl_scalar}"
     A_name = f"wp_tile_{k}x{n}_{msl_scalar}"
     name = f"wp_tile_upper_solve_{n}x{k}_{msl_scalar}_inplace_transposed"
-    parts: list[str] = [
-        f"__attribute__((noinline)) void {name}({L_name} U, thread {A_name}& A) {{"
-    ]
+    parts: list[str] = [f"__attribute__((noinline)) void {name}({L_name} U, thread {A_name}& A) {{"]
     parts.append("    #pragma clang loop unroll(disable)")
     parts.append(f"    for (int row = 0; row < {k}; ++row) {{")
     parts.append(f"        for (int i = {n} - 1; i >= 0; --i) {{")
     parts.append(f"            {msl_scalar} s = A.c[row*{n} + i];")
-    parts.append(f"            for (int kk = i + 1; kk < {n}; ++kk) s = metal::fma(-U.c[i*{n} + kk], A.c[row*{n} + kk], s);")
+    parts.append(
+        f"            for (int kk = i + 1; kk < {n}; ++kk) s = metal::fma(-U.c[i*{n} + kk], A.c[row*{n} + kk], s);"
+    )
     parts.append(f"            A.c[row*{n} + i] = s / U.c[i*{n} + i];")
     parts.append("        }")
     parts.append("    }")
@@ -1251,7 +1508,9 @@ def _emit_tile_cholesky_solve(n: int, k: int, msl_scalar: str) -> str:
     parts.append("        }")
     parts.append(f"        for (int i = {n} - 1; i >= 0; --i) {{")
     parts.append(f"            {msl_scalar} s = x.c[i*{k} + col];")
-    parts.append(f"            for (int kk = i + 1; kk < {n}; ++kk) s = metal::fma(-L.c[kk*{n} + i], x.c[kk*{k} + col], s);")
+    parts.append(
+        f"            for (int kk = i + 1; kk < {n}; ++kk) s = metal::fma(-L.c[kk*{n} + i], x.c[kk*{k} + col], s);"
+    )
     parts.append(f"            x.c[i*{k} + col] = s / L.c[i*{n} + i];")
     parts.append("        }")
     parts.append("    }")
@@ -1274,6 +1533,11 @@ def _build_kernel_header(source: str) -> str:
         if n in _MSL_VEC_NATIVE_N:
             continue
         seen_vec.add((n, scalar))
+    # Transform helpers are built on the ``wp_vec7_float`` struct — a kernel
+    # can reference them without any vec7 local of its own (e.g. a bare
+    # ``wp.transform_identity()``), so force the struct in.
+    if "wp_transform_" in source:
+        seen_vec.add((7, "float"))
     seen_mat: set[tuple[int, int, str]] = set()
     for m in _BIG_MAT_NAME_PAT.finditer(source):
         rows = int(m.group(1))
@@ -1301,6 +1565,15 @@ def _build_kernel_header(source: str) -> str:
         parts.append(native_mat_overloads)
     if "wp_diag_float3" in source:
         parts.append(_DIAG_HELPER_FLOAT3)
+    if "wp_quat_" in source or "wp_transform_" in source:
+        parts.append(_QUAT_HELPERS)
+    if "wp_transform_" in source:
+        parts.append(_TRANSFORM_HELPERS)
+    if "wp_rand" in source:
+        parts.append(_RAND_HELPERS)
+    misc_math = _emit_misc_math_helpers(source)
+    if misc_math:
+        parts.append(misc_math)
     if "wp_dot" in source:
         dot_overloads = _emit_wp_dot_overloads(source)
         if dot_overloads:
@@ -1904,6 +2177,60 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
             else m.group(0)
         ),
     ),
+    # Quaternion builtins — dispatched by name to the ``wp_quat_*`` helpers
+    # emitted in the kernel header (see ``_QUAT_HELPERS``). The
+    # ``quat_rotate_inv`` rename can't be eaten by the ``quat_rotate`` one:
+    # ``_`` is a word character, so ``\b`` after "rotate" doesn't match
+    # inside "rotate_inv". ``quat_from_matrix`` may carry explicit template
+    # args (``<3, 3, wp::float32>``); strip them — the helper is float3x3-only.
+    (re.compile(r"\bwp::quat_rotate_inv\b"), "wp_quat_rotate_inv"),
+    (re.compile(r"\bwp::quat_rotate\b"), "wp_quat_rotate"),
+    (re.compile(r"\bwp::quat_inverse\b"), "wp_quat_inverse"),
+    (re.compile(r"\bwp::quat_from_axis_angle\b"), "wp_quat_from_axis_angle"),
+    (re.compile(r"\bwp::quat_to_matrix\b"), "wp_quat_to_matrix"),
+    (re.compile(r"\bwp::quat_from_matrix\s*(?:<[^<>]*>)?"), "wp_quat_from_matrix"),
+    (re.compile(r"\bwp::quat_slerp\b"), "wp_quat_slerp"),
+    (re.compile(r"\bwp::quat_rpy\b"), "wp_quat_rpy"),
+    # ``wp.quat_identity()`` — a constant; no helper needed. Layout is
+    # (x, y, z, w) so identity is w=1.
+    (
+        re.compile(r"\bwp::quat_identity\s*(?:<[^<>]*>)?\s*\(\s*\)"),
+        "float4(0.0f, 0.0f, 0.0f, 1.0f)",
+    ),
+    # Rigid-transform builtins — transforms are ``wp_vec7_float`` after the
+    # ``vec_t<7>`` normalization; the ``wp_transform_*`` helper bodies live
+    # in ``_TRANSFORM_HELPERS``. ``transform_multiply`` must be renamed
+    # before the generic ``wp::mul`` handling can't touch it (distinct
+    # name, but keep it grouped here for clarity).
+    (re.compile(r"\bwp::transform_point\b"), "wp_transform_point"),
+    (re.compile(r"\bwp::transform_vector\b"), "wp_transform_vector"),
+    (re.compile(r"\bwp::transform_multiply\b"), "wp_transform_multiply"),
+    (re.compile(r"\bwp::transform_inverse\b"), "wp_transform_inverse"),
+    (re.compile(r"\bwp::transform_get_translation\b"), "wp_transform_get_translation"),
+    (re.compile(r"\bwp::transform_get_rotation\b"), "wp_transform_get_rotation"),
+    (
+        re.compile(r"\bwp::transform_identity\s*(?:<[^<>]*>)?\s*\(\s*\)"),
+        "wp_transform_identity()",
+    ),
+    # Random-number builtins — the ``wp_rand*`` helper bodies are a
+    # bit-exact port of warp/native/rand.h (see ``_RAND_HELPERS``).
+    (re.compile(r"\bwp::rand_init\b"), "wp_rand_init"),
+    (re.compile(r"\bwp::randi\b"), "wp_randi"),
+    (re.compile(r"\bwp::randu\b"), "wp_randu"),
+    (re.compile(r"\bwp::randf\b"), "wp_randf"),
+    (re.compile(r"\bwp::randn\b"), "wp_randn"),
+    # Interpolation / misc math — routed through ``wp_*`` helpers whose
+    # bodies match Warp's native implementations (NOT the closest MSL
+    # builtin — see ``_MISC_MATH_HELPERS`` for where they differ).
+    (re.compile(r"\bwp::lerp\b"), "wp_lerp"),
+    (re.compile(r"\bwp::smoothstep\b"), "wp_smoothstep"),
+    (re.compile(r"\bwp::frac\b"), "wp_frac"),
+    (re.compile(r"\bwp::degrees\b"), "wp_degrees"),
+    (re.compile(r"\bwp::radians\b"), "wp_radians"),
+    # Small linear-algebra builtins with no MSL native equivalent.
+    (re.compile(r"\bwp::outer\b"), "wp_outer"),
+    (re.compile(r"\bwp::skew\b"), "wp_skew"),
+    (re.compile(r"\bwp::trace\b"), "wp_trace"),
     # ``wp::cw_mul`` / ``wp::cw_div`` — component-wise multiply / divide for
     # vector operands. MSL's ``vec / vec`` and ``vec * vec`` are already
     # component-wise.
@@ -1972,14 +2299,14 @@ def _wrap_atomic_load_reads(text: str, arr_name: str) -> str:
         # Word-boundary check: the char before must not be a name char.
         prev_ch = text[j - 1] if j > 0 else ""
         if prev_ch.isalnum() or prev_ch == "_":
-            out_parts.append(text[i:j + 1])
+            out_parts.append(text[i : j + 1])
             i = j + 1
             continue
         # Skip address-of forms ``&arr[idx]`` — those feed into atomic
         # builtins (``atomic_fetch_add_explicit(&arr[i], val, ...)``)
         # which want the pointer, not the loaded value.
         if prev_ch == "&":
-            out_parts.append(text[i:j + 1])
+            out_parts.append(text[i : j + 1])
             i = j + 1
             continue
         # Find the matching close bracket, accounting for nesting.
@@ -2009,7 +2336,7 @@ def _wrap_atomic_load_reads(text: str, arr_name: str) -> str:
             out_parts.append(text[i:k])
             i = k
             continue
-        idx_expr = text[bracket_start:k - 1]
+        idx_expr = text[bracket_start : k - 1]
         out_parts.append(text[i:j])
         out_parts.append(f"atomic_load_explicit(&{arr_name}[{idx_expr}], memory_order_relaxed)")
         i = k
@@ -2047,16 +2374,12 @@ def _translate_intrinsics(line: str) -> str:
 # ``wp::tile<dtype>(x)`` — pack a per-thread value into a register tile of
 # shape (block_dim,). With block_dim=1 the tile *is* the value, so we
 # lower to a plain assign.
-_TILE_BUILTIN_TILE_PAT = re.compile(
-    r"\bvar_(\w+)\s*=\s*wp::tile\s*<[^()]*>\s*\(\s*var_(\w+)\s*\)"
-)
+_TILE_BUILTIN_TILE_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile\s*<[^()]*>\s*\(\s*var_(\w+)\s*\)")
 # ``wp::tile_reduce(op_fn, tile)`` — reduce across threads. The op (``wp::add``,
 # user fn, etc.) comes as the first *argument*, not as a template arg.
 # With block_dim=1 the tile is a single element; the reduction is a no-op
 # and the output is just the input value.
-_TILE_REDUCE_PAT = re.compile(
-    r"\bvar_(\w+)\s*=\s*wp::tile_reduce\s*\(\s*[\w:]+\s*,\s*var_(\w+)\s*\)"
-)
+_TILE_REDUCE_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_reduce\s*\(\s*[\w:]+\s*,\s*var_(\w+)\s*\)")
 # ``wp::tile_zeros<dtype, ...>()`` / ``wp::tile_ones<dtype, ...>()`` —
 # constant-fill register tile. With block_dim=1 it's the corresponding
 # scalar 0 / 1 (or vec ``T(0)`` / ``T(1)``).
@@ -2067,9 +2390,7 @@ _TILE_ARANGE_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_arange\s*<[^>]*>\s*\(
 # ``wp::tile_arange<dtype, N>(start, stop, step)`` — multi-element form
 # used by mujoco_warp's dense-Jacobian path. Lower to a runtime loop
 # that fills ``var_X.c[i] = start + i * step``.
-_TILE_ARANGE_3ARG_PAT = re.compile(
-    r"\bvar_(\w+)\s*=\s*wp::tile_arange\s*<[^>]*>\s*\(([^)]*)\)"
-)
+_TILE_ARANGE_3ARG_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_arange\s*<[^>]*>\s*\(([^)]*)\)")
 # ``wp::tile_map<fn>(args...)`` — element-wise map. With block_dim=1 each
 # tile is a scalar; reduces to a direct call to the target function. The
 # template arg holds the function name (e.g. ``wp_mul`` or a user fn).
@@ -2129,21 +2450,15 @@ _TILE_MATMUL_ASSIGN_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_matmul\s*\(([^
 # ``wp::tile_cholesky_inplace<upper>(0, var_X)`` — single tile, in-place
 # factorization. Two args after the LTO seg pad: the placeholder and the
 # tile to factor. ``upper`` template arg selects upper- vs lower-fill.
-_TILE_CHOLESKY_INPLACE_PAT = re.compile(
-    r"\bwp::tile_cholesky_inplace\s*<[^()]*>\s*\(([^)]*)\)"
-)
+_TILE_CHOLESKY_INPLACE_PAT = re.compile(r"\bwp::tile_cholesky_inplace\s*<[^()]*>\s*\(([^)]*)\)")
 # ``tile_lower_solve_inplace(0, L_tile, B_tile)`` — solve ``L X = B``
 # for X, mutating B. The CPU/no-MathDx dispatch returns
 # ``(0, L, y)`` with empty templates, so the IR emits this builtin
 # *without* the ``wp::`` prefix and without ``<...>`` template args
 # (unlike ``tile_cholesky_inplace`` which keeps a ``<upper>`` flag).
 # Match the bare form. Same shape for the upper variant.
-_TILE_LOWER_SOLVE_INPLACE_PAT = re.compile(
-    r"\btile_lower_solve_inplace\s*\(([^)]*)\)"
-)
-_TILE_UPPER_SOLVE_INPLACE_PAT = re.compile(
-    r"\btile_upper_solve_inplace\s*\(([^)]*)\)"
-)
+_TILE_LOWER_SOLVE_INPLACE_PAT = re.compile(r"\btile_lower_solve_inplace\s*\(([^)]*)\)")
+_TILE_UPPER_SOLVE_INPLACE_PAT = re.compile(r"\btile_upper_solve_inplace\s*\(([^)]*)\)")
 # ``var_X = wp::tile_view<wp::tile_shared_t<dtype, layout<shape<R,C>,
 # stride<...>>, ...>>(parent, row_off, col_off)``. The template arg
 # carries the view's output shape; the function args are the parent
@@ -2189,20 +2504,14 @@ _TILE_STORE_PAT = re.compile(
     r"(wp::vec_t<\d+,\s*wp::\w+>|wp::\w+|wp_vec\d+_\w+|wp_mat\d+x\d+_\w+)"
     r"\s*,\s*\w+\s*,\s*\w+\s*>\s*\(([^)]*)\)"
 )
-_TILE_CHOLESKY_PAT = re.compile(
-    r"\bvar_(\w+)\s*=\s*wp::tile_cholesky\s*<[^()]*>\s*\(([^)]*)\)"
-)
-_TILE_CHOLESKY_SOLVE_PAT = re.compile(
-    r"\bvar_(\w+)\s*=\s*wp::tile_cholesky_solve\s*<[^()]*>\s*\(([^)]*)\)"
-)
+_TILE_CHOLESKY_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_cholesky\s*<[^()]*>\s*\(([^)]*)\)")
+_TILE_CHOLESKY_SOLVE_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_cholesky_solve\s*<[^()]*>\s*\(([^)]*)\)")
 # ``wp::tile_cholesky_solve_inplace<upper>(0, var_L, var_b);`` — solves
 # ``L L^T x = b`` and mutates ``b`` to hold ``x``. Three args after the
 # template arg: the LTO seg pad, the factor tile, and the RHS. Lowers
 # to a self-assigning call into the existing non-inplace helper —
 # ``var_b = helper(var_L, var_b)``.
-_TILE_CHOLESKY_SOLVE_INPLACE_PAT = re.compile(
-    r"\bwp::tile_cholesky_solve_inplace\s*<[^()]*>\s*\(([^)]*)\)"
-)
+_TILE_CHOLESKY_SOLVE_INPLACE_PAT = re.compile(r"\bwp::tile_cholesky_solve_inplace\s*<[^()]*>\s*\(([^)]*)\)")
 
 
 def _build_flat_base_expr(arr_name: str, lead_idx_args: list[str], inner_dims: int) -> str:
@@ -2315,7 +2624,7 @@ def _translate_tile_intrinsics(
         n_off = 2 if cols > 1 else 1
         lead_idx_args = args[1:-n_off] if len(args) > 1 + n_off else []
         offsets = args[-n_off:]
-        arr_name = arr[len("var_"):] if arr.startswith("var_") else arr
+        arr_name = arr[len("var_") :] if arr.startswith("var_") else arr
         # Vec-element arrays expose an extra inner scalar dim in MLX
         # (``(*shape, n_elem)``); add it to ``inner_dims`` so the base
         # expression includes the element-size stride.
@@ -2378,7 +2687,7 @@ def _translate_tile_intrinsics(
         # everything between is leading-slice indices + tile offsets.
         arr = args[0]
         tile_var = args[-1]
-        tile_label = tile_var[len("var_"):] if tile_var.startswith("var_") else tile_var
+        tile_label = tile_var[len("var_") :] if tile_var.startswith("var_") else tile_var
         dims = tile_var_dims.get(tile_label)
         if dims is None:
             return m.group(0)
@@ -2387,7 +2696,7 @@ def _translate_tile_intrinsics(
         middle = args[1:-1]  # leading-idx + offsets
         lead_idx_args = middle[:-n_off] if len(middle) > n_off else []
         offsets = middle[-n_off:]
-        arr_name = arr[len("var_"):] if arr.startswith("var_") else arr
+        arr_name = arr[len("var_") :] if arr.startswith("var_") else arr
         scalar_inner_dims = 2 if cols > 1 else 1
         if vec_n_elem > 0:
             scalar_inner_dims += 1
@@ -2409,7 +2718,7 @@ def _translate_tile_intrinsics(
         # ``device <scalar>*`` won't accept ``device atomic<scalar>*``.
         # Emit an inline loop with ``atomic_store_explicit`` per
         # element instead.
-        arr_name = arr[len("var_"):] if arr.startswith("var_") else arr
+        arr_name = arr[len("var_") :] if arr.startswith("var_") else arr
         if arr_name in atomic_output_names:
             n = rows * cols
             store = (
@@ -2437,7 +2746,7 @@ def _translate_tile_intrinsics(
         if len(args) < 5:
             return m.group(0)
         in_arg = args[3]
-        in_label = in_arg[len("var_"):] if in_arg.startswith("var_") else in_arg
+        in_label = in_arg[len("var_") :] if in_arg.startswith("var_") else in_arg
         dims = tile_var_dims.get(in_label) or tile_var_dims.get(lhs)
         if dims is None:
             return m.group(0)
@@ -2471,8 +2780,8 @@ def _translate_tile_intrinsics(
             return m.group(0)
         L_arg = args[1]
         b_arg = args[2]
-        L_label = L_arg[len("var_"):] if L_arg.startswith("var_") else L_arg
-        b_label = b_arg[len("var_"):] if b_arg.startswith("var_") else b_arg
+        L_label = L_arg[len("var_") :] if L_arg.startswith("var_") else L_arg
+        b_label = b_arg[len("var_") :] if b_arg.startswith("var_") else b_arg
         L_dims = tile_var_dims.get(L_label)
         b_dims = tile_var_dims.get(b_label) or tile_var_dims.get(lhs)
         if L_dims is None or b_dims is None:
@@ -2558,9 +2867,7 @@ def _translate_tile_intrinsics(
         # ``wp::tile_zeros`` / ``wp::tile_ones`` may target a single-
         # element tile (which collapses to a scalar local) or a multi-
         # element tile. For multi-element, fill all slots.
-        scalar_ctype = (
-            scalar_token if scalar_token.startswith("wp::") else f"wp::{scalar_token}"
-        )
+        scalar_ctype = scalar_token if scalar_token.startswith("wp::") else f"wp::{scalar_token}"
         msl = _SCALAR_CTYPE_TO_MSL.get(scalar_ctype, "float")
         dims = tile_var_dims.get(lhs)
         if dims is None:
@@ -2569,10 +2876,7 @@ def _translate_tile_intrinsics(
         n = rows * cols
         if n == 1:
             return f"var_{lhs} = ({msl}){value}"
-        return (
-            f"{{ for (int _tc_i = 0; _tc_i < {n}; ++_tc_i) "
-            f"var_{lhs}.c[_tc_i] = ({msl}){value}; }}"
-        )
+        return f"{{ for (int _tc_i = 0; _tc_i < {n}; ++_tc_i) var_{lhs}.c[_tc_i] = ({msl}){value}; }}"
 
     line = _TILE_ZEROS_PAT.sub(repl_zeros, line)
     line = _TILE_ONES_PAT.sub(repl_ones, line)
@@ -2594,10 +2898,7 @@ def _translate_tile_intrinsics(
         n = rows * cols
         if n == 1:
             return f"var_{lhs} = ({start})"
-        return (
-            f"{{ for (int _ar_i = 0; _ar_i < {n}; ++_ar_i) "
-            f"var_{lhs}.c[_ar_i] = ({start}) + _ar_i * ({step}); }}"
-        )
+        return f"{{ for (int _ar_i = 0; _ar_i < {n}; ++_ar_i) var_{lhs}.c[_ar_i] = ({start}) + _ar_i * ({step}); }}"
 
     line = _TILE_ARANGE_3ARG_PAT.sub(repl_tile_arange_3, line)
 
@@ -2611,7 +2912,7 @@ def _translate_tile_intrinsics(
         # operators (matches what the regular ``wp::add`` / ``wp::mul``
         # patterns elsewhere produce).
         if fn.startswith("wp::"):
-            op = fn[len("wp::"):]
+            op = fn[len("wp::") :]
             args = m.group(3)
             if op in ("add", "sub", "mul", "div"):
                 op_sym = {"add": "+", "sub": "-", "mul": "*", "div": "/"}[op]
@@ -2640,7 +2941,7 @@ def _translate_tile_intrinsics(
 
         # Determine the tile shape from the first tile-typed arg.
         def _tile_info(a: str) -> tuple[tuple[int, int, str], int] | None:
-            label = a[len("var_"):] if a.startswith("var_") else a
+            label = a[len("var_") :] if a.startswith("var_") else a
             d = tile_var_dims.get(label)
             if d is None:
                 return None
@@ -2693,7 +2994,7 @@ def _translate_tile_intrinsics(
         # lowering, so the ``wp::sub(...)`` etc. we'd emit otherwise
         # would be left as unsupported.
         if fn.startswith("wp::"):
-            op = fn[len("wp::"):]
+            op = fn[len("wp::") :]
             arith_ops = {"add": "+", "sub": "-", "mul": "*", "div": "/"}
             if op in arith_ops and len(per_arg_access) == 2:
                 call = f"({per_arg_access[0]} {arith_ops[op]} {per_arg_access[1]})"
@@ -2738,8 +3039,8 @@ def _translate_tile_intrinsics(
             return m.group(0)
         dst, src = args
         op_sym = {"add": "+", "sub": "-", "mul": "*", "div": "/"}[op]
-        dst_label = dst[len("var_"):] if dst.startswith("var_") else dst
-        src_label = src[len("var_"):] if src.startswith("var_") else src
+        dst_label = dst[len("var_") :] if dst.startswith("var_") else dst
+        src_label = src[len("var_") :] if src.startswith("var_") else src
         dst_dims = tile_var_dims.get(dst_label)
         src_dims = tile_var_dims.get(src_label)
         if dst_dims is None:
@@ -2750,13 +3051,9 @@ def _translate_tile_intrinsics(
             return f"{dst} = ({dst} {op_sym} {src})"
         if src_dims is None:
             # Scalar broadcast.
-            return (
-                f"{{ for (int _ti_i = 0; _ti_i < {n}; ++_ti_i) "
-                f"{dst}.c[_ti_i] = {dst}.c[_ti_i] {op_sym} ({src}); }}"
-            )
+            return f"{{ for (int _ti_i = 0; _ti_i < {n}; ++_ti_i) {dst}.c[_ti_i] = {dst}.c[_ti_i] {op_sym} ({src}); }}"
         return (
-            f"{{ for (int _ti_i = 0; _ti_i < {n}; ++_ti_i) "
-            f"{dst}.c[_ti_i] = {dst}.c[_ti_i] {op_sym} {src}.c[_ti_i]; }}"
+            f"{{ for (int _ti_i = 0; _ti_i < {n}; ++_ti_i) {dst}.c[_ti_i] = {dst}.c[_ti_i] {op_sym} {src}.c[_ti_i]; }}"
         )
 
     line = _TILE_OP_INPLACE_PAT.sub(_repl_tile_op_inplace, line)
@@ -2802,7 +3099,7 @@ def _translate_tile_intrinsics(
             return m.group(0)
         m_arg = args[0]
         v_arg = args[1]
-        m_label = m_arg[len("var_"):] if m_arg.startswith("var_") else m_arg
+        m_label = m_arg[len("var_") :] if m_arg.startswith("var_") else m_arg
         m_dims = tile_var_dims.get(m_label)
         if m_dims is None:
             return m.group(0)
@@ -2872,9 +3169,9 @@ def _translate_tile_intrinsics(
         if len(args) < 8:
             return m.group(0)
         a_arg, b_arg, c_arg, alpha_arg, beta_arg = args[3], args[4], args[5], args[6], args[7]
-        a_label = a_arg[len("var_"):] if a_arg.startswith("var_") else a_arg
-        b_label = b_arg[len("var_"):] if b_arg.startswith("var_") else b_arg
-        c_label = c_arg[len("var_"):] if c_arg.startswith("var_") else c_arg
+        a_label = a_arg[len("var_") :] if a_arg.startswith("var_") else a_arg
+        b_label = b_arg[len("var_") :] if b_arg.startswith("var_") else b_arg
+        c_label = c_arg[len("var_") :] if c_arg.startswith("var_") else c_arg
         a_dims = tile_var_dims.get(a_label)
         b_dims = tile_var_dims.get(b_label)
         c_dims = tile_var_dims.get(c_label)
@@ -2890,9 +3187,7 @@ def _translate_tile_intrinsics(
         # If C is a view, write its mutated contents back to the parent.
         if view_aliases is not None and c_label in view_aliases:
             parent_label, prows, pcols, vrows, vcols, vscalar, row_off, col_off = view_aliases[c_label]
-            wb = _emit_tile_writeback(
-                parent_label, prows, pcols, vrows, vcols, vscalar, row_off, col_off, c_arg
-            )
+            wb = _emit_tile_writeback(parent_label, prows, pcols, vrows, vcols, vscalar, row_off, col_off, c_arg)
             return f"{call};\n{wb}"
         return call
 
@@ -2916,7 +3211,7 @@ def _translate_tile_intrinsics(
         if len(args) < 2:
             return m.group(0)
         tile_arg = args[1]
-        tile_label = tile_arg[len("var_"):] if tile_arg.startswith("var_") else tile_arg
+        tile_label = tile_arg[len("var_") :] if tile_arg.startswith("var_") else tile_arg
         dims = tile_var_dims.get(tile_label)
         if dims is None:
             return m.group(0)
@@ -2924,9 +3219,7 @@ def _translate_tile_intrinsics(
         if rows != cols:
             return m.group(0)
         if rows == 1:
-            return (
-                f"{tile_arg} = metal::precise::sqrt(metal::max({tile_arg}, ({scalar})1e-30))"
-            )
+            return f"{tile_arg} = metal::precise::sqrt(metal::max({tile_arg}, ({scalar})1e-30))"
         helper = f"wp_tile_{rows}x{cols}_{scalar}_cholesky_inplace"
         return f"{helper}({tile_arg})"
 
@@ -2938,8 +3231,8 @@ def _translate_tile_intrinsics(
         if len(args) < 3:
             return m.group(0)
         L_arg, B_arg = args[1], args[2]
-        L_label = L_arg[len("var_"):] if L_arg.startswith("var_") else L_arg
-        B_label = B_arg[len("var_"):] if B_arg.startswith("var_") else B_arg
+        L_label = L_arg[len("var_") :] if L_arg.startswith("var_") else L_arg
+        B_label = B_arg[len("var_") :] if B_arg.startswith("var_") else B_arg
         L_dims = tile_var_dims.get(L_label)
         B_dims = tile_var_dims.get(B_label)
         if L_dims is None or B_dims is None:
@@ -2951,9 +3244,7 @@ def _translate_tile_intrinsics(
         call = f"{helper}({L_arg}, {B_arg})"
         if view_aliases is not None and B_label in view_aliases:
             parent_label, prows, pcols, vrows, vcols, vscalar, row_off, col_off = view_aliases[B_label]
-            wb = _emit_tile_writeback(
-                parent_label, prows, pcols, vrows, vcols, vscalar, row_off, col_off, B_arg
-            )
+            wb = _emit_tile_writeback(parent_label, prows, pcols, vrows, vcols, vscalar, row_off, col_off, B_arg)
             return f"{call};\n{wb}"
         # If B was produced by ``tile_transpose``, the mutation needs to
         # propagate back to the source so its caller can ``tile_store``
@@ -2970,14 +3261,13 @@ def _translate_tile_intrinsics(
             src_dims = tile_var_dims.get(src_label)
             if src_dims is not None:
                 src_rows, src_cols, _src_scalar = src_dims
-                helper_t = (
-                    f"wp_tile_{kind}_solve_{n}x{k_cols}_{scalar}_inplace_transposed"
-                )
+                helper_t = f"wp_tile_{kind}_solve_{n}x{k_cols}_{scalar}_inplace_transposed"
                 return f"{helper_t}({L_arg}, var_{src_label})"
         return call
 
     line = _TILE_LOWER_SOLVE_INPLACE_PAT.sub(lambda m: _repl_solve_inplace("lower", m), line)
     line = _TILE_UPPER_SOLVE_INPLACE_PAT.sub(lambda m: _repl_solve_inplace("upper", m), line)
+
     def _repl_tile_broadcast(m: re.Match[str]) -> str:
         # ``var_X = wp::tile_broadcast<...>(var_Y)``. Source ``var_Y``
         # may have a different shape than target ``var_X`` — e.g.
@@ -2998,10 +3288,7 @@ def _translate_tile_intrinsics(
         in_n = in_rows * in_cols
         if in_n == 1:
             # Single-element source broadcast across the target tile.
-            return (
-                f"{{ for (int _bc_i = 0; _bc_i < {l_n}; ++_bc_i) "
-                f"var_{lhs}.c[_bc_i] = var_{in_label}.c[0]; }}"
-            )
+            return f"{{ for (int _bc_i = 0; _bc_i < {l_n}; ++_bc_i) var_{lhs}.c[_bc_i] = var_{in_label}.c[0]; }}"
         # Cases:
         #   (a) Source is 1-D (in_cols == 1), target is 2-D — repeat
         #       source along target's outer dim ``r``: var_X.c[r*l_cols
@@ -3085,8 +3372,8 @@ def _translate_tile_intrinsics(
         if len(args) < 3:
             return m.group(0)
         L_arg, b_arg = args[1], args[2]
-        L_label = L_arg[len("var_"):] if L_arg.startswith("var_") else L_arg
-        b_label = b_arg[len("var_"):] if b_arg.startswith("var_") else b_arg
+        L_label = L_arg[len("var_") :] if L_arg.startswith("var_") else L_arg
+        b_label = b_arg[len("var_") :] if b_arg.startswith("var_") else b_arg
         L_dims = tile_var_dims.get(L_label)
         b_dims = tile_var_dims.get(b_label)
         if L_dims is None or b_dims is None:
@@ -3100,9 +3387,7 @@ def _translate_tile_intrinsics(
         call = f"{b_arg} = {helper}({L_arg}, {b_arg})"
         if view_aliases is not None and b_label in view_aliases:
             parent_label, prows, pcols, vrows, vcols, vscalar, row_off, col_off = view_aliases[b_label]
-            wb = _emit_tile_writeback(
-                parent_label, prows, pcols, vrows, vcols, vscalar, row_off, col_off, b_arg
-            )
+            wb = _emit_tile_writeback(parent_label, prows, pcols, vrows, vcols, vscalar, row_off, col_off, b_arg)
             return f"{call};\n{wb}"
         return call
 
@@ -3138,16 +3423,10 @@ _USER_FUNC_MSL_DEFS: dict[str, str] = {
         "}"
     ),
     # mujoco_warp/_src/solver.py:state_check (ConstraintState.QUADRATIC = 1)
-    "state_check_0": (
-        "inline float state_check_0(float D, int state) {\n"
-        "    return state == 1 ? D : 0.0f;\n"
-        "}"
-    ),
+    "state_check_0": ("inline float state_check_0(float D, int state) {\n    return state == 1 ? D : 0.0f;\n}"),
     # mujoco_warp/_src/solver.py:active_check
     "active_check_0": (
-        "inline float active_check_0(int tid, int threshold) {\n"
-        "    return tid >= threshold ? 0.0f : 1.0f;\n"
-        "}"
+        "inline float active_check_0(int tid, int threshold) {\n    return tid >= threshold ? 0.0f : 1.0f;\n}"
     ),
 }
 
@@ -3473,6 +3752,7 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
     # Reset the global ``codegen.options`` ref to our merged dict so any
     # value-func evaluated from ``add_call`` sees the same view.
     import warp._src.codegen as _wp_codegen  # noqa: PLC0415
+
     _wp_codegen.options = adj.builder_options
 
     # Preprocess via the AST pipeline (see ``warp._src.codegen_metal_ast``):
@@ -4053,7 +4333,7 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
             args = [a.strip() for a in m.group(1).split(",")]
             if len(args) >= 5:
                 in_arg = args[3]
-                in_label = in_arg[len("var_"):] if in_arg.startswith("var_") else in_arg
+                in_label = in_arg[len("var_") :] if in_arg.startswith("var_") else in_arg
                 dims = tile_var_dims.get(in_label)
                 if dims and dims[0] == dims[1] and _COOP_CHOL_MIN_N <= dims[0] <= _COOP_CHOL_MAX_N:
                     is_coop_kernel = True
@@ -4062,21 +4342,61 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
             args = [a.strip() for a in m.group(1).split(",")]
             if len(args) >= 2:
                 in_arg = args[1]
-                in_label = in_arg[len("var_"):] if in_arg.startswith("var_") else in_arg
+                in_label = in_arg[len("var_") :] if in_arg.startswith("var_") else in_arg
                 dims = tile_var_dims.get(in_label)
                 if dims and dims[0] == dims[1] and _COOP_CHOL_MIN_N <= dims[0] <= _COOP_CHOL_MAX_N:
                     is_coop_kernel = True
                     pre_coop_chol_n = max(pre_coop_chol_n, dims[0])
 
+    # ---- Quaternion-typed locals --------------------------------------
+    # Quats are stored as ``vec_t<4>``/``float4``, but ``wp::mul`` on two
+    # quats is the Hamilton product — MSL's ``float4 * float4`` is
+    # component-wise and produces silently wrong results. Collect every
+    # quat-typed local so the rewrite in ``_finalize`` can dispatch
+    # quat-quat ``wp::mul`` to ``wp_quat_mul``. Kernel-level vars come from
+    # the IR's variable list; vars inside inlined ``@wp.func`` bodies are
+    # not in ``adj.variables``, so also scan the body text for their
+    # ``wp::quat_t<...> var_X`` declarations.
+    quat_var_labels: set[str] = set()
+    for var in adj.variables:
+        if getattr(var.type, "_wp_generic_type_str_", None) == "quat_t":
+            quat_var_labels.add(var.label)
+    for arg in adj.args:
+        if getattr(arg.type, "_wp_generic_type_str_", None) == "quat_t":
+            quat_var_labels.add(arg.label)
+    _quat_decl_pat = re.compile(r"wp::quat_t\s*<\s*wp::\w+\s*>\s+var_(\w+)")
+    for raw in forward_lines:
+        for m in _quat_decl_pat.finditer(raw):
+            quat_var_labels.add(m.group(1))
+    _quat_mul_call_pat = re.compile(r"wp::mul\s*\(\s*var_(\w+)\s*,\s*var_(\w+)\s*\)")
+
+    def _rewrite_quat_mul(text: str) -> str:
+        def repl(m: re.Match[str]) -> str:
+            if m.group(1) in quat_var_labels and m.group(2) in quat_var_labels:
+                return f"wp_quat_mul(var_{m.group(1)}, var_{m.group(2)})"
+            return m.group(0)
+
+        return _quat_mul_call_pat.sub(repl, text)
+
     # --- Forward statements --------------------------------------------
     def _finalize(translated: str) -> str:
+        # Quat-quat multiplies must be intercepted before the generic
+        # ``wp::mul`` -> ``(a * b)`` pattern erases the call, and before
+        # subscript inlining rewrites the ``var_X`` operand names the
+        # type lookup keys on.
+        translated = _rewrite_quat_mul(translated)
         # Lower tile intrinsics *before* the subscript-substitute pass —
         # the tile pattern matches on the raw ``wp::tile_*<...>`` shape,
         # which contains ``var_X`` operands that the substitute would
         # otherwise rewrite to expressions and break the parse.
         translated = _translate_tile_intrinsics(
-            translated, tile_var_dims, view_aliases, coop_chol_seen,
-            is_coop_kernel, transpose_aliases, tile_var_vec_n,
+            translated,
+            tile_var_dims,
+            view_aliases,
+            coop_chol_seen,
+            is_coop_kernel,
+            transpose_aliases,
+            tile_var_vec_n,
             atomic_output_names,
         )
         # Inline subscripts that the address-collapse produced.
@@ -4095,6 +4415,7 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
         # Warp uses for vec5+) needs the braces stripped and the type
         # renamed before the bare-type translator below sees it.
         translated = _rewrite_mat_t_constructor(translated)
+
         # Some IR paths emit the CPU-side native ``floatRxC()`` directly
         # (skipping the ``wp::mat_t<R,C,T>()`` form the rewriter above
         # expects). Native MSL matrix types reject the no-arg form;
@@ -4120,6 +4441,7 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
             _zero_native_mat,
             translated,
         )
+
         # Same for ``floatRxC(0)`` — the diagonal-scalar form. MSL only
         # accepts it on *square* matrices; non-square needs explicit
         # zero columns.
@@ -4456,7 +4778,10 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
                 flat_idx = _flat_index_expr(arr, indices)
                 body_lines.append(_finalize(_emit_scalar_write(flat_idx, value)))
                 continue
-        translated = _translate_intrinsics(line.strip())
+        # Quat-quat ``wp::mul`` must be intercepted before the generic
+        # pattern lowers it to the (component-wise, wrong-for-quats)
+        # ``(a * b)`` form.
+        translated = _translate_intrinsics(_rewrite_quat_mul(line.strip()))
         body_lines.append(f"    {_finalize(translated)}")
 
     # ---- Output-init prologue ----------------------------------------
@@ -4507,9 +4832,7 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
     # entirely — mujoco_warp's caller-side ``d.nefc.zero_()`` plus
     # MLX's ``init_value=0.0`` for atomic outputs gives the same
     # net result as a zero-seed prologue would.
-    non_standard_launch = any(
-        "_worldid_in" in a.label for a in adj.args if _is_array_arg(a)
-    )
+    non_standard_launch = any("_worldid_in" in a.label for a in adj.args if _is_array_arg(a))
     init_outputs: list[str] = []
     if has_atomic and not non_standard_launch:
         # Every atomic output gets seeded so atomic_add accumulates from
@@ -4608,10 +4931,7 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
             # slot — be conservative and always reserve it.
             tentative_seeds = len(tentative)
             slots_after = (
-                len(input_args)
-                + len(output_args)
-                + tentative_seeds
-                + 1  # __shapes_packed (may or may not be present)
+                len(input_args) + len(output_args) + tentative_seeds + 1  # __shapes_packed (may or may not be present)
             )
             if slots_after <= 30:
                 init_outputs = tentative
@@ -4626,13 +4946,11 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
         # Conservative: assume ``__shapes_packed`` is needed (it's
         # cheap to over-estimate by 1 here; the real check happens
         # at artifact-build time).
-        per_output_slots = (
-            len(input_args) + len(output_args) + len(init_outputs) + 1
-        )
+        per_output_slots = len(input_args) + len(output_args) + len(init_outputs) + 1
         if per_output_slots > 30:
             use_packed_init_shadows = True
     init_shadow_floats: list[str] = []  # float-typed init outputs (in pack order)
-    init_shadow_ints: list[str] = []    # int/bool-typed init outputs (in pack order)
+    init_shadow_ints: list[str] = []  # int/bool-typed init outputs (in pack order)
     if use_packed_init_shadows:
         for out_name in init_outputs:
             arg_var = next(a for a in output_args if a.label == out_name)
@@ -4765,10 +5083,7 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
         # (``thread_position_in_grid.x``) to use the threadgroup
         # index — every thread in the threadgroup gets the same
         # worldid and the cooperative helpers stay in lockstep.
-        body_lines = [
-            ln.replace("thread_position_in_grid.x", "threadgroup_position_in_grid.x")
-            for ln in body_lines
-        ]
+        body_lines = [ln.replace("thread_position_in_grid.x", "threadgroup_position_in_grid.x") for ln in body_lines]
 
     source = "\n".join(body_lines) + "\n"
 
@@ -5149,6 +5464,7 @@ def _msl_array_inner_msl_type(arg) -> str:
     # Struct dtypes: backing storage is float32 (see
     # ``_array_view_dtype_and_shape``).
     from warp._src.codegen import Struct  # noqa: PLC0415
+
     if isinstance(dtype, Struct):
         return "float"
     # Scalar dtypes — map via ``_SCALAR_CTYPE_TO_MSL``.
@@ -5173,7 +5489,7 @@ def _vec_dtype_info(arg) -> tuple[int, str] | None:
     dtype = getattr(arg.type, "dtype", None)
     if dtype is None:
         return None
-    if getattr(dtype, "_wp_generic_type_str_", None) not in ("vec_t", "quat_t"):
+    if getattr(dtype, "_wp_generic_type_str_", None) not in ("vec_t", "quat_t", "transform_t"):
         return None
     n = getattr(dtype, "_length_", None)
     scalar_cls = getattr(dtype, "_wp_scalar_type_", None)
@@ -5267,7 +5583,7 @@ class _StructLayout:
 def _classify_struct_field(fname: str, ftype) -> tuple[str, int, str, int, int]:
     """Return ``(kind, size_in_scalars, msl_type, rows, cols)`` for a field type."""
     # vec_t (and quat_t — laid out identically to vec4)
-    if getattr(ftype, "_wp_generic_type_str_", None) in ("vec_t", "quat_t"):
+    if getattr(ftype, "_wp_generic_type_str_", None) in ("vec_t", "quat_t", "transform_t"):
         n = int(ftype._length_)
         scalar_cls = ftype._wp_scalar_type_
         scalar_ctype = f"wp::{scalar_cls.__name__}"
@@ -5396,7 +5712,7 @@ def _array_view_dtype_and_shape(value):
 
     dtype = value.dtype
     kind = getattr(dtype, "_wp_generic_type_str_", None)
-    if kind in ("vec_t", "quat_t"):
+    if kind in ("vec_t", "quat_t", "transform_t"):
         n = dtype._length_
         scalar_cls = dtype._wp_scalar_type_
         mx_dtype = _wp_dtype_to_mx_dtype(scalar_cls)
@@ -5427,13 +5743,12 @@ def _native_scalar_msl_type(scalar_ctype: str) -> str:
 
 def _native_array_inner_msl(arg_var) -> str:
     """Return the MSL element type for a Warp array argument's storage."""
-    import warp as warp_mod  # noqa: PLC0415
 
     from warp._src.codegen import Struct  # noqa: PLC0415
 
     dtype = arg_var.type.dtype
     kind = getattr(dtype, "_wp_generic_type_str_", None)
-    if kind in ("vec_t", "quat_t", "mat_t"):
+    if kind in ("vec_t", "quat_t", "transform_t", "mat_t"):
         scalar_cls = dtype._wp_scalar_type_
         scalar_ctype = f"wp::{scalar_cls.__name__}"
         return _native_scalar_msl_type(scalar_ctype)
@@ -5544,12 +5859,7 @@ def _wrap_msl_for_native_dispatch(artifact) -> str:
     #   __init_shadows_floats        (float)   if init_shadow_floats
     #   __init_shadows_ints          (int32)   if init_shadow_ints
     has_packed_init = bool(artifact.init_shadow_packed_outputs)
-    if (
-        artifact.ints_packed_arrs
-        or artifact.ints_packed_scalars
-        or artifact.floats_packed_arrs
-        or has_packed_init
-    ):
+    if artifact.ints_packed_arrs or artifact.ints_packed_scalars or artifact.floats_packed_arrs or has_packed_init:
         add_buffer("const constant int* __ints_packed")
     if artifact.floats_packed_arrs:
         add_buffer("const constant float* __floats_packed")
@@ -5566,9 +5876,7 @@ def _wrap_msl_for_native_dispatch(artifact) -> str:
     for name in artifact.output_names:
         arg_var = out_by_name.get(name)
         if arg_var is None:
-            raise MetalCodegenError(
-                f"Native dispatch: output {name!r} has no matching Var in artifact.output_args"
-            )
+            raise MetalCodegenError(f"Native dispatch: output {name!r} has no matching Var in artifact.output_args")
         inner = _native_array_inner_msl(arg_var)
         qual = f"device atomic<{inner}>*" if artifact.atomic_outputs else f"device {inner}*"
         add_buffer(f"{qual} {name}")
@@ -5579,11 +5887,7 @@ def _wrap_msl_for_native_dispatch(artifact) -> str:
     for builtin in _NATIVE_BUILTIN_PARAMS:
         params.append(f"  {builtin}")
 
-    signature = (
-        f"[[kernel]] void custom_kernel_{artifact.name}(\n"
-        + ",\n".join(params)
-        + ")"
-    )
+    signature = f"[[kernel]] void custom_kernel_{artifact.name}(\n" + ",\n".join(params) + ")"
     # Strip the MLX-style output-init prologue from the kernel body.
     # Under native dispatch the output buffer *is* the user's wp.array,
     # so the buffer already holds the prior value the prologue would
@@ -5718,9 +6022,7 @@ def _native_pack_scalar_arg(arg_var, value) -> tuple[bytes, int]:
         elif wp_type is float:
             ct = ctypes.c_float
         else:
-            raise MetalCodegenError(
-                f"Native dispatch: don't know how to pack scalar arg of type {wp_type!r}"
-            )
+            raise MetalCodegenError(f"Native dispatch: don't know how to pack scalar arg of type {wp_type!r}")
     packed = ct(value)
     return bytes(packed), ctypes.sizeof(packed)
 
@@ -5779,9 +6081,7 @@ def launch_metal_kernel_native(kernel, dim, inputs, outputs, device, block_dim: 
         kernel._metal_native_arg_by_name = arg_by_name
         kernel._metal_native_arg_var_by_name = {a.label: a for a in artifact.input_args}
         kernel._metal_native_out_var_by_name = {a.label: a for a in artifact.output_args}
-        kernel._metal_native_init_shadow_names = frozenset(
-            n for n in artifact.input_names if n.endswith("__init")
-        )
+        kernel._metal_native_init_shadow_names = frozenset(n for n in artifact.input_names if n.endswith("__init"))
         # Outputs whose prior values are preserved by some init-shadow
         # mechanism — either a per-output ``<name>__init`` input, or a
         # slot in the packed shadow buffers. Atomic-output kernels that
@@ -5867,9 +6167,7 @@ def launch_metal_kernel_native(kernel, dim, inputs, outputs, device, block_dim: 
                 layout = _struct_layout_for(arg_var.type)
                 ctype_inst = getattr(value, "_ctype", None)
                 if ctype_inst is None:
-                    raise RuntimeError(
-                        f"Kernel '{kernel.key}' arg {name!r}: struct value lacks ``_ctype``"
-                    )
+                    raise RuntimeError(f"Kernel '{kernel.key}' arg {name!r}: struct value lacks ``_ctype``")
                 raw = bytes(ctype_inst)
                 np_buf = np.frombuffer(raw, dtype=np.float32).copy()
                 if np_buf.size != layout.scalars_per_elem:
@@ -5905,10 +6203,7 @@ def launch_metal_kernel_native(kernel, dim, inputs, outputs, device, block_dim: 
     # to MTLBuffers instead of mx.arrays.
     has_packed_init = bool(artifact.init_shadow_packed_outputs)
     needs_ints_packed = bool(
-        artifact.ints_packed_arrs
-        or artifact.ints_packed_scalars
-        or artifact.floats_packed_arrs
-        or has_packed_init
+        artifact.ints_packed_arrs or artifact.ints_packed_scalars or artifact.floats_packed_arrs or has_packed_init
     )
     if needs_ints_packed:
         K = len(artifact.ints_packed_arrs)
@@ -6037,21 +6332,14 @@ def launch_metal_kernel_native(kernel, dim, inputs, outputs, device, block_dim: 
         idx, arg_var = arg_by_name[name]
         value = fwd_args[idx]
         if not _is_array_arg(arg_var):
-            raise RuntimeError(
-                f"Kernel '{kernel.key}' output {name!r} is not a wp.array"
-            )
+            raise RuntimeError(f"Kernel '{kernel.key}' output {name!r} is not a wp.array")
         if not getattr(value, "device", None) or not value.device.is_metal:
             raise RuntimeError(
                 f"Kernel '{kernel.key}' output {name!r} must be a wp.array on a Metal "
                 f"device; got {getattr(value, 'device', '?')}"
             )
         mtl = _resolve_mtl(value, kernel.key, name)
-        if (
-            artifact.atomic_outputs
-            and name not in output_init_shadow_set
-            and value.ptr is not None
-            and value.size > 0
-        ):
+        if artifact.atomic_outputs and name not in output_init_shadow_set and value.ptr is not None and value.size > 0:
             # Pure accumulator output — must start at zero to match
             # MLX's ``init_value=0`` behaviour for atomic kernels.
             from warp._src.types import type_size_in_bytes  # noqa: PLC0415
@@ -6106,6 +6394,7 @@ def launch_metal_kernel_native(kernel, dim, inputs, outputs, device, block_dim: 
     except Exception:
         if os.environ.get("WARP_METAL_DUMP_ON_FAIL"):
             import tempfile
+
             dump_dir = tempfile.mkdtemp(prefix=f"warp_metal_fail_{kernel.key}_")
             with open(os.path.join(dump_dir, "wrapped_source.metal"), "w") as f:
                 f.write(getattr(kernel, "_metal_native_wrapped_source", "") or "")
@@ -6261,8 +6550,7 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim: int = 2
         out_name = init_name[: -len("__init")]
         if out_name not in arg_by_name:
             raise RuntimeError(
-                f"Kernel '{kernel.key}' atomic init shadow '{init_name}' references "
-                f"unknown output '{out_name}'"
+                f"Kernel '{kernel.key}' atomic init shadow '{init_name}' references unknown output '{out_name}'"
             )
         idx, _ = arg_by_name[out_name]
         value = fwd_args[idx]
@@ -6278,8 +6566,7 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim: int = 2
         mx_buf = _metal_get_buffer(value.ptr)
         if mx_buf is None:
             raise RuntimeError(
-                f"Kernel '{kernel.key}' atomic init shadow '{init_name}' has no registered "
-                f"MLX buffer (ptr={value.ptr})"
+                f"Kernel '{kernel.key}' atomic init shadow '{init_name}' has no registered MLX buffer (ptr={value.ptr})"
             )
         typed = mx_buf.view(mx_dtype).reshape(view_shape)
         mlx_inputs.append(typed)
@@ -6304,12 +6591,7 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim: int = 2
     # start offsets within the *separate* ``__floats_packed`` buffer
     # built below; then the concatenated int-array data.
     has_packed_init = bool(artifact.init_shadow_packed_outputs)
-    if (
-        artifact.ints_packed_arrs
-        or artifact.ints_packed_scalars
-        or artifact.floats_packed_arrs
-        or has_packed_init
-    ):
+    if artifact.ints_packed_arrs or artifact.ints_packed_scalars or artifact.floats_packed_arrs or has_packed_init:
         K = len(artifact.ints_packed_arrs)
         S = len(artifact.ints_packed_scalars)
         F = len(artifact.floats_packed_arrs)
@@ -6548,6 +6830,7 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim: int = 2
             tg = (1, grid_y, grid_z)
         else:
             from warp._src.utils import warn  # noqa: PLC0415
+
             warn(
                 f"Kernel '{kernel.key}' needs an init barrier but grid_y*grid_z="
                 f"{grid_y * grid_z} exceeds Metal's 1024-threads-per-threadgroup "
@@ -6590,9 +6873,10 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim: int = 2
     # serializing on per-launch GPU sync.
     try:
         mx.async_eval(out_mx_list)
-    except Exception as e:
+    except Exception:
         if os.environ.get("WARP_METAL_DUMP_ON_FAIL"):
             import tempfile
+
             dump_dir = tempfile.mkdtemp(prefix=f"warp_metal_fail_{kernel.key}_")
             with open(os.path.join(dump_dir, "header.metal"), "w") as f:
                 f.write(artifact.header or "")
@@ -6619,9 +6903,10 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim: int = 2
             nbytes = np_view.nbytes
             if not runtime.core.wp_memcpy_h2h(dest.ptr, src_ptr, nbytes):
                 raise RuntimeError(f"Failed to copy Metal kernel output back into wp.array (kernel '{kernel.key}')")
-    except Exception as e:
+    except Exception:
         if os.environ.get("WARP_METAL_DUMP_ON_FAIL"):
             import tempfile
+
             dump_dir = tempfile.mkdtemp(prefix=f"warp_metal_fail_{kernel.key}_")
             with open(os.path.join(dump_dir, "header.metal"), "w") as f:
                 f.write(artifact.header or "")
