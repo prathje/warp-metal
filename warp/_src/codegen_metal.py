@@ -3528,8 +3528,16 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
     # ``verify_autograd_array_access`` is enabled.
     written_arg_names: set[str] = set()
     atomic_arg_names: set[str] = set()
+    # Which atomic ops touch each array (``add``/``sub``/``min``/``max``) and
+    # which arrays are also targets of plain stores. The output-init prologue
+    # uses this to pick a race-free seeding op: outputs touched only by
+    # ``atomic_add``/``atomic_sub`` can be seeded with ``atomic_fetch_add``
+    # on top of MLX's zero-fill, which commutes with the body's adds — no
+    # ordering requirement between the seed and body threadgroups.
+    atomic_op_kinds: dict[str, set[str]] = {}
+    plain_store_arg_names: set[str] = set()
     array_store_pat = re.compile(r"\s*wp::array_store\s*\(\s*var_([A-Za-z_]\w*)")
-    atomic_pat = re.compile(r"wp::atomic_(?:add|sub|min|max)\s*\(\s*var_([A-Za-z_]\w*)")
+    atomic_pat = re.compile(r"wp::atomic_(add|sub|min|max)\s*\(\s*var_([A-Za-z_]\w*)")
     scalar_store_pat = re.compile(r"\s*wp::__metal_scalar_store__\s*\(\s*var_([A-Za-z_]\w*)")
     # ``wp::tile_store<...>(arr, tile, off...)`` — the blocked-Cholesky
     # path writes through tile_store directly (no array_store wrapper).
@@ -3545,18 +3553,21 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
     # gets stripped because the array is also a kernel arg, which the
     # name-substitution pass folds to its bare name later). Detect those
     # too so the output classification picks up the write.
-    raw_atomic_pat = re.compile(r"atomic_fetch_(?:add|sub|min|max)_explicit\s*\(\s*&\s*(\w+)\[")
+    raw_atomic_pat = re.compile(r"atomic_fetch_(add|sub|min|max)_explicit\s*\(\s*&\s*(\w+)\[")
     for raw in forward_lines:
         m = array_store_pat.match(raw)
         if m:
             written_arg_names.add(m.group(1))
+            plain_store_arg_names.add(m.group(1))
         m = atomic_pat.search(raw)
         if m:
-            written_arg_names.add(m.group(1))
-            atomic_arg_names.add(m.group(1))
+            written_arg_names.add(m.group(2))
+            atomic_arg_names.add(m.group(2))
+            atomic_op_kinds.setdefault(m.group(2), set()).add(m.group(1))
         m = scalar_store_pat.match(raw)
         if m:
             written_arg_names.add(m.group(1))
+            plain_store_arg_names.add(m.group(1))
         m = tile_store_pat.search(raw)
         if m:
             written_arg_names.add(m.group(1))
@@ -3565,8 +3576,9 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
             written_arg_names.add(m.group(1))
         m = raw_atomic_pat.search(raw)
         if m:
-            written_arg_names.add(m.group(1))
-            atomic_arg_names.add(m.group(1))
+            written_arg_names.add(m.group(2))
+            atomic_arg_names.add(m.group(2))
+            atomic_op_kinds.setdefault(m.group(2), set()).add(m.group(1))
 
     # MLX's ``atomic_outputs`` flag is per-kernel, not per-output: when set,
     # *every* output is typed ``device atomic<T>*``. We can still support
@@ -4681,18 +4693,38 @@ def generate_msl_kernel(kernel) -> MetalKernelArtifact:
             else:
                 src_expr = f"{out_name}__init[_init_flat]"
             if has_atomic:
-                store_stmt = (
-                    f"            atomic_store_explicit(&{out_name}[_init_flat], "
-                    f"{src_expr}, memory_order_relaxed);"
-                )
+                # Outputs touched only by ``atomic_add``/``atomic_sub`` (and
+                # never plain-stored) are seeded with ``atomic_fetch_add`` on
+                # top of MLX's zero-fill. Unlike ``atomic_store``, the add
+                # commutes with the body's own adds, so a seed landing *after*
+                # another threadgroup's accumulation no longer wipes it — the
+                # threadgroup barrier below only orders threads within one
+                # threadgroup, not across the grid.
+                ops = atomic_op_kinds.get(out_name, set())
+                if ops and ops <= {"add", "sub"} and out_name not in plain_store_arg_names:
+                    store_stmt = (
+                        f"            atomic_fetch_add_explicit(&{out_name}[_init_flat], "
+                        f"{src_expr}, memory_order_relaxed);"
+                    )
+                else:
+                    store_stmt = (
+                        f"            atomic_store_explicit(&{out_name}[_init_flat], {src_expr}, memory_order_relaxed);"
+                    )
             else:
                 store_stmt = f"            {out_name}[_init_flat] = {src_expr};"
+            # Bound the seed by the output's actual leading dim: kernels are
+            # often launched with more x-threads than the output has rows
+            # (e.g. ``dim=N`` reductions into a 1-element accumulator), and
+            # an unguarded ``_init_w`` would write past the end of the
+            # buffer.
             prologue.extend(
                 [
+                    f"        if (_init_w < (int){out_name}_shape[0]) {{",
                     f"        int _init_stride_{out_name} = {stride_expr};",
                     f"        for (int _init_i = 0; _init_i < _init_stride_{out_name}; ++_init_i) {{",
                     f"            int _init_flat = _init_w * _init_stride_{out_name} + _init_i;",
                     store_stmt,
+                    "        }",
                     "        }",
                 ]
             )
