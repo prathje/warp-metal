@@ -3661,5 +3661,385 @@ class TestMetalLaunch(unittest.TestCase):
         _run_with_metal_enabled(self, snippet)
 
 
+@unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
+@unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
+class TestMetalQuatBuiltins(unittest.TestCase):
+    """A/B tests for the quaternion builtin translations.
+
+    Quats are stored as ``float4`` on Metal, which makes ``q1 * q2`` a
+    silent-wrongness trap: MSL's ``float4 * float4`` is component-wise, but
+    Warp's quat multiply is the Hamilton product. These tests pin the
+    ``wp_quat_*`` helper translations against the CPU backend.
+    """
+
+    def test_quat_mul_is_hamilton_product(self):
+        # Regression: this used to lower to component-wise float4 multiply.
+        # Covers both the direct kernel statement and the @wp.func-inlined
+        # path (inlined vars are found via textual quat_t declarations, not
+        # the kernel IR's variable list).
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.func
+            def helper_mul(a: wp.quat, b: wp.quat) -> wp.quat:
+                return a * b
+
+            @wp.kernel
+            def k(a: wp.array(dtype=wp.quat), b: wp.array(dtype=wp.quat),
+                  direct: wp.array(dtype=wp.quat), inlined: wp.array(dtype=wp.quat)):
+                tid = wp.tid()
+                direct[tid] = a[tid] * b[tid]
+                inlined[tid] = helper_mul(a[tid], b[tid])
+
+            N = 64
+            rng = np.random.default_rng(0)
+            an = rng.standard_normal((N, 4)).astype(np.float32)
+            bn = rng.standard_normal((N, 4)).astype(np.float32)
+            an /= np.linalg.norm(an, axis=1, keepdims=True)
+            bn /= np.linalg.norm(bn, axis=1, keepdims=True)
+
+            outs = {}
+            for dev in ('cpu', 'metal:0'):
+                direct = wp.zeros(N, dtype=wp.quat, device=dev)
+                inlined = wp.zeros(N, dtype=wp.quat, device=dev)
+                wp.launch(k, dim=N,
+                          inputs=[wp.array(an, dtype=wp.quat, device=dev),
+                                  wp.array(bn, dtype=wp.quat, device=dev)],
+                          outputs=[direct, inlined], device=dev)
+                outs[dev] = (direct.numpy(), inlined.numpy())
+
+            np.testing.assert_allclose(outs['cpu'][0], outs['metal:0'][0], rtol=1e-5, atol=1e-6)
+            np.testing.assert_allclose(outs['cpu'][1], outs['metal:0'][1], rtol=1e-5, atol=1e-6)
+            # Guard against the component-wise regression specifically: the
+            # Hamilton product of two unit quats differs from the
+            # component-wise product for generic inputs.
+            assert not np.allclose(outs['metal:0'][0], an * bn, atol=1e-3), \\
+                'Metal quat mul looks component-wise again'
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_quat_rotate_inverse_identity_match_cpu(self):
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(q: wp.array(dtype=wp.quat), v: wp.array(dtype=wp.vec3),
+                  rot: wp.array(dtype=wp.vec3), rot_inv: wp.array(dtype=wp.vec3),
+                  inv: wp.array(dtype=wp.quat)):
+                tid = wp.tid()
+                rot[tid] = wp.quat_rotate(q[tid], v[tid])
+                rot_inv[tid] = wp.quat_rotate_inv(q[tid], v[tid])
+                inv[tid] = wp.quat_inverse(q[tid]) * wp.quat_identity()
+
+            N = 64
+            rng = np.random.default_rng(1)
+            qn = rng.standard_normal((N, 4)).astype(np.float32)
+            qn /= np.linalg.norm(qn, axis=1, keepdims=True)
+            vn = rng.standard_normal((N, 3)).astype(np.float32)
+
+            outs = {}
+            for dev in ('cpu', 'metal:0'):
+                rot = wp.zeros(N, dtype=wp.vec3, device=dev)
+                rot_inv = wp.zeros(N, dtype=wp.vec3, device=dev)
+                inv = wp.zeros(N, dtype=wp.quat, device=dev)
+                wp.launch(k, dim=N,
+                          inputs=[wp.array(qn, dtype=wp.quat, device=dev),
+                                  wp.array(vn, dtype=wp.vec3, device=dev)],
+                          outputs=[rot, rot_inv, inv], device=dev)
+                outs[dev] = (rot.numpy(), rot_inv.numpy(), inv.numpy())
+
+            for c, m in zip(outs['cpu'], outs['metal:0']):
+                np.testing.assert_allclose(c, m, rtol=1e-5, atol=1e-6)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_quat_conversions_match_cpu(self):
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(q: wp.array(dtype=wp.quat), v: wp.array(dtype=wp.vec3),
+                  s: wp.array(dtype=wp.float32),
+                  mat: wp.array(dtype=wp.mat33), round_trip: wp.array(dtype=wp.quat),
+                  from_axis: wp.array(dtype=wp.quat), rpy: wp.array(dtype=wp.quat)):
+                tid = wp.tid()
+                mat[tid] = wp.quat_to_matrix(q[tid])
+                round_trip[tid] = wp.quat_from_matrix(wp.quat_to_matrix(q[tid]))
+                from_axis[tid] = wp.quat_from_axis_angle(wp.normalize(v[tid]), s[tid])
+                rpy[tid] = wp.quat_rpy(v[tid][0], v[tid][1], v[tid][2])
+
+            N = 64
+            rng = np.random.default_rng(2)
+            qn = rng.standard_normal((N, 4)).astype(np.float32)
+            qn /= np.linalg.norm(qn, axis=1, keepdims=True)
+            vn = rng.standard_normal((N, 3)).astype(np.float32)
+            sn = rng.standard_normal(N).astype(np.float32)
+
+            outs = {}
+            for dev in ('cpu', 'metal:0'):
+                mat = wp.zeros(N, dtype=wp.mat33, device=dev)
+                round_trip = wp.zeros(N, dtype=wp.quat, device=dev)
+                from_axis = wp.zeros(N, dtype=wp.quat, device=dev)
+                rpy = wp.zeros(N, dtype=wp.quat, device=dev)
+                wp.launch(k, dim=N,
+                          inputs=[wp.array(qn, dtype=wp.quat, device=dev),
+                                  wp.array(vn, dtype=wp.vec3, device=dev),
+                                  wp.array(sn, dtype=wp.float32, device=dev)],
+                          outputs=[mat, round_trip, from_axis, rpy], device=dev)
+                outs[dev] = (mat.numpy(), round_trip.numpy(), from_axis.numpy(), rpy.numpy())
+
+            for c, m in zip(outs['cpu'], outs['metal:0']):
+                np.testing.assert_allclose(c, m, rtol=1e-5, atol=1e-6)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_quat_slerp_matches_cpu(self):
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(a: wp.array(dtype=wp.quat), b: wp.array(dtype=wp.quat),
+                  t: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.quat)):
+                tid = wp.tid()
+                out[tid] = wp.quat_slerp(a[tid], b[tid], t[tid])
+
+            N = 64
+            rng = np.random.default_rng(4)
+            an = rng.standard_normal((N, 4)).astype(np.float32)
+            bn = rng.standard_normal((N, 4)).astype(np.float32)
+            an /= np.linalg.norm(an, axis=1, keepdims=True)
+            bn /= np.linalg.norm(bn, axis=1, keepdims=True)
+            tn = rng.uniform(0.0, 1.0, N).astype(np.float32)
+
+            outs = {}
+            for dev in ('cpu', 'metal:0'):
+                out = wp.zeros(N, dtype=wp.quat, device=dev)
+                wp.launch(k, dim=N,
+                          inputs=[wp.array(an, dtype=wp.quat, device=dev),
+                                  wp.array(bn, dtype=wp.quat, device=dev),
+                                  wp.array(tn, dtype=wp.float32, device=dev)],
+                          outputs=[out], device=dev)
+                outs[dev] = out.numpy()
+
+            np.testing.assert_allclose(outs['cpu'], outs['metal:0'], rtol=1e-4, atol=1e-5)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+
+@unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
+@unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
+class TestMetalTransformBuiltins(unittest.TestCase):
+    """A/B tests for ``wp.transform`` support.
+
+    Transforms lower to ``wp_vec7_float`` (px, py, pz, qx, qy, qz, qw) via
+    the same normalization quats use, with ``wp_transform_*`` helpers for
+    the transform-specific operations.
+    """
+
+    def test_transform_builtins_match_cpu(self):
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(t: wp.array(dtype=wp.transform), p: wp.array(dtype=wp.vec3),
+                  out_pt: wp.array(dtype=wp.vec3), out_vec: wp.array(dtype=wp.vec3),
+                  out_rt: wp.array(dtype=wp.transform),
+                  out_ctor: wp.array(dtype=wp.transform),
+                  out_id: wp.array(dtype=wp.transform)):
+                tid = wp.tid()
+                a = t[tid]
+                out_pt[tid] = wp.transform_point(a, p[tid])
+                out_vec[tid] = wp.transform_vector(a, p[tid])
+                out_rt[tid] = wp.transform_multiply(a, wp.transform_inverse(a))
+                out_ctor[tid] = wp.transform(wp.transform_get_translation(a) * 2.0,
+                                             wp.transform_get_rotation(a))
+                out_id[tid] = wp.transform_multiply(a, wp.transform_identity())
+
+            N = 32
+            rng = np.random.default_rng(7)
+            tn = rng.standard_normal((N, 7)).astype(np.float32)
+            tn[:, 3:] /= np.linalg.norm(tn[:, 3:], axis=1, keepdims=True)
+            on = rng.standard_normal((N, 3)).astype(np.float32)
+
+            outs = {}
+            for dev in ('cpu', 'metal:0'):
+                out_pt = wp.zeros(N, dtype=wp.vec3, device=dev)
+                out_vec = wp.zeros(N, dtype=wp.vec3, device=dev)
+                out_rt = wp.zeros(N, dtype=wp.transform, device=dev)
+                out_ctor = wp.zeros(N, dtype=wp.transform, device=dev)
+                out_id = wp.zeros(N, dtype=wp.transform, device=dev)
+                wp.launch(k, dim=N,
+                          inputs=[wp.array(tn, dtype=wp.transform, device=dev),
+                                  wp.array(on, dtype=wp.vec3, device=dev)],
+                          outputs=[out_pt, out_vec, out_rt, out_ctor, out_id],
+                          device=dev)
+                outs[dev] = [o.numpy() for o in (out_pt, out_vec, out_rt, out_ctor, out_id)]
+
+            for c, m in zip(outs['cpu'], outs['metal:0']):
+                np.testing.assert_allclose(c, m, rtol=1e-5, atol=1e-5)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+
+@unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
+@unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
+class TestMetalMathBuiltins(unittest.TestCase):
+    """A/B tests for interpolation / misc-math / small linear-algebra builtins."""
+
+    def test_interp_builtins_match_cpu(self):
+        # frac deliberately covers negative inputs: Warp truncates toward
+        # zero while metal::fract floors, so a fract-based translation
+        # would diverge exactly there.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(a: wp.array(dtype=wp.float32), b: wp.array(dtype=wp.float32),
+                  va: wp.array(dtype=wp.vec3), vb: wp.array(dtype=wp.vec3),
+                  lerp_s: wp.array(dtype=wp.float32), lerp_v: wp.array(dtype=wp.vec3),
+                  smooth: wp.array(dtype=wp.float32), fr: wp.array(dtype=wp.float32),
+                  ang: wp.array(dtype=wp.float32)):
+                tid = wp.tid()
+                lerp_s[tid] = wp.lerp(a[tid], b[tid], 0.3)
+                lerp_v[tid] = wp.lerp(va[tid], vb[tid], 0.7)
+                smooth[tid] = wp.smoothstep(-1.0, 1.0, a[tid])
+                fr[tid] = wp.frac(a[tid] * 3.7)
+                ang[tid] = wp.degrees(a[tid]) + wp.radians(b[tid])
+
+            N = 128
+            rng = np.random.default_rng(5)
+            an = rng.standard_normal(N).astype(np.float32)
+            bn = rng.standard_normal(N).astype(np.float32)
+            van = rng.standard_normal((N, 3)).astype(np.float32)
+            vbn = rng.standard_normal((N, 3)).astype(np.float32)
+
+            outs = {}
+            for dev in ('cpu', 'metal:0'):
+                lerp_s = wp.zeros(N, dtype=wp.float32, device=dev)
+                lerp_v = wp.zeros(N, dtype=wp.vec3, device=dev)
+                smooth = wp.zeros(N, dtype=wp.float32, device=dev)
+                fr = wp.zeros(N, dtype=wp.float32, device=dev)
+                ang = wp.zeros(N, dtype=wp.float32, device=dev)
+                wp.launch(k, dim=N,
+                          inputs=[wp.array(an, dtype=wp.float32, device=dev),
+                                  wp.array(bn, dtype=wp.float32, device=dev),
+                                  wp.array(van, dtype=wp.vec3, device=dev),
+                                  wp.array(vbn, dtype=wp.vec3, device=dev)],
+                          outputs=[lerp_s, lerp_v, smooth, fr, ang], device=dev)
+                outs[dev] = (lerp_s.numpy(), lerp_v.numpy(), smooth.numpy(),
+                             fr.numpy(), ang.numpy())
+
+            for c, m in zip(outs['cpu'], outs['metal:0']):
+                np.testing.assert_allclose(c, m, rtol=1e-5, atol=1e-6)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_random_builtins_match_cpu(self):
+        # The PCG streams (rand_init / randf / randi / randu) are pure
+        # uint32 arithmetic and must be BIT-exact against the CPU backend.
+        # Range-scaled randf and randn go through float scaling and
+        # transcendentals, where FMA contraction / libm ulp differences are
+        # expected — those get a small tolerance instead.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(seed: wp.array(dtype=wp.int32),
+                  out_f: wp.array(dtype=wp.float32), out_fr: wp.array(dtype=wp.float32),
+                  out_i: wp.array(dtype=wp.int32), out_ir: wp.array(dtype=wp.int32),
+                  out_u: wp.array(dtype=wp.uint32), out_n: wp.array(dtype=wp.float32)):
+                tid = wp.tid()
+                state = wp.rand_init(seed[tid], tid)
+                out_f[tid] = wp.randf(state)
+                out_fr[tid] = wp.randf(state, -2.0, 3.0)
+                out_i[tid] = wp.randi(state)
+                out_ir[tid] = wp.randi(state, -10, 50)
+                out_u[tid] = wp.randu(state)
+                out_n[tid] = wp.randn(state)
+
+            N = 4096
+            seeds = np.full(N, 42, dtype=np.int32)
+
+            outs = {}
+            for dev in ('cpu', 'metal:0'):
+                arrs = [wp.zeros(N, dtype=dt, device=dev)
+                        for dt in (wp.float32, wp.float32, wp.int32,
+                                   wp.int32, wp.uint32, wp.float32)]
+                wp.launch(k, dim=N,
+                          inputs=[wp.array(seeds, dtype=wp.int32, device=dev)],
+                          outputs=arrs, device=dev)
+                outs[dev] = [a.numpy() for a in arrs]
+
+            c, m = outs['cpu'], outs['metal:0']
+            np.testing.assert_array_equal(c[0], m[0])  # randf: bit-exact
+            np.testing.assert_array_equal(c[2], m[2])  # randi: bit-exact
+            np.testing.assert_array_equal(c[3], m[3])  # randi(lo, hi): bit-exact
+            np.testing.assert_array_equal(c[4], m[4])  # randu: bit-exact
+            np.testing.assert_allclose(c[1], m[1], rtol=1e-6, atol=1e-6)  # randf(lo, hi)
+            np.testing.assert_allclose(c[5], m[5], rtol=1e-5, atol=1e-6)  # randn
+            # Sanity: the stream is actually random, not zeros.
+            assert np.std(c[0]) > 0.2, 'suspiciously uniform randf output'
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_outer_skew_trace_match_cpu(self):
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(a: wp.array(dtype=wp.vec3), b: wp.array(dtype=wp.vec3),
+                  outer: wp.array(dtype=wp.mat33), skew: wp.array(dtype=wp.mat33),
+                  tr: wp.array(dtype=wp.float32)):
+                tid = wp.tid()
+                outer[tid] = wp.outer(a[tid], b[tid])
+                skew[tid] = wp.skew(a[tid])
+                tr[tid] = wp.trace(wp.outer(a[tid], b[tid]))
+
+            N = 64
+            rng = np.random.default_rng(6)
+            an = rng.standard_normal((N, 3)).astype(np.float32)
+            bn = rng.standard_normal((N, 3)).astype(np.float32)
+
+            outs = {}
+            for dev in ('cpu', 'metal:0'):
+                outer = wp.zeros(N, dtype=wp.mat33, device=dev)
+                skew = wp.zeros(N, dtype=wp.mat33, device=dev)
+                tr = wp.zeros(N, dtype=wp.float32, device=dev)
+                wp.launch(k, dim=N,
+                          inputs=[wp.array(an, dtype=wp.vec3, device=dev),
+                                  wp.array(bn, dtype=wp.vec3, device=dev)],
+                          outputs=[outer, skew, tr], device=dev)
+                outs[dev] = (outer.numpy(), skew.numpy(), tr.numpy())
+
+            for c, m in zip(outs['cpu'], outs['metal:0']):
+                np.testing.assert_allclose(c, m, rtol=1e-5, atol=1e-6)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
