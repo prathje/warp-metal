@@ -1689,7 +1689,16 @@ def fold_views(nodes: list[Node], adj, extra_const_ints: dict[str, int] | None =
     if not view_aliases:
         return nodes, skip_decls
 
-    return _apply_view_rewrites(nodes, slice_aliases, view_aliases), skip_decls
+    # ``view.shape[k]`` lowers to ``&(var_V.shape)`` + load + extract.
+    # Collect the pointer/value locals so the rewrite below can repoint
+    # the address at the base array (the flat-side shape-alias pass then
+    # handles it like any direct ``arr.shape`` access) and shift the
+    # extract index by the number of folded leading dims.
+    shape_ptr_shift: dict[str, tuple[str, int]] = {}
+    shape_val_shift: dict[str, tuple[str, int]] = {}
+    _collect_view_shape_aliases(nodes, view_aliases, shape_ptr_shift, shape_val_shift)
+
+    return _apply_view_rewrites(nodes, slice_aliases, view_aliases, shape_val_shift), skip_decls
 
 
 def _strip_var_prefix(s: str) -> str | None:
@@ -1745,11 +1754,34 @@ def _collect_view_aliases(
             _collect_view_aliases(n.body, out, slice_aliases, arg_label_set)
 
 
+def _collect_view_shape_aliases(
+    nodes: tuple[Node, ...] | list[Node],
+    view_aliases: dict[str, tuple[str, list[str]]],
+    ptr_shift: dict[str, tuple[str, int]],
+    val_shift: dict[str, tuple[str, int]],
+) -> None:
+    """Record ``&(var_V.shape)`` pointers (and their ``wp::load`` values)
+    taken on a folded view — ``label -> (base_arr, n_lead_dims)``."""
+    for n in nodes:
+        if isinstance(n, Assign):
+            if isinstance(n.expr, AddrOf) and n.expr.inner_kind == "shape" and n.expr.inner_target in view_aliases:
+                arr_name, lead_idx_labels = view_aliases[n.expr.inner_target]
+                ptr_shift[n.lhs] = (arr_name, len(lead_idx_labels))
+            elif isinstance(n.expr, Builtin) and n.expr.name == "load" and n.expr.args:
+                src = _strip_var_prefix(n.expr.args[0])
+                if src is not None and src in ptr_shift:
+                    val_shift[n.lhs] = ptr_shift[src]
+        if isinstance(n, (If, For, While, _DoWhileZero)):
+            _collect_view_shape_aliases(n.body, view_aliases, ptr_shift, val_shift)
+
+
 def _apply_view_rewrites(
     nodes: tuple[Node, ...] | list[Node],
     slice_aliases: dict[str, str],
     view_aliases: dict[str, tuple[str, list[str]]],
+    shape_val_shift: dict[str, tuple[str, int]] | None = None,
 ) -> list[Node]:
+    shape_val_shift = shape_val_shift or {}
     out: list[Node] = []
     for n in nodes:
         # 1. Drop slice_t / view definitions we resolved as aliases.
@@ -1764,6 +1796,41 @@ def _apply_view_rewrites(
             continue
 
         # 2. Rewrite address / array_store / atomic_* on a view.
+        # ``&(var_V.shape)`` — repoint at the base array; the flat-side
+        # shape-alias pass then treats it like a direct arg shape access.
+        if isinstance(n, Assign) and isinstance(n.expr, AddrOf) and n.expr.inner_kind == "shape":
+            if n.expr.inner_target in view_aliases:
+                arr_name, _lead = view_aliases[n.expr.inner_target]
+                indent = _leading_indent(n.raw)
+                new_expr_raw = f"&(var_{arr_name}.shape)"
+                new_raw = f"{indent}var_{n.lhs} = {new_expr_raw};"
+                out.append(
+                    Assign(
+                        raw=new_raw,
+                        lhs=n.lhs,
+                        expr=AddrOf(raw=new_expr_raw, inner_kind="shape", inner_target=arr_name, inner_field=None),
+                    )
+                )
+                continue
+        # ``wp::extract(shape_val, k)`` where the shape came from a view —
+        # dim k of the view is dim k + n_lead of the base array.
+        if isinstance(n, Assign) and isinstance(n.expr, Builtin) and n.expr.name == "extract" and len(n.expr.args) == 2:
+            src = _strip_var_prefix(n.expr.args[0])
+            if src is not None and src in shape_val_shift:
+                _arr_name, n_lead = shape_val_shift[src]
+                if n_lead:
+                    idx = n.expr.args[1].strip()
+                    indent = _leading_indent(n.raw)
+                    new_expr_raw = f"wp::extract(var_{src}, {idx} + {n_lead})"
+                    new_raw = f"{indent}var_{n.lhs} = {new_expr_raw};"
+                    out.append(
+                        Assign(
+                            raw=new_raw,
+                            lhs=n.lhs,
+                            expr=Builtin(raw=new_expr_raw, name="extract", args=(f"var_{src}", f"{idx} + {n_lead}")),
+                        )
+                    )
+                    continue
         if isinstance(n, Assign) and isinstance(n.expr, Builtin) and n.expr.name == "address":
             view_arr_l = _strip_var_prefix(n.expr.args[0]) if n.expr.args else None
             if view_arr_l is not None and view_arr_l in view_aliases:
@@ -1889,7 +1956,7 @@ def _apply_view_rewrites(
                 If(
                     raw=n.raw,
                     cond=n.cond,
-                    body=tuple(_apply_view_rewrites(n.body, slice_aliases, view_aliases)),
+                    body=tuple(_apply_view_rewrites(n.body, slice_aliases, view_aliases, shape_val_shift)),
                     raw_open=n.raw_open,
                     raw_close=n.raw_close,
                 )
@@ -1903,7 +1970,7 @@ def _apply_view_rewrites(
                     range_var=n.range_var,
                     start=n.start,
                     stop=n.stop,
-                    body=tuple(_apply_view_rewrites(n.body, slice_aliases, view_aliases)),
+                    body=tuple(_apply_view_rewrites(n.body, slice_aliases, view_aliases, shape_val_shift)),
                     step=n.step,
                 )
             )
@@ -1913,7 +1980,7 @@ def _apply_view_rewrites(
                 While(
                     raw=n.raw,
                     label_k=n.label_k,
-                    body=tuple(_apply_view_rewrites(n.body, slice_aliases, view_aliases)),
+                    body=tuple(_apply_view_rewrites(n.body, slice_aliases, view_aliases, shape_val_shift)),
                 )
             )
             continue
@@ -1921,7 +1988,7 @@ def _apply_view_rewrites(
             out.append(
                 _DoWhileZero(
                     raw=n.raw,
-                    body=tuple(_apply_view_rewrites(n.body, slice_aliases, view_aliases)),
+                    body=tuple(_apply_view_rewrites(n.body, slice_aliases, view_aliases, shape_val_shift)),
                 )
             )
             continue
