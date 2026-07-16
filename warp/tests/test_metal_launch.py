@@ -4443,6 +4443,326 @@ class TestMetalArrayBuiltins(unittest.TestCase):
 
 @unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
 @unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
+class TestMetalSpecialValueBuiltins(unittest.TestCase):
+    """isfinite/isnan/isinf must reduce composite types to a scalar bool.
+
+    ``metal::isfinite(float3)`` returns ``bool3`` — assigning that to a
+    Warp bool is a compile error (and would be silently wrong if it ever
+    type-coerced). The wp_is* helpers reduce with all()/any() to match
+    warp/native/vec.h semantics: all-finite / any-nan / any-inf.
+    """
+
+    def test_special_values_match_cpu(self):
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(xs: wp.array(dtype=wp.float32), vs: wp.array(dtype=wp.vec3),
+                  ms: wp.array(dtype=wp.mat33), qs: wp.array(dtype=wp.quat),
+                  out: wp.array(dtype=wp.int32)):
+                tid = wp.tid()
+                r = int(0)
+                if wp.isfinite(xs[tid]):
+                    r += 1
+                if wp.isnan(xs[tid]):
+                    r += 2
+                if wp.isinf(xs[tid]):
+                    r += 4
+                if wp.isfinite(vs[tid]):
+                    r += 8
+                if wp.isnan(vs[tid]):
+                    r += 16
+                if wp.isinf(vs[tid]):
+                    r += 32
+                if wp.isfinite(ms[tid]):
+                    r += 64
+                if wp.isnan(ms[tid]):
+                    r += 128
+                if wp.isinf(ms[tid]):
+                    r += 256
+                if wp.isfinite(qs[tid]):
+                    r += 512
+                if wp.isnan(qs[tid]):
+                    r += 1024
+                out[tid] = r
+
+            specials = np.array([1.0, -2.5, np.inf, -np.inf, np.nan, 0.0], dtype=np.float32)
+            N = len(specials)
+            vecs = np.tile(specials[:, None], (1, 3)).astype(np.float32)
+            # Mixed vectors: one bad component among finite ones must flip
+            # the whole-vector verdict (any-nan / any-inf / not-all-finite).
+            vecs[0, 1] = np.nan
+            vecs[1, 2] = np.inf
+            mats = np.tile(specials[:, None, None], (1, 3, 3)).astype(np.float32)
+            mats[0, 2, 1] = np.nan
+            quats = np.tile(specials[:, None], (1, 4)).astype(np.float32)
+            quats[1, 3] = np.nan
+
+            outs = {}
+            for dev in ('cpu', 'metal:0'):
+                out = wp.zeros(N, dtype=wp.int32, device=dev)
+                wp.launch(k, dim=N,
+                          inputs=[wp.array(specials, device=dev),
+                                  wp.array(vecs, dtype=wp.vec3, device=dev),
+                                  wp.array(mats, dtype=wp.mat33, device=dev),
+                                  wp.array(quats, dtype=wp.quat, device=dev)],
+                          outputs=[out], device=dev)
+                outs[dev] = out.numpy()
+
+            np.testing.assert_array_equal(outs['cpu'], outs['metal:0'])
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+
+@unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
+@unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
+class TestMetalComposeAndSpatialBuiltins(unittest.TestCase):
+    """matrix_from_cols/rows, spatial algebra, and bitwise invert."""
+
+    def test_matrix_from_cols_rows_match_cpu(self):
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(v2: wp.array(dtype=wp.vec2), v3: wp.array(dtype=wp.vec3),
+                  v4: wp.array(dtype=wp.vec4),
+                  oc2: wp.array(dtype=wp.mat22), or2: wp.array(dtype=wp.mat22),
+                  oc3: wp.array(dtype=wp.mat33), or3: wp.array(dtype=wp.mat33),
+                  oc4: wp.array(dtype=wp.mat44), or4: wp.array(dtype=wp.mat44)):
+                tid = wp.tid()
+                a2 = v2[tid]
+                a3 = v3[tid]
+                a4 = v4[tid]
+                oc2[tid] = wp.matrix_from_cols(a2, a2 * 2.0)
+                or2[tid] = wp.matrix_from_rows(a2, a2 * 2.0)
+                oc3[tid] = wp.matrix_from_cols(a3, a3 * 2.0, a3 - wp.vec3(1.0))
+                or3[tid] = wp.matrix_from_rows(a3, a3 * 2.0, a3 - wp.vec3(1.0))
+                oc4[tid] = wp.matrix_from_cols(a4, a4 * 2.0, a4 * 3.0, a4 - wp.vec4(1.0))
+                or4[tid] = wp.matrix_from_rows(a4, a4 * 2.0, a4 * 3.0, a4 - wp.vec4(1.0))
+
+            N = 64
+            rng = np.random.default_rng(31)
+            v2n = rng.standard_normal((N, 2)).astype(np.float32)
+            v3n = rng.standard_normal((N, 3)).astype(np.float32)
+            v4n = rng.standard_normal((N, 4)).astype(np.float32)
+
+            outs = {}
+            for dev in ('cpu', 'metal:0'):
+                os_ = [wp.zeros(N, dtype=dt, device=dev)
+                       for dt in (wp.mat22, wp.mat22, wp.mat33, wp.mat33, wp.mat44, wp.mat44)]
+                wp.launch(k, dim=N,
+                          inputs=[wp.array(v2n, dtype=wp.vec2, device=dev),
+                                  wp.array(v3n, dtype=wp.vec3, device=dev),
+                                  wp.array(v4n, dtype=wp.vec4, device=dev)],
+                          outputs=os_, device=dev)
+                outs[dev] = [o.numpy() for o in os_]
+
+            for c, m in zip(outs['cpu'], outs['metal:0']):
+                np.testing.assert_array_equal(c, m)
+            # from_cols(v0..) must place v0 as column 0 (guards against a
+            # silent cols/rows swap that A/B alone wouldn't catch if both
+            # backends made the same mistake).
+            np.testing.assert_array_equal(outs['cpu'][2][:, :, 0], v3n)
+            np.testing.assert_array_equal(outs['cpu'][3][:, 0, :], v3n)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_spatial_algebra_matches_cpu(self):
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(a: wp.array(dtype=wp.spatial_vector), b: wp.array(dtype=wp.spatial_vector),
+                  oc: wp.array(dtype=wp.spatial_vector), od: wp.array(dtype=wp.spatial_vector),
+                  odot: wp.array(dtype=wp.float32)):
+                tid = wp.tid()
+                oc[tid] = wp.spatial_cross(a[tid], b[tid])
+                od[tid] = wp.spatial_cross_dual(a[tid], b[tid])
+                odot[tid] = wp.spatial_dot(a[tid], b[tid])
+
+            N = 128
+            rng = np.random.default_rng(37)
+            an = rng.standard_normal((N, 6)).astype(np.float32)
+            bn = rng.standard_normal((N, 6)).astype(np.float32)
+
+            outs = {}
+            for dev in ('cpu', 'metal:0'):
+                oc = wp.zeros(N, dtype=wp.spatial_vector, device=dev)
+                od = wp.zeros(N, dtype=wp.spatial_vector, device=dev)
+                odot = wp.zeros(N, dtype=wp.float32, device=dev)
+                wp.launch(k, dim=N,
+                          inputs=[wp.array(an, dtype=wp.spatial_vector, device=dev),
+                                  wp.array(bn, dtype=wp.spatial_vector, device=dev)],
+                          outputs=[oc, od, odot], device=dev)
+                outs[dev] = (oc.numpy(), od.numpy(), odot.numpy())
+
+            for c, m in zip(outs['cpu'], outs['metal:0']):
+                np.testing.assert_allclose(m, c, rtol=1e-5, atol=1e-6)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_invert_matches_cpu(self):
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(x: wp.array(dtype=wp.int32), u: wp.array(dtype=wp.uint32),
+                  ox: wp.array(dtype=wp.int32), ou: wp.array(dtype=wp.uint32)):
+                tid = wp.tid()
+                ox[tid] = wp.invert(x[tid])
+                ou[tid] = wp.invert(u[tid])
+
+            N = 64
+            rng = np.random.default_rng(41)
+            xn = rng.integers(-(2**31), 2**31 - 1, N).astype(np.int32)
+            un = rng.integers(0, 2**32 - 1, N).astype(np.uint32)
+
+            outs = {}
+            for dev in ('cpu', 'metal:0'):
+                ox = wp.zeros(N, dtype=wp.int32, device=dev)
+                ou = wp.zeros(N, dtype=wp.uint32, device=dev)
+                wp.launch(k, dim=N,
+                          inputs=[wp.array(xn, device=dev), wp.array(un, device=dev)],
+                          outputs=[ox, ou], device=dev)
+                outs[dev] = (ox.numpy(), ou.numpy())
+
+            for c, m in zip(outs['cpu'], outs['metal:0']):
+                np.testing.assert_array_equal(c, m)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+
+@unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
+@unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
+class TestMetalAtomicMinMax(unittest.TestCase):
+    """Float atomic_min/max have no MSL fetch op — they run through a
+    compare-exchange loop on the reinterpreted bit pattern (wp_atomic_min /
+    wp_atomic_max helpers). Both emission paths are covered: the intrinsic
+    regex (scalar arrays) and the multi-dim AST fold's raw per-component
+    lines (vec-typed arrays)."""
+
+    def test_atomic_minmax_float_contended(self):
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(x: wp.array(dtype=wp.float32), lo: wp.array(dtype=wp.float32),
+                  hi: wp.array(dtype=wp.float32)):
+                tid = wp.tid()
+                # All threads contend on slot 0; per-thread slots alongside.
+                wp.atomic_min(lo, 0, x[tid])
+                wp.atomic_max(hi, 0, x[tid])
+                wp.atomic_min(lo, tid + 1, x[tid] * 0.5)
+                wp.atomic_max(hi, tid + 1, x[tid] * 0.5)
+
+            N = 1024
+            rng = np.random.default_rng(43)
+            # Mix of signs and magnitudes — the CAS loop compares as float,
+            # so negative values must order correctly (a raw uint-bits
+            # comparison would get them backwards).
+            xn = np.concatenate([rng.standard_normal(N - 2) * 100.0,
+                                 [-1e30, 1e30]]).astype(np.float32)
+            rng.shuffle(xn)
+
+            outs = {}
+            for dev in ('cpu', 'metal:0'):
+                lo = wp.array(np.full(N + 1, 1e38, dtype=np.float32), device=dev)
+                hi = wp.array(np.full(N + 1, -1e38, dtype=np.float32), device=dev)
+                wp.launch(k, dim=N, inputs=[wp.array(xn, device=dev), lo, hi], device=dev)
+                outs[dev] = (lo.numpy(), hi.numpy())
+
+            for c, m in zip(outs['cpu'], outs['metal:0']):
+                np.testing.assert_array_equal(c, m)
+            # Independent ground truth for the contended slot.
+            np.testing.assert_allclose(outs['metal:0'][0][0], xn.min(), rtol=0)
+            np.testing.assert_allclose(outs['metal:0'][1][0], xn.max(), rtol=0)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_atomic_minmax_int_and_2d(self):
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(x: wp.array(dtype=wp.int32), lo: wp.array(dtype=wp.int32),
+                  hi: wp.array(dtype=wp.int32), grid: wp.array2d(dtype=wp.float32)):
+                tid = wp.tid()
+                wp.atomic_min(lo, 0, x[tid])
+                wp.atomic_max(hi, 0, x[tid])
+                # 4-arg multi-dim form — flattened by the AST fold, then the
+                # intrinsic regex routes it through the float helper.
+                wp.atomic_min(grid, tid % 4, tid % 8, wp.float32(x[tid]))
+
+            N = 512
+            rng = np.random.default_rng(47)
+            xn = rng.integers(-10**9, 10**9, N).astype(np.int32)
+
+            outs = {}
+            for dev in ('cpu', 'metal:0'):
+                lo = wp.array(np.array([2**31 - 1], dtype=np.int32), device=dev)
+                hi = wp.array(np.array([-(2**31)], dtype=np.int32), device=dev)
+                grid = wp.array(np.full((4, 8), 1e38, dtype=np.float32), device=dev)
+                wp.launch(k, dim=N, inputs=[wp.array(xn, device=dev), lo, hi, grid], device=dev)
+                outs[dev] = (lo.numpy(), hi.numpy(), grid.numpy())
+
+            for c, m in zip(outs['cpu'], outs['metal:0']):
+                np.testing.assert_array_equal(c, m)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_atomic_minmax_vec3_components(self):
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(x: wp.array(dtype=wp.vec3), lo: wp.array(dtype=wp.vec3),
+                  hi: wp.array(dtype=wp.vec3)):
+                tid = wp.tid()
+                wp.atomic_min(lo, 0, x[tid])
+                wp.atomic_max(hi, 0, x[tid])
+
+            N = 512
+            rng = np.random.default_rng(53)
+            xn = (rng.standard_normal((N, 3)) * 50.0).astype(np.float32)
+
+            outs = {}
+            for dev in ('cpu', 'metal:0'):
+                lo = wp.array(np.full((1, 3), 1e38, dtype=np.float32), dtype=wp.vec3, device=dev)
+                hi = wp.array(np.full((1, 3), -1e38, dtype=np.float32), dtype=wp.vec3, device=dev)
+                wp.launch(k, dim=N, inputs=[wp.array(xn, dtype=wp.vec3, device=dev), lo, hi], device=dev)
+                outs[dev] = (lo.numpy(), hi.numpy())
+
+            for c, m in zip(outs['cpu'], outs['metal:0']):
+                np.testing.assert_array_equal(c, m)
+            np.testing.assert_allclose(outs['metal:0'][0][0], xn.min(axis=0), rtol=0)
+            np.testing.assert_allclose(outs['metal:0'][1][0], xn.max(axis=0), rtol=0)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+
+@unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
+@unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
 class TestMetalArtifactCache(unittest.TestCase):
     """The on-disk MSL artifact cache must round-trip artifacts exactly and
     degrade to regeneration on any corruption."""

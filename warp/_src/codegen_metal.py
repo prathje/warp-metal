@@ -449,6 +449,9 @@ def _emit_spatial_helpers() -> str:
       Warp's ``wp.spatial_vector(top_vec3, bottom_vec3)`` two-arg
       constructor (used wherever a kernel composes a spatial_vector from
       two vec3s rather than 6 scalars).
+    - ``wp_spatial_cross`` / ``wp_spatial_cross_dual`` port
+      warp/native/spatial.h (top = angular ``w``, bottom = linear ``v``).
+      ``spatial_dot`` needs no helper — it rewrites to ``wp_dot``.
     """
     return (
         "inline float3 wp_spatial_top(wp_vec6_float v) { "
@@ -456,7 +459,21 @@ def _emit_spatial_helpers() -> str:
         "inline float3 wp_spatial_bottom(wp_vec6_float v) { "
         "return float3(v.c[3], v.c[4], v.c[5]); }\n"
         "inline wp_vec6_float wp_vec6_float_make(float3 a, float3 b) { "
-        "return wp_vec6_float_make(a[0], a[1], a[2], b[0], b[1], b[2]); }"
+        "return wp_vec6_float_make(a[0], a[1], a[2], b[0], b[1], b[2]); }\n"
+        "inline wp_vec6_float wp_spatial_cross(wp_vec6_float a, wp_vec6_float b) {\n"
+        "    float3 aw = wp_spatial_top(a); float3 av = wp_spatial_bottom(a);\n"
+        "    float3 bw = wp_spatial_top(b); float3 bv = wp_spatial_bottom(b);\n"
+        "    float3 w = metal::cross(aw, bw);\n"
+        "    float3 v = metal::cross(av, bw) + metal::cross(aw, bv);\n"
+        "    return wp_vec6_float_make(w, v);\n"
+        "}\n"
+        "inline wp_vec6_float wp_spatial_cross_dual(wp_vec6_float a, wp_vec6_float b) {\n"
+        "    float3 aw = wp_spatial_top(a); float3 av = wp_spatial_bottom(a);\n"
+        "    float3 bw = wp_spatial_top(b); float3 bv = wp_spatial_bottom(b);\n"
+        "    float3 w = metal::cross(aw, bw) + metal::cross(av, bv);\n"
+        "    float3 v = metal::cross(aw, bv);\n"
+        "    return wp_vec6_float_make(w, v);\n"
+        "}"
     )
 
 
@@ -951,6 +968,109 @@ _MISC_MATH_HELPERS: dict[str, str] = {
         "inline float2 wp_get_diag(float2x2 m) { return float2(m[0][0], m[1][1]); }\n"
         "inline float3 wp_get_diag(float3x3 m) { return float3(m[0][0], m[1][1], m[2][2]); }\n"
         "inline float4 wp_get_diag(float4x4 m) { return float4(m[0][0], m[1][1], m[2][2], m[3][3]); }"
+    ),
+    # Warp's isfinite/isnan/isinf reduce composite types to one bool:
+    # all components finite / any component nan / any component inf
+    # (see warp/native/vec.h). ``metal::is*`` on a vector returns
+    # ``boolN``, hence the ``metal::all``/``metal::any`` reductions.
+    # Quats are float4 here, so the float4 overload covers them.
+    "wp_isfinite": (
+        "template <typename T>\n"
+        "inline bool wp_isfinite(T x) { return metal::isfinite(x); }\n"
+        "inline bool wp_isfinite(float2 v) { return metal::all(metal::isfinite(v)); }\n"
+        "inline bool wp_isfinite(float3 v) { return metal::all(metal::isfinite(v)); }\n"
+        "inline bool wp_isfinite(float4 v) { return metal::all(metal::isfinite(v)); }\n"
+        "inline bool wp_isfinite(float2x2 m) { return wp_isfinite(m[0]) && wp_isfinite(m[1]); }\n"
+        "inline bool wp_isfinite(float3x3 m) "
+        "{ return wp_isfinite(m[0]) && wp_isfinite(m[1]) && wp_isfinite(m[2]); }\n"
+        "inline bool wp_isfinite(float4x4 m) "
+        "{ return wp_isfinite(m[0]) && wp_isfinite(m[1]) && wp_isfinite(m[2]) && wp_isfinite(m[3]); }"
+    ),
+    "wp_isnan": (
+        "template <typename T>\n"
+        "inline bool wp_isnan(T x) { return metal::isnan(x); }\n"
+        "inline bool wp_isnan(float2 v) { return metal::any(metal::isnan(v)); }\n"
+        "inline bool wp_isnan(float3 v) { return metal::any(metal::isnan(v)); }\n"
+        "inline bool wp_isnan(float4 v) { return metal::any(metal::isnan(v)); }\n"
+        "inline bool wp_isnan(float2x2 m) { return wp_isnan(m[0]) || wp_isnan(m[1]); }\n"
+        "inline bool wp_isnan(float3x3 m) { return wp_isnan(m[0]) || wp_isnan(m[1]) || wp_isnan(m[2]); }\n"
+        "inline bool wp_isnan(float4x4 m) "
+        "{ return wp_isnan(m[0]) || wp_isnan(m[1]) || wp_isnan(m[2]) || wp_isnan(m[3]); }"
+    ),
+    "wp_isinf": (
+        "template <typename T>\n"
+        "inline bool wp_isinf(T x) { return metal::isinf(x); }\n"
+        "inline bool wp_isinf(float2 v) { return metal::any(metal::isinf(v)); }\n"
+        "inline bool wp_isinf(float3 v) { return metal::any(metal::isinf(v)); }\n"
+        "inline bool wp_isinf(float4 v) { return metal::any(metal::isinf(v)); }\n"
+        "inline bool wp_isinf(float2x2 m) { return wp_isinf(m[0]) || wp_isinf(m[1]); }\n"
+        "inline bool wp_isinf(float3x3 m) { return wp_isinf(m[0]) || wp_isinf(m[1]) || wp_isinf(m[2]); }\n"
+        "inline bool wp_isinf(float4x4 m) "
+        "{ return wp_isinf(m[0]) || wp_isinf(m[1]) || wp_isinf(m[2]) || wp_isinf(m[3]); }"
+    ),
+    # MSL's native matNxN constructors take column vectors, so from_cols
+    # is a direct constructor call and from_rows is its transpose.
+    "wp_matrix_from_cols": (
+        "inline float2x2 wp_matrix_from_cols(float2 c0, float2 c1) { return float2x2(c0, c1); }\n"
+        "inline float3x3 wp_matrix_from_cols(float3 c0, float3 c1, float3 c2) { return float3x3(c0, c1, c2); }\n"
+        "inline float4x4 wp_matrix_from_cols(float4 c0, float4 c1, float4 c2, float4 c3) "
+        "{ return float4x4(c0, c1, c2, c3); }"
+    ),
+    "wp_matrix_from_rows": (
+        "inline float2x2 wp_matrix_from_rows(float2 r0, float2 r1) "
+        "{ return metal::transpose(float2x2(r0, r1)); }\n"
+        "inline float3x3 wp_matrix_from_rows(float3 r0, float3 r1, float3 r2) "
+        "{ return metal::transpose(float3x3(r0, r1, r2)); }\n"
+        "inline float4x4 wp_matrix_from_rows(float4 r0, float4 r1, float4 r2, float4 r3) "
+        "{ return metal::transpose(float4x4(r0, r1, r2, r3)); }"
+    ),
+    # Atomic min/max. Int/uint dispatch to MSL's native fetch ops; MSL has
+    # no float overload, so the float versions emulate with a
+    # compare-exchange loop on the bit pattern (same strategy as Warp's
+    # CUDA float atomicMin/Max emulation). Outputs of atomic kernels are
+    # typed ``device atomic<T>*``, so reinterpreting to ``atomic_uint*``
+    # stays within the device address space. Returns the previous value,
+    # matching Warp semantics. The trailing memory_order parameter is
+    # accepted-and-ignored so both emission sites (3-arg raw lines from
+    # the multi-dim AST fold, 2-arg from the intrinsic regex) type-check;
+    # only relaxed ordering is supported on Metal device atomics anyway.
+    "wp_atomic_min": (
+        "template <typename T>\n"
+        "inline T wp_atomic_min(device metal::atomic<T>* p, T v, "
+        "metal::memory_order o = metal::memory_order_relaxed) {\n"
+        "    return atomic_fetch_min_explicit(p, v, metal::memory_order_relaxed);\n"
+        "}\n"
+        "inline float wp_atomic_min(device metal::atomic<float>* p, float v, "
+        "metal::memory_order o = metal::memory_order_relaxed) {\n"
+        "    device atomic_uint* u = (device atomic_uint*)p;\n"
+        "    uint cur = atomic_load_explicit(u, metal::memory_order_relaxed);\n"
+        "    for (;;) {\n"
+        "        float curf = as_type<float>(cur);\n"
+        "        uint newu = as_type<uint>(metal::min(curf, v));\n"
+        "        if (newu == cur) { return curf; }\n"
+        "        if (atomic_compare_exchange_weak_explicit(u, &cur, newu, "
+        "metal::memory_order_relaxed, metal::memory_order_relaxed)) { return curf; }\n"
+        "    }\n"
+        "}"
+    ),
+    "wp_atomic_max": (
+        "template <typename T>\n"
+        "inline T wp_atomic_max(device metal::atomic<T>* p, T v, "
+        "metal::memory_order o = metal::memory_order_relaxed) {\n"
+        "    return atomic_fetch_max_explicit(p, v, metal::memory_order_relaxed);\n"
+        "}\n"
+        "inline float wp_atomic_max(device metal::atomic<float>* p, float v, "
+        "metal::memory_order o = metal::memory_order_relaxed) {\n"
+        "    device atomic_uint* u = (device atomic_uint*)p;\n"
+        "    uint cur = atomic_load_explicit(u, metal::memory_order_relaxed);\n"
+        "    for (;;) {\n"
+        "        float curf = as_type<float>(cur);\n"
+        "        uint newu = as_type<uint>(metal::max(curf, v));\n"
+        "        if (newu == cur) { return curf; }\n"
+        "        if (atomic_compare_exchange_weak_explicit(u, &cur, newu, "
+        "metal::memory_order_relaxed, metal::memory_order_relaxed)) { return curf; }\n"
+        "    }\n"
+        "}"
     ),
     # Matrix inverse — port of warp/native/mat.h ``inverse_impl`` with
     # kEps == 0.0f (a singular matrix returns the zero matrix, matching
@@ -2534,9 +2654,10 @@ _MATH_BUILTIN_NAMES: tuple[str, ...] = (
     "sinh",
     "cosh",
     "tanh",
-    "isfinite",
-    "isnan",
-    "isinf",
+    # NOTE: isfinite/isnan/isinf are NOT listed here — ``metal::isfinite``
+    # on a vector returns ``boolN`` while Warp reduces to a scalar bool
+    # (all-finite / any-nan / any-inf). They dispatch to ``wp_is*``
+    # helpers instead (see ``_MISC_MATH_HELPERS``).
     # Binary
     "min",
     "max",
@@ -2691,13 +2812,18 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         re.compile(r"wp::atomic_sub\s*\(\s*([^,()]+?)\s*,\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)"),
         r"atomic_fetch_sub_explicit(&\1[\2], \3, memory_order_relaxed)",
     ),
+    # min/max dispatch through ``wp_atomic_min``/``wp_atomic_max`` helpers
+    # instead of calling ``atomic_fetch_min/max_explicit`` directly: MSL has
+    # no float overload for those (only int/uint), so the float helper
+    # emulates via a compare-exchange loop on the reinterpreted bits (see
+    # ``_MISC_MATH_HELPERS``). Int/uint dispatch to the native fetch ops.
     (
         re.compile(r"wp::atomic_min\s*\(\s*([^,()]+?)\s*,\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)"),
-        r"atomic_fetch_min_explicit(&\1[\2], \3, memory_order_relaxed)",
+        r"wp_atomic_min(&\1[\2], \3)",
     ),
     (
         re.compile(r"wp::atomic_max\s*\(\s*([^,()]+?)\s*,\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)"),
-        r"atomic_fetch_max_explicit(&\1[\2], \3, memory_order_relaxed)",
+        r"wp_atomic_max(&\1[\2], \3)",
     ),
     # ``wp::diag(vec3)`` builds a 3x3 diagonal matrix. MSL has no native
     # diag-from-vector helper, so we route it through ``wp_diag_float3``
@@ -2733,6 +2859,26 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bwp::quat_from_matrix\s*(?:<[^<>]*>)?"), "wp_quat_from_matrix"),
     (re.compile(r"\bwp::quat_slerp\b"), "wp_quat_slerp"),
     (re.compile(r"\bwp::quat_rpy\b"), "wp_quat_rpy"),
+    # ``isfinite``/``isnan``/``isinf`` reduce vectors/matrices to a scalar
+    # bool in Warp (all-finite / any-nan / any-inf); ``metal::is*`` on a
+    # vector returns ``boolN``, so these go through wp_is* helpers.
+    (re.compile(r"\bwp::isfinite\b"), "wp_isfinite"),
+    (re.compile(r"\bwp::isnan\b"), "wp_isnan"),
+    (re.compile(r"\bwp::isinf\b"), "wp_isinf"),
+    # ``wp.invert`` is bitwise NOT (integer types only).
+    (re.compile(r"wp::invert\s*\(\s*([^()]+?)\s*\)"), r"(~(\1))"),
+    # ``matrix_from_cols``/``matrix_from_rows`` may carry explicit template
+    # args (``<wp::float32>``); strip them — helper overloads are per-size.
+    (re.compile(r"\bwp::matrix_from_cols\s*(?:<[^<>]*>)?"), "wp_matrix_from_cols"),
+    (re.compile(r"\bwp::matrix_from_rows\s*(?:<[^<>]*>)?"), "wp_matrix_from_rows"),
+    # Spatial algebra on ``spatial_vector`` (vec6). ``spatial_dot`` is just
+    # a vec6 dot product, so reuse the wp_dot machinery (which emits big-vec
+    # overloads); cross/cross_dual get helpers next to wp_spatial_top.
+    # ``\b`` after "cross" can't match inside "cross_dual" (``_`` is a word
+    # char), so plain word-boundary patterns are unambiguous here.
+    (re.compile(r"\bwp::spatial_dot\b"), "wp_dot"),
+    (re.compile(r"\bwp::spatial_cross_dual\b"), "wp_spatial_cross_dual"),
+    (re.compile(r"\bwp::spatial_cross\b"), "wp_spatial_cross"),
     # ``wp.quat_identity()`` — a constant; no helper needed. Layout is
     # (x, y, z, w) so identity is w=1.
     (
@@ -4426,7 +4572,9 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
     # gets stripped because the array is also a kernel arg, which the
     # name-substitution pass folds to its bare name later). Detect those
     # too so the output classification picks up the write.
-    raw_atomic_pat = re.compile(r"atomic_fetch_(add|sub|min|max)_explicit\s*\(\s*&\s*(\w+)\[")
+    # min/max raw lines dispatch through the wp_atomic_* helpers (float
+    # emulation — see ``_MISC_MATH_HELPERS``), so match both spellings.
+    raw_atomic_pat = re.compile(r"(?:atomic_fetch_(add|sub|min|max)_explicit|wp_atomic_(min|max))\s*\(\s*&\s*(\w+)\[")
     for raw in forward_lines:
         m = array_store_pat.match(raw)
         if m:
@@ -4449,9 +4597,11 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
             written_arg_names.add(m.group(1))
         m = raw_atomic_pat.search(raw)
         if m:
-            written_arg_names.add(m.group(2))
-            atomic_arg_names.add(m.group(2))
-            atomic_op_kinds.setdefault(m.group(2), set()).add(m.group(1))
+            op_kind = m.group(1) or m.group(2)
+            arr_name = m.group(3)
+            written_arg_names.add(arr_name)
+            atomic_arg_names.add(arr_name)
+            atomic_op_kinds.setdefault(arr_name, set()).add(op_kind)
 
     # MLX's ``atomic_outputs`` flag is per-kernel, not per-output: when set,
     # *every* output is typed ``device atomic<T>*``. We can still support
@@ -5570,6 +5720,7 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
             "    // -- Output init prologue (seed from user wp.array data) --",
             "    if (thread_position_in_threadgroup.y == 0 && thread_position_in_threadgroup.z == 0) {",
             "        int _init_w = (int)thread_position_in_grid.x;",
+            "        int _init_gridx = (int)threads_per_grid.x;",
         ]
         # Compute per-output offsets within the packed buffers (only
         # used when ``use_packed_init_shadows`` is set). Each output's
@@ -5628,17 +5779,21 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
                     )
             else:
                 store_stmt = f"            {out_name}[_init_flat] = {src_expr};"
-            # Bound the seed by the output's actual leading dim: kernels are
-            # often launched with more x-threads than the output has rows
-            # (e.g. ``dim=N`` reductions into a 1-element accumulator), and
-            # an unguarded ``_init_w`` would write past the end of the
-            # buffer.
+            # Grid-stride over the output's leading dim: kernels are often
+            # launched with more x-threads than the output has rows (e.g.
+            # ``dim=N`` reductions into a 1-element accumulator — the loop
+            # bound guards the overrun), but the reverse also happens (an
+            # output with MORE rows than launch threads, e.g. an ``N+1``-slot
+            # accumulator seeded from a ``dim=N`` launch). A plain
+            # ``_init_w < shape[0]`` bound would leave those tail rows at
+            # MLX's zero-fill instead of the user's initial values.
             prologue.extend(
                 [
-                    f"        if (_init_w < (int){out_name}_shape[0]) {{",
                     f"        int _init_stride_{out_name} = {stride_expr};",
+                    f"        for (int _init_row = _init_w; _init_row < (int){out_name}_shape[0]; "
+                    "_init_row += _init_gridx) {",
                     f"        for (int _init_i = 0; _init_i < _init_stride_{out_name}; ++_init_i) {{",
-                    f"            int _init_flat = _init_w * _init_stride_{out_name} + _init_i;",
+                    f"            int _init_flat = _init_row * _init_stride_{out_name} + _init_i;",
                     store_stmt,
                     "        }",
                     "        }",
@@ -6494,6 +6649,10 @@ _NATIVE_BUILTIN_PARAMS = (
     "uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]]",
     "uint3 thread_position_in_threadgroup [[thread_position_in_threadgroup]]",
     "uint thread_index_in_simdgroup [[thread_index_in_simdgroup]]",
+    # Used by the output-init prologue's grid-stride seeding loop. MLX
+    # auto-detects this attribute from the source; the native path must
+    # declare it explicitly.
+    "uint3 threads_per_grid [[threads_per_grid]]",
 )
 
 

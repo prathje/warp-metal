@@ -1460,7 +1460,9 @@ def _inline_walk(
                 If(
                     raw=n.raw,
                     cond=n.cond,
-                    body=tuple(_inline_walk(n.body, fn_map, depth, max_depth, const_ints_out, struct_locals_out, var_types)),
+                    body=tuple(
+                        _inline_walk(n.body, fn_map, depth, max_depth, const_ints_out, struct_locals_out, var_types)
+                    ),
                     raw_open=n.raw_open,
                     raw_close=n.raw_close,
                 )
@@ -1474,7 +1476,9 @@ def _inline_walk(
                     range_var=n.range_var,
                     start=n.start,
                     stop=n.stop,
-                    body=tuple(_inline_walk(n.body, fn_map, depth, max_depth, const_ints_out, struct_locals_out, var_types)),
+                    body=tuple(
+                        _inline_walk(n.body, fn_map, depth, max_depth, const_ints_out, struct_locals_out, var_types)
+                    ),
                     step=n.step,
                 )
             )
@@ -1484,7 +1488,9 @@ def _inline_walk(
                 While(
                     raw=n.raw,
                     label_k=n.label_k,
-                    body=tuple(_inline_walk(n.body, fn_map, depth, max_depth, const_ints_out, struct_locals_out, var_types)),
+                    body=tuple(
+                        _inline_walk(n.body, fn_map, depth, max_depth, const_ints_out, struct_locals_out, var_types)
+                    ),
                 )
             )
             continue
@@ -1492,7 +1498,9 @@ def _inline_walk(
             out.append(
                 _DoWhileZero(
                     raw=n.raw,
-                    body=tuple(_inline_walk(n.body, fn_map, depth, max_depth, const_ints_out, struct_locals_out, var_types)),
+                    body=tuple(
+                        _inline_walk(n.body, fn_map, depth, max_depth, const_ints_out, struct_locals_out, var_types)
+                    ),
                 )
             )
             continue
@@ -1794,11 +1802,7 @@ def _apply_view_rewrites(
         # underlying array name and prepend the leading slice indices —
         # downstream the ``wp::tile_load`` intrinsic regex computes the
         # flat ``base`` offset and ``row_stride`` from the array's shape.
-        if (
-            isinstance(n, Assign)
-            and isinstance(n.expr, Builtin)
-            and n.expr.name == "tile_load"
-        ):
+        if isinstance(n, Assign) and isinstance(n.expr, Builtin) and n.expr.name == "tile_load":
             view_arr_l = _strip_var_prefix(n.expr.args[0]) if n.expr.args else None
             if view_arr_l is not None and view_arr_l in view_aliases:
                 arr_name, lead_idx_labels = view_aliases[view_arr_l]
@@ -1944,8 +1948,13 @@ _ATOMIC_OPS = ("atomic_add", "atomic_sub", "atomic_min", "atomic_max")
 _ATOMIC_TO_MSL = {
     "atomic_add": "atomic_fetch_add_explicit",
     "atomic_sub": "atomic_fetch_sub_explicit",
-    "atomic_min": "atomic_fetch_min_explicit",
-    "atomic_max": "atomic_fetch_max_explicit",
+    # min/max go through the wp_atomic_* helpers in codegen_metal's
+    # ``_MISC_MATH_HELPERS`` — MSL has no float atomic_fetch_min/max, so
+    # the helper emulates via compare-exchange for float and dispatches
+    # to the native fetch op for int/uint. The helpers accept (and
+    # ignore) the trailing memory_order argument these raw lines pass.
+    "atomic_min": "wp_atomic_min",
+    "atomic_max": "wp_atomic_max",
 }
 
 
