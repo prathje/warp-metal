@@ -492,9 +492,9 @@ def _emit_big_mat_struct(name: str, rows: int, cols: int, msl_scalar: str) -> st
         ``mat[i] = vec3`` (set row) and ``vec3 v = mat[i]`` (get row);
         the proxy resolves both.
       * ``_extract`` helper for ``wp::extract(m, r, c)``.
-    No arithmetic operator overloads are emitted: the kernels we currently
-    cover use big mats as struct fields (zero-init, row write, row read),
-    not for matrix algebra.
+      * Arithmetic: ``+``/``-``/scalar ``*``/``/``, ``mat * vec`` /
+        ``vec * mat``, and (square only) ``mat * mat`` — enough for
+        spatial-matrix algebra (``wp.spatial_matrix`` products).
     """
     n = rows * cols
     # Row-vector type. Native ``floatN`` / ``intN`` for cols in 2..4 and
@@ -551,6 +551,79 @@ def _emit_big_mat_struct(name: str, rows: int, cols: int, msl_scalar: str) -> st
         f"inline void wp_mat_elem_store(thread {name}& m, int row, int col, {msl_scalar} v) "
         f"{{ m.c[row * {cols} + col] = v; }}"
     )
+
+    # ---- Arithmetic ----------------------------------------------------
+    # Element-wise binary ops, scalar scale, and matrix products. The vec
+    # operand/result types mirror the row-type selection above: native
+    # ``{msl_scalar}{n}`` for n in 2..4, custom ``wp_vecN_<scalar>`` struct
+    # otherwise (whose components live in ``.c[]``).
+    def _vec_ty(n: int) -> tuple[str, str]:
+        if n in (2, 3, 4) and msl_scalar in _MSL_PREFIX_TO_SAME:
+            return f"{msl_scalar}{n}", "[{k}]"
+        return f"wp_vec{n}_{msl_scalar}", ".c[{k}]"
+
+    col_vec_ty, col_at = _vec_ty(cols)  # operand of mat * vec
+    row_vec_ty, row_at = _vec_ty(rows)  # result of mat * vec
+    for op in ("+", "-"):
+        body.append(f"inline {name} operator{op}({name} a, {name} b) {{")
+        body.append(f"    {name} r;")
+        body.append(f"    for (int i = 0; i < {n}; ++i) r.c[i] = a.c[i] {op} b.c[i];")
+        body.append("    return r;")
+        body.append("}")
+    body.append(f"inline {name} operator-({name} a) {{")
+    body.append(f"    {name} r;")
+    body.append(f"    for (int i = 0; i < {n}; ++i) r.c[i] = -a.c[i];")
+    body.append("    return r;")
+    body.append("}")
+    for lhs, rhs, expr in (
+        (f"{name} a", f"{msl_scalar} s", "a.c[i] * s"),
+        (f"{msl_scalar} s", f"{name} a", "s * a.c[i]"),
+    ):
+        body.append(f"inline {name} operator*({lhs}, {rhs}) {{")
+        body.append(f"    {name} r;")
+        body.append(f"    for (int i = 0; i < {n}; ++i) r.c[i] = {expr};")
+        body.append("    return r;")
+        body.append("}")
+    body.append(f"inline {name} operator/({name} a, {msl_scalar} s) {{")
+    body.append(f"    {name} r;")
+    body.append(f"    for (int i = 0; i < {n}; ++i) r.c[i] = a.c[i] / s;")
+    body.append("    return r;")
+    body.append("}")
+    # mat * vec: (rows x cols) * vecC -> vecR
+    body.append(f"inline {row_vec_ty} operator*({name} m, {col_vec_ty} v) {{")
+    body.append(f"    {row_vec_ty} r;")
+    for i in range(rows):
+        terms = " + ".join(f"m.c[{i * cols + k}] * v{col_at.format(k=k)}" for k in range(cols))
+        body.append(f"    r{row_at.format(k=i)} = {terms};")
+    body.append("    return r;")
+    body.append("}")
+    # vec * mat: vecR * (rows x cols) -> vecC (v^T M)
+    body.append(f"inline {col_vec_ty} operator*({row_vec_ty} v, {name} m) {{")
+    body.append(f"    {col_vec_ty} r;")
+    for j in range(cols):
+        terms = " + ".join(f"v{row_at.format(k=k)} * m.c[{k * cols + j}]" for k in range(rows))
+        body.append(f"    r{col_at.format(k=j)} = {terms};")
+    body.append("    return r;")
+    body.append("}")
+    # Equality / inequality reduce to scalar bool like the big-vec structs
+    # (Warp semantics: ``==`` is all-equal, ``!=`` is any-not-equal).
+    body.append(f"inline bool operator==({name} a, {name} b) {{")
+    body.append(f"    for (int i = 0; i < {n}; ++i) {{ if (a.c[i] != b.c[i]) return false; }}")
+    body.append("    return true;")
+    body.append("}")
+    body.append(f"inline bool operator!=({name} a, {name} b) {{ return !(a == b); }}")
+    if rows == cols:
+        # mat * mat (square — same struct type on both sides).
+        body.append(f"inline {name} operator*({name} a, {name} b) {{")
+        body.append(f"    {name} r;")
+        body.append(f"    for (int i = 0; i < {rows}; ++i)")
+        body.append(f"    for (int j = 0; j < {cols}; ++j) {{")
+        body.append(f"        {msl_scalar} s = ({msl_scalar})0;")
+        body.append(f"        for (int k = 0; k < {cols}; ++k) s += a.c[i * {cols} + k] * b.c[k * {cols} + j];")
+        body.append(f"        r.c[i * {cols} + j] = s;")
+        body.append("    }")
+        body.append("    return r;")
+        body.append("}")
     return "\n".join(body)
 
 
@@ -942,6 +1015,22 @@ inline float4 wp_sample_unit_hypercube(thread uint& state) {
     float c = wp_randf(state) - 0.5f;
     float d = wp_randf(state) - 0.5f;
     return float4(a, b, c, d);
+}
+// Inverse-CDF sampling: one randf draw + binary search (the inlined
+// equivalent of native ``lower_bound<float>(cdf, u)``). The 2-arg call
+// gains its ``(int)<arr>_shape[0]`` length in ``_finalize`` — the shape
+// symbol only exists under the array's final parameter name. Templated
+// on the pointer type: MLX inputs land in device OR constant space.
+template <typename PtrT>
+inline int wp_sample_cdf(thread uint& state, PtrT cdf, int n) {
+    float u = wp_randf(state);
+    int lower = 0;
+    int upper = n - 1;
+    while (lower < upper) {
+        int mid = lower + (upper - lower) / 2;
+        if (cdf[mid] < u) { lower = mid + 1; } else { upper = mid; }
+    }
+    return lower;
 }"""
 
 
@@ -1341,6 +1430,197 @@ inline float3 wp_curlnoise(uint state, float4 xyzt, uint octaves, float lacunari
 }"""
 
 
+# Segment/triangle intersection queries — ports of warp/native/intersect.h.
+# ``wp_closest_point_edge_edge`` transcribes the reference Warp source that
+# generated the native IR (Ericson 5.1.9); ``wp_intersect_tri_tri``
+# transcribes Möller's NoDivTriTriIsect (warp/native/intersect_tri.h) with
+# the C macros unrolled into functions. Dot/cross are written out
+# component-wise in the macro's evaluation order rather than using
+# ``metal::dot``/``cross`` so boundary sign tests match the CPU bit pattern
+# as closely as fast-math contraction allows.
+_INTERSECT_HELPERS = """\
+inline float wp_tt_dot(float3 a, float3 b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+inline float3 wp_tt_cross(float3 a, float3 b) {
+    return float3(a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]);
+}
+inline float3 wp_closest_point_edge_edge(float3 p1, float3 q1, float3 p2, float3 q2, float epsilon) {
+    float3 d1 = q1 - p1;
+    float3 d2 = q2 - p2;
+    float3 r = p1 - p2;
+    float a = wp_tt_dot(d1, d1);
+    float e = wp_tt_dot(d2, d2);
+    float f = wp_tt_dot(d2, r);
+    float s = 0.0f;
+    float t = 0.0f;
+    float dist = metal::length(p2 - p1);
+    if (a <= epsilon && e <= epsilon) {
+        return float3(s, t, dist);
+    }
+    if (a <= epsilon) {
+        s = 0.0f;
+        t = f / e;
+    } else {
+        float c = wp_tt_dot(d1, r);
+        if (e <= epsilon) {
+            s = metal::clamp(-c / a, 0.0f, 1.0f);
+            t = 0.0f;
+        } else {
+            float b = wp_tt_dot(d1, d2);
+            float denom = a * e - b * b;
+            if (denom != 0.0f) { s = metal::clamp((b * f - c * e) / denom, 0.0f, 1.0f); } else { s = 0.0f; }
+            t = (b * s + f) / e;
+            if (t < 0.0f) {
+                t = 0.0f;
+                s = metal::clamp(-c / a, 0.0f, 1.0f);
+            } else if (t > 1.0f) {
+                t = 1.0f;
+                s = metal::clamp((b - c) / a, 0.0f, 1.0f);
+            }
+        }
+    }
+    float3 c1 = p1 + (q1 - p1) * s;
+    float3 c2 = p2 + (q2 - p2) * t;
+    dist = metal::length(c2 - c1);
+    return float3(s, t, dist);
+}
+inline bool wp_tt_edge_edge(float3 V0, float3 U0, float3 U1, int i0, int i1, float Ax, float Ay) {
+    float Bx = U0[i0] - U1[i0];
+    float By = U0[i1] - U1[i1];
+    float Cx = V0[i0] - U0[i0];
+    float Cy = V0[i1] - U0[i1];
+    float f = Ay * Bx - Ax * By;
+    float d = By * Cx - Bx * Cy;
+    if ((f > 0.0f && d >= 0.0f && d <= f) || (f < 0.0f && d <= 0.0f && d >= f)) {
+        float e = Ax * Cy - Ay * Cx;
+        if (f > 0.0f) {
+            if (e >= 0.0f && e <= f) { return true; }
+        } else {
+            if (e <= 0.0f && e >= f) { return true; }
+        }
+    }
+    return false;
+}
+inline bool wp_tt_edge_against_tri(float3 V0, float3 V1, float3 U0, float3 U1, float3 U2, int i0, int i1) {
+    float Ax = V1[i0] - V0[i0];
+    float Ay = V1[i1] - V0[i1];
+    return wp_tt_edge_edge(V0, U0, U1, i0, i1, Ax, Ay) || wp_tt_edge_edge(V0, U1, U2, i0, i1, Ax, Ay) ||
+        wp_tt_edge_edge(V0, U2, U0, i0, i1, Ax, Ay);
+}
+inline bool wp_tt_point_in_tri(float3 V0, float3 U0, float3 U1, float3 U2, int i0, int i1) {
+    float a = U1[i1] - U0[i1];
+    float b = -(U1[i0] - U0[i0]);
+    float c = -a * U0[i0] - b * U0[i1];
+    float d0 = a * V0[i0] + b * V0[i1] + c;
+    a = U2[i1] - U1[i1];
+    b = -(U2[i0] - U1[i0]);
+    c = -a * U1[i0] - b * U1[i1];
+    float d1 = a * V0[i0] + b * V0[i1] + c;
+    a = U0[i1] - U2[i1];
+    b = -(U0[i0] - U2[i0]);
+    c = -a * U2[i0] - b * U2[i1];
+    float d2 = a * V0[i0] + b * V0[i1] + c;
+    return d0 * d1 > 0.0f && d0 * d2 > 0.0f;
+}
+inline int wp_tt_coplanar(float3 N, float3 V0, float3 V1, float3 V2, float3 U0, float3 U1, float3 U2) {
+    float3 A = float3(metal::abs(N[0]), metal::abs(N[1]), metal::abs(N[2]));
+    int i0;
+    int i1;
+    if (A[0] > A[1]) {
+        if (A[0] > A[2]) { i0 = 1; i1 = 2; } else { i0 = 0; i1 = 1; }
+    } else {
+        if (A[2] > A[1]) { i0 = 0; i1 = 1; } else { i0 = 0; i1 = 2; }
+    }
+    if (wp_tt_edge_against_tri(V0, V1, U0, U1, U2, i0, i1)) { return 1; }
+    if (wp_tt_edge_against_tri(V1, V2, U0, U1, U2, i0, i1)) { return 1; }
+    if (wp_tt_edge_against_tri(V2, V0, U0, U1, U2, i0, i1)) { return 1; }
+    if (wp_tt_point_in_tri(V0, U0, U1, U2, i0, i1)) { return 1; }
+    if (wp_tt_point_in_tri(U0, V0, V1, V2, i0, i1)) { return 1; }
+    return 0;
+}
+// Returns true when the triangles are coplanar (caller falls through to the
+// 2-D coplanar test); otherwise fills the projection interval params.
+inline bool wp_tt_intervals(float VV0, float VV1, float VV2, float D0, float D1, float D2, float D0D1, float D0D2,
+    thread float& A, thread float& B, thread float& C, thread float& X0, thread float& X1) {
+    if (D0D1 > 0.0f) {
+        A = VV2; B = (VV0 - VV2) * D2; C = (VV1 - VV2) * D2; X0 = D2 - D0; X1 = D2 - D1;
+    } else if (D0D2 > 0.0f) {
+        A = VV1; B = (VV0 - VV1) * D1; C = (VV2 - VV1) * D1; X0 = D1 - D0; X1 = D1 - D2;
+    } else if (D1 * D2 > 0.0f || D0 != 0.0f) {
+        A = VV0; B = (VV1 - VV0) * D0; C = (VV2 - VV0) * D0; X0 = D0 - D1; X1 = D0 - D2;
+    } else if (D1 != 0.0f) {
+        A = VV1; B = (VV0 - VV1) * D1; C = (VV2 - VV1) * D1; X0 = D1 - D0; X1 = D1 - D2;
+    } else if (D2 != 0.0f) {
+        A = VV2; B = (VV0 - VV2) * D2; C = (VV1 - VV2) * D2; X0 = D2 - D0; X1 = D2 - D1;
+    } else {
+        return true;
+    }
+    return false;
+}
+inline int wp_intersect_tri_tri(float3 V0, float3 V1, float3 V2, float3 U0, float3 U1, float3 U2) {
+    const float EPS = 0.000001f;
+    float3 E1 = V1 - V0;
+    float3 E2 = V2 - V0;
+    float3 N1 = wp_tt_cross(E1, E2);
+    float d1 = -wp_tt_dot(N1, V0);
+    float du0 = wp_tt_dot(N1, U0) + d1;
+    float du1 = wp_tt_dot(N1, U1) + d1;
+    float du2 = wp_tt_dot(N1, U2) + d1;
+    if (metal::abs(du0) < EPS) { du0 = 0.0f; }
+    if (metal::abs(du1) < EPS) { du1 = 0.0f; }
+    if (metal::abs(du2) < EPS) { du2 = 0.0f; }
+    float du0du1 = du0 * du1;
+    float du0du2 = du0 * du2;
+    if (du0du1 > 0.0f && du0du2 > 0.0f) { return 0; }
+    E1 = U1 - U0;
+    E2 = U2 - U0;
+    float3 N2 = wp_tt_cross(E1, E2);
+    float d2 = -wp_tt_dot(N2, U0);
+    float dv0 = wp_tt_dot(N2, V0) + d2;
+    float dv1 = wp_tt_dot(N2, V1) + d2;
+    float dv2 = wp_tt_dot(N2, V2) + d2;
+    if (metal::abs(dv0) < EPS) { dv0 = 0.0f; }
+    if (metal::abs(dv1) < EPS) { dv1 = 0.0f; }
+    if (metal::abs(dv2) < EPS) { dv2 = 0.0f; }
+    float dv0dv1 = dv0 * dv1;
+    float dv0dv2 = dv0 * dv2;
+    if (dv0dv1 > 0.0f && dv0dv2 > 0.0f) { return 0; }
+    float3 D = wp_tt_cross(N1, N2);
+    float max_c = metal::abs(D[0]);
+    int index = 0;
+    float bb = metal::abs(D[1]);
+    float cc = metal::abs(D[2]);
+    if (bb > max_c) { max_c = bb; index = 1; }
+    if (cc > max_c) { max_c = cc; index = 2; }
+    float vp0 = V0[index];
+    float vp1 = V1[index];
+    float vp2 = V2[index];
+    float up0 = U0[index];
+    float up1 = U1[index];
+    float up2 = U2[index];
+    float a, b, c, x0, x1;
+    if (wp_tt_intervals(vp0, vp1, vp2, dv0, dv1, dv2, dv0dv1, dv0dv2, a, b, c, x0, x1)) {
+        return wp_tt_coplanar(N1, V0, V1, V2, U0, U1, U2);
+    }
+    float d, e, f, y0, y1;
+    if (wp_tt_intervals(up0, up1, up2, du0, du1, du2, du0du1, du0du2, d, e, f, y0, y1)) {
+        return wp_tt_coplanar(N1, V0, V1, V2, U0, U1, U2);
+    }
+    float xx = x0 * x1;
+    float yy = y0 * y1;
+    float xxyy = xx * yy;
+    float tmp = a * xxyy;
+    float isect1_0 = tmp + b * x1 * yy;
+    float isect1_1 = tmp + c * x0 * yy;
+    tmp = d * xxyy;
+    float isect2_0 = tmp + e * xx * y1;
+    float isect2_1 = tmp + f * xx * y0;
+    if (isect1_0 > isect1_1) { float sw = isect1_0; isect1_0 = isect1_1; isect1_1 = sw; }
+    if (isect2_0 > isect2_1) { float sw = isect2_0; isect2_0 = isect2_1; isect2_1 = sw; }
+    if (isect1_1 < isect2_0 || isect2_1 < isect1_0) { return 0; }
+    return 1;
+}"""
+
+
 # Interpolation / misc math / small linear-algebra helpers. Each piece is
 # emitted only when the translated source references it (see
 # ``_emit_misc_math_helpers``). Bodies mirror the Warp native
@@ -1422,6 +1702,96 @@ _MISC_MATH_HELPERS: dict[str, str] = {
     # MSL has no cbrt; copysign+pow keeps the sign for negative inputs
     # like C's ``cbrtf`` (plain ``pow`` of a negative base is NaN).
     "wp_cbrt": ("inline float wp_cbrt(float x) { return metal::copysign(metal::pow(metal::abs(x), 1.0f / 3.0f), x); }"),
+    # Warp's ``==`` on vectors/matrices reduces to a scalar bool (ALL
+    # components equal); ``!=`` is ANY-not-equal. MSL comparisons on native
+    # vectors yield boolN and native matrices define no operator== at all.
+    # The generic template is an identity passthrough for scalars and for
+    # our big-vec/big-mat structs (whose operator== already returns a
+    # reduced bool). Each entry is self-contained — a kernel can reference
+    # one without the other.
+    "wp_eq_reduce": (
+        "template <typename T>\n"
+        "inline bool wp_eq_reduce(T a, T b) { return a == b; }\n"
+        "template <typename T, int N>\n"
+        "inline bool wp_eq_reduce(metal::vec<T, N> a, metal::vec<T, N> b) { return metal::all(a == b); }\n"
+        "template <typename T, int C, int R>\n"
+        "inline bool wp_eq_reduce(metal::matrix<T, C, R> a, metal::matrix<T, C, R> b) {\n"
+        "    for (int i = 0; i < C; ++i) { if (!metal::all(a[i] == b[i])) return false; }\n"
+        "    return true;\n"
+        "}"
+    ),
+    "wp_ne_reduce": (
+        "template <typename T>\n"
+        "inline bool wp_ne_reduce(T a, T b) { return a != b; }\n"
+        "template <typename T, int N>\n"
+        "inline bool wp_ne_reduce(metal::vec<T, N> a, metal::vec<T, N> b) { return metal::any(a != b); }\n"
+        "template <typename T, int C, int R>\n"
+        "inline bool wp_ne_reduce(metal::matrix<T, C, R> a, metal::matrix<T, C, R> b) {\n"
+        "    for (int i = 0; i < C; ++i) { if (metal::any(a[i] != b[i])) return true; }\n"
+        "    return false;\n"
+        "}"
+    ),
+    # MSL has no erf family. erfc is Numerical Recipes' rational-Chebyshev
+    # fit (fractional error < 1.2e-7 everywhere); erf uses the Maclaurin
+    # series below |x| < 0.5 (1 - erfc cancels there) and 1 - erfc above.
+    # erfinv is M. Giles' single-precision polynomial (rel. error ~ 1e-6),
+    # the same approximation CUDA's erfinvf implements; CPU-side Warp
+    # evaluates Cephes ndtri in double, so expect only float32-level
+    # agreement (~1e-6 relative), not bit equality. All four keys contain
+    # the substring "wp_erf", so this one entry serves every use site.
+    "wp_erf": (
+        "inline float wp_erfc(float x) {\n"
+        "    float t = 1.0f / (1.0f + 0.5f * metal::abs(x));\n"
+        "    float ans = t * metal::exp(-x * x - 1.26551223f + t * (1.00002368f + t * (0.37409196f +\n"
+        "        t * (0.09678418f + t * (-0.18628806f + t * (0.27886807f + t * (-1.13520398f +\n"
+        "        t * (1.48851587f + t * (-0.82215223f + t * 0.17087277f)))))))));\n"
+        "    return x >= 0.0f ? ans : 2.0f - ans;\n"
+        "}\n"
+        "inline float wp_erf(float x) {\n"
+        "    if (metal::abs(x) < 0.5f) {\n"
+        "        // 2/sqrt(pi) * (x - x^3/3 + x^5/10 - x^7/42 + x^9/216 - x^11/1320 + x^13/9360)\n"
+        "        float x2 = x * x;\n"
+        "        float s = 1.0f + x2 * (-1.0f / 3.0f + x2 * (0.1f + x2 * (-1.0f / 42.0f +\n"
+        "            x2 * (1.0f / 216.0f + x2 * (-1.0f / 1320.0f + x2 * (1.0f / 9360.0f))))));\n"
+        "        return 1.1283791670955126f * x * s;\n"
+        "    }\n"
+        "    return 1.0f - wp_erfc(x);\n"
+        "}\n"
+        "inline float wp_erfinv(float x) {\n"
+        "    if (x <= -1.0f || x >= 1.0f) {\n"
+        "        if (x == 1.0f) return INFINITY;\n"
+        "        if (x == -1.0f) return -INFINITY;\n"
+        "        return NAN;\n"
+        "    }\n"
+        "    float w = -metal::log((1.0f - x) * (1.0f + x));\n"
+        "    float p;\n"
+        "    if (w < 5.0f) {\n"
+        "        w = w - 2.5f;\n"
+        "        p = 2.81022636e-08f;\n"
+        "        p = 3.43273939e-07f + p * w;\n"
+        "        p = -3.5233877e-06f + p * w;\n"
+        "        p = -4.39150654e-06f + p * w;\n"
+        "        p = 0.00021858087f + p * w;\n"
+        "        p = -0.00125372503f + p * w;\n"
+        "        p = -0.00417768164f + p * w;\n"
+        "        p = 0.246640727f + p * w;\n"
+        "        p = 1.50140941f + p * w;\n"
+        "    } else {\n"
+        "        w = metal::sqrt(w) - 3.0f;\n"
+        "        p = -0.000200214257f;\n"
+        "        p = 0.000100950558f + p * w;\n"
+        "        p = 0.00134934322f + p * w;\n"
+        "        p = -0.00367342844f + p * w;\n"
+        "        p = 0.00573950773f + p * w;\n"
+        "        p = -0.0076224613f + p * w;\n"
+        "        p = 0.00943887047f + p * w;\n"
+        "        p = 1.00167406f + p * w;\n"
+        "        p = 2.83297682f + p * w;\n"
+        "    }\n"
+        "    return p * x;\n"
+        "}\n"
+        "inline float wp_erfcinv(float x) { return wp_erfinv(1.0f - x); }"
+    ),
     # Component-wise multiply / divide. The generic template covers
     # vectors (MSL floatN ``*`` is already component-wise, and our
     # big-vec structs overload ``*`` element-wise); native matrix
@@ -2692,6 +3062,13 @@ def _build_kernel_header(source: str) -> str:
         if rows == cols and rows in _MSL_VEC_NATIVE_N:
             continue
         seen_mat.add((rows, cols, scalar))
+    # Big-mat arithmetic (mat * vec / vec * mat) is typed on the big-vec
+    # structs for any non-native row/col count, so those structs must be
+    # emitted even when the kernel body never names them directly.
+    for rows, cols, scalar in seen_mat:
+        for n in (rows, cols):
+            if n not in _MSL_VEC_NATIVE_N:
+                seen_vec.add((n, scalar))
     parts: list[str] = []
     for n, scalar in sorted(seen_vec):
         parts.append(_emit_big_vec_struct(f"wp_vec{n}_{scalar}", n, scalar))
@@ -2723,6 +3100,8 @@ def _build_kernel_header(source: str) -> str:
         parts.append(_NOISE_HELPERS)
     if "wp_svd" in source or "wp_qr3" in source or "wp_eig3" in source:
         parts.append(_SVD_HELPERS)
+    if "wp_closest_point_edge_edge" in source or "wp_intersect_tri_tri" in source:
+        parts.append(_INTERSECT_HELPERS)
     misc_math = _emit_misc_math_helpers(source)
     if misc_math:
         parts.append(misc_math)
@@ -3444,6 +3823,18 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     # ``wp::cbrt`` — MSL has no cbrt; emulate with copysign+pow so
     # negative inputs keep their sign like C's ``cbrtf``.
     (re.compile(r"\bwp::cbrt\b"), "wp_cbrt"),
+    # erf family — MSL has none of these (see the ``wp_erf`` helper entry).
+    # Longest alternatives first so ``erfcinv`` isn't eaten by ``erfc``.
+    (re.compile(r"\bwp::(erfcinv|erfinv|erfc|erf)\b"), r"wp_\1"),
+    # Three-address comparison statements ``x = (a == b);`` — Warp reduces
+    # vector/matrix comparisons to ONE bool (all-equal / any-not-equal);
+    # MSL yields boolN for native vectors and lacks operator== on native
+    # matrices entirely. ``wp_eq_reduce``/``wp_ne_reduce`` overloads carry
+    # the reduction; the scalar instantiation is an identity passthrough.
+    # Operands in three-address IR are plain vars/literals, so the
+    # character class can safely exclude nesting and other comparisons.
+    (re.compile(r"=\s*\(([^()=!<>]+?)\s*==\s*([^()=!<>]+?)\)\s*;"), r"= wp_eq_reduce(\1, \2);"),
+    (re.compile(r"=\s*\(([^()=!<>]+?)\s*!=\s*([^()=!<>]+?)\)\s*;"), r"= wp_ne_reduce(\1, \2);"),
     # Matrix inverse / diagonal extraction — ``wp_inverse`` overloads for
     # float2x2/3x3/4x4 are ports of warp/native/mat.h (kEps == 0.0f, so
     # a singular matrix returns the zero matrix, matching CPU).
@@ -3455,6 +3846,10 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bwp::svd2\b"), "wp_svd2"),
     (re.compile(r"\bwp::qr3\b"), "wp_qr3"),
     (re.compile(r"\bwp::eig3\b"), "wp_eig3"),
+    # Intersection queries — ports of warp/native/intersect.h (see
+    # ``_INTERSECT_HELPERS``).
+    (re.compile(r"\bwp::closest_point_edge_edge\b"), "wp_closest_point_edge_edge"),
+    (re.compile(r"\bwp::intersect_tri_tri\b"), "wp_intersect_tri_tri"),
     # NOTE: ``wp::lower_bound`` is intentionally NOT handled here — its
     # 2-arg form references the array's ``<argname>_shape`` input, which
     # requires the *final* parameter name. It's rewritten inside
@@ -3569,6 +3964,9 @@ _LOWER_BOUND_4ARG_PAT = re.compile(
     r"wp::lower_bound\s*\(\s*([A-Za-z_]\w*)\s*,\s*([^,()]+?)\s*,\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)"
 )
 _LOWER_BOUND_2ARG_PAT = re.compile(r"wp::lower_bound\s*\(\s*([A-Za-z_]\w*)\s*,\s*([^()]+?)\s*\)")
+# ``wp_sample_cdf(state, arr)`` — the 2-arg form left by the generic
+# ``wp::sample_*`` intrinsic rename; ``_finalize`` appends the array length.
+_SAMPLE_CDF_2ARG_PAT = re.compile(r"wp_sample_cdf\s*\(\s*([^,()]+?)\s*,\s*([A-Za-z_]\w*)\s*\)")
 
 
 def _translate_intrinsics(line: str) -> str:
@@ -4717,6 +5115,10 @@ _TID_2D_PAT = re.compile(r"^(?P<indent>\s*)builtin_tid2d\s*\(\s*var_(?P<i>\w+)\s
 _TID_3D_PAT = re.compile(
     r"^(?P<indent>\s*)builtin_tid3d\s*\(\s*var_(?P<i>\w+)\s*,\s*var_(?P<j>\w+)\s*,\s*var_(?P<k>\w+)\s*\)\s*;\s*$"
 )
+_TID_4D_PAT = re.compile(
+    r"^(?P<indent>\s*)builtin_tid4d\s*\(\s*var_(?P<i>\w+)\s*,\s*var_(?P<j>\w+)\s*,\s*"
+    r"var_(?P<k>\w+)\s*,\s*var_(?P<l>\w+)\s*\)\s*;\s*$"
+)
 
 
 def _flat_index_expr(arr_name: str, index_var_names: list[str]) -> str:
@@ -4854,6 +5256,11 @@ class MetalKernelArtifact:
     # have native MSL ``floatN`` equivalents. Empty for kernels that only
     # use native types.
     header: str = ""
+    # ``True`` when the kernel uses 4-D ``wp.tid()``. Metal grids stop at
+    # 3 axes, so the launcher folds launch dims 2 and 3 into grid z and
+    # binds a 1-int ``__tid4_dim3`` input (= ``dim[3]``) that the kernel
+    # uses to decompose ``z`` back into the k/l indices.
+    tid4: bool = False
 
 
 # Match the AST-emitted ``for`` lines so we can flip ``<`` to ``>`` when
@@ -5432,6 +5839,9 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
 
     # --- Local variable declarations -----------------------------------
     body_lines: list[str] = []
+    # Set when the body uses 4-D ``wp.tid()`` — the launcher then folds
+    # launch dims 2 and 3 into grid z and binds ``__tid4_dim3``.
+    uses_tid4 = False
     for var in adj.variables:
         if var.label in subscript_map:
             # This local was a pointer into an array arg; we'll inline its
@@ -5733,6 +6143,10 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
         # which only exists under the array's final parameter name.
         translated = _LOWER_BOUND_4ARG_PAT.sub(r"wp_lower_bound(\1, \2, \3, \4)", translated)
         translated = _LOWER_BOUND_2ARG_PAT.sub(r"wp_lower_bound(\1, 0, (int)\1_shape[0], \2)", translated)
+        # ``wp_sample_cdf(state, arr)`` (already renamed by the generic
+        # sample_* intrinsic pattern) gains the array length here for the
+        # same reason as ``lower_bound`` above.
+        translated = _SAMPLE_CDF_2ARG_PAT.sub(r"wp_sample_cdf(\1, \2, (int)\2_shape[0])", translated)
         # When the kernel uses ``wp.atomic_*`` on any output, MLX makes
         # *every* output ``device atomic<T>*``. Plain reads
         # ``var_X = atomic_arr[idx]`` then fail to compile because MSL
@@ -6011,6 +6425,23 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
             body_lines.append(_finalize(f"{indent}var_{i_label} = (int)thread_position_in_grid.x;"))
             body_lines.append(_finalize(f"{indent}var_{j_label} = (int)thread_position_in_grid.y;"))
             body_lines.append(_finalize(f"{indent}var_{k_label} = (int)thread_position_in_grid.z;"))
+            continue
+        # 4-D tid — Metal grids stop at 3 axes, so the launcher folds the
+        # last two launch dims into grid z (``z = dim[2] * dim[3]``) and
+        # passes ``dim[3]`` in the 1-int ``__tid4_dim3`` buffer for the
+        # decomposition here.
+        m = _TID_4D_PAT.match(raw)
+        if m:
+            uses_tid4 = True
+            indent = m.group("indent")
+            body_lines.append(_finalize(f"{indent}var_{m.group('i')} = (int)thread_position_in_grid.x;"))
+            body_lines.append(_finalize(f"{indent}var_{m.group('j')} = (int)thread_position_in_grid.y;"))
+            body_lines.append(
+                _finalize(f"{indent}var_{m.group('k')} = (int)thread_position_in_grid.z / __tid4_dim3[0];")
+            )
+            body_lines.append(
+                _finalize(f"{indent}var_{m.group('l')} = (int)thread_position_in_grid.z % __tid4_dim3[0];")
+            )
             continue
         # ``wp::__metal_scalar_store__(arr, op, flat_idx, val);`` — synthetic
         # token emitted by ``_preprocess_indexref_writes`` for single-
@@ -6635,6 +7066,8 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
         extra_input_names.append("__init_shadows_ints")
     if _shape_arrs_seen:
         extra_input_names.append("__shapes_packed")
+    if uses_tid4:
+        extra_input_names.append("__tid4_dim3")
 
     header = _build_kernel_header(source)
 
@@ -6658,6 +7091,7 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
         init_shadow_floats=tuple(init_shadow_floats),
         init_shadow_ints=tuple(init_shadow_ints),
         header=header,
+        tid4=uses_tid4,
     )
 
 
@@ -7081,11 +7515,8 @@ def _mat_dtype_info(arg) -> tuple[int, int, str] | None:
     if shape is None or len(shape) != 2 or scalar_cls is None:
         return None
     rows, cols = int(shape[0]), int(shape[1])
-    if rows not in _MSL_VEC_SUPPORTED_N or cols not in _MSL_VEC_SUPPORTED_N:
-        raise MetalCodegenError(
-            f"MSL codegen does not yet support arrays of mat{rows}x{cols} "
-            f"(only sizes 2, 3, 4 per dim have native MSL types)"
-        )
+    if rows < 2 or cols < 2:
+        raise MetalCodegenError(f"MSL codegen does not yet support arrays of mat{rows}x{cols} (need dims >= 2)")
     scalar_ctype = f"wp::{scalar_cls.__name__}"
     if scalar_ctype not in _MSL_VEC_SCALAR_PREFIX:
         raise MetalCodegenError(f"MSL codegen does not yet support arrays of mat_t with element type {scalar_ctype!r}")
@@ -7543,9 +7974,12 @@ def _wrap_msl_for_native_dispatch(artifact) -> str:
     if artifact.init_shadow_ints:
         add_buffer("const constant int* __init_shadows_ints")
 
-    # ``__shapes_packed`` always last among inputs (when present).
+    # ``__shapes_packed`` always last among inputs (when present),
+    # followed only by ``__tid4_dim3`` for 4-D-tid kernels.
     if artifact.shape_packed_arrs:
         add_buffer("const constant int* __shapes_packed")
+    if artifact.tid4:
+        add_buffer("const constant int* __tid4_dim3")
 
     # Outputs.
     for name in artifact.output_names:
@@ -7989,6 +8423,14 @@ def launch_metal_kernel_native(kernel, dim, inputs, outputs, device, block_dim: 
         bindings.append(_alloc_buffer_with_data(packed))
         binding_modes.append(None)
 
+    # 4b) __tid4_dim3 — the trailing launch dim for the grid-z decomposition.
+    if artifact.tid4:
+        launch_dims = (dim,) if isinstance(dim, int) else tuple(dim)
+        if len(launch_dims) != 4:
+            raise RuntimeError(f"Kernel '{kernel.key}' uses 4-D wp.tid() but was launched with dim={dim}")
+        bindings.append(_alloc_buffer_with_data(np.array([launch_dims[3]], dtype=np.int32)))
+        binding_modes.append(None)
+
     # 5) Outputs (bind each output wp.array's MTLBuffer directly — kernel
     #    writes IN PLACE, no fresh allocation).
     #
@@ -8036,6 +8478,10 @@ def launch_metal_kernel_native(kernel, dim, inputs, outputs, device, block_dim: 
         dims = tuple(dim)
     if len(dims) == 0:
         return
+    if len(dims) == 4 and artifact.tid4:
+        # 4-D tid: fold the last two launch dims into grid z; the kernel
+        # decomposes via the ``__tid4_dim3`` input bound above.
+        dims = (dims[0], dims[1], dims[2] * dims[3])
     if len(dims) > 3:
         raise RuntimeError(
             f"Metal backend supports up to 3-D launches; kernel '{kernel.key}' was launched with dim={dim}"
@@ -8403,6 +8849,14 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim: int = 2
                 packed[i * slot + k] = dim_k
         mlx_inputs.append(mx.array(packed, dtype=mx.int32))
 
+    # ``__tid4_dim3`` — the trailing launch dim for 4-D-tid kernels (the
+    # grid folds dims 2 and 3 into z; the kernel decomposes with this).
+    if artifact.tid4:
+        tid4_dims = (dim,) if isinstance(dim, int) else tuple(dim)
+        if len(tid4_dims) != 4:
+            raise RuntimeError(f"Kernel '{kernel.key}' uses 4-D wp.tid() but was launched with dim={dim}")
+        mlx_inputs.append(mx.array(np.array([tid4_dims[3]], dtype=np.int32), dtype=mx.int32))
+
     # ---- Build MLX output specs from user's output wp.arrays ----
     output_shapes: list = []
     output_dtypes: list = []
@@ -8445,6 +8899,10 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim: int = 2
         dims = tuple(dim)
     if len(dims) == 0:
         return
+    if len(dims) == 4 and artifact.tid4:
+        # 4-D tid: fold the last two launch dims into grid z; the kernel
+        # decomposes via the ``__tid4_dim3`` input bound above.
+        dims = (dims[0], dims[1], dims[2] * dims[3])
     if len(dims) > 3:
         raise RuntimeError(
             f"Metal backend supports up to 3-D launches; kernel '{kernel.key}' was launched with dim={dim}"
