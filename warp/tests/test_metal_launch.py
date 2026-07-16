@@ -4763,6 +4763,352 @@ class TestMetalAtomicMinMax(unittest.TestCase):
 
 @unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
 @unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
+class TestMetalComponentAssign(unittest.TestCase):
+    """Indexed element assignment on matrix/vector locals.
+
+    ``m[r, c] = v`` lowers to the 4-arg ``wp::assign_inplace(m, r, c, v)``.
+    A value-group regex that admits commas turns that into the comma
+    expression ``m[r] = c, v`` — which compiles (scalar broadcast onto an
+    MSL matrix column) and silently discards the value. The translation
+    must route through ``wp_mat_elem_store`` (MSL forbids references to
+    vector elements, so it cannot be a reference-returning accessor).
+    """
+
+    def test_component_assign_matches_cpu(self):
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(out: wp.array(dtype=wp.mat33), outv: wp.array(dtype=wp.vec3),
+                  out22: wp.array(dtype=wp.mat22)):
+                i = wp.tid()
+                m = wp.mat33(0.0)
+                m[0, 0] = float(i)
+                m[1, 2] = 5.0
+                m[2, 1] = -3.0
+                m[0, 2] += 2.5   # compound op through read-modify-write
+                m[1, 2] *= 2.0
+                out[i] = m
+                v = wp.vec3()
+                v[0] = float(i) * 2.0
+                v[2] = 7.0
+                outv[i] = v
+                m2 = wp.mat22(1.0)
+                m2[1, 0] = -4.0
+                m2[0, 1] -= float(i)
+                out22[i] = m2
+
+            N = 32
+            outs = {}
+            for dev in ('cpu', 'metal:0'):
+                args = [wp.zeros(N, dtype=wp.mat33, device=dev),
+                        wp.zeros(N, dtype=wp.vec3, device=dev),
+                        wp.zeros(N, dtype=wp.mat22, device=dev)]
+                wp.launch(k, dim=N, inputs=args, device=dev)
+                outs[dev] = [a.numpy() for a in args]
+
+            for c, m in zip(outs['cpu'], outs['metal:0']):
+                np.testing.assert_array_equal(m, c)
+            # Independent ground truth: the write must land at [row, col],
+            # not transposed and not broadcast over a column.
+            np.testing.assert_array_equal(outs['metal:0'][0][:, 1, 2], 10.0)
+            np.testing.assert_array_equal(outs['metal:0'][0][:, 2, 1], -3.0)
+            np.testing.assert_array_equal(outs['metal:0'][0][:, 0, 2], 2.5)
+            np.testing.assert_array_equal(outs['metal:0'][0][:, 0, 0], np.arange(N, dtype=np.float32))
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+
+@unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
+@unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
+class TestMetalStructSupport(unittest.TestCase):
+    """Struct args, arrays of structs, and nested structs.
+
+    Struct storage on Metal is a flat float32 *bitcast* of the ctypes
+    bytes, so int/uint components must round-trip through ``as_type<>``
+    casts — reading an int field as a float value-converts a denormal
+    bit pattern to 0 (the original struct-param bug: an int ``count``
+    field silently read as 0, zeroing every term it multiplied).
+    """
+
+    def test_struct_param_with_int_field(self):
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.struct
+            class Params:
+                scale: float
+                offset: wp.vec3
+                count: int
+
+            @wp.kernel
+            def k(p: Params, x: wp.array(dtype=wp.vec3), out: wp.array(dtype=wp.vec3)):
+                i = wp.tid()
+                out[i] = x[i] * p.scale + p.offset * float(p.count)
+
+            N = 32
+            xn = np.random.default_rng(3).standard_normal((N, 3)).astype(np.float32)
+            outs = {}
+            for dev in ('cpu', 'metal:0'):
+                p = Params()
+                p.scale = 2.5
+                p.offset = wp.vec3(1.0, -2.0, 3.0)
+                p.count = 3
+                x = wp.array(xn, dtype=wp.vec3, device=dev)
+                out = wp.zeros(N, dtype=wp.vec3, device=dev)
+                wp.launch(k, dim=N, inputs=[p, x, out], device=dev)
+                outs[dev] = out.numpy()
+            np.testing.assert_array_equal(outs['metal:0'], outs['cpu'])
+            # The int field must contribute: term is offset * 3, not 0.
+            np.testing.assert_allclose(outs['metal:0'][0], xn[0] * 2.5 + np.array([3.0, -6.0, 9.0]), rtol=1e-6)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_struct_array_roundtrip(self):
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.struct
+            class Item:
+                a: float
+                v: wp.vec3
+                n: int
+
+            @wp.kernel
+            def k(items: wp.array(dtype=Item), out: wp.array(dtype=float)):
+                i = wp.tid()
+                s = Item()
+                s.a = float(i) * 0.5
+                s.v = wp.vec3(float(i), 1.0, -1.0)
+                s.n = i * 1000 + 7
+                items[i] = s
+                t = items[i]
+                out[i] = t.a + t.v[0] * 2.0 + float(t.n)
+
+            N = 32
+            outs = {}
+            for dev in ('cpu', 'metal:0'):
+                items = wp.zeros(N, dtype=Item, device=dev)
+                out = wp.zeros(N, dtype=float, device=dev)
+                wp.launch(k, dim=N, inputs=[items, out], device=dev)
+                outs[dev] = (items.numpy(), out.numpy())
+            for f in outs['cpu'][0].dtype.names:
+                np.testing.assert_array_equal(outs['metal:0'][0][f], outs['cpu'][0][f])
+            np.testing.assert_array_equal(outs['metal:0'][1], outs['cpu'][1])
+            # Bitcast ground truth: the int field must hold i*1000+7 exactly
+            # (a value round-trip through float32 would corrupt large ints).
+            np.testing.assert_array_equal(outs['metal:0'][0]['n'], np.arange(N) * 1000 + 7)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_nested_struct(self):
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.struct
+            class Inner:
+                w: wp.vec2
+                k: float
+
+            @wp.struct
+            class Outer:
+                inner: Inner
+                bias: float
+
+            @wp.kernel
+            def kern(o: Outer, out: wp.array(dtype=float)):
+                i = wp.tid()
+                t = o.inner  # whole nested-struct load into a local
+                out[i] = o.inner.w[0] * o.inner.k + o.inner.w[1] + o.bias * float(i) + t.k
+
+            N = 32
+            outs = {}
+            for dev in ('cpu', 'metal:0'):
+                o = Outer()
+                inner = Inner()
+                inner.w = wp.vec2(3.0, -4.0)
+                inner.k = 2.0
+                o.inner = inner
+                o.bias = 0.25
+                out = wp.zeros(N, dtype=float, device=dev)
+                wp.launch(kern, dim=N, inputs=[o, out], device=dev)
+                outs[dev] = out.numpy()
+            np.testing.assert_array_equal(outs['metal:0'], outs['cpu'])
+            np.testing.assert_allclose(outs['metal:0'][4], 3.0 * 2.0 - 4.0 + 0.25 * 4.0 + 2.0, rtol=1e-6)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+
+@unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
+@unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
+class TestMetalNonSquareMatAndDdot(unittest.TestCase):
+    """Non-square matrices route through row-major ``wp_matRxC`` structs.
+
+    The array load/store paths must NOT use the native column-major
+    ``value[c][r]`` convention for them — that transposes the payload.
+    """
+
+    def test_mat23_and_vec5_roundtrip(self):
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            vec5 = wp.types.vector(length=5, dtype=float)
+            mat23 = wp.types.matrix(shape=(2, 3), dtype=float)
+
+            @wp.kernel
+            def k(out5: wp.array(dtype=vec5), out23: wp.array(dtype=mat23), outf: wp.array(dtype=float)):
+                i = wp.tid()
+                v = vec5(1.0, 2.0, 3.0, 4.0, float(i))
+                out5[i] = v * 2.0
+                m = mat23(1.0, 2.0, 3.0, 4.0, 5.0, float(i))
+                m[0, 1] = 20.0
+                out23[i] = m
+                back = out23[i]  # exercise the big-mat array *load* path
+                outf[i] = wp.length_sq(v) + back[1, 2] + back[0, 1]
+
+            N = 16
+            outs = {}
+            for dev in ('cpu', 'metal:0'):
+                args = [wp.zeros(N, dtype=vec5, device=dev),
+                        wp.zeros(N, dtype=mat23, device=dev),
+                        wp.zeros(N, dtype=float, device=dev)]
+                wp.launch(k, dim=N, inputs=args, device=dev)
+                outs[dev] = [a.numpy() for a in args]
+            for c, m in zip(outs['cpu'], outs['metal:0']):
+                np.testing.assert_array_equal(m, c)
+            # Row-major ground truth: element (1, 0) is 4.0, NOT the
+            # transposed 2.0.
+            np.testing.assert_array_equal(outs['metal:0'][1][:, 1, 0], 4.0)
+            np.testing.assert_array_equal(outs['metal:0'][1][:, 0, 1], 20.0)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_ddot_matches_cpu(self):
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(a: wp.array(dtype=wp.vec3), b: wp.array(dtype=wp.vec3), out: wp.array(dtype=float)):
+                i = wp.tid()
+                m1 = wp.outer(a[i], b[i])
+                out[i] = wp.ddot(m1, wp.transpose(m1)) + wp.trace(m1)
+
+            N = 64
+            rng = np.random.default_rng(11)
+            an = rng.standard_normal((N, 3)).astype(np.float32)
+            bn = rng.standard_normal((N, 3)).astype(np.float32)
+            outs = {}
+            for dev in ('cpu', 'metal:0'):
+                out = wp.zeros(N, dtype=float, device=dev)
+                wp.launch(k, dim=N, inputs=[wp.array(an, dtype=wp.vec3, device=dev),
+                                            wp.array(bn, dtype=wp.vec3, device=dev), out], device=dev)
+                outs[dev] = out.numpy()
+            np.testing.assert_allclose(outs['metal:0'], outs['cpu'], rtol=1e-5, atol=1e-6)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+
+@unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
+@unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
+class TestMetalNoiseAndSampling(unittest.TestCase):
+    """Perlin/curl noise and geometric sampling — ports of noise.h/rand.h.
+
+    The RNG streams are bit-identical to CPU, so outputs must match to
+    float rounding (the noise lattice interpolation may reassociate).
+    """
+
+    def test_sampling_matches_cpu(self):
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(seed: int, outs: wp.array(dtype=wp.vec3), outd: wp.array(dtype=wp.vec2),
+                  outt: wp.array(dtype=wp.vec2), outh: wp.array(dtype=wp.vec3)):
+                i = wp.tid()
+                state = wp.rand_init(seed, i)
+                outs[i] = wp.sample_unit_sphere(state)
+                outd[i] = wp.sample_unit_disk(state)
+                outt[i] = wp.sample_triangle(state)
+                outh[i] = wp.sample_unit_hemisphere(state)
+
+            N = 256
+            res = {}
+            for dev in ('cpu', 'metal:0'):
+                args = [77,
+                        wp.zeros(N, dtype=wp.vec3, device=dev),
+                        wp.zeros(N, dtype=wp.vec2, device=dev),
+                        wp.zeros(N, dtype=wp.vec2, device=dev),
+                        wp.zeros(N, dtype=wp.vec3, device=dev)]
+                wp.launch(k, dim=N, inputs=args, device=dev)
+                res[dev] = [a.numpy() for a in args if isinstance(a, wp.array)]
+            for c, m in zip(res['cpu'], res['metal:0']):
+                np.testing.assert_allclose(m, c, rtol=1e-5, atol=1e-6)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_noise_family_matches_cpu(self):
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(seed: int, xs: wp.array(dtype=wp.vec2), zs: wp.array(dtype=wp.vec3),
+                  o1: wp.array(dtype=float), o2: wp.array(dtype=float),
+                  o3: wp.array(dtype=wp.vec2), o4: wp.array(dtype=float)):
+                i = wp.tid()
+                state = wp.rand_init(seed)
+                p = xs[i]
+                o1[i] = wp.noise(state, p)
+                o2[i] = wp.pnoise(state, p, 4, 4)
+                o3[i] = wp.curlnoise(state, p)
+                o4[i] = wp.noise(state, zs[i])
+
+            N = 256
+            rng = np.random.default_rng(5)
+            xn = rng.uniform(-3, 3, (N, 2)).astype(np.float32)
+            zn = rng.uniform(-3, 3, (N, 3)).astype(np.float32)
+            res = {}
+            for dev in ('cpu', 'metal:0'):
+                args = [5,
+                        wp.array(xn, dtype=wp.vec2, device=dev),
+                        wp.array(zn, dtype=wp.vec3, device=dev),
+                        wp.zeros(N, dtype=float, device=dev),
+                        wp.zeros(N, dtype=float, device=dev),
+                        wp.zeros(N, dtype=wp.vec2, device=dev),
+                        wp.zeros(N, dtype=float, device=dev)]
+                wp.launch(k, dim=N, inputs=args, device=dev)
+                res[dev] = [a.numpy() for a in args if isinstance(a, wp.array)]
+            for c, m in zip(res['cpu'][2:], res['metal:0'][2:]):
+                np.testing.assert_allclose(m, c, rtol=1e-4, atol=1e-5)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+
+@unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
+@unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
 class TestMetalArtifactCache(unittest.TestCase):
     """The on-disk MSL artifact cache must round-trip artifacts exactly and
     degrade to regeneration on any corruption."""

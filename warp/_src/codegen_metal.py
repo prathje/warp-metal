@@ -521,6 +521,10 @@ def _emit_big_mat_struct(name: str, rows: int, cols: int, msl_scalar: str) -> st
     body.append("};")
     body.append(f"struct {proxy} {{")
     body.append(f"    thread {msl_scalar}* p;")
+    # Element subscript so ``m[r][c]`` reads/writes work through the proxy
+    # (the matrix array-store epilogue and chained subscripts rely on it).
+    body.append(f"    inline {msl_scalar} operator[](int j) const thread {{ return p[j]; }}")
+    body.append(f"    inline thread {msl_scalar}& operator[](int j) thread {{ return p[j]; }}")
     body.append(f"    inline operator {row_type}() const thread {{ return {proxy_read}; }}")
     body.append(f"    inline thread {proxy}& operator=({row_type} v) thread {{")
     body.append(f"        {proxy_assign};")
@@ -543,6 +547,10 @@ def _emit_big_mat_struct(name: str, rows: int, cols: int, msl_scalar: str) -> st
     body.append("    return r;")
     body.append("}")
     body.append(f"inline {msl_scalar} wp_mat_extract({name} m, int row, int col) {{ return m.c[row * {cols} + col]; }}")
+    body.append(
+        f"inline void wp_mat_elem_store(thread {name}& m, int row, int col, {msl_scalar} v) "
+        f"{{ m.c[row * {cols} + col] = v; }}"
+    )
     return "\n".join(body)
 
 
@@ -585,6 +593,15 @@ def _emit_native_mat_extract_overloads(source: str) -> str:
     for scalar, rows, cols in sorted(seen):
         parts.append(
             f"inline {scalar} wp_mat_extract({scalar}{rows}x{cols} m, int row, int col) {{ return m[col][row]; }}"
+        )
+        # Writable element access for ``m[r, c] = v`` (4-arg ``assign_inplace``
+        # and friends). Same column-major swap as ``wp_mat_extract``. A
+        # reference-returning helper won't compile — MSL forbids binding a
+        # non-const reference to a vector element — but direct subscript
+        # assignment is legal, so this is a store function.
+        parts.append(
+            f"inline void wp_mat_elem_store(thread {scalar}{rows}x{cols}& m, int row, int col, {scalar} v) "
+            f"{{ m[col][row] = v; }}"
         )
         if needs_slice:
             # Row-slice: extract a vec spanning a row range at a fixed
@@ -865,6 +882,462 @@ inline float wp_randn(thread uint& state) {
     float v = wp_randf(state);
     return metal::sqrt(-2.0f * metal::log(u + 5.96e-8f)) *
            metal::cos(2.0f * 3.14159265358979323846f * v);
+}
+// Geometric sampling — ports of warp/native/rand.h. Like ``wp_randn``,
+// every ``wp_randf`` draw is bound to a named temporary so the draw order
+// matches the native left-to-right evaluation exactly.
+inline float2 wp_sample_triangle(thread uint& state) {
+    float r = metal::sqrt(wp_randf(state));
+    float u = 1.0f - r;
+    float v = wp_randf(state) * r;
+    return float2(u, v);
+}
+inline float2 wp_sample_unit_ring(thread uint& state) {
+    float theta = wp_randf(state, 0.0f, 2.0f * 3.14159265358979323846f);
+    return float2(metal::cos(theta), metal::sin(theta));
+}
+inline float2 wp_sample_unit_disk(thread uint& state) {
+    float r = metal::sqrt(wp_randf(state));
+    float theta = wp_randf(state, 0.0f, 2.0f * 3.14159265358979323846f);
+    return float2(r * metal::cos(theta), r * metal::sin(theta));
+}
+inline float3 wp_sample_unit_sphere_surface(thread uint& state) {
+    float phi = metal::acos(1.0f - 2.0f * wp_randf(state));
+    float theta = wp_randf(state, 0.0f, 2.0f * 3.14159265358979323846f);
+    return float3(metal::cos(theta) * metal::sin(phi), metal::sin(theta) * metal::sin(phi), metal::cos(phi));
+}
+inline float3 wp_sample_unit_sphere(thread uint& state) {
+    float phi = metal::acos(1.0f - 2.0f * wp_randf(state));
+    float theta = wp_randf(state, 0.0f, 2.0f * 3.14159265358979323846f);
+    float r = metal::pow(wp_randf(state), 1.0f / 3.0f);
+    return float3(r * metal::cos(theta) * metal::sin(phi), r * metal::sin(theta) * metal::sin(phi),
+                  r * metal::cos(phi));
+}
+inline float3 wp_sample_unit_hemisphere_surface(thread uint& state) {
+    float phi = metal::acos(1.0f - wp_randf(state));
+    float theta = wp_randf(state, 0.0f, 2.0f * 3.14159265358979323846f);
+    return float3(metal::cos(theta) * metal::sin(phi), metal::sin(theta) * metal::sin(phi), metal::cos(phi));
+}
+inline float3 wp_sample_unit_hemisphere(thread uint& state) {
+    float phi = metal::acos(1.0f - wp_randf(state));
+    float theta = wp_randf(state, 0.0f, 2.0f * 3.14159265358979323846f);
+    float r = metal::pow(wp_randf(state), 1.0f / 3.0f);
+    return float3(r * metal::cos(theta) * metal::sin(phi), r * metal::sin(theta) * metal::sin(phi),
+                  r * metal::cos(phi));
+}
+inline float2 wp_sample_unit_square(thread uint& state) {
+    float x = wp_randf(state) - 0.5f;
+    float y = wp_randf(state) - 0.5f;
+    return float2(x, y);
+}
+inline float3 wp_sample_unit_cube(thread uint& state) {
+    float x = wp_randf(state) - 0.5f;
+    float y = wp_randf(state) - 0.5f;
+    float z = wp_randf(state) - 0.5f;
+    return float3(x, y, z);
+}
+inline float4 wp_sample_unit_hypercube(thread uint& state) {
+    float a = wp_randf(state) - 0.5f;
+    float b = wp_randf(state) - 0.5f;
+    float c = wp_randf(state) - 0.5f;
+    float d = wp_randf(state) - 0.5f;
+    return float4(a, b, c, d);
+}"""
+
+
+# Perlin / curl noise — a bit-faithful port of ``warp/native/noise.h``.
+# The gradient hashes reproduce the native int->uint wraparound arithmetic
+# (including the ``^`` / ``+`` precedence: ``a ^ b ^ (c + state)``), and the
+# per-corner ``wp_randf`` draw order matches native left-to-right evaluation.
+# Emitted only when the kernel references ``wp_noise`` / ``wp_pnoise`` /
+# ``wp_curlnoise`` (which also pulls in ``_RAND_HELPERS``).
+_NOISE_HELPERS = """\
+inline float wp_noise_smootherstep(float t) { return t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f); }
+inline float wp_noise_smootherstep_grad(float t) { return 30.0f * t * t * (t * (t - 2.0f) + 1.0f); }
+inline float wp_noise_interp(float a0, float a1, float t) {
+    return (a1 - a0) * wp_noise_smootherstep(t) + a0;
+}
+template <typename T>
+inline T wp_noise_interp_grad(float a0, float a1, float t, T d_a0, T d_a1, T d_t) {
+    return (d_a1 - d_a0) * wp_noise_smootherstep(t) + (a1 - a0) * wp_noise_smootherstep_grad(t) * d_t + d_a0;
+}
+inline float wp_random_gradient_1d(uint state, int ix) {
+    const uint p1 = 73856093u;
+    uint idx = uint(ix) * p1 + state;
+    return wp_randf(idx, -1.0f, 1.0f);
+}
+inline float2 wp_random_gradient_2d(uint state, int ix, int iy) {
+    const uint p1 = 73856093u;
+    const uint p2 = 19349663u;
+    uint idx = (uint(ix) * p1) ^ (uint(iy) * p2 + state);
+    return metal::normalize(wp_sample_unit_square(idx));
+}
+inline float3 wp_random_gradient_3d(uint state, int ix, int iy, int iz) {
+    const uint p1 = 73856093u;
+    const uint p2 = 19349663u;
+    const uint p3 = 53471161u;
+    uint idx = (uint(ix) * p1) ^ (uint(iy) * p2) ^ (uint(iz) * p3 + state);
+    return metal::normalize(wp_sample_unit_cube(idx));
+}
+inline float4 wp_random_gradient_4d(uint state, int ix, int iy, int iz, int it) {
+    const uint p1 = 73856093u;
+    const uint p2 = 19349663u;
+    const uint p3 = 53471161u;
+    const uint p4 = 10000019u;
+    uint idx = (uint(ix) * p1) ^ (uint(iy) * p2) ^ (uint(iz) * p3) ^ (uint(it) * p4 + state);
+    return metal::normalize(wp_sample_unit_hypercube(idx));
+}
+inline float wp_dot_grid_gradient_1d(uint state, int ix, float dx) {
+    return dx * wp_random_gradient_1d(state, ix);
+}
+inline float wp_dot_grid_gradient_2d(uint state, int ix, int iy, float dx, float dy) {
+    float2 g = wp_random_gradient_2d(state, ix, iy);
+    return dx * g[0] + dy * g[1];
+}
+inline float wp_dot_grid_gradient_3d(uint state, int ix, int iy, int iz, float dx, float dy, float dz) {
+    float3 g = wp_random_gradient_3d(state, ix, iy, iz);
+    return dx * g[0] + dy * g[1] + dz * g[2];
+}
+inline float wp_dot_grid_gradient_4d(uint state, int ix, int iy, int iz, int it,
+                                     float dx, float dy, float dz, float dt) {
+    float4 g = wp_random_gradient_4d(state, ix, iy, iz, it);
+    return dx * g[0] + dy * g[1] + dz * g[2] + dt * g[3];
+}
+inline float wp_noise_1d(uint state, int x0, int x1, float dx) {
+    float v0 = wp_dot_grid_gradient_1d(state, x0, dx);
+    float v1 = wp_dot_grid_gradient_1d(state, x1, dx - 1.0f);
+    return wp_noise_interp(v0, v1, dx);
+}
+inline float wp_noise_2d(uint state, int x0, int y0, int x1, int y1, float dx, float dy) {
+    float v00 = wp_dot_grid_gradient_2d(state, x0, y0, dx, dy);
+    float v10 = wp_dot_grid_gradient_2d(state, x1, y0, dx - 1.0f, dy);
+    float xi0 = wp_noise_interp(v00, v10, dx);
+    float v01 = wp_dot_grid_gradient_2d(state, x0, y1, dx, dy - 1.0f);
+    float v11 = wp_dot_grid_gradient_2d(state, x1, y1, dx - 1.0f, dy - 1.0f);
+    float xi1 = wp_noise_interp(v01, v11, dx);
+    return wp_noise_interp(xi0, xi1, dy);
+}
+inline float wp_noise_3d(uint state, int x0, int y0, int z0, int x1, int y1, int z1,
+                         float dx, float dy, float dz) {
+    float v000 = wp_dot_grid_gradient_3d(state, x0, y0, z0, dx, dy, dz);
+    float v100 = wp_dot_grid_gradient_3d(state, x1, y0, z0, dx - 1.0f, dy, dz);
+    float xi00 = wp_noise_interp(v000, v100, dx);
+    float v010 = wp_dot_grid_gradient_3d(state, x0, y1, z0, dx, dy - 1.0f, dz);
+    float v110 = wp_dot_grid_gradient_3d(state, x1, y1, z0, dx - 1.0f, dy - 1.0f, dz);
+    float xi10 = wp_noise_interp(v010, v110, dx);
+    float yi0 = wp_noise_interp(xi00, xi10, dy);
+    float v001 = wp_dot_grid_gradient_3d(state, x0, y0, z1, dx, dy, dz - 1.0f);
+    float v101 = wp_dot_grid_gradient_3d(state, x1, y0, z1, dx - 1.0f, dy, dz - 1.0f);
+    float xi01 = wp_noise_interp(v001, v101, dx);
+    float v011 = wp_dot_grid_gradient_3d(state, x0, y1, z1, dx, dy - 1.0f, dz - 1.0f);
+    float v111 = wp_dot_grid_gradient_3d(state, x1, y1, z1, dx - 1.0f, dy - 1.0f, dz - 1.0f);
+    float xi11 = wp_noise_interp(v011, v111, dx);
+    float yi1 = wp_noise_interp(xi01, xi11, dy);
+    return wp_noise_interp(yi0, yi1, dz);
+}
+inline float wp_noise_4d(uint state, int x0, int y0, int z0, int t0, int x1, int y1, int z1, int t1,
+                         float dx, float dy, float dz, float dt) {
+    float v0000 = wp_dot_grid_gradient_4d(state, x0, y0, z0, t0, dx, dy, dz, dt);
+    float v1000 = wp_dot_grid_gradient_4d(state, x1, y0, z0, t0, dx - 1.0f, dy, dz, dt);
+    float xi000 = wp_noise_interp(v0000, v1000, dx);
+    float v0100 = wp_dot_grid_gradient_4d(state, x0, y1, z0, t0, dx, dy - 1.0f, dz, dt);
+    float v1100 = wp_dot_grid_gradient_4d(state, x1, y1, z0, t0, dx - 1.0f, dy - 1.0f, dz, dt);
+    float xi100 = wp_noise_interp(v0100, v1100, dx);
+    float yi00 = wp_noise_interp(xi000, xi100, dy);
+    float v0010 = wp_dot_grid_gradient_4d(state, x0, y0, z1, t0, dx, dy, dz - 1.0f, dt);
+    float v1010 = wp_dot_grid_gradient_4d(state, x1, y0, z1, t0, dx - 1.0f, dy, dz - 1.0f, dt);
+    float xi010 = wp_noise_interp(v0010, v1010, dx);
+    float v0110 = wp_dot_grid_gradient_4d(state, x0, y1, z1, t0, dx, dy - 1.0f, dz - 1.0f, dt);
+    float v1110 = wp_dot_grid_gradient_4d(state, x1, y1, z1, t0, dx - 1.0f, dy - 1.0f, dz - 1.0f, dt);
+    float xi110 = wp_noise_interp(v0110, v1110, dx);
+    float yi10 = wp_noise_interp(xi010, xi110, dy);
+    float zi0 = wp_noise_interp(yi00, yi10, dz);
+    float v0001 = wp_dot_grid_gradient_4d(state, x0, y0, z0, t1, dx, dy, dz, dt - 1.0f);
+    float v1001 = wp_dot_grid_gradient_4d(state, x1, y0, z0, t1, dx - 1.0f, dy, dz, dt - 1.0f);
+    float xi001 = wp_noise_interp(v0001, v1001, dx);
+    float v0101 = wp_dot_grid_gradient_4d(state, x0, y1, z0, t1, dx, dy - 1.0f, dz, dt - 1.0f);
+    float v1101 = wp_dot_grid_gradient_4d(state, x1, y1, z0, t1, dx - 1.0f, dy - 1.0f, dz, dt - 1.0f);
+    float xi101 = wp_noise_interp(v0101, v1101, dx);
+    float yi01 = wp_noise_interp(xi001, xi101, dy);
+    float v0011 = wp_dot_grid_gradient_4d(state, x0, y0, z1, t1, dx, dy, dz - 1.0f, dt - 1.0f);
+    float v1011 = wp_dot_grid_gradient_4d(state, x1, y0, z1, t1, dx - 1.0f, dy, dz - 1.0f, dt - 1.0f);
+    float xi011 = wp_noise_interp(v0011, v1011, dx);
+    float v0111 = wp_dot_grid_gradient_4d(state, x0, y1, z1, t1, dx, dy - 1.0f, dz - 1.0f, dt - 1.0f);
+    float v1111 = wp_dot_grid_gradient_4d(state, x1, y1, z1, t1, dx - 1.0f, dy - 1.0f, dz - 1.0f, dt - 1.0f);
+    float xi111 = wp_noise_interp(v0111, v1111, dx);
+    float yi11 = wp_noise_interp(xi011, xi111, dy);
+    float zi1 = wp_noise_interp(yi01, yi11, dz);
+    return wp_noise_interp(zi0, zi1, dt);
+}
+inline float2 wp_noise_2d_gradient(uint state, int x0, int y0, int x1, int y1, float dx, float dy) {
+    float2 d00 = float2(dx, dy);
+    float2 g00 = wp_random_gradient_2d(state, x0, y0);
+    float v00 = metal::dot(d00, g00);
+    float2 d10 = float2(dx - 1.0f, dy);
+    float2 g10 = wp_random_gradient_2d(state, x1, y0);
+    float v10 = metal::dot(d10, g10);
+    float2 d01 = float2(dx, dy - 1.0f);
+    float2 g01 = wp_random_gradient_2d(state, x0, y1);
+    float v01 = metal::dot(d01, g01);
+    float2 d11 = float2(dx - 1.0f, dy - 1.0f);
+    float2 g11 = wp_random_gradient_2d(state, x1, y1);
+    float v11 = metal::dot(d11, g11);
+    float2 dx_dt = float2(1.0f, 0.0f);
+    float xi0 = wp_noise_interp(v00, v10, dx);
+    float2 gxi0 = wp_noise_interp_grad(v00, v10, dx, g00, g10, dx_dt);
+    float xi1 = wp_noise_interp(v01, v11, dx);
+    float2 gxi1 = wp_noise_interp_grad(v01, v11, dx, g01, g11, dx_dt);
+    float2 dy_dt = float2(0.0f, 1.0f);
+    return wp_noise_interp_grad(xi0, xi1, dy, gxi0, gxi1, dy_dt);
+}
+inline float3 wp_noise_3d_gradient(uint state, int x0, int y0, int z0, int x1, int y1, int z1,
+                                   float dx, float dy, float dz) {
+    float3 g000 = wp_random_gradient_3d(state, x0, y0, z0);
+    float v000 = metal::dot(float3(dx, dy, dz), g000);
+    float3 g100 = wp_random_gradient_3d(state, x1, y0, z0);
+    float v100 = metal::dot(float3(dx - 1.0f, dy, dz), g100);
+    float3 g010 = wp_random_gradient_3d(state, x0, y1, z0);
+    float v010 = metal::dot(float3(dx, dy - 1.0f, dz), g010);
+    float3 g110 = wp_random_gradient_3d(state, x1, y1, z0);
+    float v110 = metal::dot(float3(dx - 1.0f, dy - 1.0f, dz), g110);
+    float3 g001 = wp_random_gradient_3d(state, x0, y0, z1);
+    float v001 = metal::dot(float3(dx, dy, dz - 1.0f), g001);
+    float3 g101 = wp_random_gradient_3d(state, x1, y0, z1);
+    float v101 = metal::dot(float3(dx - 1.0f, dy, dz - 1.0f), g101);
+    float3 g011 = wp_random_gradient_3d(state, x0, y1, z1);
+    float v011 = metal::dot(float3(dx, dy - 1.0f, dz - 1.0f), g011);
+    float3 g111 = wp_random_gradient_3d(state, x1, y1, z1);
+    float v111 = metal::dot(float3(dx - 1.0f, dy - 1.0f, dz - 1.0f), g111);
+    float3 dx_dt = float3(1.0f, 0.0f, 0.0f);
+    float xi00 = wp_noise_interp(v000, v100, dx);
+    float3 gxi00 = wp_noise_interp_grad(v000, v100, dx, g000, g100, dx_dt);
+    float xi10 = wp_noise_interp(v010, v110, dx);
+    float3 gxi10 = wp_noise_interp_grad(v010, v110, dx, g010, g110, dx_dt);
+    float xi01 = wp_noise_interp(v001, v101, dx);
+    float3 gxi01 = wp_noise_interp_grad(v001, v101, dx, g001, g101, dx_dt);
+    float xi11 = wp_noise_interp(v011, v111, dx);
+    float3 gxi11 = wp_noise_interp_grad(v011, v111, dx, g011, g111, dx_dt);
+    float3 dy_dt = float3(0.0f, 1.0f, 0.0f);
+    float yi0 = wp_noise_interp(xi00, xi10, dy);
+    float3 gyi0 = wp_noise_interp_grad(xi00, xi10, dy, gxi00, gxi10, dy_dt);
+    float yi1 = wp_noise_interp(xi01, xi11, dy);
+    float3 gyi1 = wp_noise_interp_grad(xi01, xi11, dy, gxi01, gxi11, dy_dt);
+    float3 dz_dt = float3(0.0f, 0.0f, 1.0f);
+    return wp_noise_interp_grad(yi0, yi1, dz, gyi0, gyi1, dz_dt);
+}
+inline float4 wp_noise_4d_gradient(uint state, int x0, int y0, int z0, int t0, int x1, int y1, int z1, int t1,
+                                   float dx, float dy, float dz, float dt) {
+    float4 g0000 = wp_random_gradient_4d(state, x0, y0, z0, t0);
+    float v0000 = metal::dot(float4(dx, dy, dz, dt), g0000);
+    float4 g1000 = wp_random_gradient_4d(state, x1, y0, z0, t0);
+    float v1000 = metal::dot(float4(dx - 1.0f, dy, dz, dt), g1000);
+    float4 g0100 = wp_random_gradient_4d(state, x0, y1, z0, t0);
+    float v0100 = metal::dot(float4(dx, dy - 1.0f, dz, dt), g0100);
+    float4 g1100 = wp_random_gradient_4d(state, x1, y1, z0, t0);
+    float v1100 = metal::dot(float4(dx - 1.0f, dy - 1.0f, dz, dt), g1100);
+    float4 g0010 = wp_random_gradient_4d(state, x0, y0, z1, t0);
+    float v0010 = metal::dot(float4(dx, dy, dz - 1.0f, dt), g0010);
+    float4 g1010 = wp_random_gradient_4d(state, x1, y0, z1, t0);
+    float v1010 = metal::dot(float4(dx - 1.0f, dy, dz - 1.0f, dt), g1010);
+    float4 g0110 = wp_random_gradient_4d(state, x0, y1, z1, t0);
+    float v0110 = metal::dot(float4(dx, dy - 1.0f, dz - 1.0f, dt), g0110);
+    float4 g1110 = wp_random_gradient_4d(state, x1, y1, z1, t0);
+    float v1110 = metal::dot(float4(dx - 1.0f, dy - 1.0f, dz - 1.0f, dt), g1110);
+    float4 g0001 = wp_random_gradient_4d(state, x0, y0, z0, t1);
+    float v0001 = metal::dot(float4(dx, dy, dz, dt - 1.0f), g0001);
+    float4 g1001 = wp_random_gradient_4d(state, x1, y0, z0, t1);
+    float v1001 = metal::dot(float4(dx - 1.0f, dy, dz, dt - 1.0f), g1001);
+    float4 g0101 = wp_random_gradient_4d(state, x0, y1, z0, t1);
+    float v0101 = metal::dot(float4(dx, dy - 1.0f, dz, dt - 1.0f), g0101);
+    float4 g1101 = wp_random_gradient_4d(state, x1, y1, z0, t1);
+    float v1101 = metal::dot(float4(dx - 1.0f, dy - 1.0f, dz, dt - 1.0f), g1101);
+    float4 g0011 = wp_random_gradient_4d(state, x0, y0, z1, t1);
+    float v0011 = metal::dot(float4(dx, dy, dz - 1.0f, dt - 1.0f), g0011);
+    float4 g1011 = wp_random_gradient_4d(state, x1, y0, z1, t1);
+    float v1011 = metal::dot(float4(dx - 1.0f, dy, dz - 1.0f, dt - 1.0f), g1011);
+    float4 g0111 = wp_random_gradient_4d(state, x0, y1, z1, t1);
+    float v0111 = metal::dot(float4(dx, dy - 1.0f, dz - 1.0f, dt - 1.0f), g0111);
+    float4 g1111 = wp_random_gradient_4d(state, x1, y1, z1, t1);
+    float v1111 = metal::dot(float4(dx - 1.0f, dy - 1.0f, dz - 1.0f, dt - 1.0f), g1111);
+    float4 dx_dt = float4(1.0f, 0.0f, 0.0f, 0.0f);
+    float xi000 = wp_noise_interp(v0000, v1000, dx);
+    float4 gxi000 = wp_noise_interp_grad(v0000, v1000, dx, g0000, g1000, dx_dt);
+    float xi100 = wp_noise_interp(v0100, v1100, dx);
+    float4 gxi100 = wp_noise_interp_grad(v0100, v1100, dx, g0100, g1100, dx_dt);
+    float xi010 = wp_noise_interp(v0010, v1010, dx);
+    float4 gxi010 = wp_noise_interp_grad(v0010, v1010, dx, g0010, g1010, dx_dt);
+    float xi110 = wp_noise_interp(v0110, v1110, dx);
+    float4 gxi110 = wp_noise_interp_grad(v0110, v1110, dx, g0110, g1110, dx_dt);
+    float xi001 = wp_noise_interp(v0001, v1001, dx);
+    float4 gxi001 = wp_noise_interp_grad(v0001, v1001, dx, g0001, g1001, dx_dt);
+    float xi101 = wp_noise_interp(v0101, v1101, dx);
+    float4 gxi101 = wp_noise_interp_grad(v0101, v1101, dx, g0101, g1101, dx_dt);
+    float xi011 = wp_noise_interp(v0011, v1011, dx);
+    float4 gxi011 = wp_noise_interp_grad(v0011, v1011, dx, g0011, g1011, dx_dt);
+    float xi111 = wp_noise_interp(v0111, v1111, dx);
+    float4 gxi111 = wp_noise_interp_grad(v0111, v1111, dx, g0111, g1111, dx_dt);
+    float4 dy_dt = float4(0.0f, 1.0f, 0.0f, 0.0f);
+    float yi00 = wp_noise_interp(xi000, xi100, dy);
+    float4 gyi00 = wp_noise_interp_grad(xi000, xi100, dy, gxi000, gxi100, dy_dt);
+    float yi10 = wp_noise_interp(xi010, xi110, dy);
+    float4 gyi10 = wp_noise_interp_grad(xi010, xi110, dy, gxi010, gxi110, dy_dt);
+    float yi01 = wp_noise_interp(xi001, xi101, dy);
+    float4 gyi01 = wp_noise_interp_grad(xi001, xi101, dy, gxi001, gxi101, dy_dt);
+    float yi11 = wp_noise_interp(xi011, xi111, dy);
+    float4 gyi11 = wp_noise_interp_grad(xi011, xi111, dy, gxi011, gxi111, dy_dt);
+    float4 dz_dt = float4(0.0f, 0.0f, 1.0f, 0.0f);
+    float zi0 = wp_noise_interp(yi00, yi10, dz);
+    float4 gzi0 = wp_noise_interp_grad(yi00, yi10, dz, gyi00, gyi10, dz_dt);
+    float zi1 = wp_noise_interp(yi01, yi11, dz);
+    float4 gzi1 = wp_noise_interp_grad(yi01, yi11, dz, gyi01, gyi11, dz_dt);
+    float4 dt_dt = float4(0.0f, 0.0f, 0.0f, 1.0f);
+    return wp_noise_interp_grad(zi0, zi1, dt, gzi0, gzi1, dt_dt);
+}
+inline float wp_noise(uint state, float x) {
+    float dx = x - metal::floor(x);
+    int x0 = (int)metal::floor(x);
+    return wp_noise_1d(state, x0, x0 + 1, dx);
+}
+inline float wp_noise(uint state, float2 xy) {
+    float dx = xy[0] - metal::floor(xy[0]);
+    float dy = xy[1] - metal::floor(xy[1]);
+    int x0 = (int)metal::floor(xy[0]);
+    int y0 = (int)metal::floor(xy[1]);
+    return wp_noise_2d(state, x0, y0, x0 + 1, y0 + 1, dx, dy);
+}
+inline float wp_noise(uint state, float3 xyz) {
+    float dx = xyz[0] - metal::floor(xyz[0]);
+    float dy = xyz[1] - metal::floor(xyz[1]);
+    float dz = xyz[2] - metal::floor(xyz[2]);
+    int x0 = (int)metal::floor(xyz[0]);
+    int y0 = (int)metal::floor(xyz[1]);
+    int z0 = (int)metal::floor(xyz[2]);
+    return wp_noise_3d(state, x0, y0, z0, x0 + 1, y0 + 1, z0 + 1, dx, dy, dz);
+}
+inline float wp_noise(uint state, float4 xyzt) {
+    float dx = xyzt[0] - metal::floor(xyzt[0]);
+    float dy = xyzt[1] - metal::floor(xyzt[1]);
+    float dz = xyzt[2] - metal::floor(xyzt[2]);
+    float dt = xyzt[3] - metal::floor(xyzt[3]);
+    int x0 = (int)metal::floor(xyzt[0]);
+    int y0 = (int)metal::floor(xyzt[1]);
+    int z0 = (int)metal::floor(xyzt[2]);
+    int t0 = (int)metal::floor(xyzt[3]);
+    return wp_noise_4d(state, x0, y0, z0, t0, x0 + 1, y0 + 1, z0 + 1, t0 + 1, dx, dy, dz, dt);
+}
+inline float wp_pnoise(uint state, float x, int px) {
+    float dx = x - metal::floor(x);
+    int x0 = ((int)metal::floor(x)) % px;
+    int x1 = (x0 + 1) % px;
+    return wp_noise_1d(state, x0, x1, dx);
+}
+inline float wp_pnoise(uint state, float2 xy, int px, int py) {
+    float dx = xy[0] - metal::floor(xy[0]);
+    float dy = xy[1] - metal::floor(xy[1]);
+    int x0 = ((int)metal::floor(xy[0])) % px;
+    int y0 = ((int)metal::floor(xy[1])) % py;
+    int x1 = (x0 + 1) % px;
+    int y1 = (y0 + 1) % py;
+    return wp_noise_2d(state, x0, y0, x1, y1, dx, dy);
+}
+inline float wp_pnoise(uint state, float3 xyz, int px, int py, int pz) {
+    float dx = xyz[0] - metal::floor(xyz[0]);
+    float dy = xyz[1] - metal::floor(xyz[1]);
+    float dz = xyz[2] - metal::floor(xyz[2]);
+    int x0 = ((int)metal::floor(xyz[0])) % px;
+    int y0 = ((int)metal::floor(xyz[1])) % py;
+    int z0 = ((int)metal::floor(xyz[2])) % pz;
+    int x1 = (x0 + 1) % px;
+    int y1 = (y0 + 1) % py;
+    int z1 = (z0 + 1) % pz;
+    return wp_noise_3d(state, x0, y0, z0, x1, y1, z1, dx, dy, dz);
+}
+inline float wp_pnoise(uint state, float4 xyzt, int px, int py, int pz, int pt) {
+    float dx = xyzt[0] - metal::floor(xyzt[0]);
+    float dy = xyzt[1] - metal::floor(xyzt[1]);
+    float dz = xyzt[2] - metal::floor(xyzt[2]);
+    float dt = xyzt[3] - metal::floor(xyzt[3]);
+    int x0 = ((int)metal::floor(xyzt[0])) % px;
+    int y0 = ((int)metal::floor(xyzt[1])) % py;
+    int z0 = ((int)metal::floor(xyzt[2])) % pz;
+    int t0 = ((int)metal::floor(xyzt[3])) % pt;
+    int x1 = (x0 + 1) % px;
+    int y1 = (y0 + 1) % py;
+    int z1 = (z0 + 1) % pz;
+    int t1 = (t0 + 1) % pt;
+    return wp_noise_4d(state, x0, y0, z0, t0, x1, y1, z1, t1, dx, dy, dz, dt);
+}
+inline float2 wp_curlnoise(uint state, float2 xy, uint octaves, float lacunarity, float gain) {
+    float2 curl_sum = float2(0.0f);
+    float freq = 1.0f;
+    float amplitude = 1.0f;
+    for (uint i = 0u; i < octaves; i++) {
+        float2 pt = freq * xy;
+        float dx = pt[0] - metal::floor(pt[0]);
+        float dy = pt[1] - metal::floor(pt[1]);
+        int x0 = (int)metal::floor(pt[0]);
+        int y0 = (int)metal::floor(pt[1]);
+        curl_sum += amplitude * wp_noise_2d_gradient(state, x0, y0, x0 + 1, y0 + 1, dx, dy);
+        amplitude *= gain;
+        freq *= lacunarity;
+    }
+    return float2(-curl_sum[1], curl_sum[0]);
+}
+inline float3 wp_curlnoise(uint state, float3 xyz, uint octaves, float lacunarity, float gain) {
+    float3 curl_sum_1 = float3(0.0f);
+    float3 curl_sum_2 = float3(0.0f);
+    float3 curl_sum_3 = float3(0.0f);
+    float freq = 1.0f;
+    float amplitude = 1.0f;
+    for (uint i = 0u; i < octaves; i++) {
+        float3 pt = freq * xyz;
+        float dx = pt[0] - metal::floor(pt[0]);
+        float dy = pt[1] - metal::floor(pt[1]);
+        float dz = pt[2] - metal::floor(pt[2]);
+        int x0 = (int)metal::floor(pt[0]);
+        int y0 = (int)metal::floor(pt[1]);
+        int z0 = (int)metal::floor(pt[2]);
+        float3 gf1 = wp_noise_3d_gradient(state, x0, y0, z0, x0 + 1, y0 + 1, z0 + 1, dx, dy, dz);
+        state = wp_rand_init(int(state), 10019689);
+        float3 gf2 = wp_noise_3d_gradient(state, x0, y0, z0, x0 + 1, y0 + 1, z0 + 1, dx, dy, dz);
+        state = wp_rand_init(int(state), 13112221);
+        float3 gf3 = wp_noise_3d_gradient(state, x0, y0, z0, x0 + 1, y0 + 1, z0 + 1, dx, dy, dz);
+        curl_sum_1 += amplitude * gf1;
+        curl_sum_2 += amplitude * gf2;
+        curl_sum_3 += amplitude * gf3;
+        amplitude *= gain;
+        freq *= lacunarity;
+    }
+    return float3(curl_sum_3[1] - curl_sum_2[2], curl_sum_1[2] - curl_sum_3[0], curl_sum_2[0] - curl_sum_1[1]);
+}
+inline float3 wp_curlnoise(uint state, float4 xyzt, uint octaves, float lacunarity, float gain) {
+    float4 curl_sum_1 = float4(0.0f);
+    float4 curl_sum_2 = float4(0.0f);
+    float4 curl_sum_3 = float4(0.0f);
+    float freq = 1.0f;
+    float amplitude = 1.0f;
+    for (uint i = 0u; i < octaves; i++) {
+        float4 pt = freq * xyzt;
+        float dx = pt[0] - metal::floor(pt[0]);
+        float dy = pt[1] - metal::floor(pt[1]);
+        float dz = pt[2] - metal::floor(pt[2]);
+        float dt = pt[3] - metal::floor(pt[3]);
+        int x0 = (int)metal::floor(pt[0]);
+        int y0 = (int)metal::floor(pt[1]);
+        int z0 = (int)metal::floor(pt[2]);
+        int t0 = (int)metal::floor(pt[3]);
+        float4 gf1 = wp_noise_4d_gradient(state, x0, y0, z0, t0, x0 + 1, y0 + 1, z0 + 1, t0 + 1, dx, dy, dz, dt);
+        state = wp_rand_init(int(state), 10019689);
+        float4 gf2 = wp_noise_4d_gradient(state, x0, y0, z0, t0, x0 + 1, y0 + 1, z0 + 1, t0 + 1, dx, dy, dz, dt);
+        state = wp_rand_init(int(state), 13112221);
+        float4 gf3 = wp_noise_4d_gradient(state, x0, y0, z0, t0, x0 + 1, y0 + 1, z0 + 1, t0 + 1, dx, dy, dz, dt);
+        curl_sum_1 += amplitude * gf1;
+        curl_sum_2 += amplitude * gf2;
+        curl_sum_3 += amplitude * gf3;
+        amplitude *= gain;
+        freq *= lacunarity;
+    }
+    return float3(curl_sum_3[1] - curl_sum_2[2], curl_sum_1[2] - curl_sum_3[0], curl_sum_2[0] - curl_sum_1[1]);
 }"""
 
 
@@ -916,6 +1389,17 @@ _MISC_MATH_HELPERS: dict[str, str] = {
         "inline float wp_trace(float2x2 m) { return m[0][0] + m[1][1]; }\n"
         "inline float wp_trace(float3x3 m) { return m[0][0] + m[1][1] + m[2][2]; }\n"
         "inline float wp_trace(float4x4 m) { return m[0][0] + m[1][1] + m[2][2] + m[3][3]; }"
+    ),
+    # Double-dot (Frobenius inner) product: sum of elementwise products.
+    # Column-pair dots are layout-agnostic since both operands share it.
+    "wp_ddot": (
+        "inline float wp_ddot(float2x2 a, float2x2 b) "
+        "{ return metal::dot(a[0], b[0]) + metal::dot(a[1], b[1]); }\n"
+        "inline float wp_ddot(float3x3 a, float3x3 b) "
+        "{ return metal::dot(a[0], b[0]) + metal::dot(a[1], b[1]) + metal::dot(a[2], b[2]); }\n"
+        "inline float wp_ddot(float4x4 a, float4x4 b) "
+        "{ return metal::dot(a[0], b[0]) + metal::dot(a[1], b[1]) + "
+        "metal::dot(a[2], b[2]) + metal::dot(a[3], b[3]); }"
     ),
     # ``wp.sign(0) == 1`` — do NOT swap in ``metal::sign`` (returns 0 at 0).
     # The uint instantiation's ``x < 0`` is always false, so it returns 1
@@ -2227,8 +2711,16 @@ def _build_kernel_header(source: str) -> str:
         parts.append(_QUAT_HELPERS)
     if "wp_transform_" in source:
         parts.append(_TRANSFORM_HELPERS)
-    if "wp_rand" in source:
+    if (
+        "wp_rand" in source
+        or "wp_sample_" in source
+        or "wp_noise" in source
+        or "wp_pnoise" in source
+        or "wp_curlnoise" in source
+    ):
         parts.append(_RAND_HELPERS)
+    if "wp_noise" in source or "wp_pnoise" in source or "wp_curlnoise" in source:
+        parts.append(_NOISE_HELPERS)
     if "wp_svd" in source or "wp_qr3" in source or "wp_eig3" in source:
         parts.append(_SVD_HELPERS)
     misc_math = _emit_misc_math_helpers(source)
@@ -2445,9 +2937,13 @@ def _rewrite_mat_t_constructor(text: str) -> str:
         if len(args) == 1:
             scalar_arg = args[0]
             if rows == cols and rows in _MSL_VEC_NATIVE_N:
-                # Square native mat: ``floatNxN(scalar)`` is the diagonal-
-                # broadcast form and does fill-from-scalar in MSL when N==M.
-                return f"{msl_scalar}{rows}x{cols}({scalar_arg})"
+                # MSL's single-scalar matrix constructor fills the DIAGONAL
+                # (GLSL semantics); Warp broadcasts to every element. Expand
+                # to an explicit all-columns broadcast — ``mat22(1.0)`` must
+                # be all-ones, not identity. (Indistinguishable at 0.0,
+                # which is why this hid for so long.)
+                vec = f"{msl_scalar}{rows}({scalar_arg})"
+                return f"{msl_scalar}{rows}x{cols}({', '.join([vec] * cols)})"
             # Non-square or big sizes go through the broadcast factory.
             return f"wp_mat{rows}x{cols}_{msl_scalar}_make({scalar_arg})"
         if len(args) != rows * cols:
@@ -2877,6 +3373,7 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     # ``\b`` after "cross" can't match inside "cross_dual" (``_`` is a word
     # char), so plain word-boundary patterns are unambiguous here.
     (re.compile(r"\bwp::spatial_dot\b"), "wp_dot"),
+    (re.compile(r"\bwp::ddot\b"), "wp_ddot"),
     (re.compile(r"\bwp::spatial_cross_dual\b"), "wp_spatial_cross_dual"),
     (re.compile(r"\bwp::spatial_cross\b"), "wp_spatial_cross"),
     # ``wp.quat_identity()`` — a constant; no helper needed. Layout is
@@ -2907,6 +3404,10 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bwp::randu\b"), "wp_randu"),
     (re.compile(r"\bwp::randf\b"), "wp_randf"),
     (re.compile(r"\bwp::randn\b"), "wp_randn"),
+    # Geometric sampling + Perlin/curl noise — ports of rand.h / noise.h
+    # (see ``_RAND_HELPERS`` / ``_NOISE_HELPERS``). One generic rewrite:
+    # every ``wp::sample_*`` / noise name maps to its ``wp_``-prefixed twin.
+    (re.compile(r"\bwp::(sample_\w+|noise|pnoise|curlnoise)\b"), r"wp_\1"),
     # Interpolation / misc math — routed through ``wp_*`` helpers whose
     # bodies match Warp's native implementations (NOT the closest MSL
     # builtin — see ``_MISC_MATH_HELPERS`` for where they differ).
@@ -4760,21 +5261,28 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
                 subscript_map[local_label] = f"{msl_vec_ctor}({', '.join(comps)})"
             elif arr_arg in mat_arr_info:
                 # Mat-typed array: each *element* is ``rows*cols`` consecutive
-                # row-major-stored scalars. Build the column-major MSL
-                # ``floatRxC`` from those scalars (column k = M[*][k]).
+                # row-major-stored scalars. Square native sizes build the
+                # column-major MSL ``floatRxC`` (column k = M[*][k]); other
+                # shapes build the row-major ``wp_matRxC_<scalar>`` struct
+                # via its flat ``_make`` factory (same predicate as
+                # ``_msl_mat_name``).
                 rows, cols, msl_scalar = mat_arr_info[arr_arg]
                 stride = rows * cols
-                msl_vec_type = f"{msl_scalar}{rows}"
-                msl_mat_type = f"{msl_scalar}{rows}x{cols}"
                 if len(index_var_names) == 1:
                     elem_idx = index_var_names[0]
                 else:
                     elem_idx = f"({_flat_index_expr(arr_arg, index_var_names)})"
-                col_strs: list[str] = []
-                for c in range(cols):
-                    col_components = [f"{arr_arg}[{elem_idx} * {stride} + {r * cols + c}]" for r in range(rows)]
-                    col_strs.append(f"{msl_vec_type}({', '.join(col_components)})")
-                subscript_map[local_label] = f"{msl_mat_type}({', '.join(col_strs)})"
+                if rows == cols and rows in _MSL_VEC_NATIVE_N:
+                    msl_vec_type = f"{msl_scalar}{rows}"
+                    msl_mat_type = f"{msl_scalar}{rows}x{cols}"
+                    col_strs: list[str] = []
+                    for c in range(cols):
+                        col_components = [f"{arr_arg}[{elem_idx} * {stride} + {r * cols + c}]" for r in range(rows)]
+                        col_strs.append(f"{msl_vec_type}({', '.join(col_components)})")
+                    subscript_map[local_label] = f"{msl_mat_type}({', '.join(col_strs)})"
+                else:
+                    comps = [f"{arr_arg}[{elem_idx} * {stride} + {i}]" for i in range(stride)]
+                    subscript_map[local_label] = f"wp_mat{rows}x{cols}_{msl_scalar}_make({', '.join(comps)})"
             else:
                 subscript_map[local_label] = f"{arr_arg}[{_flat_index_expr(arr_arg, index_var_names)}]"
 
@@ -4814,11 +5322,31 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
         # clashes with raw Warp local labels (which are integers).
         return f"var_{struct_label}__{field_name}"
 
-    # Struct field pointer pass: handle BOTH ``->`` (struct-array refs) and
-    # ``.`` (struct locals) field addresses. The result is the same shape:
-    # ``subscript_map[field_local]`` gets an expression that's used as the
-    # value when ``wp::load`` reads it, and as the LHS when ``wp::store``
-    # writes through it.
+    # Struct field pointer pass: handle BOTH ``->`` (struct-buffer refs) and
+    # ``.`` (struct locals / struct args) field addresses. The result is the
+    # same shape: ``subscript_map[field_local]`` gets an expression that's
+    # used as the value when ``wp::load`` reads it; buffer-backed writes go
+    # through ``buffer_field_stores`` (per-component, with bitcasts) instead.
+    #
+    # ``struct_ptr_bases`` generalises the old struct-array-only mechanism:
+    # every pointer into flat float32 struct storage — a struct-array
+    # element, a struct arg's nested-struct field, or a deeper chain — maps
+    # to ``(buffer_name, base_offset_expr, layout)``. ``struct_ptr_locals``
+    # does the same for pointers into struct *locals* (which are split into
+    # per-field MSL locals): pointer label -> (local label prefix, layout).
+    struct_ptr_bases: dict[str, tuple[str, str, _StructLayout]] = {}
+    struct_ptr_locals: dict[str, tuple[str, _StructLayout]] = {}
+    # Buffer-backed field pointers that may be written through: pointer
+    # label -> (buffer, base_expr, finfo). Consulted by the store branch.
+    buffer_field_stores: dict[str, tuple[str, str, _StructFieldInfo]] = {}
+    for label, (arr_name, elem_idx_expr) in struct_refs.items():
+        layout = struct_arr_info[arr_name]
+        struct_ptr_bases[label] = (arr_name, f"{elem_idx_expr} * {layout.scalars_per_elem}", layout)
+
+    def _bind_buffer_field(field_local: str, buf: str, base_expr: str, finfo: _StructFieldInfo) -> None:
+        subscript_map[field_local] = _struct_field_read_expr(buf, base_expr, finfo)
+        buffer_field_stores[field_local] = (buf, base_expr, finfo)
+
     struct_field_addr_pat = re.compile(r"^\s*var_(\w+)\s*=\s*&\s*\(\s*var_(\w+)\s*(->|\.)\s*(\w+)\s*\)\s*;\s*$")
     for raw in forward_lines:
         m = struct_field_addr_pat.match(raw)
@@ -4845,6 +5373,11 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
                     # dropped — see the store handling below).
                     unused_field_ptrs.add(field_local)
                     continue
+                if field_info.kind == _STRUCT_FIELD_KIND_STRUCT:
+                    # Pointer to a nested struct inside a local — deeper
+                    # field accesses resolve against the extended prefix.
+                    struct_ptr_locals[field_local] = (f"{struct_local}__{field_name}", field_info.sub)
+                    continue
                 subscript_map[field_local] = _per_field_local(struct_local, field_name)
                 continue
             # Struct-arg field: the launcher serialises the struct into a
@@ -4860,61 +5393,42 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
                 if field_info.kind == _STRUCT_FIELD_KIND_ARRAY_UNUSED:
                     unused_field_ptrs.add(field_local)
                     continue
-                base = str(field_info.offset)
-                if field_info.kind == _STRUCT_FIELD_KIND_SCALAR:
-                    subscript_map[field_local] = f"{struct_local}[{base}]"
-                elif field_info.kind == _STRUCT_FIELD_KIND_VEC:
-                    comps = [f"{struct_local}[{base} + {k}]" for k in range(field_info.size)]
-                    ctor = (
-                        field_info.msl_type if field_info.size in _MSL_VEC_NATIVE_N else f"{field_info.msl_type}_make"
-                    )
-                    subscript_map[field_local] = f"{ctor}({', '.join(comps)})"
-                elif field_info.kind == _STRUCT_FIELD_KIND_MAT:
-                    rows, cols = field_info.rows, field_info.cols
-                    if rows in _MSL_VEC_NATIVE_N and cols in _MSL_VEC_NATIVE_N:
-                        msl_vec = field_info.msl_type.split("x")[0]
-                        col_strs: list[str] = []
-                        for c in range(cols):
-                            col_components = [f"{struct_local}[{base} + {r * cols + c}]" for r in range(rows)]
-                            col_strs.append(f"{msl_vec}({', '.join(col_components)})")
-                        subscript_map[field_local] = f"{field_info.msl_type}({', '.join(col_strs)})"
-                    else:
-                        comps = [f"{struct_local}[{base} + {r * cols + c}]" for r in range(rows) for c in range(cols)]
-                        subscript_map[field_local] = f"{field_info.msl_type}_make({', '.join(comps)})"
+                if field_info.kind == _STRUCT_FIELD_KIND_STRUCT:
+                    struct_ptr_bases[field_local] = (struct_local, str(field_info.offset), field_info.sub)
+                    continue
+                _bind_buffer_field(field_local, struct_local, str(field_info.offset), field_info)
                 continue
             continue
 
-        # accessor == "->": struct-array field, build a flat-buffer expression.
-        if struct_local not in struct_refs:
+        # accessor == "->": field access through a pointer into flat struct
+        # storage (struct-array element / nested-struct chain) or into a
+        # struct local's nested-struct field.
+        if struct_local in struct_ptr_locals:
+            prefix, layout = struct_ptr_locals[struct_local]
+            field_info = layout.fields.get(field_name)
+            if field_info is None:
+                raise MetalCodegenError(f"Kernel {adj.fun_name!r}: struct {layout.name!r} has no field {field_name!r}")
+            if field_info.kind == _STRUCT_FIELD_KIND_ARRAY_UNUSED:
+                unused_field_ptrs.add(field_local)
+                continue
+            if field_info.kind == _STRUCT_FIELD_KIND_STRUCT:
+                struct_ptr_locals[field_local] = (f"{prefix}__{field_name}", field_info.sub)
+                continue
+            subscript_map[field_local] = _per_field_local(prefix, field_name)
             continue
-        arr_name, elem_idx_expr = struct_refs[struct_local]
-        layout = struct_arr_info[arr_name]
+        if struct_local not in struct_ptr_bases:
+            continue
+        buf, base_expr, layout = struct_ptr_bases[struct_local]
         field_info = layout.fields.get(field_name)
         if field_info is None:
             raise MetalCodegenError(f"Kernel {adj.fun_name!r}: struct {layout.name!r} has no field {field_name!r}")
         if field_info.kind == _STRUCT_FIELD_KIND_ARRAY_UNUSED:
             unused_field_ptrs.add(field_local)
             continue
-        base = f"{elem_idx_expr} * {layout.scalars_per_elem} + {field_info.offset}"
-        if field_info.kind == _STRUCT_FIELD_KIND_SCALAR:
-            subscript_map[field_local] = f"{arr_name}[{base}]"
-        elif field_info.kind == _STRUCT_FIELD_KIND_VEC:
-            comps = [f"{arr_name}[({base}) + {k}]" for k in range(field_info.size)]
-            ctor = field_info.msl_type if field_info.size in _MSL_VEC_NATIVE_N else f"{field_info.msl_type}_make"
-            subscript_map[field_local] = f"{ctor}({', '.join(comps)})"
-        elif field_info.kind == _STRUCT_FIELD_KIND_MAT:
-            rows, cols = field_info.rows, field_info.cols
-            if rows in _MSL_VEC_NATIVE_N and cols in _MSL_VEC_NATIVE_N:
-                msl_vec = field_info.msl_type.split("x")[0]  # e.g. "float3" from "float3x3"
-                col_strs: list[str] = []
-                for c in range(cols):
-                    col_components = [f"{arr_name}[({base}) + {r * cols + c}]" for r in range(rows)]
-                    col_strs.append(f"{msl_vec}({', '.join(col_components)})")
-                subscript_map[field_local] = f"{field_info.msl_type}({', '.join(col_strs)})"
-            else:
-                # Big-mat custom struct: row-major flat factory.
-                comps = [f"{arr_name}[({base}) + {r * cols + c}]" for r in range(rows) for c in range(cols)]
-                subscript_map[field_local] = f"{field_info.msl_type}_make({', '.join(comps)})"
+        if field_info.kind == _STRUCT_FIELD_KIND_STRUCT:
+            struct_ptr_bases[field_local] = (buf, f"{base_expr} + {field_info.offset}", field_info.sub)
+            continue
+        _bind_buffer_field(field_local, buf, f"{base_expr} + {field_info.offset}", field_info)
 
     # --- Local variable declarations -----------------------------------
     body_lines: list[str] = []
@@ -4927,21 +5441,20 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
             # Pointer into a struct's array field — not materialised on
             # Metal. Writes are dropped, so the local is unreferenced.
             continue
-        if var.label in struct_refs:
-            # Struct-array pointer local — its ``->field`` accesses go
-            # through ``subscript_map`` and the struct-pointer itself is
-            # never used in code we emit.
+        if var.label in struct_refs or var.label in struct_ptr_bases or var.label in struct_ptr_locals:
+            # Struct-pointer local (array element / nested-struct field) —
+            # its ``->field`` accesses go through ``subscript_map`` and the
+            # struct-pointer itself is never used in code we emit.
             continue
         if var.label in struct_local_layouts:
             # Struct *value* local — emit per-field locals instead, each
             # zero-initialised so default-constructed structs behave as on
             # CPU. The original struct local (var_X with ctype like
             # ``Particle_4b7eabdf``) never appears in our emitted code.
+            # Nested-struct fields recurse into ``__``-joined leaf locals.
             layout = struct_local_layouts[var.label]
-            for field_name, field_info in layout.fields.items():
-                if field_info.kind == _STRUCT_FIELD_KIND_ARRAY_UNUSED:
-                    continue
-                local_name = _per_field_local(var.label, field_name)
+            for field_path, _off, field_info in _iter_scalar_leaves(layout):
+                local_name = _per_field_local(var.label, field_path)
                 # MSL ``T()`` zero-constructs scalar / vec / mat values.
                 # Zero-init form differs by type:
                 #   - Native MSL types (``float``, ``float3``, ``float3x3``,
@@ -4978,10 +5491,8 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
     # didn't catch them).
     for mangled_label in _inlined_struct_locals:
         layout = struct_local_layouts[mangled_label]
-        for field_name, field_info in layout.fields.items():
-            if field_info.kind == _STRUCT_FIELD_KIND_ARRAY_UNUSED:
-                continue
-            local_name = _per_field_local(mangled_label, field_name)
+        for field_path, _off, field_info in _iter_scalar_leaves(layout):
+            local_name = _per_field_local(mangled_label, field_path)
             _zero = (
                 f"{field_info.msl_type}()"
                 if field_info.msl_type.startswith(("wp_mat", "wp_vec"))
@@ -5295,8 +5806,11 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
         # split locals that don't exist in MSL.
         m_struct_copy = re.match(r"^(?P<indent>\s*)var_(\w+)\s*=\s*var_(\w+)\s*;\s*$", raw)
         if m_struct_copy is None:
+            # Also match the raw ``wp::copy`` / ``wp::load`` forms —
+            # ``t = items[i]`` and ``t = o.inner`` lower to ``wp::load``
+            # of a struct pointer.
             m_struct_copy = re.match(
-                r"^(?P<indent>\s*)var_(\w+)\s*=\s*wp::copy\s*\(\s*var_(\w+)\s*\)\s*;\s*$",
+                r"^(?P<indent>\s*)var_(\w+)\s*=\s*wp::(?:copy|load)\s*\(\s*var_(\w+)\s*\)\s*;\s*$",
                 raw,
             )
         if (
@@ -5309,14 +5823,52 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
             src = m_struct_copy.group(3)
             dst_layout = struct_local_layouts[dst]
             src_layout = struct_local_layouts[src]
-            for fname, finfo in dst_layout.fields.items():
-                if finfo.kind == _STRUCT_FIELD_KIND_ARRAY_UNUSED:
-                    continue
-                if fname not in src_layout.fields:
+            src_leaves = {path for path, _off, _fi in _iter_scalar_leaves(src_layout)}
+            for fpath, _off, _finfo in _iter_scalar_leaves(dst_layout):
+                if fpath not in src_leaves:
                     continue  # different layouts; nothing sensible to copy
-                dst_local = _per_field_local(dst, fname)
-                src_local = _per_field_local(src, fname)
+                dst_local = _per_field_local(dst, fpath)
+                src_local = _per_field_local(src, fpath)
                 body_lines.append(f"{indent}{dst_local} = {src_local};")
+            continue
+        # Whole-struct load from flat float32 storage into a struct value
+        # local: ``t = items[i]`` / ``t = o.inner`` lowers to
+        # ``var_X = wp::load(var_ptr);`` where ``var_ptr`` points into a
+        # struct buffer. Expand into one per-leaf-field load (with
+        # ``as_type`` bitcasts for non-float components).
+        if (
+            m_struct_copy
+            and m_struct_copy.group(2) in struct_local_layouts
+            and m_struct_copy.group(3) in struct_ptr_bases
+        ):
+            indent = m_struct_copy.group("indent")
+            dst = m_struct_copy.group(2)
+            buf, base_expr, src_layout = struct_ptr_bases[m_struct_copy.group(3)]
+            dst_layout = struct_local_layouts[dst]
+            dst_leaves = {path for path, _off, _fi in _iter_scalar_leaves(dst_layout)}
+            for fpath, off, finfo in _iter_scalar_leaves(src_layout):
+                if fpath not in dst_leaves:
+                    continue
+                dst_local = _per_field_local(dst, fpath)
+                read = _struct_field_read_expr(buf, f"{base_expr} + {off}", finfo)
+                body_lines.append(_finalize(f"{indent}{dst_local} = {read};"))
+            continue
+        # ``t = l.inner`` where ``l`` is a struct *local*: the source is a
+        # pointer alias into the local's per-field expansion.
+        if (
+            m_struct_copy
+            and m_struct_copy.group(2) in struct_local_layouts
+            and m_struct_copy.group(3) in struct_ptr_locals
+        ):
+            indent = m_struct_copy.group("indent")
+            dst = m_struct_copy.group(2)
+            prefix, src_layout = struct_ptr_locals[m_struct_copy.group(3)]
+            dst_layout = struct_local_layouts[dst]
+            dst_leaves = {path for path, _off, _fi in _iter_scalar_leaves(dst_layout)}
+            for fpath, _off, _finfo in _iter_scalar_leaves(src_layout):
+                if fpath not in dst_leaves:
+                    continue
+                body_lines.append(f"{indent}{_per_field_local(dst, fpath)} = {_per_field_local(prefix, fpath)};")
             continue
         # ``wp::store(addr_var, value);`` — write through a field pointer.
         # We translate by looking up the LHS expression we recorded in
@@ -5339,10 +5891,40 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
         # ``wp_vecN_<scalar>`` struct exposes a writable ``operator[]``,
         # so the translation is direct. Match before the 2-arg form because
         # ``[^()]+?`` for the value would otherwise eat the comma + index.
+        # 4-arg form: ``wp::*_inplace(mat, row, col, val)`` — element-wise
+        # assignment to a matrix local (``m[r, c] op= val``). Must match
+        # BEFORE the 3-arg vec form: its ``[^()]+?`` value group would
+        # otherwise swallow ``col, val`` and emit a comma-expression that
+        # broadcast-assigns the column index and discards the value.
+        # ``wp_mat_elem_store`` overloads (native column-major and big-mat
+        # row-major) are emitted alongside ``wp_mat_extract``. MSL forbids
+        # references to vector elements, so compound ops lower to a
+        # read-modify-write through ``wp_mat_extract``.
+        mat_elem_inplace_pat = re.compile(
+            r"^(?P<indent>\s*)wp::(?P<op>assign_inplace|add_inplace|sub_inplace|"
+            r"mul_inplace|div_inplace)\s*\(\s*var_(?P<mat>\w+)\s*,\s*var_(?P<row>\w+)\s*,\s*"
+            r"var_(?P<col>\w+)\s*,\s*(?P<val>[^(),]+?)\s*\)\s*;\s*$"
+        )
+        m_mat_elem = mat_elem_inplace_pat.match(raw)
+        if m_mat_elem:
+            indent = m_mat_elem.group("indent")
+            op = store_op_map[m_mat_elem.group("op")]
+            mat = m_mat_elem.group("mat")
+            row = m_mat_elem.group("row")
+            col = m_mat_elem.group("col")
+            value = m_mat_elem.group("val")
+            dst = f"var_{mat}, var_{row}, var_{col}"
+            if op == "=":
+                body_lines.append(_finalize(f"{indent}wp_mat_elem_store({dst}, {value});"))
+            else:
+                body_lines.append(
+                    _finalize(f"{indent}wp_mat_elem_store({dst}, wp_mat_extract({dst}) {op[:-1]} ({value}));")
+                )
+            continue
         elem_inplace_pat = re.compile(
             r"^(?P<indent>\s*)wp::(?P<op>assign_inplace|add_inplace|sub_inplace|"
             r"mul_inplace|div_inplace)\s*\(\s*var_(?P<vec>\w+)\s*,\s*var_(?P<idx>\w+)\s*,\s*"
-            r"(?P<val>[^()]+?)\s*\)\s*;\s*$"
+            r"(?P<val>[^(),]+?)\s*\)\s*;\s*$"
         )
         m_elem = elem_inplace_pat.match(raw)
         if m_elem:
@@ -5366,6 +5948,42 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
             if addr in unused_field_ptrs:
                 # Drop the write — the target struct field is an array
                 # field that isn't materialised on Metal.
+                continue
+            if addr in buffer_field_stores:
+                # Write through a pointer into flat float32 struct storage
+                # (struct-array element field / nested-struct-arg field).
+                # Expand per component with ``as_type`` bitcasts for
+                # non-float fields; compound ops read-modify-write through
+                # the field's read expression.
+                buf, base_expr, finfo = buffer_field_stores[addr]
+
+                def _slot_rhs(slot: str, comp_val: str, _op=op, _scalar=finfo.scalar_msl) -> str:
+                    if _op == "=":
+                        return _struct_bitcast_write(comp_val, _scalar)
+                    read = _struct_bitcast_read(slot, _scalar)
+                    return _struct_bitcast_write(f"({read} {_op[:-1]} {comp_val})", _scalar)
+
+                writes: list[str] = []
+                if finfo.kind == _STRUCT_FIELD_KIND_SCALAR:
+                    slot = f"{buf}[{base_expr}]"
+                    writes.append(f"{indent}{slot} = {_slot_rhs(slot, value)};")
+                elif finfo.kind == _STRUCT_FIELD_KIND_VEC:
+                    for k in range(finfo.size):
+                        slot = f"{buf}[({base_expr}) + {k}]"
+                        writes.append(f"{indent}{slot} = {_slot_rhs(slot, f'{value}[{k}]')};")
+                elif finfo.kind == _STRUCT_FIELD_KIND_MAT:
+                    rows, cols = finfo.rows, finfo.cols
+                    native_mat = rows == cols and rows in _MSL_VEC_NATIVE_N
+                    for r in range(rows):
+                        for c in range(cols):
+                            slot = f"{buf}[({base_expr}) + {r * cols + c}]"
+                            comp = f"{value}[{c}][{r}]" if native_mat else f"{value}.c[{r * cols + c}]"
+                            writes.append(f"{indent}{slot} = {_slot_rhs(slot, comp)};")
+                else:
+                    raise MetalCodegenError(
+                        f"Kernel {adj.fun_name!r}: cannot store through struct field {finfo.name!r} ({finfo.kind})"
+                    )
+                body_lines.extend(_finalize(w) for w in writes)
                 continue
             if addr in subscript_map:
                 lhs = subscript_map[addr]
@@ -5467,19 +6085,23 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
                 if arr in mat_arr_info:
                     rows, cols, _ = mat_arr_info[arr]
                     stride = rows * cols
+                    native_mat = rows == cols and rows in _MSL_VEC_NATIVE_N
                     if len(indices) == 1:
                         elem_idx = indices[0]
                     else:
                         elem_idx = f"({_flat_index_expr(arr, indices)})"
                     # Scatter to row-major storage: data[i*RC + r*C + c] =
-                    # logical M[r][c] = MSL ``value[c][r]`` (column, then row).
+                    # logical M[r][c] = MSL ``value[c][r]`` (column, then
+                    # row) for native column-major types; ``value.c[flat]``
+                    # for the row-major ``wp_matRxC`` structs.
                     for r in range(rows):
                         for c in range(cols):
+                            rhs = f"{value}[{c}][{r}]" if native_mat else f"{value}.c[{r * cols + c}]"
                             body_lines.append(
                                 _finalize(
                                     _emit_scalar_write(
                                         f"{elem_idx} * {stride} + {r * cols + c}",
-                                        f"{value}[{c}][{r}]",
+                                        rhs,
                                     )
                                 )
                             )
@@ -5501,16 +6123,24 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
                             "struct local; only stores from struct locals are supported on Metal"
                         )
                     base = f"{elem_idx} * {layout.scalars_per_elem}"
-                    for fname, finfo in layout.fields.items():
-                        src = _per_field_local(val_struct_label, fname)
-                        off = finfo.offset
+                    for fpath, off, finfo in _iter_scalar_leaves(layout):
+                        src = _per_field_local(val_struct_label, fpath)
+                        cast = finfo.scalar_msl
                         if finfo.kind == _STRUCT_FIELD_KIND_SCALAR:
-                            body_lines.append(_finalize(_emit_scalar_write(f"{base} + {off}", src)))
+                            body_lines.append(
+                                _finalize(_emit_scalar_write(f"{base} + {off}", _struct_bitcast_write(src, cast)))
+                            )
                         elif finfo.kind == _STRUCT_FIELD_KIND_VEC:
                             for k in range(finfo.size):
-                                body_lines.append(_finalize(_emit_scalar_write(f"{base} + {off} + {k}", f"{src}[{k}]")))
+                                body_lines.append(
+                                    _finalize(
+                                        _emit_scalar_write(
+                                            f"{base} + {off} + {k}", _struct_bitcast_write(f"{src}[{k}]", cast)
+                                        )
+                                    )
+                                )
                         elif finfo.kind == _STRUCT_FIELD_KIND_MAT:
-                            native = finfo.rows in _MSL_VEC_NATIVE_N and finfo.cols in _MSL_VEC_NATIVE_N
+                            native = finfo.rows == finfo.cols and finfo.rows in _MSL_VEC_NATIVE_N
                             for r in range(finfo.rows):
                                 for c in range(finfo.cols):
                                     rhs = f"{src}[{c}][{r}]" if native else f"{src}.c[{r * finfo.cols + c}]"
@@ -5518,7 +6148,7 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
                                         _finalize(
                                             _emit_scalar_write(
                                                 f"{base} + {off + r * finfo.cols + c}",
-                                                rhs,
+                                                _struct_bitcast_write(rhs, cast),
                                             )
                                         )
                                     )
@@ -6485,6 +7115,7 @@ def _mat_dtype_info(arg) -> tuple[int, int, str] | None:
 _STRUCT_FIELD_KIND_SCALAR = "scalar"
 _STRUCT_FIELD_KIND_VEC = "vec"
 _STRUCT_FIELD_KIND_MAT = "mat"
+_STRUCT_FIELD_KIND_STRUCT = "struct"
 _STRUCT_FIELD_KIND_ARRAY_UNUSED = "array_unused"
 """Sentinel for ``wp.array``-typed struct fields. We allow them to exist in
 the layout (so the struct's other fields can still be read/written) but
@@ -6503,6 +7134,12 @@ class _StructFieldInfo:
     msl_type: str  # MSL name (``float`` / ``float3`` / ``float3x3`` etc.)
     rows: int = 0
     cols: int = 0
+    # MSL scalar of the field's components (``float`` / ``int`` / ``uint``).
+    # The struct buffer is a float32 *bitcast* of the ctypes bytes, so
+    # non-float components round-trip through ``as_type<>`` casts.
+    scalar_msl: str = "float"
+    # Sub-layout for ``_STRUCT_FIELD_KIND_STRUCT`` (nested struct) fields.
+    sub: _StructLayout | None = None
 
 
 @dataclass
@@ -6512,33 +7149,70 @@ class _StructLayout:
     scalars_per_elem: int = 0
 
 
-def _classify_struct_field(fname: str, ftype) -> tuple[str, int, str, int, int]:
-    """Return ``(kind, size_in_scalars, msl_type, rows, cols)`` for a field type."""
+# Struct fields must be 4-byte-per-component so the flat float32 view of
+# the ctypes bytes has one buffer slot per component (no packing/padding
+# surprises). Non-float components round-trip via ``as_type<>`` bitcasts.
+_STRUCT_SCALAR_MSL_4BYTE = ("float", "int", "uint")
+
+
+def _classify_struct_field(fname: str, ftype) -> _StructFieldInfo:
+    """Return a ``_StructFieldInfo`` (offset filled in by the caller) for a field type."""
+    from warp._src.codegen import Struct  # noqa: PLC0415
+
     # vec_t (and quat_t — laid out identically to vec4)
     if getattr(ftype, "_wp_generic_type_str_", None) in ("vec_t", "quat_t", "transform_t"):
         n = int(ftype._length_)
         scalar_cls = ftype._wp_scalar_type_
         scalar_ctype = f"wp::{scalar_cls.__name__}"
-        if n < 2 or scalar_ctype not in _MSL_VEC_SCALAR_PREFIX:
+        msl_scalar = _MSL_VEC_SCALAR_PREFIX.get(scalar_ctype)
+        if n < 2 or msl_scalar not in _STRUCT_SCALAR_MSL_4BYTE:
             raise MetalCodegenError(f"MSL codegen does not support vec field {fname!r} of {ftype!r} in a struct")
-        msl_scalar = _MSL_VEC_SCALAR_PREFIX[scalar_ctype]
-        return _STRUCT_FIELD_KIND_VEC, n, _msl_vec_name(n, msl_scalar), 0, 0
+        return _StructFieldInfo(
+            name=fname,
+            offset=0,
+            size=n,
+            kind=_STRUCT_FIELD_KIND_VEC,
+            msl_type=_msl_vec_name(n, msl_scalar),
+            scalar_msl=msl_scalar,
+        )
     # mat_t
     if getattr(ftype, "_wp_generic_type_str_", None) == "mat_t":
         rows, cols = int(ftype._shape_[0]), int(ftype._shape_[1])
         scalar_cls = ftype._wp_scalar_type_
         scalar_ctype = f"wp::{scalar_cls.__name__}"
-        if rows < 2 or cols < 2 or scalar_ctype not in _MSL_VEC_SCALAR_PREFIX:
+        msl_scalar = _MSL_VEC_SCALAR_PREFIX.get(scalar_ctype)
+        if rows < 2 or cols < 2 or msl_scalar not in _STRUCT_SCALAR_MSL_4BYTE:
             raise MetalCodegenError(f"MSL codegen does not support mat field {fname!r} of {ftype!r} in a struct")
-        msl_scalar = _MSL_VEC_SCALAR_PREFIX[scalar_ctype]
         # Native ``floatNxN`` for sizes in {2, 3, 4} per dim; otherwise the
         # custom ``wp_matRxC_<scalar>`` struct (header-emitted big-mat).
-        return _STRUCT_FIELD_KIND_MAT, rows * cols, _msl_mat_name(rows, cols, msl_scalar), rows, cols
+        return _StructFieldInfo(
+            name=fname,
+            offset=0,
+            size=rows * cols,
+            kind=_STRUCT_FIELD_KIND_MAT,
+            msl_type=_msl_mat_name(rows, cols, msl_scalar),
+            rows=rows,
+            cols=cols,
+            scalar_msl=msl_scalar,
+        )
+    # Nested struct — recurse. All leaves are 4-byte components, and ctypes
+    # natural alignment of an all-4-byte struct is 4, so the flat scalar
+    # offsets line up with the parent's packing.
+    if isinstance(ftype, Struct):
+        sub = _struct_layout_for(ftype)
+        return _StructFieldInfo(
+            name=fname,
+            offset=0,
+            size=sub.scalars_per_elem,
+            kind=_STRUCT_FIELD_KIND_STRUCT,
+            msl_type=f"<struct {sub.name}>",
+            sub=sub,
+        )
     # array (1D, 2D, ..., any dtype) — tag as unused. Only kernels that
     # never actually read/write the field will codegen successfully; if
     # the field is touched, the field-pointer pass raises a clear error.
     if _is_array_arg_type(ftype):
-        return _STRUCT_FIELD_KIND_ARRAY_UNUSED, 0, "<array>", 0, 0
+        return _StructFieldInfo(name=fname, offset=0, size=0, kind=_STRUCT_FIELD_KIND_ARRAY_UNUSED, msl_type="<array>")
     # Scalar
     name = getattr(ftype, "__name__", None)
     if name is None:
@@ -6546,12 +7220,18 @@ def _classify_struct_field(fname: str, ftype) -> tuple[str, int, str, int, int]:
     scalar_ctype = f"wp::{name}"
     if scalar_ctype == "wp::float64":
         raise MetalCodegenError(f"MSL codegen: struct field {fname!r} is float64 — MSL has no fp64")
-    if scalar_ctype not in _SCALAR_CTYPE_TO_MSL:
+    msl = _SCALAR_CTYPE_TO_MSL.get(scalar_ctype)
+    if msl is None:
         raise MetalCodegenError(
             f"MSL codegen does not yet support struct field {fname!r} of type {ftype!r} "
             f"(no MSL scalar mapping for {scalar_ctype})"
         )
-    return _STRUCT_FIELD_KIND_SCALAR, 1, _SCALAR_CTYPE_TO_MSL[scalar_ctype], 0, 0
+    if msl not in _STRUCT_SCALAR_MSL_4BYTE:
+        raise MetalCodegenError(
+            f"MSL codegen: struct field {fname!r} of type {ftype!r} is not 4 bytes — struct "
+            f"buffers are flat float32 bitcasts, so only float32/int32/uint32 components are supported"
+        )
+    return _StructFieldInfo(name=fname, offset=0, size=1, kind=_STRUCT_FIELD_KIND_SCALAR, msl_type=msl, scalar_msl=msl)
 
 
 def _struct_layout_for(struct_cls) -> _StructLayout:
@@ -6559,13 +7239,72 @@ def _struct_layout_for(struct_cls) -> _StructLayout:
     layout = _StructLayout(name=getattr(struct_cls, "key", "anonymous_struct"))
     offset = 0
     for fname, fvar in getattr(struct_cls, "vars", {}).items():
-        kind, size, msl_type, rows, cols = _classify_struct_field(fname, fvar.type)
-        layout.fields[fname] = _StructFieldInfo(
-            name=fname, offset=offset, size=size, kind=kind, msl_type=msl_type, rows=rows, cols=cols
-        )
-        offset += size
+        finfo = _classify_struct_field(fname, fvar.type)
+        finfo.offset = offset
+        layout.fields[fname] = finfo
+        offset += finfo.size
     layout.scalars_per_elem = offset
     return layout
+
+
+def _iter_scalar_leaves(layout: _StructLayout, prefix: str = "", base: int = 0):
+    """Yield ``(path, abs_offset, finfo)`` for every non-struct leaf field.
+
+    ``path`` uses ``__`` separators (matching ``_per_field_local`` naming,
+    e.g. ``inner__w``); ``abs_offset`` is the leaf's scalar offset from the
+    start of the outermost struct. Array-typed fields are skipped.
+    """
+    for fname, finfo in layout.fields.items():
+        path = f"{prefix}{fname}"
+        if finfo.kind == _STRUCT_FIELD_KIND_STRUCT:
+            yield from _iter_scalar_leaves(finfo.sub, prefix=f"{path}__", base=base + finfo.offset)
+        elif finfo.kind != _STRUCT_FIELD_KIND_ARRAY_UNUSED:
+            yield path, base + finfo.offset, finfo
+
+
+def _struct_bitcast_read(expr: str, scalar_msl: str) -> str:
+    """Wrap a float-buffer slot read so non-float components bit-decode."""
+    if scalar_msl == "float":
+        return expr
+    return f"as_type<{scalar_msl}>({expr})"
+
+
+def _struct_bitcast_write(expr: str, scalar_msl: str) -> str:
+    """Wrap a component value so it bit-encodes into the float buffer."""
+    if scalar_msl == "float":
+        return expr
+    return f"as_type<float>({expr})"
+
+
+def _struct_field_read_expr(buf: str, base_expr: str, finfo: _StructFieldInfo) -> str:
+    """Build the MSL rvalue reading leaf field ``finfo`` from flat float32
+    storage ``buf`` at scalar offset ``base_expr`` (the field's absolute
+    offset already folded in by the caller)."""
+    if finfo.kind == _STRUCT_FIELD_KIND_SCALAR:
+        return _struct_bitcast_read(f"{buf}[{base_expr}]", finfo.scalar_msl)
+    if finfo.kind == _STRUCT_FIELD_KIND_VEC:
+        comps = [_struct_bitcast_read(f"{buf}[({base_expr}) + {k}]", finfo.scalar_msl) for k in range(finfo.size)]
+        ctor = finfo.msl_type if finfo.size in _MSL_VEC_NATIVE_N else f"{finfo.msl_type}_make"
+        return f"{ctor}({', '.join(comps)})"
+    if finfo.kind == _STRUCT_FIELD_KIND_MAT:
+        rows, cols = finfo.rows, finfo.cols
+        if rows == cols and rows in _MSL_VEC_NATIVE_N:
+            msl_vec = finfo.msl_type.split("x")[0]
+            col_strs = []
+            for c in range(cols):
+                col_components = [
+                    _struct_bitcast_read(f"{buf}[({base_expr}) + {r * cols + c}]", finfo.scalar_msl)
+                    for r in range(rows)
+                ]
+                col_strs.append(f"{msl_vec}({', '.join(col_components)})")
+            return f"{finfo.msl_type}({', '.join(col_strs)})"
+        comps = [
+            _struct_bitcast_read(f"{buf}[({base_expr}) + {r * cols + c}]", finfo.scalar_msl)
+            for r in range(rows)
+            for c in range(cols)
+        ]
+        return f"{finfo.msl_type}_make({', '.join(comps)})"
+    raise MetalCodegenError(f"cannot build a read expression for struct field {finfo.name!r} ({finfo.kind})")
 
 
 def _struct_dtype_info(arg) -> _StructLayout | None:
