@@ -4767,6 +4767,48 @@ class TestMetalArtifactCache(unittest.TestCase):
     """The on-disk MSL artifact cache must round-trip artifacts exactly and
     degrade to regeneration on any corruption."""
 
+    def test_closure_kernels_with_different_constants_do_not_collide(self):
+        # Kernel factories (mujoco_warp's ``@wp.kernel``-in-a-function
+        # pattern) produce instantiations that share kernel.key, the arg
+        # signature, AND the forward IR statements — the captured Python
+        # scalar only shows up as a baked ``const`` declaration sourced
+        # from ``Var.constant``. The cache key must include those values,
+        # otherwise the second instantiation silently loads the first
+        # one's artifact (this bit mujoco_warp's ``_solve_LD_sparse_fused``:
+        # an nv=1 solver cached from one model was served to an nv=6
+        # model, freezing the dynamics).
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+            import warp as wp
+            from warp._src import codegen_metal as cm
+
+            def make(scale):
+                @wp.kernel
+                def k(x: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
+                    tid = wp.tid()
+                    out[tid] = x[tid] * scale
+                return k
+
+            k1 = make(1.0)
+            k6 = make(6.0)
+
+            key1 = cm._artifact_cache_key(k1, cm._ensure_adj_built(k1))
+            key6 = cm._artifact_cache_key(k6, cm._ensure_adj_built(k6))
+            assert key1 != key6, 'closure constants must be part of the cache key'
+
+            xn = np.arange(1.0, 9.0, dtype=np.float32)
+            x = wp.array(xn, device='metal:0')
+            o1 = wp.zeros(8, dtype=wp.float32, device='metal:0')
+            o6 = wp.zeros(8, dtype=wp.float32, device='metal:0')
+            wp.launch(k1, dim=8, inputs=[x], outputs=[o1], device='metal:0')
+            wp.launch(k6, dim=8, inputs=[x], outputs=[o6], device='metal:0')
+            np.testing.assert_allclose(o1.numpy(), xn)
+            np.testing.assert_allclose(o6.numpy(), xn * 6.0)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
     def test_artifact_cache_roundtrip(self):
         snippet = textwrap.dedent(
             """

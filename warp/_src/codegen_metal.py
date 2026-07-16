@@ -6052,7 +6052,10 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
 #
 # Kill switch: ``WARP_METAL_DISABLE_ARTIFACT_CACHE=1``.
 
-_ARTIFACT_CACHE_VERSION = 1
+# v2: added captured-constant values (``Var.constant``) to the key —
+# closure-kernel instantiations previously collided (same kernel.key,
+# args, and IR statements; different baked ``const`` declarations).
+_ARTIFACT_CACHE_VERSION = 2
 _codegen_source_hash_cached: str | None = None
 
 
@@ -6093,6 +6096,18 @@ def _artifact_cache_key(kernel, adj) -> str | None:
     try:
         body = "\n".join(adj.blocks[0].body_forward)
         arg_sig = ";".join(f"{a.label}:{a.ctype()}" for a in adj.args)
+        # Closure-generated kernels (e.g. mujoco_warp's ``@wp.kernel``
+        # factories) can share ``kernel.key``, arg signature, AND
+        # ``body_forward`` while differing only in captured Python scalars:
+        # those are baked into the artifact as ``const T var_N = <value>;``
+        # declarations sourced from ``Var.constant``, which never appears
+        # in the IR statements. Without this component, two instantiations
+        # (say ``nv=1`` and ``nv=6`` solver kernels) collide on one cache
+        # entry and the second model silently loads the first model's
+        # kernel.
+        const_sig = ";".join(
+            f"{v.label}={v.constant!r}" for v in adj.variables if getattr(v, "constant", None) is not None
+        )
     except Exception:
         return None
     import warp  # noqa: PLC0415
@@ -6107,6 +6122,7 @@ def _artifact_cache_key(kernel, adj) -> str | None:
         arg_sig,
         str(opts.get("block_dim")),
         str(opts.get("output_arch")),
+        const_sig,
         body,
     ):
         h.update(part.encode("utf-8"))
