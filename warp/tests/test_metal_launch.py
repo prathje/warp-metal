@@ -5393,6 +5393,265 @@ class TestMetalArrayViews(unittest.TestCase):
 
 @unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
 @unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
+class TestMetalUtilsOps(unittest.TestCase):
+    """``wp.utils`` reductions/sorts on Metal route through the ``_host``
+    native implementations (unified memory + device sync). Before that fix
+    they either raised ``UnboundLocalError`` (sum/inner) or silently
+    returned stale output data (scan/sort/RLE)."""
+
+    def test_reductions_match_numpy(self):
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+            import warp as wp
+            import warp.utils
+
+            rng = np.random.default_rng(42)
+            dev = 'metal:0'
+
+            x = rng.standard_normal(1000).astype(np.float32)
+            y = rng.standard_normal(1000).astype(np.float32)
+            ax = wp.array(x, device=dev)
+            ay = wp.array(y, device=dev)
+            np.testing.assert_allclose(wp.utils.array_sum(ax), x.sum(), rtol=1e-4)
+            np.testing.assert_allclose(wp.utils.array_inner(ax, ay), np.dot(x, y), rtol=1e-4)
+
+            m = rng.standard_normal((6, 5)).astype(np.float32)
+            am = wp.array(m, device=dev)
+            np.testing.assert_allclose(
+                wp.utils.array_sum(am, axis=1).numpy().squeeze(), m.sum(axis=1), rtol=1e-5)
+
+            # A device kernel writes the input first — the host op must see
+            # the post-kernel data, which exercises the pre-op sync.
+            @wp.kernel
+            def scale(a: wp.array(dtype=wp.float32)):
+                i = wp.tid()
+                a[i] = a[i] * 3.0
+
+            wp.launch(scale, dim=1000, inputs=[ax], device=dev)
+            np.testing.assert_allclose(wp.utils.array_sum(ax), 3.0 * x.sum(), rtol=1e-4)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_scan_sort_rle_match_numpy(self):
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+            import warp as wp
+            import warp.utils
+
+            rng = np.random.default_rng(7)
+            dev = 'metal:0'
+
+            # array_scan (inclusive + exclusive)
+            src = rng.integers(0, 10, 256).astype(np.int32)
+            a = wp.array(src, device=dev)
+            out = wp.zeros(256, dtype=wp.int32, device=dev)
+            wp.utils.array_scan(a, out, inclusive=True)
+            np.testing.assert_array_equal(out.numpy(), np.cumsum(src).astype(np.int32))
+            wp.utils.array_scan(a, out, inclusive=False)
+            np.testing.assert_array_equal(
+                out.numpy(), (np.cumsum(src) - src).astype(np.int32))
+
+            # radix_sort_pairs (stable)
+            n = 128
+            keys_np = rng.integers(0, 1 << 20, n).astype(np.int32)
+            vals_np = np.arange(n, dtype=np.int32)
+            keys = wp.zeros(n * 2, dtype=wp.int32, device=dev)
+            vals = wp.zeros(n * 2, dtype=wp.int32, device=dev)
+            keys.assign(np.concatenate([keys_np, np.zeros(n, np.int32)]))
+            vals.assign(np.concatenate([vals_np, np.zeros(n, np.int32)]))
+            wp.utils.radix_sort_pairs(keys, vals, n)
+            order = np.argsort(keys_np, kind='stable')
+            np.testing.assert_array_equal(keys.numpy()[:n], keys_np[order])
+            np.testing.assert_array_equal(vals.numpy()[:n], vals_np[order])
+
+            # segmented_sort_pairs
+            seg_starts = np.array([0, 20, 45, n], dtype=np.int32)
+            keys.assign(np.concatenate([keys_np, np.zeros(n, np.int32)]))
+            vals.assign(np.concatenate([vals_np, np.zeros(n, np.int32)]))
+            starts = wp.array(seg_starts, device=dev)
+            wp.utils.segmented_sort_pairs(keys, vals, n, starts)
+            expect_k = keys_np.copy()
+            expect_v = vals_np.copy()
+            for s, e in zip(seg_starts[:-1], seg_starts[1:]):
+                seg_order = np.argsort(keys_np[s:e], kind='stable')
+                expect_k[s:e] = keys_np[s:e][seg_order]
+                expect_v[s:e] = vals_np[s:e][seg_order]
+            np.testing.assert_array_equal(keys.numpy()[:n], expect_k)
+            np.testing.assert_array_equal(vals.numpy()[:n], expect_v)
+
+            # runlength_encode
+            rle_src = np.sort(rng.integers(0, 8, 100)).astype(np.int32)
+            arr = wp.array(rle_src, device=dev)
+            run_values = wp.zeros(100, dtype=wp.int32, device=dev)
+            run_lengths = wp.zeros(100, dtype=wp.int32, device=dev)
+            n_runs = wp.utils.runlength_encode(arr, run_values, run_lengths)
+            uniq, counts = np.unique(rle_src, return_counts=True)
+            assert n_runs == len(uniq), (n_runs, len(uniq))
+            np.testing.assert_array_equal(run_values.numpy()[:n_runs], uniq)
+            np.testing.assert_array_equal(run_lengths.numpy()[:n_runs], counts.astype(np.int32))
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+
+@unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
+@unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
+class TestMetalUnsupportedFeaturesRaise(unittest.TestCase):
+    """Unsupported subsystems must raise clear errors, never return silently
+    wrong results (zero gradients, flat-indexed indexedarray reads)."""
+
+    def test_indexedarray_launch_raises(self):
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+            import warp as wp
+
+            @wp.kernel
+            def k_idx(src: wp.indexedarray(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
+                i = wp.tid()
+                out[i] = src[i] * 2.0
+
+            dev = 'metal:0'
+            a = wp.array(np.arange(20, dtype=np.float32), device=dev)
+            indices = wp.array(np.array([3, 7, 11, 19], np.int32), device=dev)
+            ia = wp.indexedarray(a, [indices])
+            out = wp.zeros(4, dtype=wp.float32, device=dev)
+            try:
+                wp.launch(k_idx, dim=4, inputs=[ia], outputs=[out], device=dev)
+            except Exception as e:
+                assert 'indexedarray' in str(e), str(e)
+            else:
+                raise AssertionError('indexedarray launch should have raised')
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_tape_backward_raises(self):
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+            import warp as wp
+
+            @wp.kernel
+            def k_sq(x: wp.array(dtype=wp.float32), y: wp.array(dtype=wp.float32)):
+                i = wp.tid()
+                y[i] = x[i] * x[i]
+
+            dev = 'metal:0'
+            x = wp.array(np.ones(4, np.float32), device=dev, requires_grad=True)
+            y = wp.zeros(4, dtype=wp.float32, device=dev, requires_grad=True)
+            tape = wp.Tape()
+            with tape:
+                wp.launch(k_sq, dim=4, inputs=[x], outputs=[y], device=dev)
+            # The forward launch must be recorded — a silently empty tape
+            # would "succeed" and leave every gradient at zero.
+            assert len(tape.launches) == 1, len(tape.launches)
+            try:
+                tape.backward(grads={y: wp.array(np.ones(4, np.float32), device=dev)})
+            except RuntimeError as e:
+                assert 'adjoint' in str(e), str(e)
+            else:
+                raise AssertionError('tape.backward should have raised')
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_mesh_query_kernel_raises(self):
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+            import warp as wp
+
+            @wp.kernel
+            def k_mesh(mesh: wp.uint64, pts: wp.array(dtype=wp.vec3), d: wp.array(dtype=wp.float32)):
+                i = wp.tid()
+                q = wp.mesh_query_point(mesh, pts[i], 10.0)
+                if q.result:
+                    d[i] = 1.0
+
+            dev = 'metal:0'
+            mesh_pts = wp.array(np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0]], np.float32),
+                                dtype=wp.vec3, device=dev)
+            tris = wp.array(np.array([0, 1, 2], np.int32), device=dev)
+            mesh = wp.Mesh(points=mesh_pts, indices=tris)
+            pts = wp.array(np.zeros((4, 3), np.float32), dtype=wp.vec3, device=dev)
+            d = wp.zeros(4, dtype=wp.float32, device=dev)
+            try:
+                wp.launch(k_mesh, dim=4, inputs=[mesh.id, pts], outputs=[d], device=dev)
+            except Exception as e:
+                assert 'mesh_query_point' in str(e), str(e)
+            else:
+                raise AssertionError('mesh query launch should have raised')
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+
+@unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
+@unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
+class TestMetalConstBufferCache(unittest.TestCase):
+    """The native launcher caches constant per-launch buffers (packed
+    shapes, struct args) keyed on their contents. Repeated launches must
+    reuse them; launches with different shapes/struct values must not."""
+
+    def test_repeat_and_varied_launches_stay_correct(self):
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+            import warp as wp
+
+            @wp.kernel
+            def k(a: wp.array2d(dtype=wp.float32), out: wp.array2d(dtype=wp.float32)):
+                i, j = wp.tid()
+                out[i, j] = a[i, j] * 2.0
+
+            dev = 'metal:0'
+            rng = np.random.default_rng(3)
+            # Two different shapes through the SAME kernel, interleaved, so a
+            # wrongly keyed shapes cache would bind the wrong __shapes_packed.
+            an = rng.standard_normal((16, 8)).astype(np.float32)
+            bn = rng.standard_normal((5, 31)).astype(np.float32)
+            a = wp.array(an, device=dev)
+            b = wp.array(bn, device=dev)
+            out_a = wp.zeros((16, 8), dtype=wp.float32, device=dev)
+            out_b = wp.zeros((5, 31), dtype=wp.float32, device=dev)
+            for _ in range(3):
+                wp.launch(k, dim=(16, 8), inputs=[a], outputs=[out_a], device=dev)
+                wp.launch(k, dim=(5, 31), inputs=[b], outputs=[out_b], device=dev)
+            np.testing.assert_allclose(out_a.numpy(), an * 2.0)
+            np.testing.assert_allclose(out_b.numpy(), bn * 2.0)
+
+            @wp.struct
+            class Params:
+                scale: wp.float32
+                offset: wp.float32
+
+            @wp.kernel
+            def k_struct(p: Params, x: wp.array(dtype=wp.float32), y: wp.array(dtype=wp.float32)):
+                i = wp.tid()
+                y[i] = x[i] * p.scale + p.offset
+
+            xn = rng.standard_normal(64).astype(np.float32)
+            x = wp.array(xn, device=dev)
+            y = wp.zeros(64, dtype=wp.float32, device=dev)
+            # Different struct VALUES per launch — the bytes-keyed cache must
+            # not serve launch 1's params to launch 2.
+            for scale, offset in ((2.0, 1.0), (3.0, -0.5), (2.0, 1.0)):
+                p = Params()
+                p.scale = scale
+                p.offset = offset
+                wp.launch(k_struct, dim=64, inputs=[p, x], outputs=[y], device=dev)
+                np.testing.assert_allclose(y.numpy(), xn * scale + offset, rtol=1e-6)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+
+@unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
+@unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
 class TestMetalArtifactCache(unittest.TestCase):
     """The on-disk MSL artifact cache must round-trip artifacts exactly and
     degrade to regeneration on any corruption."""

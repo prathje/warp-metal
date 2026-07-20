@@ -46,6 +46,24 @@ def quat_between_vectors(a: wp.vec3, b: wp.vec3) -> wp.quat:
     return wp.normalize(q)
 
 
+def _use_host_native_op(device) -> bool:
+    """Return ``True`` if arrays on ``device`` should use the ``_host`` native ops.
+
+    True for CPU arrays, and for Metal arrays: Apple unified memory makes
+    ``array.ptr`` host-addressable on both Metal backends, so the CPU
+    implementations operate on device data in place. For Metal this first
+    flushes outstanding GPU work so the host op sees current data (the
+    reverse direction needs no fence — shared-storage buffers are coherent
+    at the next command-buffer boundary).
+    """
+    if device.is_cpu:
+        return True
+    if getattr(device, "is_metal", False):
+        wp.synchronize_device(device)
+        return True
+    return False
+
+
 def array_scan(in_array: wp.array, out_array: wp.array, inclusive: bool = True) -> None:
     """Perform a scan (prefix sum) operation on an array.
 
@@ -116,7 +134,7 @@ def array_scan(in_array: wp.array, out_array: wp.array, inclusive: bool = True) 
         apic_capture.track_array(in_array)
         apic_capture.track_array(out_array)
 
-    if in_array.device.is_cpu:
+    if _use_host_native_op(in_array.device):
         if scalar_type == wp.int32:
             native_func = runtime.core.wp_array_scan_int_host
         elif scalar_type == wp.int64:
@@ -138,6 +156,8 @@ def array_scan(in_array: wp.array, out_array: wp.array, inclusive: bool = True) 
             native_func = runtime.core.wp_array_scan_double_device
         else:
             raise RuntimeError(f"Unsupported data type: {type_repr(in_array.dtype)}")
+    else:
+        raise RuntimeError(f"Unsupported device: {in_array.device}")
 
     status = native_func(in_array.ptr, out_array.ptr, in_array.size, in_stride, out_stride, type_length, inclusive)
 
@@ -223,7 +243,7 @@ def radix_sort_pairs(
         apic_capture.track_array(keys)
         apic_capture.track_array(values)
 
-    if keys.device.is_cpu:
+    if _use_host_native_op(keys.device):
         if keys.dtype == wp.int32:
             runtime.core.wp_radix_sort_pairs_int_host(keys.ptr, values.ptr, count, begin_bit, end_bit, value_size)
         elif keys.dtype == wp.uint32:
@@ -257,6 +277,8 @@ def radix_sort_pairs(
             raise RuntimeError(
                 f"Unsupported keys and values data types: {type_repr(keys.dtype)}, {type_repr(values.dtype)}"
             )
+    else:
+        raise RuntimeError(f"Unsupported device: {keys.device}")
 
 
 def segmented_sort_pairs(
@@ -411,7 +433,7 @@ def segmented_sort_pairs(
         apic_capture.track_array(segment_start_indices)
         apic_capture.track_array(segment_end_indices)
 
-    if keys.device.is_cpu:
+    if _use_host_native_op(keys.device):
         if keys.dtype == wp.int32 and values.dtype == wp.int32:
             success = runtime.core.wp_segmented_sort_pairs_int_host(
                 keys.ptr,
@@ -455,6 +477,8 @@ def segmented_sort_pairs(
             )
         else:
             raise RuntimeError(f"Unsupported data type: {type_repr(keys.dtype)}")
+    else:
+        raise RuntimeError(f"Unsupported device: {keys.device}")
 
 
 def runlength_encode(
@@ -546,7 +570,7 @@ def runlength_encode(
         apic_capture.track_array(run_lengths)
         apic_capture.track_array(run_count)
 
-    if values.device.is_cpu:
+    if _use_host_native_op(values.device):
         if values.dtype == wp.int32:
             runtime.core.wp_runlength_encode_int_host(
                 values.ptr, run_values.ptr, run_lengths.ptr, run_count.ptr, value_count
@@ -560,6 +584,8 @@ def runlength_encode(
             )
         else:
             raise RuntimeError(f"Unsupported data type: {type_repr(values.dtype)}")
+    else:
+        raise RuntimeError(f"Unsupported device: {values.device}")
 
     if host_return:
         return int(run_count.numpy()[0])
@@ -715,7 +741,7 @@ def array_sum(
             return out.numpy()[0]
         return out
 
-    if values.device.is_cpu:
+    if _use_host_native_op(values.device):
         if scalar_type == wp.float32:
             native_func = context.runtime.core.wp_array_sum_float_host
         elif scalar_type == wp.float64:
@@ -729,6 +755,8 @@ def array_sum(
             native_func = context.runtime.core.wp_array_sum_double_device
         else:
             raise RuntimeError(f"Unsupported data type: {type_repr(values.dtype)}")
+    else:
+        raise RuntimeError(f"Unsupported device: {values.device}")
 
     if axis is None:
         stride = wp._src.types.type_size_in_bytes(values.dtype)
@@ -863,7 +891,7 @@ def array_inner(
         out.zero_()
         return out
 
-    if a.device.is_cpu:
+    if _use_host_native_op(a.device):
         if scalar_type == wp.float32:
             native_func = context.runtime.core.wp_array_inner_float_host
         elif scalar_type == wp.float64:
@@ -877,6 +905,8 @@ def array_inner(
             native_func = context.runtime.core.wp_array_inner_double_device
         else:
             raise RuntimeError(f"Unsupported data type: {type_repr(a.dtype)}")
+    else:
+        raise RuntimeError(f"Unsupported device: {a.device}")
 
     if axis is None:
         stride_a = wp._src.types.type_size_in_bytes(a.dtype)
