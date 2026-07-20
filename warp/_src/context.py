@@ -8480,6 +8480,15 @@ def launch(
         from warp._src.codegen_metal import launch_metal_kernel  # noqa: PLC0415
 
         launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim=block_dim)
+        # Record on an active tape so a later ``tape.backward()`` raises the
+        # adjoint-launch error above instead of silently replaying an empty
+        # tape (which would leave all gradients at zero).
+        if runtime.tape and record_tape:
+            frame = inspect.currentframe().f_back
+            caller = {"file": frame.f_code.co_filename, "lineno": frame.f_lineno, "func": frame.f_code.co_name}
+            runtime.tape.record_launch(
+                kernel, dim, max_blocks, inputs, outputs, device, block_dim, metadata={"caller": caller}
+            )
         return
 
     # construct launch bounds
@@ -10538,10 +10547,7 @@ def copy(
                 # ``wp.copy(d.qacc_warmstart, d.qacc)`` at the end of
                 # ``mjw_step`` snapshots a stale ``qacc`` and the next
                 # step's solver starts from the wrong warmstart.
-                if (
-                    getattr(src.device, "is_metal", False)
-                    and warp.config.metal_native_dispatch
-                ):
+                if getattr(src.device, "is_metal", False) and warp.config.metal_native_dispatch:
                     from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
 
                     get_dispatcher().sync()

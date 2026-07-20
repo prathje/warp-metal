@@ -7285,6 +7285,25 @@ def _is_array_arg_type(t) -> bool:
     return getattr(t, "_wp_generic_type_str_", None) in ("array_t", "indexedarray_t")
 
 
+def _reject_unsupported_launch_args(kernel) -> None:
+    """Raise for argument types the MSL codegen would translate incorrectly.
+
+    ``wp.indexedarray`` matches the array-arg predicates, but the generated
+    body would index the base storage flat — silently skipping the index
+    indirection — so it must be rejected before codegen or a cached-artifact
+    launch can run.
+    """
+    from warp._src.types import indexedarray  # noqa: PLC0415
+
+    for arg in kernel.adj.args:
+        t = arg.type
+        if isinstance(t, indexedarray) or getattr(t, "_wp_generic_type_str_", None) == "indexedarray_t":
+            raise MetalCodegenError(
+                f"Kernel '{kernel.key}': wp.indexedarray arguments are not supported on the "
+                "Metal backend. Gather the indexed elements into a contiguous wp.array first."
+            )
+
+
 def _is_array_arg(var) -> bool:
     """Return True if a kernel arg's type is a ``wp.array`` family.
 
@@ -8050,6 +8069,12 @@ def _strip_init_prologue(source: str) -> str:
     return source[:start] + source[end:]
 
 
+# Sentinel for kernels whose args were all pruned (no PSO to dispatch).
+# Compared by identity — an ``==`` against a real PSO would bridge into
+# ObjC ``isEqual:`` and cost ~8 µs on every cached-launch fast path.
+_METAL_NOOP_PSO = object()
+
+
 def _get_or_build_metal_kernel_native(kernel):
     """Return ``(artifact, pso)`` for a Warp kernel under native dispatch.
 
@@ -8066,13 +8091,13 @@ def _get_or_build_metal_kernel_native(kernel):
         kernel._metal_artifact = artifact
     if pso is None:
         if not artifact.input_names and not artifact.output_names:
-            kernel._metal_native_pso = "noop"
+            kernel._metal_native_pso = _METAL_NOOP_PSO
             return artifact, None
         wrapped = _wrap_msl_for_native_dispatch(artifact)
         kernel._metal_native_wrapped_source = wrapped
         pso = get_dispatcher().compile(wrapped, f"custom_kernel_{artifact.name}")
         kernel._metal_native_pso = pso
-    elif pso == "noop":
+    elif pso is _METAL_NOOP_PSO:
         return artifact, None
     return artifact, pso
 
@@ -8171,6 +8196,8 @@ def launch_metal_kernel_native(kernel, dim, inputs, outputs, device, block_dim: 
     if any(d <= 0 for d in dims_check):
         return
 
+    _reject_unsupported_launch_args(kernel)
+
     artifact, pso = _get_or_build_metal_kernel_native(kernel)
     if pso is None:
         return
@@ -8256,6 +8283,33 @@ def launch_metal_kernel_native(kernel, dim, inputs, outputs, device, block_dim: 
         transient_refs.append(buf)
         return buf
 
+    # Constant per-launch buffers (packed shapes, struct args, tid4) whose
+    # contents are a pure function of a small hashable key. ``newBufferWith-
+    # Length`` costs ~15 µs per call, so reusing one immutable MTLBuffer per
+    # distinct key removes the dominant transient-alloc cost from steady-state
+    # launch loops (shapes/struct values repeat every step in mujoco_warp).
+    # Safe by construction: the buffer contents are derived from the key
+    # alone, and ``dispatch`` holds an in-flight reference during execution.
+    buf_cache = getattr(kernel, "_metal_native_const_buf_cache", None)
+    if buf_cache is None:
+        buf_cache = {}
+        kernel._metal_native_const_buf_cache = buf_cache
+
+    def _cached_const_buffer(key, make_np) -> Any:
+        buf = buf_cache.get(key)
+        if buf is None:
+            np_array = make_np()
+            nb = int(np_array.nbytes)
+            # Cap the cache so a launch pattern with unbounded distinct keys
+            # (e.g. a time-varying struct arg) degrades to the transient path
+            # instead of leaking buffers.
+            if nb == 0 or len(buf_cache) >= 128:
+                return _alloc_buffer_with_data(np_array)
+            buf, addr = dispatcher.alloc(nb)
+            ctypes.memmove(addr, np_array.ctypes.data, nb)
+            buf_cache[key] = buf
+        return buf
+
     # init_shadow_names is already cached on the kernel above.
 
     # 1) Real inputs from the kernel signature.
@@ -8278,13 +8332,16 @@ def launch_metal_kernel_native(kernel, dim, inputs, outputs, device, block_dim: 
                 if ctype_inst is None:
                     raise RuntimeError(f"Kernel '{kernel.key}' arg {name!r}: struct value lacks ``_ctype``")
                 raw = bytes(ctype_inst)
-                np_buf = np.frombuffer(raw, dtype=np.float32).copy()
-                if np_buf.size != layout.scalars_per_elem:
+                if len(raw) != 4 * layout.scalars_per_elem:
                     raise RuntimeError(
                         f"Kernel '{kernel.key}' arg {name!r}: struct serialisation produced "
-                        f"{np_buf.size} float32s but layout expects {layout.scalars_per_elem}"
+                        f"{len(raw)} bytes but layout expects {4 * layout.scalars_per_elem}"
                     )
-                bindings.append(_alloc_buffer_with_data(np_buf))
+                bindings.append(
+                    _cached_const_buffer(
+                        ("struct", name, raw), lambda raw=raw: np.frombuffer(raw, dtype=np.float32).copy()
+                    )
+                )
                 # Struct args are read-only constants per-launch but they
                 # live in a transient MTLBuffer that's not shared with
                 # any other binding, so the mode is effectively None.
@@ -8413,14 +8470,22 @@ def launch_metal_kernel_native(kernel, dim, inputs, outputs, device, block_dim: 
     # 4) __shapes_packed.
     if artifact.shape_packed_arrs:
         slot = artifact.shape_packed_slot
-        packed = np.zeros(len(artifact.shape_packed_arrs) * slot, dtype=np.int32)
-        for i, arr_name in enumerate(artifact.shape_packed_arrs):
+        shapes_key = []
+        for arr_name in artifact.shape_packed_arrs:
             idx, _ = arg_by_name[arr_name]
             value = fwd_args[idx]
             _, view_shape = _array_view_dtype_and_shape(value)
-            for k, dim_k in enumerate(view_shape[:slot]):
-                packed[i * slot + k] = dim_k
-        bindings.append(_alloc_buffer_with_data(packed))
+            shapes_key.append(tuple(view_shape[:slot]))
+        shapes_key = tuple(shapes_key)
+
+        def _make_shapes_np():
+            packed = np.zeros(len(shapes_key) * slot, dtype=np.int32)
+            for i, shp in enumerate(shapes_key):
+                for k, dim_k in enumerate(shp):
+                    packed[i * slot + k] = dim_k
+            return packed
+
+        bindings.append(_cached_const_buffer(("shapes", shapes_key), _make_shapes_np))
         binding_modes.append(None)
 
     # 4b) __tid4_dim3 — the trailing launch dim for the grid-z decomposition.
@@ -8428,7 +8493,9 @@ def launch_metal_kernel_native(kernel, dim, inputs, outputs, device, block_dim: 
         launch_dims = (dim,) if isinstance(dim, int) else tuple(dim)
         if len(launch_dims) != 4:
             raise RuntimeError(f"Kernel '{kernel.key}' uses 4-D wp.tid() but was launched with dim={dim}")
-        bindings.append(_alloc_buffer_with_data(np.array([launch_dims[3]], dtype=np.int32)))
+        bindings.append(
+            _cached_const_buffer(("tid4", launch_dims[3]), lambda: np.array([launch_dims[3]], dtype=np.int32))
+        )
         binding_modes.append(None)
 
     # 5) Outputs (bind each output wp.array's MTLBuffer directly — kernel
@@ -8528,7 +8595,7 @@ def launch_metal_kernel_native(kernel, dim, inputs, outputs, device, block_dim: 
     # Guard mode is opt-in via ``WARP_METAL_CANARY=1`` (see
     # ``MetalDispatcher.alloc``); the dispatcher returns an empty
     # list and short-circuits when off.
-    if os.environ.get("WARP_METAL_CANARY"):
+    if dispatcher._canary_enabled:
         slot_names = list(artifact.input_names) + list(artifact.output_names)
         dispatcher.check_canaries(kernel.key, bindings, slot_names=slot_names)
 
@@ -8581,6 +8648,8 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim: int = 2
         _dims_check = tuple(dim)
     if any(d <= 0 for d in _dims_check):
         return
+
+    _reject_unsupported_launch_args(kernel)
 
     artifact, mlx_kernel = _get_or_build_metal_kernel(kernel)
     # No-op kernel (the prune step found every declared output is
