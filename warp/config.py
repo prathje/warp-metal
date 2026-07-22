@@ -16,6 +16,13 @@ For information on module-level and kernel-level settings, see :doc:`/user_guide
 
 _wp_module_name_ = "warp.config"
 
+import os as _os  # noqa: E402
+
+
+def _env_flag(name: str) -> bool:
+    return _os.environ.get(name, "").strip().lower() not in ("", "0", "false", "off")
+
+
 version: str = "1.14.0.dev0"
 """Warp version string"""
 
@@ -223,8 +230,11 @@ Only affects systems with CUDA driver versions below 12.3.
 enable_mempools_at_init: bool = True
 """Enable CUDA memory pools during device initialization when supported."""
 
-enable_metal: bool = False
+enable_metal: bool = _env_flag("WARP_ENABLE_METAL")
 """Enable the experimental Metal backend on macOS (Apple Silicon).
+
+Defaults to the ``WARP_ENABLE_METAL`` environment variable (unset → ``False``),
+so applications that never touch ``warp.config`` can opt in from the shell.
 
 When ``True``, Warp registers a ``"metal:0"`` device backed by Apple's Metal API
 via the `MLX <https://github.com/ml-explore/mlx>`_ runtime. Requires ``mlx`` to
@@ -236,8 +246,12 @@ intended for inference-only workloads — autograd, graph capture, and most of
 the kernel-builtin surface are not yet wired up.
 """
 
-metal_native_dispatch: bool = False
+metal_native_dispatch: bool = _env_flag("WARP_METAL_NATIVE_DISPATCH")
 """Route Metal launches through Apple's Metal API directly instead of MLX.
+
+Defaults to the ``WARP_METAL_NATIVE_DISPATCH`` environment variable (unset →
+``False``), so applications that never touch ``warp.config`` can opt in from
+the shell.
 
 Experimental. When ``True`` (and :data:`enable_metal` is also true), Warp's
 Metal backend bypasses ``mlx.core.fast.metal_kernel`` for dispatch — kernels
