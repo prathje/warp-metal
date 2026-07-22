@@ -350,6 +350,32 @@ class TestMetalLaunch(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet)
 
+    def test_eq_mixed_scalar_types_matches_cpu(self):
+        # ``float32 == int32`` inside a kernel: the wp_eq_reduce helper must
+        # deduce independent scalar types (a same-type template signature
+        # fails deduction where plain C++ would have promoted the int).
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+            import warp as wp
+
+            @wp.kernel
+            def eq_mixed(a: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.int32)):
+                i = wp.tid()
+                if a[i] == i:
+                    out[i] = 1
+                else:
+                    out[i] = 0
+
+            src = np.array([0.0, 5.0, 2.0, 3.0], dtype=np.float32)
+            a = wp.array(src, device='metal:0')
+            out = wp.zeros(4, dtype=wp.int32, device='metal:0')
+            wp.launch(eq_mixed, dim=4, inputs=[a, out], device='metal:0')
+            np.testing.assert_array_equal(out.numpy(), [1, 0, 1, 1])
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
     def test_if_else_all_comparison_ops_match_cpu(self):
         # Exercises every binary comparison operator the codegen needs to
         # support: ``<``, ``<=``, ``==``, ``!=``, ``>=``, ``>``. Each operator
@@ -5775,8 +5801,10 @@ class TestMetalTorchInterop(unittest.TestCase):
 class TestMetalGraphCapture(unittest.TestCase):
     """``wp.capture_begin/end/launch`` on Metal map onto the dispatcher's
     ICB record/replay (native dispatch only). Launches are recorded, NOT
-    executed; host-side memory ops raise instead of silently executing
-    once and diverging from CUDA-graph replay semantics."""
+    executed; fills and metal-to-metal copies are recorded as compute
+    dispatches so they re-run on every replay, while host<->device
+    transfers raise instead of silently executing once and diverging
+    from CUDA-graph replay semantics."""
 
     def test_capture_replay_semantics(self):
         snippet = textwrap.dedent(
@@ -5850,7 +5878,10 @@ class TestMetalGraphCapture(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet, timeout=120)
 
-    def test_host_ops_raise_during_capture(self):
+    def test_host_ops_record_into_capture(self):
+        # fill_/zero_/wp.copy inside a capture are recorded as compute
+        # dispatches (they must re-run on every replay); host<->device
+        # transfers still raise.
         snippet = textwrap.dedent(
             """
             import numpy as np
@@ -5859,29 +5890,167 @@ class TestMetalGraphCapture(unittest.TestCase):
             if not wp.config.metal_native_dispatch:
                 raise SystemExit(0)
 
+            @wp.kernel
+            def add_one(a: wp.array(dtype=wp.float32)):
+                i = wp.tid()
+                a[i] = a[i] + 1.0
+
             a = wp.zeros(8, dtype=wp.float32, device=dev)
             b = wp.zeros(8, dtype=wp.float32, device=dev)
+            v = wp.zeros(4, dtype=wp.vec3, device=dev)
+            # warm the module outside the capture
+            wp.launch(add_one, dim=8, inputs=[a], device=dev)
+            wp.synchronize_device(dev)
+            a.zero_()
 
             with wp.ScopedDevice(dev):
                 wp.capture_begin()
                 try:
-                    for fn in (
-                        lambda: a.zero_(),
-                        lambda: wp.copy(b, a),
-                        lambda: wp.array(np.arange(4, dtype=np.float32), device=dev),
-                    ):
-                        try:
-                            fn()
-                            raise AssertionError('expected RuntimeError')
-                        except RuntimeError as e:
-                            assert 'capture' in str(e), e
+                    a.fill_(3.0)              # memtile -> recorded tile dispatch
+                    wp.launch(add_one, dim=8, inputs=[a])
+                    wp.copy(b, a)             # metal->metal -> recorded copy dispatch
+                    a.zero_()                 # memset -> recorded fill dispatch
+                    v.fill_([1.0, 2.0, 3.0])  # 12-byte pattern tile
+                    # host->device upload is not recordable
+                    try:
+                        wp.array(np.arange(4, dtype=np.float32), device=dev)
+                        raise AssertionError('expected RuntimeError')
+                    except RuntimeError as e:
+                        assert 'capture' in str(e), e
                 finally:
                     g = wp.capture_end()
 
-            # nothing was recorded; replay is a harmless no-op
-            wp.capture_launch(g)
+            # capture must not have executed anything
+            np.testing.assert_allclose(a.numpy(), 0.0)
+            np.testing.assert_allclose(b.numpy(), 0.0)
+            np.testing.assert_allclose(v.numpy(), 0.0)
+
+            # every replay re-runs fill -> +1 -> copy -> zero, so the result
+            # is identical no matter how many times it replays
+            for _ in range(3):
+                wp.capture_launch(g)
             wp.synchronize_device(dev)
             np.testing.assert_allclose(a.numpy(), 0.0)
+            np.testing.assert_allclose(b.numpy(), 4.0)
+            np.testing.assert_allclose(v.numpy(), np.tile([1.0, 2.0, 3.0], (4, 1)))
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=60)
+
+    def test_capture_retains_freed_temporaries(self):
+        # Temporaries allocated inside the capture and released before
+        # replay must stay alive through the graph (the ICB retains the
+        # MTLBuffers), mirroring CUDA mempool graph-ownership semantics.
+        snippet = textwrap.dedent(
+            """
+            import gc
+            import numpy as np
+
+            dev = 'metal:0'
+            if not wp.config.metal_native_dispatch:
+                raise SystemExit(0)
+
+            @wp.kernel
+            def double_into(src: wp.array(dtype=wp.float32), dst: wp.array(dtype=wp.float32)):
+                i = wp.tid()
+                dst[i] = src[i] * 2.0
+
+            @wp.kernel
+            def add_into(src: wp.array(dtype=wp.float32), dst: wp.array(dtype=wp.float32)):
+                i = wp.tid()
+                dst[i] = dst[i] + src[i]
+
+            out = wp.zeros(32, dtype=wp.float32, device=dev)
+            seed = wp.array(np.full(32, 5.0, dtype=np.float32), device=dev)
+            wp.launch(double_into, dim=32, inputs=[seed, out], device=dev)
+            wp.launch(add_into, dim=32, inputs=[seed, out], device=dev)
+            wp.synchronize_device(dev)
+            out.zero_()
+
+            with wp.ScopedDevice(dev):
+                wp.capture_begin()
+                try:
+                    tmp = wp.zeros(32, dtype=wp.float32, device=dev)  # recorded fill
+                    wp.launch(add_into, dim=32, inputs=[seed, tmp])   # tmp = 5
+                    wp.launch(double_into, dim=32, inputs=[tmp, out]) # out = 10
+                finally:
+                    g = wp.capture_end()
+
+            del tmp
+            gc.collect()
+
+            for _ in range(4):
+                wp.capture_launch(g)
+            wp.synchronize_device(dev)
+            np.testing.assert_allclose(out.numpy(), 10.0)
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=60)
+
+    def test_atomic_outputs_in_capture(self):
+        # Two atomic-output flavours must both behave replay == direct:
+        #  * seeded outputs (init shadow) accumulate onto prior values, so
+        #    N replays add N launches' worth — CUDA parity;
+        #  * pure accumulators (``_worldid_in`` non-standard-launch kernels
+        #    skip the shadow prologue) get an implicit pre-launch zero fill,
+        #    which is recorded as a compute dispatch so every replay
+        #    restarts the count from zero.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            dev = 'metal:0'
+            if not wp.config.metal_native_dispatch:
+                raise SystemExit(0)
+
+            @wp.kernel
+            def hist(src: wp.array(dtype=wp.int32), out: wp.array(dtype=wp.int32)):
+                i = wp.tid()
+                wp.atomic_add(out, src[i], 1)
+
+            @wp.kernel
+            def hist_pure(vals_worldid_in: wp.array(dtype=wp.int32), out: wp.array(dtype=wp.int32)):
+                i = wp.tid()
+                wp.atomic_add(out, vals_worldid_in[i], 1)
+
+            src_np = np.arange(64, dtype=np.int32) % 4
+            src = wp.array(src_np, device=dev)
+
+            # ---- seeded accumulator: replays accumulate like direct launches
+            out = wp.zeros(4, dtype=wp.int32, device=dev)
+            wp.launch(hist, dim=64, inputs=[src], outputs=[out], device=dev)
+            wp.synchronize_device(dev)
+            per_launch = out.numpy().copy()  # [16 16 16 16]
+
+            with wp.ScopedDevice(dev):
+                wp.capture_begin()
+                try:
+                    wp.launch(hist, dim=64, inputs=[src], outputs=[out])
+                finally:
+                    g = wp.capture_end()
+            for _ in range(3):
+                wp.capture_launch(g)
+            wp.synchronize_device(dev)
+            np.testing.assert_array_equal(out.numpy(), per_launch * 4)
+
+            # ---- pure accumulator: implicit zero fill re-runs per replay
+            out2 = wp.zeros(4, dtype=wp.int32, device=dev)
+            wp.launch(hist_pure, dim=64, inputs=[src], outputs=[out2], device=dev)
+            wp.launch(hist_pure, dim=64, inputs=[src], outputs=[out2], device=dev)
+            wp.synchronize_device(dev)
+            np.testing.assert_array_equal(out2.numpy(), per_launch)  # no accumulation
+
+            with wp.ScopedDevice(dev):
+                wp.capture_begin()
+                try:
+                    wp.launch(hist_pure, dim=64, inputs=[src], outputs=[out2])
+                finally:
+                    g2 = wp.capture_end()
+            assert g2._metal_graph.count == 2, g2._metal_graph.count  # fill + kernel
+            for _ in range(3):
+                wp.capture_launch(g2)
+            wp.synchronize_device(dev)
+            np.testing.assert_array_equal(out2.numpy(), per_launch)
             """
         )
         _run_with_metal_enabled(self, snippet, timeout=60)

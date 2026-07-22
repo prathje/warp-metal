@@ -1710,8 +1710,12 @@ _MISC_MATH_HELPERS: dict[str, str] = {
     # reduced bool). Each entry is self-contained — a kernel can reference
     # one without the other.
     "wp_eq_reduce": (
-        "template <typename T>\n"
-        "inline bool wp_eq_reduce(T a, T b) { return a == b; }\n"
+        # Two independent scalar type params: mixed comparisons like
+        # ``float == int`` deduce fine and resolve via the usual arithmetic
+        # promotion inside; a same-type (T, T) signature would fail template
+        # deduction where plain C++ would have promoted.
+        "template <typename T, typename U>\n"
+        "inline bool wp_eq_reduce(T a, U b) { return a == b; }\n"
         "template <typename T, int N>\n"
         "inline bool wp_eq_reduce(metal::vec<T, N> a, metal::vec<T, N> b) { return metal::all(a == b); }\n"
         "template <typename T, int C, int R>\n"
@@ -1721,8 +1725,8 @@ _MISC_MATH_HELPERS: dict[str, str] = {
         "}"
     ),
     "wp_ne_reduce": (
-        "template <typename T>\n"
-        "inline bool wp_ne_reduce(T a, T b) { return a != b; }\n"
+        "template <typename T, typename U>\n"
+        "inline bool wp_ne_reduce(T a, U b) { return a != b; }\n"
         "template <typename T, int N>\n"
         "inline bool wp_ne_reduce(metal::vec<T, N> a, metal::vec<T, N> b) { return metal::any(a != b); }\n"
         "template <typename T, int C, int R>\n"
@@ -8378,6 +8382,19 @@ def launch_metal_kernel_native(kernel, dim, inputs, outputs, device, block_dim: 
         N = len(artifact.init_shadow_packed_outputs)
         # Header: [int_offsets..., scalars..., float_offsets..., init_offsets...]
         header_np = np.zeros(K + S + F + N, dtype=np.int32)
+        # Packed slabs copy LIVE array bytes at launch time. Inside an ICB
+        # recording that copy would be frozen at capture-time values, so we
+        # additionally record a device-side refresh copy (slab <- array) for
+        # every packed part; each replay then re-packs before the kernel's
+        # prologue reads the slab. Without this, a captured kernel whose
+        # packed init shadow seeds e.g. ``d.nl`` re-seeds it from the stale
+        # snapshot on every replay, wiping counts added earlier in the graph.
+        recording = dispatcher._record_state is not None
+        # (value, dst_elem_offset, elem_count) per slab, filled while packing.
+        refresh_ints: list = []
+        refresh_floats: list = []
+        refresh_shadow_floats: list = []
+        refresh_shadow_ints: list = []
         # Int-array data follows the header.
         running = K + S + F + N
         int_data_parts: list = []
@@ -8392,6 +8409,8 @@ def launch_metal_kernel_native(kernel, dim, inputs, outputs, device, block_dim: 
             # ptr (unified memory).
             src_bytes = (ctypes.c_int32 * sz).from_address(value.ptr)
             int_data_parts.append(np.frombuffer(src_bytes, dtype=np.int32).copy())
+            if recording:
+                refresh_ints.append((value, running, sz))
             running += sz
         for j, scalar_name in enumerate(artifact.ints_packed_scalars):
             idx, _ = arg_by_name[scalar_name]
@@ -8410,6 +8429,8 @@ def launch_metal_kernel_native(kernel, dim, inputs, outputs, device, block_dim: 
                 continue
             src_bytes = (ctypes.c_float * sz).from_address(value.ptr)
             float_data_parts.append(np.frombuffer(src_bytes, dtype=np.float32).copy())
+            if recording:
+                refresh_floats.append((value, float_running, sz))
             float_running += sz
         # Init-shadow offsets (relative to __init_shadows_floats / __init_shadows_ints).
         init_floats_running = 0
@@ -8432,40 +8453,68 @@ def launch_metal_kernel_native(kernel, dim, inputs, outputs, device, block_dim: 
                 if is_float_pack:
                     src_bytes = (ctypes.c_float * sz).from_address(value.ptr)
                     init_floats_parts.append(np.frombuffer(src_bytes, dtype=np.float32).copy())
+                    if recording:
+                        refresh_shadow_floats.append((value, init_floats_running, sz))
                     init_floats_running += sz
                 else:
                     src_bytes = (ctypes.c_int32 * sz).from_address(value.ptr)
                     init_ints_parts.append(np.frombuffer(src_bytes, dtype=np.int32).copy())
+                    if recording:
+                        refresh_shadow_ints.append((value, init_ints_running, sz))
                     init_ints_running += sz
+
+        def _record_slab_refresh(slab_buf, parts) -> None:
+            # Record device copies (slab <- live array) so every graph
+            # replay re-packs this slab before the kernel reads it. The
+            # copies conflict with the kernel via the slab's ``"r"`` mode,
+            # so dependency chunking orders them correctly. Unconditional:
+            # packed inputs can carry graph-mutated data (e.g. ``qpos``
+            # value-packed into a wide constraint kernel), and skipping
+            # "probably static" parts measurably drifts G1 replay.
+            for src_value, dst_elems, n_elems in parts:
+                src_buf = _resolve_mtl(src_value, kernel.key, "__packed_refresh_src")
+                dispatcher.device_copy(slab_buf, src_buf, n_elems * 4, dst_off=dst_elems * 4, src_off=0)
 
         # Build __ints_packed buffer (header + int-array data).
         if int_data_parts:
             combined = np.concatenate([header_np, *int_data_parts])
         else:
             combined = header_np
-        bindings.append(_alloc_buffer_with_data(combined))
-        binding_modes.append(None)  # transient per-launch slab
+        slab = _alloc_buffer_with_data(combined)  # transient per-launch slab
+        if recording and refresh_ints:
+            _record_slab_refresh(slab, refresh_ints)
+        bindings.append(slab)
+        binding_modes.append("r" if recording and refresh_ints else None)
         # __floats_packed
         if artifact.floats_packed_arrs:
             if float_data_parts:
-                bindings.append(_alloc_buffer_with_data(np.concatenate(float_data_parts)))
+                slab = _alloc_buffer_with_data(np.concatenate(float_data_parts))
             else:
-                bindings.append(_alloc_buffer_with_data(np.zeros(1, dtype=np.float32)))
-            binding_modes.append(None)
+                slab = _alloc_buffer_with_data(np.zeros(1, dtype=np.float32))
+            if recording and refresh_floats:
+                _record_slab_refresh(slab, refresh_floats)
+            bindings.append(slab)
+            binding_modes.append("r" if recording and refresh_floats else None)
         # __init_shadows_floats
         if artifact.init_shadow_floats:
             if init_floats_parts:
-                bindings.append(_alloc_buffer_with_data(np.concatenate(init_floats_parts)))
+                slab = _alloc_buffer_with_data(np.concatenate(init_floats_parts))
             else:
-                bindings.append(_alloc_buffer_with_data(np.zeros(1, dtype=np.float32)))
-            binding_modes.append(None)
+                slab = _alloc_buffer_with_data(np.zeros(1, dtype=np.float32))
+            bindings.append(slab)
+            binding_modes.append("r" if recording and refresh_shadow_floats else None)
+            if recording and refresh_shadow_floats:
+                _record_slab_refresh(slab, refresh_shadow_floats)
         # __init_shadows_ints
         if artifact.init_shadow_ints:
             if init_ints_parts:
-                bindings.append(_alloc_buffer_with_data(np.concatenate(init_ints_parts)))
+                slab = _alloc_buffer_with_data(np.concatenate(init_ints_parts))
             else:
-                bindings.append(_alloc_buffer_with_data(np.zeros(1, dtype=np.int32)))
-            binding_modes.append(None)
+                slab = _alloc_buffer_with_data(np.zeros(1, dtype=np.int32))
+            bindings.append(slab)
+            binding_modes.append("r" if recording and refresh_shadow_ints else None)
+            if recording and refresh_shadow_ints:
+                _record_slab_refresh(slab, refresh_shadow_ints)
 
     # 4) __shapes_packed.
     if artifact.shape_packed_arrs:

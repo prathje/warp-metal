@@ -32,6 +32,68 @@ from typing import Any
 _dispatcher_singleton: MetalDispatcher | None = None
 _dispatcher_lock = threading.Lock()
 
+# Built-in compute kernels for host-op equivalents (fill / copy / pattern
+# tile). Dispatched through the ordinary :meth:`MetalDispatcher.dispatch`
+# path, so unlike blit-encoder ops they can be recorded into an
+# MTLIndirectCommandBuffer and replayed as part of a captured graph.
+# ``dispatchThreads`` grids are exact (no partial-threadgroup overrun), so
+# the kernels need no bounds check — every thread maps 1:1 to an element.
+_DEVICE_OPS_SOURCE = """
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void wp_fill4(device uint* dst [[buffer(0)]],
+                     constant uint& value [[buffer(1)]],
+                     constant uint& off [[buffer(2)]],
+                     uint tid [[thread_position_in_grid]]) {
+    dst[off + tid] = value;
+}
+
+kernel void wp_fill1(device uchar* dst [[buffer(0)]],
+                     constant uint& value [[buffer(1)]],
+                     constant uint& off [[buffer(2)]],
+                     uint tid [[thread_position_in_grid]]) {
+    dst[off + tid] = uchar(value);
+}
+
+kernel void wp_copy4(device const uint* src [[buffer(0)]],
+                     device uint* dst [[buffer(1)]],
+                     constant uint& src_off [[buffer(2)]],
+                     constant uint& dst_off [[buffer(3)]],
+                     uint tid [[thread_position_in_grid]]) {
+    dst[dst_off + tid] = src[src_off + tid];
+}
+
+kernel void wp_copy1(device const uchar* src [[buffer(0)]],
+                     device uchar* dst [[buffer(1)]],
+                     constant uint& src_off [[buffer(2)]],
+                     constant uint& dst_off [[buffer(3)]],
+                     uint tid [[thread_position_in_grid]]) {
+    dst[dst_off + tid] = src[src_off + tid];
+}
+
+kernel void wp_tile4(device const uint* pat [[buffer(0)]],
+                     device uint* dst [[buffer(1)]],
+                     constant uint& patlen [[buffer(2)]],
+                     constant uint& off [[buffer(3)]],
+                     uint tid [[thread_position_in_grid]]) {
+    dst[off + tid] = pat[tid % patlen];
+}
+
+kernel void wp_tile1(device const uchar* pat [[buffer(0)]],
+                     device uchar* dst [[buffer(1)]],
+                     constant uint& patlen [[buffer(2)]],
+                     constant uint& off [[buffer(3)]],
+                     uint tid [[thread_position_in_grid]]) {
+    dst[off + tid] = pat[tid % patlen];
+}
+"""
+
+
+def _u32(value: int) -> tuple[bytes, int]:
+    """Pack an int as a 4-byte setBytes binding tuple."""
+    return ((value & 0xFFFFFFFF).to_bytes(4, "little"), 4)
+
 
 class MetalGraph:
     """Replayable graph of Metal compute dispatches.
@@ -457,15 +519,11 @@ class MetalDispatcher:
         if nbytes <= 0:
             return
         if self._record_state is not None:
-            # Blit commands cannot be encoded into a compute ICB — the fill
-            # would execute once at capture time and never on replay, so a
-            # replayed atomic accumulator would keep its previous values.
-            raise MetalDispatchError(
-                "A kernel with a zero-initialized atomic output cannot be captured into a "
-                "Metal graph — its pre-launch zero-fill is a blit that ICBs cannot record. "
-                "Zero the output with a plain (non-atomic) kernel inside the capture, or "
-                "keep this launch outside the capture region."
-            )
+            # Blit commands cannot be encoded into a compute ICB, but the
+            # compute-kernel fill can — record it so the zero re-runs on
+            # every replay (a replayed atomic accumulator must restart at 0).
+            self.device_fill(mtl_buf, 0, nbytes)
+            return
         Metal = self._Metal
         # End the live compute encoder, if any, so we can switch to a
         # blit encoder. Reopen the compute encoder after — minor
@@ -483,6 +541,77 @@ class MetalDispatcher:
         blit.fillBuffer_range_value_(mtl_buf, Metal.NSMakeRange(0, nbytes), 0)
         blit.endEncoding()
         self._inflight_refs.append(mtl_buf)
+
+    # ------------------------------------------------------------------
+    # Device-side host-op equivalents (recordable into ICB graphs)
+    # ------------------------------------------------------------------
+
+    def _device_op(self, entry_point: str):
+        return self.compile(_DEVICE_OPS_SOURCE, entry_point)
+
+    @staticmethod
+    def _op_tg(n: int) -> tuple[int, int, int]:
+        return (min(256, n), 1, 1)
+
+    def device_fill(self, mtl_buf, value: int, nbytes: int, offset: int = 0) -> None:
+        """Fill ``nbytes`` of ``mtl_buf`` starting at byte ``offset`` with the
+        byte ``value`` (C ``memset`` semantics) via a compute dispatch.
+
+        Goes through :meth:`dispatch`, so inside a recording it is encoded
+        into the ICB and re-runs on every replay — the correct semantics
+        for fills captured inside a graph, which the host/blit paths can't
+        provide.
+        """
+        if nbytes <= 0:
+            return
+        value &= 0xFF
+        if offset % 4 == 0 and nbytes % 4 == 0:
+            word = value * 0x01010101
+            n = nbytes // 4
+            pso = self._device_op("wp_fill4")
+            bindings = [mtl_buf, _u32(word), _u32(offset // 4)]
+        else:
+            n = nbytes
+            pso = self._device_op("wp_fill1")
+            bindings = [mtl_buf, _u32(value), _u32(offset)]
+        self.dispatch(pso, bindings, (n, 1, 1), self._op_tg(n), binding_modes=["w", None, None])
+
+    def device_memtile(self, mtl_buf, pattern: bytes, reps: int, offset: int = 0) -> None:
+        """Tile ``pattern`` ``reps`` times into ``mtl_buf`` at byte ``offset``
+        via a compute dispatch (``wp_memtile_host`` equivalent, recordable)."""
+        patlen = len(pattern)
+        nbytes = patlen * reps
+        if nbytes <= 0:
+            return
+        # All-same-byte patterns collapse to a plain fill (covers zeros and
+        # e.g. float32 0x01010101-style splats).
+        if pattern == bytes([pattern[0]]) * patlen:
+            self.device_fill(mtl_buf, pattern[0], nbytes, offset)
+            return
+        if offset % 4 == 0 and patlen % 4 == 0:
+            n = nbytes // 4
+            pso = self._device_op("wp_tile4")
+            bindings = [(pattern, patlen), mtl_buf, _u32(patlen // 4), _u32(offset // 4)]
+        else:
+            n = nbytes
+            pso = self._device_op("wp_tile1")
+            bindings = [(pattern, patlen), mtl_buf, _u32(patlen), _u32(offset)]
+        self.dispatch(pso, bindings, (n, 1, 1), self._op_tg(n), binding_modes=[None, "w", None, None])
+
+    def device_copy(self, dst_buf, src_buf, nbytes: int, dst_off: int = 0, src_off: int = 0) -> None:
+        """Copy ``nbytes`` from ``src_buf`` (+``src_off``) to ``dst_buf``
+        (+``dst_off``) via a compute dispatch (recordable ``memcpy``)."""
+        if nbytes <= 0:
+            return
+        if dst_off % 4 == 0 and src_off % 4 == 0 and nbytes % 4 == 0:
+            n = nbytes // 4
+            pso = self._device_op("wp_copy4")
+            bindings = [src_buf, dst_buf, _u32(src_off // 4), _u32(dst_off // 4)]
+        else:
+            n = nbytes
+            pso = self._device_op("wp_copy1")
+            bindings = [src_buf, dst_buf, _u32(src_off), _u32(dst_off)]
+        self.dispatch(pso, bindings, (n, 1, 1), self._op_tg(n), binding_modes=["r", "w", None, None])
 
     def alloc(self, nbytes: int):
         """Allocate a shared-storage ``MTLBuffer`` of ``nbytes`` bytes.
