@@ -4091,6 +4091,19 @@ class array(Array[DType, NDim]):
                     self.device.context, carr_ptr, ARRAY_TYPE_REGULAR, cvalue_ptr, cvalue_size
                 )
             else:
+                if getattr(self.device, "is_metal", False) and warp.config.metal_native_dispatch:
+                    # Strided fill runs on the host: drain queued GPU work first
+                    # (unified memory), and refuse inside an ICB recording — a
+                    # host op would execute once at capture time, not on replay.
+                    from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
+
+                    dispatcher = get_dispatcher()
+                    if dispatcher._record_state is not None:
+                        raise RuntimeError(
+                            "fill_ on a non-contiguous Metal array is not supported inside a "
+                            "Metal graph capture — move it outside the capture region."
+                        )
+                    dispatcher.sync()
                 warp._src.context.runtime.core.wp_array_fill_host(carr_ptr, ARRAY_TYPE_REGULAR, cvalue_ptr, cvalue_size)
 
         self.mark_init()

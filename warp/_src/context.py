@@ -3532,29 +3532,74 @@ def _metal_release_foreign_buffer(ptr: int) -> None:
         _metal_buffer_registry.pop(ptr, None)
 
 
-def _metal_guarded_host_op(native_func, op_label: str):
-    """Wrap a host-side memory op for use on Metal arrays.
+def _metal_find_buffer(ptr: int):
+    """Return ``(mtl_buffer, byte_offset)`` for the registered allocation
+    containing ``ptr``, or ``(None, 0)`` if no allocation covers it.
 
-    Unified memory makes the host implementations correct, but only once
-    queued GPU work has drained (a pending kernel write would land after the
-    host op and silently clobber it), and never inside a Metal graph capture
-    (the op would execute once at capture time instead of being replayed).
+    Exact-base lookups are O(1); interior pointers (contiguous views into a
+    larger array) fall back to a linear scan over the registry. The scan
+    only runs on capture-time host-op recording, never on the launch path.
     """
+    with _metal_buffer_lock:
+        buf = _metal_buffer_registry.get(ptr)
+        if buf is not None:
+            return buf, 0
+        for base, b in _metal_buffer_registry.items():
+            if not isinstance(base, int):
+                continue
+            length = getattr(b, "length", None)
+            if length is None:  # mx.array in MLX mode — no byte-length probe
+                continue
+            if base < ptr < base + length():
+                return b, ptr - base
+    return None, 0
 
-    def guarded(*args):
-        if warp.config.metal_native_dispatch:
-            if runtime._metal_capture_graph is not None:
+
+def _metal_host_memset(ptr, value, nbytes):
+    """``wp_memset_host`` for Metal arrays: drains queued GPU work first
+    (unified memory — a pending kernel write would land after the host op),
+    and inside an ICB recording records a device-side fill instead so the
+    op replays with the captured graph."""
+    if warp.config.metal_native_dispatch:
+        from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
+
+        disp = get_dispatcher()
+        if disp._record_state is not None:
+            if not ptr or nbytes <= 0:
+                return True
+            buf, off = _metal_find_buffer(ptr)
+            if buf is None:
                 raise RuntimeError(
-                    f"Host-side {op_label} on a Metal array is not supported inside a Metal "
-                    "graph capture — it would execute once at capture time instead of being "
-                    "replayed. Move it outside the capture region, or express it as a kernel."
+                    "fill/zero during a Metal graph capture requires the target array's "
+                    f"buffer to be registered with the Metal allocator (ptr={ptr})."
                 )
-            from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
+            disp.device_fill(buf, value, nbytes, offset=off)
+            return True
+        disp.sync()
+    return runtime.core.wp_memset_host(ptr, value, nbytes)
 
-            get_dispatcher().sync()
-        return native_func(*args)
 
-    return guarded
+def _metal_host_memtile(ptr, src_ptr, srcsize, reps):
+    """``wp_memtile_host`` for Metal arrays — same drain/record policy as
+    :func:`_metal_host_memset`."""
+    if warp.config.metal_native_dispatch:
+        from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
+
+        disp = get_dispatcher()
+        if disp._record_state is not None:
+            if not ptr or srcsize <= 0 or reps <= 0:
+                return None
+            buf, off = _metal_find_buffer(ptr)
+            if buf is None:
+                raise RuntimeError(
+                    "fill during a Metal graph capture requires the target array's "
+                    f"buffer to be registered with the Metal allocator (ptr={ptr})."
+                )
+            pattern = ctypes.string_at(src_ptr, srcsize)
+            disp.device_memtile(buf, pattern, reps, offset=off)
+            return None
+        disp.sync()
+    return runtime.core.wp_memtile_host(ptr, src_ptr, srcsize, reps)
 
 
 class MetalDefaultAllocator:
@@ -4113,11 +4158,11 @@ class Device:
             self.pinned_allocator = self.default_allocator
             # Host-side memset/memtile need the same guards as the h2h copy
             # path: drain queued GPU work first (a pending kernel write would
-            # otherwise land AFTER the host fill and silently undo it), and
-            # refuse to run inside a Metal graph capture (the fill would
-            # execute once at capture time instead of being replayed).
-            self.memset = _metal_guarded_host_op(runtime.core.wp_memset_host, "fill/zero")
-            self.memtile = _metal_guarded_host_op(runtime.core.wp_memtile_host, "fill")
+            # otherwise land AFTER the host fill and silently undo it). Inside
+            # an ICB recording they record a device-side fill instead, so the
+            # op replays as part of the captured graph.
+            self.memset = _metal_host_memset
+            self.memtile = _metal_host_memtile
 
         else:
             raise RuntimeError(f"Invalid device ordinal ({ordinal})'")
@@ -9678,10 +9723,11 @@ def capture_begin(
     if device.is_metal:
         # Kernel launches are recorded into an MTLIndirectCommandBuffer by the
         # native dispatcher and NOT executed during capture (same semantics as
-        # CUDA graph capture). Host-side operations (wp.copy between Metal
-        # arrays, fill_/zero_, wp.utils host ops) cannot be recorded and raise
-        # during capture instead of silently executing once — move them
-        # outside the capture region.
+        # CUDA graph capture). Fills (fill_/zero_/implicit atomic-output
+        # zeroing) and metal-to-metal wp.copy are recorded as compute
+        # dispatches so they re-run on every replay; host<->device transfers
+        # and wp.utils host ops cannot be recorded and raise during capture —
+        # move them outside the capture region.
         if not warp.config.metal_native_dispatch:
             raise RuntimeError(
                 "Graph capture on Metal requires the native dispatch path — set "
@@ -9697,7 +9743,10 @@ def capture_begin(
 
         from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
 
-        get_dispatcher().begin_record()
+        # Whole-model step captures (e.g. mujoco_warp with the solver loop
+        # unrolled) easily run to thousands of commands; ICB slot
+        # over-allocation is cheap, expansion is impossible.
+        get_dispatcher().begin_record(max_commands=16384)
         graph = Graph(device)
         runtime._metal_capture_graph = graph
         return
@@ -10670,17 +10719,33 @@ def copy(
                 if (
                     getattr(src.device, "is_metal", False) or getattr(dest.device, "is_metal", False)
                 ) and warp.config.metal_native_dispatch:
-                    if runtime._metal_capture_graph is not None:
-                        raise RuntimeError(
-                            "wp.copy involving a Metal array is not supported inside a Metal "
-                            "graph capture — the copy runs on the host and would not be "
-                            "replayed by the captured graph. Move it outside the capture "
-                            "region, or express it as a kernel."
-                        )
                     from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
 
-                    get_dispatcher().sync()
-                result = runtime.core.wp_memcpy_h2h(dst_ptr, src_ptr, bytes_to_copy)
+                    dispatcher = get_dispatcher()
+                    if dispatcher._record_state is not None:
+                        # Recording an ICB graph: a host memcpy would run once
+                        # at capture time and never replay. Metal-to-metal
+                        # copies are recorded as a compute dispatch instead.
+                        if not (getattr(src.device, "is_metal", False) and getattr(dest.device, "is_metal", False)):
+                            raise RuntimeError(
+                                "wp.copy between a host and a Metal array is not supported "
+                                "inside a Metal graph capture — the transfer runs on the host "
+                                "and would not be replayed. Move it outside the capture region."
+                            )
+                        src_buf, src_off = _metal_find_buffer(src_ptr)
+                        dst_buf, dst_off = _metal_find_buffer(dst_ptr)
+                        if src_buf is None or dst_buf is None:
+                            raise RuntimeError(
+                                "wp.copy during a Metal graph capture requires both arrays' "
+                                "buffers to be registered with the Metal allocator."
+                            )
+                        dispatcher.device_copy(dst_buf, src_buf, bytes_to_copy, dst_off, src_off)
+                        result = True
+                    else:
+                        dispatcher.sync()
+                        result = runtime.core.wp_memcpy_h2h(dst_ptr, src_ptr, bytes_to_copy)
+                else:
+                    result = runtime.core.wp_memcpy_h2h(dst_ptr, src_ptr, bytes_to_copy)
 
         if not result:
             raise RuntimeError(f"Warp copy error: {runtime.get_error_string()}")
