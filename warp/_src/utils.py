@@ -103,6 +103,12 @@ def _use_host_native_op(device) -> bool:
     if device.is_cpu:
         return True
     if getattr(device, "is_metal", False):
+        if warp._src.context.runtime._metal_capture_graph is not None:
+            raise RuntimeError(
+                "wp.utils host ops on Metal arrays are not supported inside a Metal graph "
+                "capture — they run on the host and would not be replayed. Move the call "
+                "outside the capture region."
+            )
         wp.synchronize_device(device)
         return True
     return False

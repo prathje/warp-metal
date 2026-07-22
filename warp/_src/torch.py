@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ctypes
+import weakref
 from typing import TYPE_CHECKING
 
 import numpy
@@ -41,6 +42,16 @@ def device_from_torch(torch_device: torch.device | str) -> warp.Device:
                 return warp._src.context.runtime.cuda_devices[torch_device.index]
             elif torch_device.type == "cpu":
                 return warp._src.context.runtime.cpu_device
+            elif torch_device.type == "mps":
+                # Torch calls the Apple GPU "mps"; Warp registers the same
+                # alias in its device map when the Metal backend is enabled.
+                metal_device = warp._src.context.runtime.device_map.get("mps")
+                if metal_device is not None:
+                    return metal_device
+                raise RuntimeError(
+                    "Torch device 'mps' has no corresponding Warp device — enable the Metal "
+                    "backend with wp.config.enable_metal = True before wp.init()"
+                )
             else:
                 raise RuntimeError(f"Unsupported Torch device type {torch_device.type}")
         except Exception as e:
@@ -191,6 +202,110 @@ dtype_is_compatible.compatible_sets = None
 
 
 # wrap a torch tensor to a wp array, data is not copied
+def _from_torch_mps(t, dtype, shape, strides, requires_grad, grad, return_ctype, device):
+    """Wrap an MPS Torch tensor as a zero-copy Warp array on the Metal device.
+
+    Torch's MPS ``data_ptr()`` is not a data pointer: it is the ObjC
+    ``id<MTLBuffer>`` of the storage plus the byte storage offset (see
+    ``getMTLBufferStorage`` in Torch's MPS backend). For an offset-0 tensor
+    whose buffer uses *shared* storage we can recover the buffer object, take
+    its ``contents()`` host address (Apple unified memory), and register the
+    buffer with Warp's Metal registry so native-dispatch launches can bind it.
+
+    Torch's own MPS allocations use *private* storage and cannot be wrapped —
+    only tensors whose buffer originated elsewhere qualify, most usefully a
+    Warp array round-tripped through ``wp.to_torch`` (zero-copy on the native
+    dispatch path). The idiomatic Metal pattern is therefore Warp-owned
+    memory viewed from Torch, with Torch writing back in place through the
+    view — the reverse of the CUDA habit of wrapping Torch-owned tensors.
+
+    Coherency contract (same as the round-5 host-op rules): pending Torch
+    GPU work is drained here so the initial contents are visible; after
+    that, callers must synchronize the writing side before the other side
+    reads (``torch.mps.synchronize()`` for Torch writes,
+    ``wp.synchronize_device()`` for Warp writes) — the two frameworks
+    dispatch on separate MTLCommandQueues with no cross-queue ordering.
+    """
+    import numpy as np  # noqa: PLC0415
+    import objc  # noqa: PLC0415
+    import torch  # noqa: PLC0415
+
+    from warp._src.context import _metal_register_foreign_buffer  # noqa: PLC0415
+
+    if not warp.config.metal_native_dispatch:
+        raise RuntimeError(
+            "wp.from_torch on an MPS tensor requires the native Metal dispatch path — "
+            "set wp.config.metal_native_dispatch = True before wp.init(). The MLX "
+            "dispatch path cannot bind Torch-owned MTLBuffers to kernels."
+        )
+    if requires_grad or (requires_grad is None and t.requires_grad) or grad is not None:
+        raise RuntimeError(
+            "wp.from_torch on an MPS tensor does not support gradients — the Metal "
+            "backend has no adjoint kernel support. Pass requires_grad=False (and "
+            "detach the tensor if it requires grad)."
+        )
+    if return_ctype:
+        raise RuntimeError("wp.from_torch(..., return_ctype=True) is not supported for MPS tensors")
+    if t.storage_offset() != 0:
+        raise RuntimeError(
+            "wp.from_torch on an MPS tensor requires storage_offset() == 0 — Metal kernel "
+            "launches bind whole MTLBuffers. Wrap the base tensor, or make an offset-free "
+            "copy with .clone()."
+        )
+    if not t.is_contiguous():
+        raise RuntimeError(
+            "wp.from_torch on an MPS tensor requires a contiguous tensor — Metal kernels "
+            "index arrays as row-major contiguous. Call .contiguous() first."
+        )
+
+    mtl_buf = objc.objc_object(c_void_p=t.data_ptr())
+    try:
+        buf_nbytes = int(mtl_buf.length())
+        storage_mode = int(mtl_buf.storageMode())
+    except Exception as e:
+        raise RuntimeError(
+            "wp.from_torch could not interpret the MPS tensor's storage as an MTLBuffer — "
+            "this Torch version may have changed its MPS data_ptr() convention."
+        ) from e
+    if storage_mode != 0:  # MTLStorageModeShared
+        raise RuntimeError(
+            "wp.from_torch: this MPS tensor's MTLBuffer uses private storage (Torch's MPS "
+            "allocator default), so its bytes are not host-addressable and Warp cannot wrap "
+            "it. Allocate the array in Warp instead and view it in Torch via wp.to_torch "
+            "(zero-copy on the native Metal dispatch path) — Torch ops can write back "
+            "in place through that view."
+        )
+    data_nbytes = t.numel() * t.element_size()
+    if buf_nbytes < data_nbytes:
+        raise RuntimeError(
+            f"wp.from_torch: MPS tensor claims {data_nbytes} bytes but its MTLBuffer holds "
+            f"only {buf_nbytes} — refusing to wrap."
+        )
+    mv = mtl_buf.contents().as_buffer(buf_nbytes)
+    addr = int(np.frombuffer(mv, dtype=np.uint8).__array_interface__["data"][0])
+
+    # Drain pending Torch GPU work so the wrapped array's initial contents
+    # are coherent (see the coherency contract in the docstring).
+    torch.mps.synchronize()
+
+    _metal_register_foreign_buffer(addr, mtl_buf)
+
+    a = warp.array(
+        ptr=addr,
+        dtype=dtype,
+        shape=shape,
+        strides=strides,
+        device=device,
+        copy=False,
+    )
+    # Keep the tensor alive: it owns the storage; if it died, Torch's MPS
+    # allocator could hand the MTLBuffer to a new tensor while Warp still
+    # reads/writes through it.
+    a._tensor = t
+    weakref.finalize(a, warp._src.context._metal_release_foreign_buffer, addr)
+    return a
+
+
 def from_torch(
     t: torch.Tensor,
     dtype: type | None = None,
@@ -200,6 +315,16 @@ def from_torch(
     retain_grad: bool = False,
 ) -> warp.array | warp._src.types.array_t:
     """Convert a Torch tensor to a Warp array without copying the data.
+
+    MPS (Apple GPU) tensors can only be wrapped when their ``MTLBuffer`` uses
+    shared storage — in practice, tensors that view Warp-owned memory (e.g.
+    obtained from ``wp.to_torch``), since Torch's own MPS allocations use
+    private storage. The idiomatic Metal pattern is the reverse of CUDA's:
+    allocate in Warp, view in Torch via ``wp.to_torch`` (zero-copy on the
+    native dispatch path), and let Torch write back in place through the view.
+    Torch and Warp dispatch on separate Metal command queues: synchronize the
+    writing side (``torch.mps.synchronize()`` / ``wp.synchronize_device()``)
+    before the other side reads.
 
     Args:
         t: The torch tensor to wrap.
@@ -245,6 +370,11 @@ def from_torch(
         # trim shape and strides
         shape = tuple(shape[:-dtype_dims]) or (1,)
         strides = tuple(strides[:-dtype_dims]) or (ctype_size,)
+
+    if t.device.type == "mps":
+        # Apple-GPU tensors need special pointer handling (their data_ptr()
+        # is not a data pointer) — see _from_torch_mps.
+        return _from_torch_mps(t, dtype, shape, strides, requires_grad, grad, return_ctype, device_from_torch(t.device))
 
     # gradient
     # - if return_ctype is False, we set `grad` to a wp.array or None
@@ -322,6 +452,10 @@ def from_torch(
 def to_torch(a: warp.array, requires_grad: bool | None = None):
     """Convert a Warp array to a Torch tensor without copying the data.
 
+    On Metal devices the conversion is zero-copy on the native dispatch path
+    (the result is an MPS view of the Warp array's unified memory, so Torch
+    ops can write back in place); the MLX dispatch path falls back to a copy.
+
     Args:
         a: The Warp array to convert.
         requires_grad: Whether the resulting tensor should convert the array's
@@ -376,12 +510,24 @@ def to_torch(a: warp.array, requires_grad: bool | None = None):
         return t
 
     elif a.device.is_metal:
+        # Native dispatch path: zero-copy. Export the array's MTLBuffer as a
+        # kDLMetal DLPack capsule and let Torch wrap it as an MPS tensor
+        # aliasing the same unified memory — Torch ops write back in place.
+        # Falls through to the copy path when the pointer is not a base
+        # allocation (offset views) or when gradient wiring is requested.
+        if warp.config.metal_native_dispatch and not (requires_grad and a.requires_grad):
+            mtl_buf = warp._src.context._metal_get_buffer(a.ptr)
+            if mtl_buf is not None:
+                t = torch.from_dlpack(warp.to_dlpack(a))
+                t.requires_grad = requires_grad
+                return t
+
         # MLX-managed unified memory is host-readable. Round-trip through
         # numpy and let torch place the result on MPS. NB: this is a
         # *copy* in both directions — host-side mutations on the torch
         # tensor will not propagate back to the Warp array. mjlab and
         # similar host frameworks that round-trip between the two need
-        # an explicit ``wp.from_torch`` writeback.
+        # an explicit writeback.
         t = torch.as_tensor(a.numpy(), device="mps")
         # ``a.numpy()`` discards Warp's zero strides — the numpy round-
         # trip produces a contiguous copy with normal strides, even for

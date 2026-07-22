@@ -99,6 +99,17 @@ def _dlpack_capsule_deleter(ptr) -> None:
             managed_tensor.deleter(managed_ptr)
 
 
+# Immortalize the ctypes callbacks: consumers (e.g. a Torch tensor wrapping an
+# exported capsule) hold raw pointers into these closures and may invoke them
+# during interpreter shutdown, AFTER this module's globals have been cleared.
+# If the CFUNCTYPE objects were deallocated with the module dict, their libffi
+# closures would be freed and the late call would crash with EXC_BAD_ACCESS in
+# ffi_closure_SYSV_inner. The extra permanent reference keeps the closures
+# alive for the life of the process (two small allocations).
+Py_IncRef(_dlpack_tensor_deleter)
+Py_IncRef(_dlpack_capsule_deleter)
+
+
 def _device_to_dlpack(wp_device: warp._src.context.Device) -> DLDevice:
     dl_device = DLDevice()
 
@@ -108,6 +119,17 @@ def _device_to_dlpack(wp_device: warp._src.context.Device) -> DLDevice:
     elif wp_device.is_cuda:
         dl_device.device_type = DLDeviceType.kDLCUDA
         dl_device.device_id = wp_device.ordinal
+    elif getattr(wp_device, "is_metal", False):
+        if warp.config.metal_native_dispatch:
+            # ``kDLMetal`` convention (used by Torch MPS): ``data`` is the
+            # ObjC ``id<MTLBuffer>``, ``byte_offset`` the offset into it.
+            dl_device.device_type = DLDeviceType.kDLMetal
+        else:
+            # The MLX dispatch path has no MTLBuffer to hand out; export the
+            # unified-memory host pointer as a CPU tensor instead (this is
+            # also what MLX itself writes into its DLPack capsules).
+            dl_device.device_type = DLDeviceType.kDLCPU
+        dl_device.device_id = 0
     else:
         raise RuntimeError(f"Invalid device type converting to DLPack: {wp_device}")
 
@@ -197,6 +219,14 @@ def device_from_dlpack(dl_device):
         or dl_device.device_type.value == DLDeviceType.kDLCUDAManaged
     ):
         return warp._src.context.runtime.cuda_devices[dl_device.device_id]
+    elif dl_device.device_type.value == DLDeviceType.kDLMetal:
+        metal_device = warp._src.context.runtime.device_map.get("metal:0")
+        if metal_device is None:
+            raise RuntimeError(
+                "DLPack tensor lives on a Metal device but the Warp Metal backend is not "
+                "enabled — set wp.config.enable_metal = True before wp.init()"
+            )
+        return metal_device
     else:
         raise RuntimeError(f"Unknown device type from DLPack: {dl_device.device_type.value}")
 
@@ -253,6 +283,33 @@ def to_dlpack(wp_array: warp.array):
     else:
         dl_device = _device_to_dlpack(wp_array.device)
 
+    # The DLTensor ``data`` field. For most devices this is ``wp_array.ptr``;
+    # for the native-Metal export it is the ObjC ``id<MTLBuffer>`` per the
+    # ``kDLMetal`` convention.
+    data_value = wp_array.ptr
+    if getattr(wp_array.device, "is_metal", False):
+        # Flush + wait on outstanding Warp GPU work so the consumer sees the
+        # array's current bytes. Ongoing coherency across the two frameworks'
+        # command queues remains the caller's responsibility (synchronize the
+        # writing side before the other side reads).
+        if warp.config.metal_native_dispatch:
+            from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
+
+            get_dispatcher().sync()
+            mtl_buf = warp._src.context._metal_get_buffer(wp_array.ptr)
+            if mtl_buf is None:
+                raise RuntimeError(
+                    "Cannot export this Metal array via DLPack: its pointer is not a base "
+                    "allocation (offset views cannot be described as an MTLBuffer + offset "
+                    "here). Export the base array, or make a contiguous copy first."
+                )
+            import objc  # noqa: PLC0415
+
+            data_value = objc.pyobjc_id(mtl_buf)
+        # MLX dispatch path: fall through with the unified-memory host pointer
+        # and the kDLCPU device set by _device_to_dlpack (MLX launches are
+        # synchronous, so the bytes are already current).
+
     # allocate DLManagedTensor, shape, and strides together
     managed_tensor_size = ctypes.sizeof(DLManagedTensor)
     padding = managed_tensor_size & 7
@@ -263,7 +320,7 @@ def to_dlpack(wp_array: warp.array):
 
     # set managed tensor attributes
     managed_tensor = DLManagedTensor.from_address(mem_ptr)
-    managed_tensor.dl_tensor.data = wp_array.ptr
+    managed_tensor.dl_tensor.data = data_value
     managed_tensor.dl_tensor.device = dl_device
     managed_tensor.dl_tensor.ndim = target_ndim
     managed_tensor.dl_tensor.dtype = dtype_to_dlpack(target_dtype)
@@ -338,6 +395,49 @@ def dtype_is_compatible(dl_dtype, wp_dtype):
         raise RuntimeError(f"Unsupported DLPack dtype {(str(dl_dtype.type_code), dl_dtype.bits)}")
 
 
+def _map_metal_dltensor(dlt: DLTensor) -> int:
+    """Resolve a ``kDLMetal`` DLTensor to a host address and register its buffer.
+
+    Per the ``kDLMetal`` convention (shared with Torch MPS), ``dlt.data`` is an
+    ObjC ``id<MTLBuffer>``. Shared-storage buffers are host-addressable on Apple
+    unified memory; the returned address doubles as the Warp array pointer and
+    the key under which the buffer is registered for native-dispatch launches.
+    The caller must pair the registration with
+    ``_metal_release_foreign_buffer`` when the wrapping array dies.
+    """
+    import numpy as np  # noqa: PLC0415
+
+    if not warp.config.metal_native_dispatch:
+        raise RuntimeError(
+            "Importing a Metal DLPack tensor requires the native Metal dispatch path — "
+            "set wp.config.metal_native_dispatch = True before wp.init()."
+        )
+    import objc  # noqa: PLC0415
+
+    mtl_buf = objc.objc_object(c_void_p=dlt.data)
+    try:
+        storage_mode = int(mtl_buf.storageMode())
+        buf_nbytes = int(mtl_buf.length())
+    except Exception as e:
+        raise RuntimeError("Metal DLPack tensor's data field could not be interpreted as an MTLBuffer") from e
+    if storage_mode != 0:  # MTLStorageModeShared
+        raise RuntimeError(
+            "Cannot import this Metal DLPack tensor: its MTLBuffer does not use shared "
+            "storage, so its bytes are not host-addressable. (Torch MPS tensors allocate "
+            "private storage — allocate in Warp instead and view the array in Torch via "
+            "wp.to_torch, which is zero-copy on the native Metal dispatch path.)"
+        )
+    if dlt.byte_offset != 0:
+        raise RuntimeError(
+            "Cannot import a Metal DLPack tensor with a non-zero byte_offset — Metal "
+            "kernel launches bind whole MTLBuffers. Import the base tensor instead."
+        )
+    mv = mtl_buf.contents().as_buffer(buf_nbytes)
+    addr = int(np.frombuffer(mv, dtype=np.uint8).__array_interface__["data"][0])
+    warp._src.context._metal_register_foreign_buffer(addr, mtl_buf)
+    return addr
+
+
 def _unpack_array(dlt: DLTensor, dtype=None):
     device = device_from_dlpack(dlt.device)
     pinned = dlt.device.device_type.value == DLDeviceType.kDLCUDAHost
@@ -390,9 +490,20 @@ def _unpack_array(dlt: DLTensor, dtype=None):
         # incompatible dtype requested
         raise RuntimeError(f"Incompatible data types: {dlt.dtype} and {dtype}")
 
+    data_ptr = dlt.data
+    metal_foreign_ptr = None
+    if dlt.device.device_type.value == DLDeviceType.kDLMetal:
+        data_ptr = _map_metal_dltensor(dlt)
+        metal_foreign_ptr = data_ptr
+
     a = warp._src.types.array(
-        ptr=dlt.data, dtype=dtype, shape=shape, strides=strides, copy=False, device=device, pinned=pinned
+        ptr=data_ptr, dtype=dtype, shape=shape, strides=strides, copy=False, device=device, pinned=pinned
     )
+
+    if metal_foreign_ptr is not None:
+        import weakref  # noqa: PLC0415
+
+        weakref.finalize(a, warp._src.context._metal_release_foreign_buffer, metal_foreign_ptr)
 
     return a
 
@@ -474,6 +585,13 @@ def from_dlpack(source, dtype=None, hint=None) -> warp.array | warp.Texture:
             # For pinned memory, we sync with the current CUDA device's stream.
             # Note that we pass 1 for the null stream, per DLPack spec.
             cuda_stream = warp.get_cuda_device().stream.cuda_stream or 1
+        elif device_type == DLDeviceType.kDLMetal:
+            # DLPack defines no stream semantics for Metal; the exporter is
+            # responsible for making its bytes current (Torch MPS syncs its
+            # queue on export). Call without the ``stream`` keyword — some
+            # exporters with Metal devices (MLX) reject ``stream=None``.
+            capsule = source.__dlpack__()
+            return _from_dlpack(capsule, dtype=dtype, hint=hint)
         else:
             raise TypeError("Unsupported source device")
 

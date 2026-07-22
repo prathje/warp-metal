@@ -3498,6 +3498,65 @@ def _metal_release_buffer(ptr: int) -> None:
         _metal_buffer_registry.pop(ptr, None)
 
 
+# Foreign (externally owned) Metal buffers — e.g. a Torch MPS tensor's
+# MTLBuffer wrapped via wp.from_dlpack — registered under their host address,
+# refcounted because the same buffer can be wrapped by several wp.arrays and
+# the registry entry must survive until the LAST of them dies.
+_metal_foreign_refcounts: dict[int, int] = {}
+
+
+def _metal_register_foreign_buffer(ptr: int, owner) -> None:
+    with _metal_buffer_lock:
+        if ptr in _metal_buffer_registry and ptr not in _metal_foreign_refcounts:
+            # Already a Warp-owned allocation at this address (e.g. a Warp
+            # array round-tripped through an external framework and wrapped
+            # back). The allocator entry outlives any foreign wrapper —
+            # leave it alone so releasing the wrapper can't unregister it.
+            return
+        n = _metal_foreign_refcounts.get(ptr, 0)
+        _metal_foreign_refcounts[ptr] = n + 1
+        if n == 0:
+            _metal_buffer_registry[ptr] = owner
+
+
+def _metal_release_foreign_buffer(ptr: int) -> None:
+    with _metal_buffer_lock:
+        n = _metal_foreign_refcounts.get(ptr)
+        if n is None:
+            # Not a foreign registration (Warp-owned, or already released).
+            return
+        if n > 1:
+            _metal_foreign_refcounts[ptr] = n - 1
+            return
+        _metal_foreign_refcounts.pop(ptr, None)
+        _metal_buffer_registry.pop(ptr, None)
+
+
+def _metal_guarded_host_op(native_func, op_label: str):
+    """Wrap a host-side memory op for use on Metal arrays.
+
+    Unified memory makes the host implementations correct, but only once
+    queued GPU work has drained (a pending kernel write would land after the
+    host op and silently clobber it), and never inside a Metal graph capture
+    (the op would execute once at capture time instead of being replayed).
+    """
+
+    def guarded(*args):
+        if warp.config.metal_native_dispatch:
+            if runtime._metal_capture_graph is not None:
+                raise RuntimeError(
+                    f"Host-side {op_label} on a Metal array is not supported inside a Metal "
+                    "graph capture — it would execute once at capture time instead of being "
+                    "replayed. Move it outside the capture region, or express it as a kernel."
+                )
+            from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
+
+            get_dispatcher().sync()
+        return native_func(*args)
+
+    return guarded
+
+
 class MetalDefaultAllocator:
     """Allocator for Apple-Silicon Metal devices.
 
@@ -4052,8 +4111,13 @@ class Device:
             self.default_allocator = MetalDefaultAllocator(self)
             # Pinned/unpinned distinction does not apply to unified memory; alias.
             self.pinned_allocator = self.default_allocator
-            self.memset = runtime.core.wp_memset_host
-            self.memtile = runtime.core.wp_memtile_host
+            # Host-side memset/memtile need the same guards as the h2h copy
+            # path: drain queued GPU work first (a pending kernel write would
+            # otherwise land AFTER the host fill and silently undo it), and
+            # refuse to run inside a Metal graph capture (the fill would
+            # execute once at capture time instead of being replayed).
+            self.memset = _metal_guarded_host_op(runtime.core.wp_memset_host, "fill/zero")
+            self.memtile = _metal_guarded_host_op(runtime.core.wp_memtile_host, "fill")
 
         else:
             raise RuntimeError(f"Invalid device ordinal ({ordinal})'")
@@ -4466,6 +4530,9 @@ class Graph:
         self._native_graph: ctypes.c_void_p | None = None  # APICGraphInternal*
         self._params: dict = {}  # name -> {"size": int}
 
+        # Metal ICB graph (from a capture on a Metal device)
+        self._metal_graph = None  # warp._src.metal_dispatch.MetalGraph
+
     def __del__(self):
         try:
             # Clean up APIC capture state
@@ -4757,6 +4824,9 @@ class Runtime:
         # APIC capture state (set during capture_begin, cleared at capture_end)
         self._apic_capture = None
         self._apic_graph = None
+
+        # Metal ICB capture state (set during capture_begin, cleared at capture_end)
+        self._metal_capture_graph = None
 
         # setup c-types for warp.dll
         try:
@@ -9604,6 +9674,34 @@ def capture_begin(
             raise
         return
 
+    # ---- Metal capture path ----
+    if device.is_metal:
+        # Kernel launches are recorded into an MTLIndirectCommandBuffer by the
+        # native dispatcher and NOT executed during capture (same semantics as
+        # CUDA graph capture). Host-side operations (wp.copy between Metal
+        # arrays, fill_/zero_, wp.utils host ops) cannot be recorded and raise
+        # during capture instead of silently executing once — move them
+        # outside the capture region.
+        if not warp.config.metal_native_dispatch:
+            raise RuntimeError(
+                "Graph capture on Metal requires the native dispatch path — set "
+                "wp.config.metal_native_dispatch = True before wp.init(). The MLX "
+                "dispatch path executes launches eagerly and cannot record them."
+            )
+        if external:
+            raise RuntimeError("External captures are not supported on Metal devices")
+        if apic:
+            raise RuntimeError("APIC capture (capture_save) is not supported on Metal devices")
+        if runtime._metal_capture_graph is not None:
+            raise RuntimeError("Graph capture already in progress")
+
+        from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
+
+        get_dispatcher().begin_record()
+        graph = Graph(device)
+        runtime._metal_capture_graph = graph
+        return
+
     # ---- CUDA capture path ----
     if force_module_load is None:
         if runtime.driver_version is not None and runtime.driver_version >= (12, 3):
@@ -9680,6 +9778,15 @@ def capture_end(device: DeviceLike = None, stream: Stream | None = None) -> Grap
             apic_capture.end_recording()
         runtime._apic_capture = None
         runtime._apic_graph = None
+        return graph
+
+    # ---- Metal capture path ----
+    if runtime._metal_capture_graph is not None:
+        from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
+
+        graph = runtime._metal_capture_graph
+        runtime._metal_capture_graph = None
+        graph._metal_graph = get_dispatcher().end_record()
         return graph
 
     if stream is not None:
@@ -10092,6 +10199,17 @@ def capture_launch(graph: Graph, stream: Stream | None = None):
         graph: A :class:`Graph` as returned by :func:`~warp.capture_end()`
         stream: A :class:`Stream` to launch the graph on (CUDA only)
     """
+
+    # ---- Metal graph path ----
+    if getattr(graph, "_metal_graph", None) is not None:
+        from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
+
+        # Fire-and-forget, same as CUDA graph launch: the replayed dispatches
+        # join the dispatcher's normal autoflush/sync machinery, so a later
+        # wp.synchronize_device() (or any host read, e.g. .numpy()) waits on
+        # them like on directly launched kernels.
+        get_dispatcher().replay(graph._metal_graph)
+        return
 
     # ---- APIC loaded graph path ----
     if graph._native_graph is not None:
@@ -10540,14 +10658,25 @@ def copy(
                 )
             else:
                 # Metal unified memory: ``wp_memcpy_h2h`` is a plain CPU
-                # memcpy, but the source's MTLBuffer may still have
-                # pending GPU writes from a kernel launched earlier in
-                # this step. Drain the dispatcher first so the host
-                # reads land *after* the GPU finishes — without this,
-                # ``wp.copy(d.qacc_warmstart, d.qacc)`` at the end of
-                # ``mjw_step`` snapshots a stale ``qacc`` and the next
-                # step's solver starts from the wrong warmstart.
-                if getattr(src.device, "is_metal", False) and warp.config.metal_native_dispatch:
+                # memcpy, but either side's MTLBuffer may still have
+                # pending GPU work from a kernel launched earlier in
+                # this step (reads from a stale source, or a queued
+                # kernel overwriting the fresh destination). Drain the
+                # dispatcher first so the host op lands *after* the GPU
+                # finishes — without this, ``wp.copy(d.qacc_warmstart,
+                # d.qacc)`` at the end of ``mjw_step`` snapshots a stale
+                # ``qacc`` and the next step's solver starts from the
+                # wrong warmstart.
+                if (
+                    getattr(src.device, "is_metal", False) or getattr(dest.device, "is_metal", False)
+                ) and warp.config.metal_native_dispatch:
+                    if runtime._metal_capture_graph is not None:
+                        raise RuntimeError(
+                            "wp.copy involving a Metal array is not supported inside a Metal "
+                            "graph capture — the copy runs on the host and would not be "
+                            "replayed by the captured graph. Move it outside the capture "
+                            "region, or express it as a kernel."
+                        )
                     from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
 
                     get_dispatcher().sync()

@@ -3611,6 +3611,23 @@ class array(Array[DType, NDim]):
             # Suppress TypeError and AttributeError when callables become None during shutdown
             pass
 
+    def __array__(self, dtype=None):
+        # NumPy prefers ``__array_interface__`` (zero-copy, CPU arrays) over
+        # this hook, so ``__array__`` is only consulted for GPU arrays. Metal
+        # arrays live in unified memory — ``numpy()`` syncs and copies, which
+        # is what an explicit ``np.asarray(a)`` asks for. Anything else keeps
+        # failing, but with a clear message instead of NumPy's fallback
+        # iteration error ("Item indexing is not supported").
+        if self.device is None or not (self.device.is_cpu or getattr(self.device, "is_metal", False)):
+            raise TypeError(
+                f"Implicit conversion to a NumPy array is not supported for arrays on device "
+                f"{self.device} — copy to the host first with .numpy()"
+            )
+        result = self.numpy()
+        if dtype is not None and result.dtype != np.dtype(dtype):
+            result = result.astype(dtype)
+        return result
+
     @property
     def __array_interface__(self):
         # raising an AttributeError here makes hasattr() return False
@@ -3715,6 +3732,11 @@ class array(Array[DType, NDim]):
             return (warp._src.dlpack.DLDeviceType.kDLCUDA, self.device.ordinal)
         elif self.pinned:
             return (warp._src.dlpack.DLDeviceType.kDLCUDAHost, 0)
+        elif getattr(self.device, "is_metal", False) and warp.config.metal_native_dispatch:
+            # Must match what to_dlpack exports: the native dispatch path
+            # writes a kDLMetal capsule (data = id<MTLBuffer>); the MLX path
+            # exports the unified-memory host pointer as a CPU tensor.
+            return (warp._src.dlpack.DLDeviceType.kDLMetal, 0)
         else:
             return (warp._src.dlpack.DLDeviceType.kDLCPU, 0)
 

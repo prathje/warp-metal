@@ -456,6 +456,16 @@ class MetalDispatcher:
         """
         if nbytes <= 0:
             return
+        if self._record_state is not None:
+            # Blit commands cannot be encoded into a compute ICB — the fill
+            # would execute once at capture time and never on replay, so a
+            # replayed atomic accumulator would keep its previous values.
+            raise MetalDispatchError(
+                "A kernel with a zero-initialized atomic output cannot be captured into a "
+                "Metal graph — its pre-launch zero-fill is a blit that ICBs cannot record. "
+                "Zero the output with a plain (non-atomic) kernel inside the capture, or "
+                "keep this launch outside the capture region."
+            )
         Metal = self._Metal
         # End the live compute encoder, if any, so we can switch to a
         # blit encoder. Reopen the compute encoder after — minor
