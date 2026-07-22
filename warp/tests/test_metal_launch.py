@@ -5650,6 +5650,287 @@ class TestMetalConstBufferCache(unittest.TestCase):
         _run_with_metal_enabled(self, snippet)
 
 
+def _has_torch_mps() -> bool:
+    try:
+        import torch  # noqa: PLC0415
+
+        return torch.backends.mps.is_available()
+    except Exception:
+        return False
+
+
+@unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
+@unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
+@unittest.skipUnless(_has_torch_mps(), "Torch with MPS support is not installed")
+class TestMetalTorchInterop(unittest.TestCase):
+    """Torch interop on Metal. Native dispatch: ``wp.to_torch`` is a
+    zero-copy MPS view of the Warp array's MTLBuffer (kDLMetal DLPack) and
+    Torch ops write back in place; ``wp.from_torch`` re-wraps such views.
+    MLX dispatch: ``to_torch`` copies, ``from_torch`` raises with guidance."""
+
+    def test_to_torch_and_writeback(self):
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+            import torch
+
+            dev = 'metal:0'
+            assert wp.device_from_torch(torch.device('mps')).is_metal
+            assert wp.device_to_torch(dev) == 'mps'
+
+            @wp.kernel
+            def scale2(a: wp.array(dtype=wp.float32)):
+                i = wp.tid()
+                a[i] = a[i] * 2.0
+
+            src = np.arange(64, dtype=np.float32)
+            a = wp.array(src, device=dev)
+            t = wp.to_torch(a)
+            assert t.device.type == 'mps', t.device
+            np.testing.assert_allclose(t.cpu().numpy(), src)
+
+            if wp.config.metal_native_dispatch:
+                # zero-copy: Warp kernel writes are visible through the view...
+                wp.launch(scale2, dim=64, inputs=[a], device=dev)
+                wp.synchronize_device(dev)
+                np.testing.assert_allclose(t.cpu().numpy(), src * 2)
+                # ...and Torch writes land in the Warp array (action writeback).
+                t.copy_(torch.arange(64, dtype=torch.float32, device='mps') + 100.0)
+                torch.mps.synchronize()
+                np.testing.assert_allclose(a.numpy(), src + 100.0)
+
+                # zero-stride broadcast dims survive (mjlab TorchArray heuristics)
+                base = wp.array(np.arange(5, dtype=np.float32), device=dev)
+                b = wp.array(ptr=base.ptr, dtype=wp.float32, shape=(4, 5), strides=(0, 4), device=dev, copy=False)
+                tb = wp.to_torch(b)
+                assert tb.stride(0) == 0, tb.stride()
+                np.testing.assert_allclose(tb[3].cpu().numpy(), np.arange(5))
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
+    def test_from_torch_roundtrip_and_errors(self):
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+            import torch
+
+            dev = 'metal:0'
+
+            @wp.kernel
+            def scale2(a: wp.array(dtype=wp.float32)):
+                i = wp.tid()
+                a[i] = a[i] * 2.0
+
+            src = np.arange(32, dtype=np.float32)
+            a = wp.array(src, device=dev)
+            t = wp.to_torch(a)
+
+            if wp.config.metal_native_dispatch:
+                # a Torch view of Warp memory wraps back zero-copy...
+                back = wp.from_torch(t)
+                assert back.ptr == a.ptr
+                wp.launch(scale2, dim=32, inputs=[back], device=dev)
+                wp.synchronize_device(dev)
+                np.testing.assert_allclose(a.numpy(), src * 2)
+                # ...and releasing the wrapper must not unregister the
+                # Warp-owned buffer (launches on ``a`` must keep working).
+                import gc
+                import warp._src.context as ctx
+                del back
+                gc.collect()
+                assert ctx._metal_get_buffer(a.ptr) is not None
+                wp.launch(scale2, dim=32, inputs=[a], device=dev)
+                wp.synchronize_device(dev)
+                np.testing.assert_allclose(a.numpy(), src * 4)
+
+                # Torch-owned MPS tensors use private storage -> clear error
+                try:
+                    wp.from_torch(torch.zeros(8, device='mps'))
+                    raise AssertionError('expected RuntimeError')
+                except RuntimeError as e:
+                    assert 'private storage' in str(e), e
+
+                # torch consumes Warp's kDLMetal capsule directly too
+                t2 = torch.from_dlpack(wp.to_dlpack(a))
+                assert t2.device.type == 'mps'
+                np.testing.assert_allclose(t2.cpu().numpy(), a.numpy())
+            else:
+                # MLX path: from_torch(mps) raises with guidance
+                try:
+                    wp.from_torch(torch.zeros(8, device='mps'))
+                    raise AssertionError('expected RuntimeError')
+                except RuntimeError as e:
+                    assert 'metal_native_dispatch' in str(e), e
+                # ...and the CPU-capsule export gives numpy a zero-copy view
+                n = np.from_dlpack(a)
+                np.testing.assert_allclose(n, src)
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
+
+@unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
+@unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
+class TestMetalGraphCapture(unittest.TestCase):
+    """``wp.capture_begin/end/launch`` on Metal map onto the dispatcher's
+    ICB record/replay (native dispatch only). Launches are recorded, NOT
+    executed; host-side memory ops raise instead of silently executing
+    once and diverging from CUDA-graph replay semantics."""
+
+    def test_capture_replay_semantics(self):
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            dev = 'metal:0'
+
+            @wp.kernel
+            def add_one(a: wp.array(dtype=wp.float32)):
+                i = wp.tid()
+                a[i] = a[i] + 1.0
+
+            @wp.kernel
+            def double_into(src: wp.array(dtype=wp.float32), dst: wp.array(dtype=wp.float32)):
+                i = wp.tid()
+                dst[i] = src[i] * 2.0
+
+            if not wp.config.metal_native_dispatch:
+                try:
+                    with wp.ScopedDevice(dev):
+                        wp.capture_begin()
+                    raise AssertionError('expected RuntimeError')
+                except RuntimeError as e:
+                    assert 'metal_native_dispatch' in str(e), e
+                raise SystemExit(0)
+
+            a = wp.zeros(64, dtype=wp.float32, device=dev)
+            b = wp.zeros(64, dtype=wp.float32, device=dev)
+            # warm modules outside the capture
+            wp.launch(add_one, dim=64, inputs=[a], device=dev)
+            wp.launch(double_into, dim=64, inputs=[a, b], device=dev)
+            wp.synchronize_device(dev)
+            a.zero_()
+            b.zero_()
+
+            with wp.ScopedDevice(dev):
+                wp.capture_begin()
+                try:
+                    for _ in range(3):
+                        wp.launch(add_one, dim=64, inputs=[a])
+                    wp.launch(double_into, dim=64, inputs=[a, b])
+                finally:
+                    g = wp.capture_end()
+
+            # capture must not have executed
+            np.testing.assert_allclose(a.numpy(), 0.0)
+            np.testing.assert_allclose(b.numpy(), 0.0)
+
+            for _ in range(5):
+                wp.capture_launch(g)
+            wp.synchronize_device(dev)
+            np.testing.assert_allclose(a.numpy(), 15.0)  # 5 replays x 3 increments
+            np.testing.assert_allclose(b.numpy(), 30.0)  # dependent kernel saw final a
+
+            # direct launches interleave with replays
+            wp.launch(add_one, dim=64, inputs=[a], device=dev)
+            wp.capture_launch(g)
+            wp.synchronize_device(dev)
+            np.testing.assert_allclose(a.numpy(), 19.0)
+            np.testing.assert_allclose(b.numpy(), 38.0)
+
+            # ScopedCapture sugar
+            with wp.ScopedDevice(dev):
+                with wp.ScopedCapture() as cap:
+                    wp.launch(add_one, dim=64, inputs=[a])
+            wp.capture_launch(cap.graph)
+            wp.synchronize_device(dev)
+            np.testing.assert_allclose(a.numpy(), 20.0)
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
+    def test_host_ops_raise_during_capture(self):
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            dev = 'metal:0'
+            if not wp.config.metal_native_dispatch:
+                raise SystemExit(0)
+
+            a = wp.zeros(8, dtype=wp.float32, device=dev)
+            b = wp.zeros(8, dtype=wp.float32, device=dev)
+
+            with wp.ScopedDevice(dev):
+                wp.capture_begin()
+                try:
+                    for fn in (
+                        lambda: a.zero_(),
+                        lambda: wp.copy(b, a),
+                        lambda: wp.array(np.arange(4, dtype=np.float32), device=dev),
+                    ):
+                        try:
+                            fn()
+                            raise AssertionError('expected RuntimeError')
+                        except RuntimeError as e:
+                            assert 'capture' in str(e), e
+                finally:
+                    g = wp.capture_end()
+
+            # nothing was recorded; replay is a harmless no-op
+            wp.capture_launch(g)
+            wp.synchronize_device(dev)
+            np.testing.assert_allclose(a.numpy(), 0.0)
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=60)
+
+
+@unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
+@unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
+class TestMetalHostOpOrdering(unittest.TestCase):
+    """Host-side ops on Metal arrays must drain queued GPU work first, and
+    ``np.asarray`` must convert instead of hitting NumPy's fallback
+    iteration error."""
+
+    def test_fill_after_unsynced_kernel(self):
+        # Before the memset guard, ``zero_()`` ran immediately on the host
+        # while the kernel's write was still queued on the GPU — the kernel
+        # then overwrote the zeros (silent wrong values on native dispatch).
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            dev = 'metal:0'
+
+            @wp.kernel
+            def fill7(a: wp.array(dtype=wp.float32)):
+                i = wp.tid()
+                a[i] = 7.0
+
+            a = wp.zeros(1 << 20, dtype=wp.float32, device=dev)
+            wp.launch(fill7, dim=1 << 20, inputs=[a], device=dev)
+            a.zero_()  # no explicit sync: the guard must order this after the kernel
+            np.testing.assert_allclose(a.numpy(), 0.0)
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=60)
+
+    def test_np_asarray(self):
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            src = np.arange(16, dtype=np.float32)
+            a = wp.array(src, device='metal:0')
+            np.testing.assert_allclose(np.asarray(a), src)
+            np.testing.assert_allclose(np.asarray(a, dtype=np.float64), src)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+
 @unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
 @unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
 class TestMetalArtifactCache(unittest.TestCase):
