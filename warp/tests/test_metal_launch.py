@@ -5585,7 +5585,10 @@ class TestMetalUnsupportedFeaturesRaise(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet)
 
-    def test_mesh_query_kernel_raises(self):
+    def test_mesh_query_point_kernel_raises(self):
+        # Mesh RAY queries are supported on Metal (see TestMetalBvhMesh);
+        # the point-query family is not yet. On the MLX path even mesh
+        # CREATION raises (BVH residency needs native dispatch).
         snippet = textwrap.dedent(
             """
             import numpy as np
@@ -5602,6 +5605,14 @@ class TestMetalUnsupportedFeaturesRaise(unittest.TestCase):
             mesh_pts = wp.array(np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0]], np.float32),
                                 dtype=wp.vec3, device=dev)
             tris = wp.array(np.array([0, 1, 2], np.int32), device=dev)
+            if not wp.config.metal_native_dispatch:
+                try:
+                    wp.Mesh(points=mesh_pts, indices=tris)
+                except RuntimeError as e:
+                    assert 'native dispatch' in str(e), str(e)
+                else:
+                    raise AssertionError('Mesh creation should have raised on the MLX path')
+                raise SystemExit(0)
             mesh = wp.Mesh(points=mesh_pts, indices=tris)
             pts = wp.array(np.zeros((4, 3), np.float32), dtype=wp.vec3, device=dev)
             d = wp.zeros(4, dtype=wp.float32, device=dev)
@@ -6219,6 +6230,301 @@ class TestMetalArtifactCache(unittest.TestCase):
             """
         )
         _run_with_metal_enabled(self, snippet)
+
+
+@unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
+@unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
+class TestMetalBvhMesh(unittest.TestCase):
+    """``wp.Bvh`` / ``wp.Mesh`` on Metal: host-built trees queried through
+    descriptor buffers whose gpuAddress is the id (native dispatch only —
+    the MLX launch path can't declare the node buffers GPU-resident)."""
+
+    def test_bvh_queries_match_cpu(self):
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            rng = np.random.default_rng(42)
+            N = 64
+            centers = rng.uniform(-5.0, 5.0, size=(N, 3)).astype(np.float32)
+            half = rng.uniform(0.1, 0.6, size=(N, 3)).astype(np.float32)
+            groups_np = np.sort(rng.integers(0, 4, size=N).astype(np.int32))
+            NQ = 64
+            q_lo = rng.uniform(-6.0, 5.0, size=(NQ, 3)).astype(np.float32)
+            q_hi = q_lo + rng.uniform(0.2, 2.0, size=(NQ, 3)).astype(np.float32)
+            starts_np = rng.uniform(-8.0, 8.0, size=(NQ, 3)).astype(np.float32)
+            dirs_np = rng.normal(size=(NQ, 3)).astype(np.float32)
+            dirs_np /= np.linalg.norm(dirs_np, axis=1, keepdims=True)
+
+            @wp.kernel
+            def q_aabb(bvh_id: wp.uint64, lo: wp.array(dtype=wp.vec3), hi: wp.array(dtype=wp.vec3),
+                       mask: wp.array2d(dtype=wp.int32)):
+                tid = wp.tid()
+                q = wp.bvh_query_aabb(bvh_id, lo[tid], hi[tid], -1)
+                nr = int(0)
+                while wp.bvh_query_next(q, nr):
+                    mask[tid, nr] = 1
+
+            @wp.kernel
+            def q_ray(bvh_id: wp.uint64, s: wp.array(dtype=wp.vec3), d: wp.array(dtype=wp.vec3),
+                      gq: wp.array(dtype=wp.int32), mask: wp.array2d(dtype=wp.int32)):
+                tid = wp.tid()
+                root = wp.bvh_get_group_root(bvh_id, gq[tid])
+                q = wp.bvh_query_ray(bvh_id, s[tid], d[tid], root)
+                nr = int(0)
+                while wp.bvh_query_next(q, nr, 100.0):
+                    mask[tid, nr] = 1
+
+            if not wp.config.metal_native_dispatch:
+                try:
+                    with wp.ScopedDevice('metal:0'):
+                        wp.Bvh(wp.array(centers - half, dtype=wp.vec3), wp.array(centers + half, dtype=wp.vec3))
+                    raise AssertionError('expected RuntimeError')
+                except RuntimeError as e:
+                    assert 'native dispatch' in str(e), e
+                raise SystemExit(0)
+
+            outs = {}
+            for dev in ('cpu', 'metal:0'):
+                with wp.ScopedDevice(dev):
+                    bvh = wp.Bvh(wp.array(centers - half, dtype=wp.vec3),
+                                 wp.array(centers + half, dtype=wp.vec3),
+                                 constructor='sah', groups=wp.array(groups_np, dtype=wp.int32), leaf_size=2)
+                    m1 = wp.zeros((NQ, N), dtype=wp.int32)
+                    wp.launch(q_aabb, dim=NQ,
+                              inputs=[bvh.id, wp.array(q_lo, dtype=wp.vec3), wp.array(q_hi, dtype=wp.vec3)],
+                              outputs=[m1])
+                    gq = wp.array((np.arange(NQ) % 4).astype(np.int32), dtype=wp.int32)
+                    m2 = wp.zeros((NQ, N), dtype=wp.int32)
+                    wp.launch(q_ray, dim=NQ,
+                              inputs=[bvh.id, wp.array(starts_np, dtype=wp.vec3),
+                                      wp.array(dirs_np, dtype=wp.vec3), gq],
+                              outputs=[m2])
+                    wp.synchronize_device()
+                    outs[dev] = (m1.numpy().copy(), m2.numpy().copy())
+            np.testing.assert_array_equal(outs['cpu'][0], outs['metal:0'][0])
+            np.testing.assert_array_equal(outs['cpu'][1], outs['metal:0'][1])
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=180)
+
+    def test_bvh_refit_capture_replay(self):
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            rng = np.random.default_rng(3)
+            N = 32
+            centers0 = rng.uniform(-4.0, 4.0, size=(N, 3)).astype(np.float32)
+            half = rng.uniform(0.2, 0.5, size=(N, 3)).astype(np.float32)
+            NR = 48
+            starts_np = rng.uniform(-8.0, 8.0, size=(NR, 3)).astype(np.float32)
+            dirs_np = rng.normal(size=(NR, 3)).astype(np.float32)
+            dirs_np /= np.linalg.norm(dirs_np, axis=1, keepdims=True)
+
+            @wp.kernel
+            def update_bounds(c: wp.array(dtype=wp.vec3), h: wp.array(dtype=wp.vec3),
+                              off: wp.array(dtype=wp.vec3),
+                              lo: wp.array(dtype=wp.vec3), hi: wp.array(dtype=wp.vec3)):
+                tid = wp.tid()
+                p = c[tid] + off[0]
+                lo[tid] = p - h[tid]
+                hi[tid] = p + h[tid]
+
+            @wp.kernel
+            def raycast(bvh_id: wp.uint64, s: wp.array(dtype=wp.vec3), d: wp.array(dtype=wp.vec3),
+                        n_hit: wp.array(dtype=wp.int32)):
+                tid = wp.tid()
+                q = wp.bvh_query_ray(bvh_id, s[tid], d[tid], -1)
+                nr = int(0)
+                n = int(0)
+                while wp.bvh_query_next(q, nr, 100.0):
+                    n += 1
+                n_hit[tid] = n
+
+            if not wp.config.metal_native_dispatch:
+                raise SystemExit(0)
+
+            def reference(off):
+                with wp.ScopedDevice('cpu'):
+                    b = wp.Bvh(wp.array(centers0 + off - half, dtype=wp.vec3),
+                               wp.array(centers0 + off + half, dtype=wp.vec3), constructor='sah', leaf_size=2)
+                    out = wp.zeros(NR, dtype=wp.int32)
+                    wp.launch(raycast, dim=NR,
+                              inputs=[b.id, wp.array(starts_np, dtype=wp.vec3),
+                                      wp.array(dirs_np, dtype=wp.vec3)],
+                              outputs=[out])
+                    return out.numpy().copy()
+
+            with wp.ScopedDevice('metal:0'):
+                centers = wp.array(centers0, dtype=wp.vec3)
+                halfext = wp.array(half, dtype=wp.vec3)
+                offset = wp.zeros(1, dtype=wp.vec3)
+                lowers = wp.array(centers0 - half, dtype=wp.vec3)
+                uppers = wp.array(centers0 + half, dtype=wp.vec3)
+                bvh = wp.Bvh(lowers, uppers, constructor='sah', leaf_size=2)
+                starts = wp.array(starts_np, dtype=wp.vec3)
+                dirs = wp.array(dirs_np, dtype=wp.vec3)
+                n_hit = wp.zeros(NR, dtype=wp.int32)
+
+                def sense():
+                    wp.launch(update_bounds, dim=N, inputs=[centers, halfext, offset], outputs=[lowers, uppers])
+                    bvh.refit()
+                    wp.launch(raycast, dim=NR, inputs=[bvh.id, starts, dirs], outputs=[n_hit])
+
+                sense()
+                wp.synchronize_device()
+                with wp.ScopedCapture() as capture:
+                    sense()
+
+                for off in [(0.0, 0.0, 0.0), (1.5, -0.5, 0.25), (-2.0, 1.0, -1.0)]:
+                    offset.assign(np.array([off], dtype=np.float32))
+                    wp.capture_launch(capture.graph)
+                    wp.synchronize_device()
+                    got = n_hit.numpy().copy()
+                    want = reference(np.array(off, dtype=np.float32))
+                    np.testing.assert_array_equal(got, want)
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=180)
+
+    def test_mesh_query_ray_matches_cpu(self):
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            # Octahedron (closed, convex): rays from a shell aimed at origin all hit.
+            pts_np = np.array([[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]],
+                              dtype=np.float32)
+            idx_np = np.array([0, 2, 4, 2, 1, 4, 1, 3, 4, 3, 0, 4,
+                               2, 0, 5, 1, 2, 5, 3, 1, 5, 0, 3, 5], dtype=np.int32)
+            rng = np.random.default_rng(7)
+            NQ = 64
+            starts_np = rng.normal(size=(NQ, 3)).astype(np.float32)
+            starts_np /= np.linalg.norm(starts_np, axis=1, keepdims=True)
+            starts_np *= 3.0
+            dirs_np = (-starts_np / np.linalg.norm(starts_np, axis=1, keepdims=True)).astype(np.float32)
+
+            @wp.kernel
+            def mesh_ray(ids: wp.array(dtype=wp.uint64), s: wp.array(dtype=wp.vec3),
+                         d: wp.array(dtype=wp.vec3), out_t: wp.array(dtype=wp.float32),
+                         out_f: wp.array(dtype=wp.int32), out_n: wp.array(dtype=wp.vec3),
+                         out_any: wp.array(dtype=wp.int32)):
+                tid = wp.tid()
+                t = float(0.0)
+                u = float(0.0)
+                v = float(0.0)
+                sign = float(0.0)
+                n = wp.vec3()
+                f = int(-1)
+                if wp.mesh_query_ray(ids[0], s[tid], d[tid], 100.0, t, u, v, sign, n, f):
+                    out_t[tid] = t
+                    out_f[tid] = f
+                    out_n[tid] = n
+                else:
+                    out_t[tid] = -1.0
+                    out_f[tid] = -1
+                if wp.mesh_query_ray_anyhit(ids[0], s[tid], d[tid], 100.0):
+                    out_any[tid] = 1
+
+            if not wp.config.metal_native_dispatch:
+                raise SystemExit(0)
+
+            outs = {}
+            for dev in ('cpu', 'metal:0'):
+                with wp.ScopedDevice(dev):
+                    mesh = wp.Mesh(points=wp.array(pts_np, dtype=wp.vec3),
+                                   indices=wp.array(idx_np, dtype=wp.int32),
+                                   bvh_constructor='sah', bvh_leaf_size=2)
+                    ids = wp.array([mesh.id], dtype=wp.uint64)
+                    out_t = wp.zeros(NQ, dtype=wp.float32)
+                    out_f = wp.zeros(NQ, dtype=wp.int32)
+                    out_n = wp.zeros(NQ, dtype=wp.vec3)
+                    out_any = wp.zeros(NQ, dtype=wp.int32)
+                    wp.launch(mesh_ray, dim=NQ,
+                              inputs=[ids, wp.array(starts_np, dtype=wp.vec3),
+                                      wp.array(dirs_np, dtype=wp.vec3)],
+                              outputs=[out_t, out_f, out_n, out_any])
+                    wp.synchronize_device()
+                    outs[dev] = (out_t.numpy().copy(), out_f.numpy().copy(),
+                                 out_n.numpy().copy(), out_any.numpy().copy())
+            assert (outs['cpu'][3] == 1).all()  # sanity: every ray hits
+            np.testing.assert_allclose(outs['cpu'][0], outs['metal:0'][0], rtol=1e-5, atol=1e-6)
+            np.testing.assert_array_equal(outs['cpu'][1], outs['metal:0'][1])
+            np.testing.assert_allclose(outs['cpu'][2], outs['metal:0'][2], rtol=1e-5, atol=1e-6)
+            np.testing.assert_array_equal(outs['cpu'][3], outs['metal:0'][3])
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=180)
+
+
+@unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
+@unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
+class TestMetalLaunchDimAndParams(unittest.TestCase):
+    """Regressions surfaced by mujoco_warp's BVH raycast kernel."""
+
+    def test_2d_launch_last_dim_equals_block_dim(self):
+        # A plain 2-D launch whose trailing dim equals the default
+        # block_dim (256) must NOT be folded away — the launch_tiled
+        # collapse only applies to kernels using block/tile semantics.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            @wp.kernel
+            def mark(out: wp.array2d(dtype=wp.int32)):
+                i, j = wp.tid()
+                out[i, j] = i * 1000 + j
+
+            out = wp.zeros((2, 256), dtype=wp.int32, device='metal:0')
+            wp.launch(mark, dim=(2, 256), inputs=[], outputs=[out], device='metal:0')
+            wp.synchronize_device('metal:0')
+            want = np.arange(2)[:, None] * 1000 + np.arange(256)[None, :]
+            np.testing.assert_array_equal(out.numpy(), want)
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
+    def test_vec_by_value_param_and_mat_constant(self):
+        # vec6-by-value kernel params bind as setBytes scalar blobs; a
+        # closure-captured wp.mat33 constant must render as an MSL
+        # matrix constructor (column-major).
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            if not wp.config.metal_native_dispatch:
+                # By-value vector params bind via the native setBytes path
+                # only; the MLX launcher has no packing for them.
+                raise SystemExit(0)
+
+            vec6 = wp.types.vector(length=6, dtype=wp.float32)
+            ROT = wp.constant(wp.mat33(0.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0))
+
+            @wp.kernel
+            def k(g: vec6, x: wp.array(dtype=wp.vec3), out: wp.array(dtype=wp.float32),
+                  outv: wp.array(dtype=wp.vec3)):
+                tid = wp.tid()
+                s = float(0.0)
+                for i in range(6):
+                    s += g[i]
+                out[tid] = s
+                outv[tid] = ROT * x[tid]
+
+            xn = np.random.default_rng(0).normal(size=(8, 3)).astype(np.float32)
+            g = vec6(1.0, 2.0, 3.0, 4.0, 5.0, 6.0)
+            outs = {}
+            for dev in ('cpu', 'metal:0'):
+                out = wp.zeros(8, dtype=wp.float32, device=dev)
+                outv = wp.zeros(8, dtype=wp.vec3, device=dev)
+                wp.launch(k, dim=8, inputs=[g, wp.array(xn, dtype=wp.vec3, device=dev)],
+                          outputs=[out, outv], device=dev)
+                outs[dev] = (out.numpy().copy(), outv.numpy().copy())
+            np.testing.assert_allclose(outs['cpu'][0], outs['metal:0'][0])
+            np.testing.assert_allclose(outs['cpu'][1], outs['metal:0'][1], rtol=1e-6, atol=1e-7)
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
 
 
 if __name__ == "__main__":

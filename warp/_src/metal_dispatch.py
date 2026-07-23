@@ -278,6 +278,19 @@ class MetalDispatcher:
         # Cache the buffer-scope barrier value — used between every
         # dispatch in the same encoder when batching is enabled.
         self._barrier_scope_buffers = Metal.MTLBarrierScopeBuffers
+        # GPU-resident resources: MTLBuffers reached only through
+        # descriptor-embedded ``gpuAddress``es (BVH node / item arrays,
+        # descriptor buffers — see ``warp/_src/metal_bvh.py``). They are
+        # never bound to an encoder slot, so every compute encoder must
+        # declare them via ``useResource:usage:`` before work that
+        # dereferences them. ``_resident_applied``/``_resident_encoder``
+        # track how many entries the *current* encoder has seen so the
+        # per-dispatch cost is one identity check.
+        self._resident_resources: list = []
+        self._resident_ids: set[int] = set()
+        self._resident_applied = 0
+        self._resident_encoder: Any = None
+        self._usage_read_write = Metal.MTLResourceUsageRead | Metal.MTLResourceUsageWrite
         # ``WARP_METAL_CANARY=1`` enables OOB-write detection: alloc
         # fills the guard region with a sentinel pattern and stores
         # ``buf -> (data_nbytes, guard_nbytes)`` here. After a sync we
@@ -503,6 +516,46 @@ class MetalDispatcher:
     # ------------------------------------------------------------------
     # Buffer allocation
     # ------------------------------------------------------------------
+
+    def add_resident_resource(self, mtl_buf) -> None:
+        """Mark ``mtl_buf`` as reachable via raw ``gpuAddress`` dereference.
+
+        Buffers registered here are declared to every subsequent compute
+        encoder with ``useResource:usage:`` (read+write) so kernels that
+        chase descriptor-embedded addresses (BVH / mesh queries) get
+        residency and hazard tracking without an encoder binding. Idempotent
+        per buffer object; entries live for the dispatcher's lifetime unless
+        removed via :meth:`remove_resident_resource`.
+        """
+        if id(mtl_buf) in self._resident_ids:
+            return
+        self._resident_ids.add(id(mtl_buf))
+        self._resident_resources.append(mtl_buf)
+
+    def remove_resident_resource(self, mtl_buf) -> None:
+        """Drop ``mtl_buf`` from the resident set (e.g. on ``Bvh.__del__``)."""
+        if id(mtl_buf) not in self._resident_ids:
+            return
+        self._resident_ids.discard(id(mtl_buf))
+        self._resident_resources = [r for r in self._resident_resources if r is not mtl_buf]
+        # Force a full re-apply on the next dispatch — the applied-count
+        # bookkeeping is positional and just went stale.
+        self._resident_encoder = None
+        self._resident_applied = 0
+
+    def _apply_resident_resources(self, encoder) -> None:
+        """Declare any not-yet-declared resident resources to ``encoder``."""
+        n = len(self._resident_resources)
+        if n == 0:
+            return
+        if self._resident_encoder is encoder and self._resident_applied >= n:
+            return
+        start = self._resident_applied if self._resident_encoder is encoder else 0
+        usage = self._usage_read_write
+        for r in self._resident_resources[start:]:
+            encoder.useResource_usage_(r, usage)
+        self._resident_encoder = encoder
+        self._resident_applied = n
 
     def fill_zero(self, mtl_buf, nbytes: int) -> None:
         """Zero a region of an ``MTLBuffer`` via a blit encoder.
@@ -734,6 +787,7 @@ class MetalDispatcher:
         grid: tuple[int, int, int],
         threadgroup: tuple[int, int, int],
         binding_modes: list | None = None,
+        reads_resident: bool = False,
     ) -> None:
         """Encode one compute dispatch onto the in-flight command buffer.
 
@@ -750,6 +804,14 @@ class MetalDispatcher:
         dependency chunks. Each entry is one of ``None`` /
         ``"r"`` / ``"w"`` / ``"rw"``. ``None`` (or ``binding_modes``
         omitted) keeps the safe per-command-barrier replay path.
+
+        ``reads_resident`` declares that the kernel may read any of the
+        dispatcher's resident resources through descriptor-embedded
+        ``gpuAddress``es (BVH / mesh query kernels). Direct dispatch needs
+        no extra work (residency is applied per encoder), but ICB
+        recording folds the resident set into this command's resource
+        list and read set so replay gets residency and RAW barriers
+        against refit kernels that write those buffers.
 
         The caller is responsible for ordering bindings to match the
         kernel's signature.
@@ -770,7 +832,7 @@ class MetalDispatcher:
         # Recording path: write the dispatch into an ICB slot. No
         # encoder commands hit the live cmd buffer until replay.
         if self._record_state is not None:
-            self._record_dispatch(pso, bindings, grid, threadgroup, binding_modes)
+            self._record_dispatch(pso, bindings, grid, threadgroup, binding_modes, reads_resident=reads_resident)
             if self._profile_dispatch:
                 self._bump_stats(pso, grid, _time.perf_counter_ns() - _prof_t0)
             return
@@ -784,6 +846,7 @@ class MetalDispatcher:
             if self._encoder is None:
                 raise MetalDispatchError("MTLCommandBuffer computeCommandEncoder returned None")
         encoder = self._encoder
+        self._apply_resident_resources(encoder)
         encoder.setComputePipelineState_(pso)
         # Batch-bind buffers. ``setBytes`` entries are passed one at a
         # time (each pushes a separate small allocation into the
@@ -1092,6 +1155,10 @@ class MetalDispatcher:
         usage = Metal.MTLResourceUsageRead | Metal.MTLResourceUsageWrite
         for r in graph._resources:
             encoder.useResource_usage_(r, usage)
+        # BVH / mesh buffers reached via descriptor gpuAddresses — the
+        # recorded resource list covers those known at record time; this
+        # covers ones registered since.
+        self._apply_resident_resources(encoder)
         # Keep both the graph and its owned buffers alive until the
         # cmd buffer completes — Metal can dereference them at any
         # point during GPU execution.
@@ -1133,6 +1200,7 @@ class MetalDispatcher:
         grid: tuple[int, int, int],
         threadgroup: tuple[int, int, int],
         binding_modes: list | None = None,
+        reads_resident: bool = False,
     ) -> None:
         """Encode one dispatch into the active recording's next ICB slot.
 
@@ -1164,6 +1232,15 @@ class MetalDispatcher:
         # MTLBuffer per command (see below) so they never alias.
         cmd_reads: set = set()
         cmd_writes: set = set()
+        if reads_resident:
+            # Descriptor-mediated reads (BVH / mesh queries): the kernel can
+            # touch any resident buffer without binding it. Fold the whole
+            # resident set into this command's read set so the chunker
+            # serialises it against refit kernels that WRITE those buffers
+            # through normal bindings, and into the graph resources so
+            # replay declares them via ``useResource``.
+            for r in self._resident_resources:
+                cmd_reads.add(id(r))
         if binding_modes is not None:
             st["has_modes"] = True
             # A short modes list would silently drop trailing buffers from
@@ -1207,6 +1284,12 @@ class MetalDispatcher:
         res_set = st["resources_set"]
         resources = st["resources"]
         owned = st["owned_buffers"]
+        if reads_resident:
+            for r in self._resident_resources:
+                rid = id(r)
+                if rid not in res_set:
+                    res_set.add(rid)
+                    resources.append(r)
         for idx, entry in enumerate(bindings):
             if isinstance(entry, tuple) and len(entry) == 2:
                 # setBytes equivalent: stash the data in a fresh

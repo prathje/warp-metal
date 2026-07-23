@@ -6002,6 +6002,22 @@ class Bvh:
         if leaf_size < 1:
             raise ValueError(f"leaf_size must be greater than or equal to 1, current value: {leaf_size}")
 
+        if getattr(self.device, "is_metal", False):
+            # Metal trees are host-built (native SAH/median builder over the
+            # unified-memory bounds) and queried through a descriptor buffer
+            # whose gpuAddress is the id — see warp/_src/metal_bvh.py.
+            from warp._src.metal_bvh import MetalBvh  # noqa: PLC0415
+
+            if constructor == BvhConstructor.LBVH:
+                warp._src.utils.warn(
+                    "LBVH constructor is not available for a Metal tree. Falling back to SAH constructor.",
+                    stacklevel=2,
+                )
+                constructor = BvhConstructor.SAH
+            self._metal = MetalBvh(lowers, uppers, int(constructor), groups, leaf_size)
+            self.id = self._metal.id
+            return
+
         if self.device.is_cpu:
             if constructor == BvhConstructor.LBVH:
                 log_warning(
@@ -6037,7 +6053,9 @@ class Bvh:
             return
 
         try:
-            if self.device.is_cpu:
+            if getattr(self, "_metal", None) is not None:
+                self._metal.release()
+            elif self.device.is_cpu:
                 self.runtime.core.wp_bvh_destroy_host(self.id)
             else:
                 # use CUDA context guard to avoid side effects during garbage collection
@@ -6058,7 +6076,9 @@ class Bvh:
             with :func:`warp.capture_save`.
         """
 
-        if self.device.is_cpu:
+        if getattr(self, "_metal", None) is not None:
+            self._metal.refit()
+        elif self.device.is_cpu:
             self.runtime.core.wp_bvh_refit_host(self.id)
         else:
             self.runtime.core.wp_bvh_refit_device(self.id)
@@ -6123,6 +6143,18 @@ class Bvh:
 
         if self._constructor == BvhConstructor.CUBQL:
             raise ValueError("Cannot rebuild a cuBQL BVH with a different constructor; create a new BVH instead")
+
+        if getattr(self, "_metal", None) is not None:
+            if constructor == BvhConstructor.LBVH:
+                warp._src.utils.warn(
+                    "LBVH constructor is not available for a Metal tree. Falling back to SAH constructor.",
+                    stacklevel=2,
+                )
+                constructor = BvhConstructor.SAH
+            # NB: unlike CUDA, the Metal rebuild reallocates node storage —
+            # graphs captured before the rebuild must be re-captured.
+            self._metal.rebuild(int(constructor))
+            return
 
         if self.device.is_cpu:
             if constructor == BvhConstructor.LBVH:
@@ -6251,6 +6283,28 @@ class Mesh:
             elif bvh_leaf_size < 1:
                 raise ValueError(f"bvh_leaf_size must be greater than or equal to 1, current value: {bvh_leaf_size}")
 
+        if getattr(self.device, "is_metal", False):
+            # Metal meshes build their own warp-backend BVH over host-computed
+            # triangle AABBs — see warp/_src/metal_bvh.py. Only the ray-query
+            # APIs (mesh_query_ray / mesh_query_ray_anyhit) are implemented in
+            # MSL so far.
+            from warp._src.metal_bvh import MetalMesh  # noqa: PLC0415
+
+            if support_winding_number:
+                raise RuntimeError("support_winding_number=True is not supported for wp.Mesh on Metal")
+            if bvh_constructor in (BvhConstructor.LBVH, BvhConstructor.CUBQL):
+                warp._src.utils.warn(
+                    f"{BvhConstructor(bvh_constructor).name} constructor is not available for a Metal mesh. "
+                    "Falling back to SAH constructor.",
+                    stacklevel=2,
+                )
+                bvh_constructor = BvhConstructor.SAH
+                if bvh_leaf_size < 1:  # cubql default resolved to 0 above
+                    bvh_leaf_size = 4
+            self._metal = MetalMesh(points, indices, int(bvh_constructor), bvh_leaf_size, groups)
+            self.id = self._metal.id
+            return
+
         if self.device.is_cpu:
             if bvh_constructor == BvhConstructor.LBVH:
                 log_warning(
@@ -6291,7 +6345,9 @@ class Mesh:
             return
 
         try:
-            if self.device.is_cpu:
+            if getattr(self, "_metal", None) is not None:
+                self._metal.release()
+            elif self.device.is_cpu:
                 self.runtime.core.wp_mesh_destroy_host(self.id)
             else:
                 # use CUDA context guard to avoid side effects during garbage collection
@@ -6307,7 +6363,9 @@ class Mesh:
         This should be called after users modify the ``points`` data.
         """
 
-        if self.device.is_cpu:
+        if getattr(self, "_metal", None) is not None:
+            self._metal.refit()
+        elif self.device.is_cpu:
             self.runtime.core.wp_mesh_refit_host(self.id)
         else:
             if not self.runtime.core.wp_mesh_refit_device(self.id):
@@ -6340,7 +6398,9 @@ class Mesh:
             )
 
         self._points = points_new
-        if self.device.is_cpu:
+        if getattr(self, "_metal", None) is not None:
+            self._metal.set_points(points_new)
+        elif self.device.is_cpu:
             self.runtime.core.wp_mesh_set_points_host(self.id, points_new.__ctype__())
         else:
             if not self.runtime.core.wp_mesh_set_points_device(self.id, points_new.__ctype__()):
@@ -6371,7 +6431,9 @@ class Mesh:
             )
 
         self._velocities = velocities_new
-        if self.device.is_cpu:
+        if getattr(self, "_metal", None) is not None:
+            pass  # velocities are not part of the Metal mesh descriptor
+        elif self.device.is_cpu:
             self.runtime.core.wp_mesh_set_velocities_host(self.id, velocities_new.__ctype__())
         else:
             self.runtime.core.wp_mesh_set_velocities_device(self.id, velocities_new.__ctype__())

@@ -172,6 +172,8 @@ _SCALAR_CTYPE_TO_MSL: dict[str, str] = {
     # matrix slicing builtins (``mat[:, c]`` / ``mat[r, :]``). The MSL
     # equivalent ``wp_slice_t`` struct is emitted in the kernel header.
     "wp::slice_t": "wp_slice_t",
+    # BVH traversal state — the MSL struct is emitted with ``_BVH_HELPERS``.
+    "wp::bvh_query_t": "wp_bvh_query_t",
 }
 
 # MSL has built-in vector types ``floatN`` / ``intN`` / ``uintN`` etc. for
@@ -1618,6 +1620,410 @@ inline int wp_intersect_tri_tri(float3 V0, float3 V1, float3 V2, float3 U0, floa
     if (isect2_0 > isect2_1) { float sw = isect2_0; isect2_0 = isect2_1; isect2_1 = sw; }
     if (isect1_1 < isect2_0 || isect2_1 < isect1_0) { return 0; }
     return 1;
+}"""
+
+
+# BVH / mesh query helpers — ports of warp/native/bvh.h, mesh.h and the ray
+# intersectors in intersect.h. The Metal side has no ``BVH*`` host pointer to
+# chase: ``bvh.id`` / ``mesh.id`` is the ``gpuAddress`` of a descriptor
+# buffer (see ``warp/_src/metal_bvh.py``) whose fields are themselves
+# ``gpuAddress``es of the node / item arrays. Buffers reached this way are
+# never bound to the encoder — the dispatcher marks them GPU-resident via
+# ``useResource`` (``MetalDispatcher.add_resident_resource``).
+#
+# Layout contracts (must match ``metal_bvh.py`` packing exactly):
+#   wp_bvh_node_t   == native BVHPackedNodeHalf (16 B; bits = i:31 | b:1).
+#   wp_bvh_desc_t   == 7 ulongs + 6 ints (80 B).
+#   wp_mesh_desc_t  == wp_bvh_desc_t + 2 ulongs + 2 ints (104 B).
+# ``item_lowers``/``item_uppers``/``points`` address packed 12-byte vec3s.
+#
+# ``wp_bvh_minf``/``wp_bvh_maxf`` mirror wp::min/wp::max (``a < b ? a : b``)
+# rather than metal::min/max (fmin/fmax) so NaN propagation matches CPU.
+_BVH_HELPERS = """\
+struct wp_bvh_node_t {
+    float x;
+    float y;
+    float z;
+    uint bits;
+};
+struct wp_bvh_desc_t {
+    ulong node_lowers;
+    ulong node_uppers;
+    ulong node_parents;
+    ulong primitive_indices;
+    ulong item_lowers;
+    ulong item_uppers;
+    ulong item_groups;
+    int root;
+    int num_nodes;
+    int num_leaf_nodes;
+    int num_items;
+    int leaf_size;
+    int pad0;
+};
+struct wp_mesh_desc_t {
+    wp_bvh_desc_t bvh;
+    ulong points;
+    ulong indices;
+    int num_points;
+    int num_tris;
+};
+inline const device wp_bvh_node_t* wp_bvh_node_ptr(ulong a) { return reinterpret_cast<const device wp_bvh_node_t*>(a); }
+inline const device int* wp_bvh_int_ptr(ulong a) { return reinterpret_cast<const device int*>(a); }
+inline float3 wp_bvh_load_v3(ulong a, int i) {
+    const device packed_float3* p = reinterpret_cast<const device packed_float3*>(a);
+    return float3(p[i]);
+}
+inline wp_bvh_desc_t wp_bvh_get_desc(ulong id) { return *reinterpret_cast<const device wp_bvh_desc_t*>(id); }
+inline wp_mesh_desc_t wp_mesh_get_desc(ulong id) { return *reinterpret_cast<const device wp_mesh_desc_t*>(id); }
+inline float wp_bvh_minf(float a, float b) { return a < b ? a : b; }
+inline float wp_bvh_maxf(float a, float b) { return a > b ? a : b; }
+inline int wp_bvh_leaf_group(const thread wp_bvh_desc_t& bvh, int leaf) {
+    if (bvh.item_groups == 0ul) { return 0; }
+    int start = int(wp_bvh_node_ptr(bvh.node_lowers)[leaf].bits & 0x7fffffffu);
+    int prim = wp_bvh_int_ptr(bvh.primitive_indices)[start];
+    return wp_bvh_int_ptr(bvh.item_groups)[prim];
+}
+inline int wp_bvh_lower_bound_group(const thread wp_bvh_desc_t& bvh, int group) {
+    int lo = 0;
+    int hi = bvh.num_leaf_nodes;
+    while (lo < hi) {
+        int mid = (lo + hi) >> 1;
+        if (wp_bvh_leaf_group(bvh, mid) < group) { lo = mid + 1; } else { hi = mid; }
+    }
+    if (lo == bvh.num_leaf_nodes || wp_bvh_leaf_group(bvh, lo) != group) { return -1; }
+    return lo;
+}
+inline int wp_bvh_lca(int node_a, int node_b, const device int* parent) {
+    int da = 0;
+    int db = 0;
+    for (int t = node_a; t != -1; t = parent[t]) { ++da; }
+    for (int t = node_b; t != -1; t = parent[t]) { ++db; }
+    if (da > db) {
+        int diff = da - db;
+        while (diff-- && node_a != -1) { node_a = parent[node_a]; }
+    } else if (db > da) {
+        int diff = db - da;
+        while (diff-- && node_b != -1) { node_b = parent[node_b]; }
+    }
+    while (node_a != node_b) {
+        if (node_a == -1 || node_b == -1) { return -1; }
+        node_a = parent[node_a];
+        node_b = parent[node_b];
+    }
+    return node_a;
+}
+inline int wp_bvh_group_root_impl(const thread wp_bvh_desc_t& bvh, int group_id) {
+    int first = wp_bvh_lower_bound_group(bvh, group_id);
+    if (first < 0) { return -1; }
+    int next = wp_bvh_lower_bound_group(bvh, group_id + 1);
+    int last = (next < 0 ? bvh.num_leaf_nodes : next) - 1;
+    return wp_bvh_lca(first, last, wp_bvh_int_ptr(bvh.node_parents));
+}
+inline int wp_bvh_get_group_root(ulong id, int group_id) {
+    wp_bvh_desc_t bvh = wp_bvh_get_desc(id);
+    return wp_bvh_group_root_impl(bvh, group_id);
+}
+inline int wp_mesh_get_group_root(ulong id, int group_id) {
+    wp_mesh_desc_t mesh = wp_mesh_get_desc(id);
+    return wp_bvh_group_root_impl(mesh.bvh, group_id);
+}
+inline bool wp_bvh_intersect_ray_aabb(float3 pos, float3 rcp_dir, float3 lower, float3 upper, thread float& t) {
+    float l1 = (lower.x - pos.x) * rcp_dir.x;
+    float l2 = (upper.x - pos.x) * rcp_dir.x;
+    float lmin = wp_bvh_minf(l1, l2);
+    float lmax = wp_bvh_maxf(l1, l2);
+    l1 = (lower.y - pos.y) * rcp_dir.y;
+    l2 = (upper.y - pos.y) * rcp_dir.y;
+    lmin = wp_bvh_maxf(wp_bvh_minf(l1, l2), lmin);
+    lmax = wp_bvh_minf(wp_bvh_maxf(l1, l2), lmax);
+    l1 = (lower.z - pos.z) * rcp_dir.z;
+    l2 = (upper.z - pos.z) * rcp_dir.z;
+    lmin = wp_bvh_maxf(wp_bvh_minf(l1, l2), lmin);
+    lmax = wp_bvh_minf(wp_bvh_maxf(l1, l2), lmax);
+    bool hit = (lmax >= 0.0f) && (lmax >= lmin);
+    if (hit) { t = lmin; }
+    return hit;
+}
+inline bool wp_bvh_intersect_aabb_aabb(float3 a_lower, float3 a_upper, float3 b_lower, float3 b_upper) {
+    if (a_lower.x > b_upper.x || a_lower.y > b_upper.y || a_lower.z > b_upper.z ||
+        a_upper.x < b_lower.x || a_upper.y < b_lower.y || a_upper.z < b_lower.z) {
+        return false;
+    }
+    return true;
+}
+struct wp_bvh_query_t {
+    wp_bvh_desc_t bvh;
+    int stack[32];
+    int count;
+    int primitive_counter;
+    float3 input_lower;
+    float3 input_upper;
+    int bounds_nr;
+    bool is_ray;
+};
+inline bool wp_bvh_query_intersection_test(
+    const thread wp_bvh_query_t& query, float3 node_lower, float3 node_upper, thread float& t)
+{
+    if (query.is_ray) {
+        return wp_bvh_intersect_ray_aabb(query.input_lower, query.input_upper, node_lower, node_upper, t);
+    }
+    return wp_bvh_intersect_aabb_aabb(query.input_lower, query.input_upper, node_lower, node_upper);
+}
+inline wp_bvh_query_t wp_bvh_query_init(ulong id, bool is_ray, float3 lower, float3 upper, int root) {
+    wp_bvh_query_t query;
+    query.bvh = wp_bvh_get_desc(id);
+    query.is_ray = is_ray;
+    query.stack[0] = root == -1 ? query.bvh.root : root;
+    query.count = 1;
+    query.primitive_counter = 0;
+    query.input_lower = lower;
+    query.input_upper = upper;
+    query.bounds_nr = -1;
+    return query;
+}
+inline wp_bvh_query_t wp_bvh_query_aabb(ulong id, float3 lower, float3 upper, int root) {
+    return wp_bvh_query_init(id, false, lower, upper, root);
+}
+inline wp_bvh_query_t wp_bvh_query_ray(ulong id, float3 start, float3 dir, int root) {
+    return wp_bvh_query_init(id, true, start, 1.0f / dir, root);
+}
+inline bool wp_bvh_query_next(thread wp_bvh_query_t& query, thread int& index, float max_dist) {
+    const device wp_bvh_node_t* lowers = wp_bvh_node_ptr(query.bvh.node_lowers);
+    const device wp_bvh_node_t* uppers = wp_bvh_node_ptr(query.bvh.node_uppers);
+    const device int* prims = wp_bvh_int_ptr(query.bvh.primitive_indices);
+    while (query.count) {
+        const int node_index = query.stack[--query.count];
+        wp_bvh_node_t node_lower = lowers[node_index];
+        wp_bvh_node_t node_upper = uppers[node_index];
+        if (query.primitive_counter == 0) {
+            float t = FLT_MAX;
+            bool hit = wp_bvh_query_intersection_test(
+                query, float3(node_lower.x, node_lower.y, node_lower.z),
+                float3(node_upper.x, node_upper.y, node_upper.z), t);
+            if (!hit || (query.is_ray && t >= max_dist)) { continue; }
+        }
+        const int left_index = int(node_lower.bits & 0x7fffffffu);
+        const int right_index = int(node_upper.bits & 0x7fffffffu);
+        if (node_lower.bits & 0x80000000u) {
+            const int start = left_index;
+            const int end = right_index;
+            if (end - start == 1) {
+                int primitive_index = prims[start];
+                index = primitive_index;
+                query.bounds_nr = primitive_index;
+                return true;
+            } else {
+                int primitive_index = prims[start + (query.primitive_counter++)];
+                if (start + query.primitive_counter == end) {
+                    query.primitive_counter = 0;
+                } else {
+                    query.stack[query.count++] = node_index;
+                }
+                float t = FLT_MAX;
+                bool hit = wp_bvh_query_intersection_test(
+                    query, wp_bvh_load_v3(query.bvh.item_lowers, primitive_index),
+                    wp_bvh_load_v3(query.bvh.item_uppers, primitive_index), t);
+                if (!hit || (query.is_ray && t >= max_dist)) { continue; }
+                index = primitive_index;
+                query.bounds_nr = primitive_index;
+                return true;
+            }
+        } else {
+            query.primitive_counter = 0;
+            query.stack[query.count++] = left_index;
+            query.stack[query.count++] = right_index;
+        }
+    }
+    return false;
+}
+inline int wp_bvh_ray_max_dim(float3 a) {
+    float x = metal::abs(a.x);
+    float y = metal::abs(a.y);
+    float z = metal::abs(a.z);
+    int ret = 0;
+    float lmax = x;
+    if (y > lmax) { ret = 1; lmax = y; }
+    if (z > lmax) { ret = 2; }
+    return ret;
+}
+inline float wp_bvh_diff_product(float a, float b, float c, float d) {
+    float cd = c * d;
+    float diff = metal::fma(a, b, -cd);
+    float error = metal::fma(-c, d, cd);
+    return diff + error;
+}
+inline bool wp_bvh_intersect_ray_tri_woop(
+    float3 p, float3 dir, float3 a, float3 b, float3 c,
+    thread float& t, thread float& u, thread float& v, thread float& sign_out, thread float3& normal)
+{
+    int kz = wp_bvh_ray_max_dim(dir);
+    int kx = kz + 1;
+    if (kx == 3) { kx = 0; }
+    int ky = kx + 1;
+    if (ky == 3) { ky = 0; }
+    if (dir[kz] < 0.0f) {
+        int tmp = kx;
+        kx = ky;
+        ky = tmp;
+    }
+    float Sx = dir[kx] / dir[kz];
+    float Sy = dir[ky] / dir[kz];
+    float Sz = 1.0f / dir[kz];
+    float3 A = a - p;
+    float3 B = b - p;
+    float3 C = c - p;
+    float Ax = A[kx] - Sx * A[kz];
+    float Ay = A[ky] - Sy * A[kz];
+    float Bx = B[kx] - Sx * B[kz];
+    float By = B[ky] - Sy * B[kz];
+    float Cx = C[kx] - Sx * C[kz];
+    float Cy = C[ky] - Sy * C[kz];
+    float U = wp_bvh_diff_product(Cx, By, Cy, Bx);
+    float V = wp_bvh_diff_product(Ax, Cy, Ay, Cx);
+    float W = wp_bvh_diff_product(Bx, Ay, By, Ax);
+    // The native version refines exact-zero U/V/W in double precision; MSL
+    // has no double, so edge-grazing rays keep the fma-compensated values.
+    if ((U < 0.0f || V < 0.0f || W < 0.0f) && (U > 0.0f || V > 0.0f || W > 0.0f)) { return false; }
+    float det = U + V + W;
+    if (det == 0.0f) { return false; }
+    float Az = Sz * A[kz];
+    float Bz = Sz * B[kz];
+    float Cz = Sz * C[kz];
+    float T = U * Az + V * Bz + W * Cz;
+    int det_sign = as_type<int>(det) & int(0x80000000u);
+    if (as_type<float>(as_type<int>(T) ^ det_sign) < 0.0f) { return false; }
+    float rcp_det = 1.0f / det;
+    u = U * rcp_det;
+    v = V * rcp_det;
+    t = T * rcp_det;
+    sign_out = det;
+    float3 ab = b - a;
+    float3 ac = c - a;
+    normal = metal::cross(ab, ac);
+    return true;
+}
+inline bool wp_mesh_query_ray(
+    ulong id, float3 start, float3 dir, float max_t,
+    thread float& t, thread float& u, thread float& v, thread float& sign_out,
+    thread float3& normal, thread int& face, int root)
+{
+    wp_mesh_desc_t mesh = wp_mesh_get_desc(id);
+    const device wp_bvh_node_t* lowers = wp_bvh_node_ptr(mesh.bvh.node_lowers);
+    const device wp_bvh_node_t* uppers = wp_bvh_node_ptr(mesh.bvh.node_uppers);
+    const device int* prims = wp_bvh_int_ptr(mesh.bvh.primitive_indices);
+    const device int* tri_indices = wp_bvh_int_ptr(mesh.indices);
+    int stack[32];
+    stack[0] = root == -1 ? mesh.bvh.root : root;
+    int count = 1;
+    float3 rcp_dir = float3(1.0f / dir.x, 1.0f / dir.y, 1.0f / dir.z);
+    float min_t = max_t;
+    int min_face = 0;
+    float min_u = 0.0f;
+    float min_v = 0.0f;
+    float min_sign = 1.0f;
+    float temp_t = 0.0f;
+    float3 min_normal = float3(0.0f);
+    const float eps = 1.0e-3f;
+    while (count) {
+        const int node_index = stack[--count];
+        wp_bvh_node_t lower = lowers[node_index];
+        wp_bvh_node_t upper = uppers[node_index];
+        bool hit = wp_bvh_intersect_ray_aabb(
+            start, rcp_dir, float3(lower.x - eps, lower.y - eps, lower.z - eps),
+            float3(upper.x + eps, upper.y + eps, upper.z + eps), temp_t);
+        if (hit && temp_t < min_t) {
+            if (lower.bits & 0x80000000u) {
+                const int start_index = int(lower.bits & 0x7fffffffu);
+                const int end_index = int(upper.bits & 0x7fffffffu);
+                for (int pc = start_index; pc < end_index; ++pc) {
+                    int primitive_index = prims[pc];
+                    int i = tri_indices[primitive_index * 3 + 0];
+                    int j = tri_indices[primitive_index * 3 + 1];
+                    int k = tri_indices[primitive_index * 3 + 2];
+                    float3 pp = wp_bvh_load_v3(mesh.points, i);
+                    float3 qq = wp_bvh_load_v3(mesh.points, j);
+                    float3 rr = wp_bvh_load_v3(mesh.points, k);
+                    float tri_t = 0.0f;
+                    float tri_u = 0.0f;
+                    float tri_v = 0.0f;
+                    float tri_sign = 0.0f;
+                    float3 n = float3(0.0f);
+                    if (wp_bvh_intersect_ray_tri_woop(start, dir, pp, qq, rr, tri_t, tri_u, tri_v, tri_sign, n)) {
+                        if (tri_t < min_t && tri_t >= 0.0f) {
+                            min_t = tri_t;
+                            min_face = primitive_index;
+                            min_u = tri_u;
+                            min_v = tri_v;
+                            min_sign = tri_sign;
+                            min_normal = n;
+                        }
+                    }
+                }
+            } else {
+                stack[count++] = int(lower.bits & 0x7fffffffu);
+                stack[count++] = int(upper.bits & 0x7fffffffu);
+            }
+        }
+    }
+    if (min_t < max_t) {
+        u = min_u;
+        v = min_v;
+        sign_out = min_sign;
+        t = min_t;
+        normal = metal::normalize(min_normal);
+        face = min_face;
+        return true;
+    }
+    return false;
+}
+inline bool wp_mesh_query_ray_anyhit(ulong id, float3 start, float3 dir, float max_t, int root) {
+    wp_mesh_desc_t mesh = wp_mesh_get_desc(id);
+    const device wp_bvh_node_t* lowers = wp_bvh_node_ptr(mesh.bvh.node_lowers);
+    const device wp_bvh_node_t* uppers = wp_bvh_node_ptr(mesh.bvh.node_uppers);
+    const device int* prims = wp_bvh_int_ptr(mesh.bvh.primitive_indices);
+    const device int* tri_indices = wp_bvh_int_ptr(mesh.indices);
+    int stack[32];
+    stack[0] = root == -1 ? mesh.bvh.root : root;
+    int count = 1;
+    float3 rcp_dir = float3(1.0f / dir.x, 1.0f / dir.y, 1.0f / dir.z);
+    const float eps = 1.0e-3f;
+    float temp_t = 0.0f;
+    while (count) {
+        const int node_index = stack[--count];
+        wp_bvh_node_t lower = lowers[node_index];
+        wp_bvh_node_t upper = uppers[node_index];
+        bool hit = wp_bvh_intersect_ray_aabb(
+            start, rcp_dir, float3(lower.x - eps, lower.y - eps, lower.z - eps),
+            float3(upper.x + eps, upper.y + eps, upper.z + eps), temp_t);
+        if (hit && temp_t < max_t) {
+            if (lower.bits & 0x80000000u) {
+                const int start_index = int(lower.bits & 0x7fffffffu);
+                const int end_index = int(upper.bits & 0x7fffffffu);
+                for (int pc = start_index; pc < end_index; ++pc) {
+                    int primitive_index = prims[pc];
+                    int i = tri_indices[primitive_index * 3 + 0];
+                    int j = tri_indices[primitive_index * 3 + 1];
+                    int k = tri_indices[primitive_index * 3 + 2];
+                    float3 pp = wp_bvh_load_v3(mesh.points, i);
+                    float3 qq = wp_bvh_load_v3(mesh.points, j);
+                    float3 rr = wp_bvh_load_v3(mesh.points, k);
+                    float tri_t = 0.0f;
+                    float tri_u = 0.0f;
+                    float tri_v = 0.0f;
+                    float tri_sign = 0.0f;
+                    float3 n = float3(0.0f);
+                    if (wp_bvh_intersect_ray_tri_woop(start, dir, pp, qq, rr, tri_t, tri_u, tri_v, tri_sign, n)) {
+                        if (tri_t < max_t && tri_t >= 0.0f) { return true; }
+                    }
+                }
+            } else {
+                stack[count++] = int(lower.bits & 0x7fffffffu);
+                stack[count++] = int(upper.bits & 0x7fffffffu);
+            }
+        }
+    }
+    return false;
 }"""
 
 
@@ -3106,6 +3512,8 @@ def _build_kernel_header(source: str) -> str:
         parts.append(_SVD_HELPERS)
     if "wp_closest_point_edge_edge" in source or "wp_intersect_tri_tri" in source:
         parts.append(_INTERSECT_HELPERS)
+    if "wp_bvh_" in source or "wp_mesh_" in source:
+        parts.append(_BVH_HELPERS)
     misc_math = _emit_misc_math_helpers(source)
     if misc_math:
         parts.append(misc_math)
@@ -3487,9 +3895,43 @@ def _msl_constant_str(value) -> str:
     if isinstance(value, int):
         return str(value)
     if isinstance(value, float):
+        # Non-finite floats have no C literal — ``repr`` gives ``inf``/
+        # ``nan`` which would render as the undeclared ``inff``/``nanf``.
+        if value != value:
+            return "NAN"
+        if value == float("inf"):
+            return "INFINITY"
+        if value == float("-inf"):
+            return "-INFINITY"
         # MSL accepts the same syntax as C++; ``f`` suffix marks single
         # precision so the literal stays in fp32 register pressure.
         return f"{value!r}f"
+    # Captured vec_t / mat_t constants (e.g. a closure-level ``wp.mat33``
+    # rotation) — emit the equivalent MSL constructor call. Warp stores
+    # matrices row-major; MSL matrix constructors take columns.
+    shape = getattr(type(value), "_shape_", None)
+    if shape is not None:
+        import numpy as np  # noqa: PLC0415
+
+        scalar_t = getattr(type(value), "_wp_scalar_type_", None)
+        scalar_name = scalar_t.__name__ if scalar_t is not None else "float32"
+        msl_scalar = _MSL_VEC_SCALAR_PREFIX.get(f"wp::{scalar_name}")
+        if msl_scalar is None:
+            raise MetalCodegenError(f"MSL codegen: constant element type wp::{scalar_name} is not supported")
+        elems = [_msl_constant_str(x) for x in np.array(value).flatten().tolist()]
+        if len(shape) == 1:
+            # Big vecs (5/6/8) use the free ``_make`` factory of the custom
+            # struct; the preamble emitter picks the struct up from the name.
+            return f"{_msl_vec_ctor(shape[0], msl_scalar)}({', '.join(elems)})"
+        rows, cols = shape
+        if rows == cols and rows in _MSL_VEC_NATIVE_N:
+            # Native square matrix: MSL constructors take COLUMNS.
+            msl_vec = f"{msl_scalar}{rows}"
+            col_strs = [f"{msl_vec}({', '.join(elems[r * cols + c] for r in range(rows))})" for c in range(cols)]
+            return f"{msl_scalar}{rows}x{cols}({', '.join(col_strs)})"
+        # Non-square / big matrix: custom row-major struct + ``_make`` factory
+        # taking Warp's row-major argument order.
+        return f"wp_mat{rows}x{cols}_{msl_scalar}_make({', '.join(elems)})"
     # Warp's ``uint32`` / ``int32`` etc. wrap into typed-int classes
     # whose ``int(...)`` works. mujoco_warp's solver passes these as
     # bitmask constants (``DisableBit.WARMSTART`` = ``uint32(2)``).
@@ -3854,6 +4296,17 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     # ``_INTERSECT_HELPERS``).
     (re.compile(r"\bwp::closest_point_edge_edge\b"), "wp_closest_point_edge_edge"),
     (re.compile(r"\bwp::intersect_tri_tri\b"), "wp_intersect_tri_tri"),
+    # BVH / mesh queries — descriptor-buffer ports of warp/native/bvh.h and
+    # mesh.h (see ``_BVH_HELPERS``). Ids are ``gpuAddress``es of descriptor
+    # buffers built by ``warp/_src/metal_bvh.py``.
+    (re.compile(r"\bwp::bvh_query_t\b"), "wp_bvh_query_t"),
+    (re.compile(r"\bwp::bvh_query_aabb\b"), "wp_bvh_query_aabb"),
+    (re.compile(r"\bwp::bvh_query_ray\b"), "wp_bvh_query_ray"),
+    (re.compile(r"\bwp::bvh_query_next\b"), "wp_bvh_query_next"),
+    (re.compile(r"\bwp::bvh_get_group_root\b"), "wp_bvh_get_group_root"),
+    (re.compile(r"\bwp::mesh_query_ray_anyhit\b"), "wp_mesh_query_ray_anyhit"),
+    (re.compile(r"\bwp::mesh_query_ray\b"), "wp_mesh_query_ray"),
+    (re.compile(r"\bwp::mesh_get_group_root\b"), "wp_mesh_get_group_root"),
     # NOTE: ``wp::lower_bound`` is intentionally NOT handled here — its
     # 2-arg form references the array's ``<argname>_shape`` input, which
     # requires the *final* parameter name. It's rewritten inside
@@ -5255,6 +5708,26 @@ class MetalKernelArtifact:
     init_shadow_packed_outputs: tuple[str, ...] = ()
     init_shadow_floats: tuple[str, ...] = ()
     init_shadow_ints: tuple[str, ...] = ()
+    # Outputs whose prior contents the kernel logically preserves. On the
+    # MLX path these get physical ``__init`` shadows / packed shadows; on
+    # the native path outputs bind in place so no shadow is emitted, but
+    # the launcher still needs this set to suppress the pre-launch
+    # ``fill_zero`` for accumulator atomic outputs.
+    seeded_outputs: tuple[str, ...] = ()
+    # ``True`` when the kernel calls BVH / mesh query builtins. Those read
+    # node and item buffers through descriptor-embedded ``gpuAddress``es —
+    # buffers never bound to the encoder — so the launcher must (a) rely on
+    # the dispatcher's resident-resource set for direct dispatch and (b)
+    # declare the indirect touches to ICB recording so graph replay gets
+    # both residency and dependency barriers right.
+    uses_bvh: bool = False
+    # ``True`` when the kernel depends on ``wp.launch_tiled`` block
+    # semantics (calls ``wp.block_dim()`` or tile intrinsics). MSL lowers
+    # ``wp.block_dim()`` to literal 1 (serial per-tile execution), so the
+    # launcher must collapse the appended trailing launch dim for these
+    # kernels — and ONLY these: folding a genuine N-wide launch whose last
+    # dim happens to equal ``block_dim`` would silently drop N-1 threads.
+    tile_block_fold: bool = True
     # MSL declarations to inject before the kernel function body — used for
     # custom big-vec structs (vec5, vec6 = spatial_vector, vec8) that don't
     # have native MSL ``floatN`` equivalents. Empty for kernels that only
@@ -6748,6 +7221,24 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
             )
             if slots_after <= 30:
                 init_outputs = tentative
+    # ---- Native dispatch: outputs bind in place, prologue is a no-op --
+    # Every seed above exists to counter MLX's fresh-output-buffer
+    # semantics. Under native dispatch each output binds the caller's
+    # MTLBuffer directly, so "seed the output from the user's wp.array"
+    # copies a buffer onto itself. Skip emitting the prologue and the
+    # shadow inputs entirely: this deletes the per-launch packed-slab
+    # snapshot writes, the per-kernel seed bandwidth, AND the recorded
+    # slab-refresh copies inside graph captures. ``seeded_outputs``
+    # keeps the would-be seeded set so the launcher can still tell
+    # accumulator atomics (suppress pre-launch ``fill_zero``) apart
+    # from pure accumulators (which need it for MLX ``init_value=0``
+    # parity).
+    import warp.config as _wp_cfg  # noqa: PLC0415
+
+    seeded_outputs = tuple(init_outputs)
+    if _wp_cfg.metal_native_dispatch:
+        init_outputs = []
+
     # ---- Decide between per-output __init shadows and packed shadows --
     # When the kernel has many init outputs (e.g. mujoco_warp's
     # 15-output ``_limit_slide_hinge`` / ``_equality_connect``), per-
@@ -7089,11 +7580,24 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
         ints_packed_arrs=tuple(ints_packed_arrs),
         ints_packed_scalars=tuple(ints_packed_scalars),
         floats_packed_arrs=tuple(floats_packed_arrs),
-        needs_init_barrier=bool(init_outputs),
+        # Keyed on ``seeded_outputs`` (not ``init_outputs``, which native
+        # dispatch clears): the launcher's threadgroup reshape for these
+        # kernels doubles as the thing that keeps multi-dim atomic-add
+        # launches deterministic run-to-run — dropping it with the prologue
+        # broke replay-vs-direct bit-exactness on mjwarp G1.
+        needs_init_barrier=bool(seeded_outputs),
         coop_chol_n=coop_chol_n,
         init_shadow_packed_outputs=tuple(init_outputs) if use_packed_init_shadows else (),
         init_shadow_floats=tuple(init_shadow_floats),
         init_shadow_ints=tuple(init_shadow_ints),
+        seeded_outputs=seeded_outputs,
+        uses_bvh=("wp_bvh_" in source or "wp_mesh_" in source),
+        # NB: ``builtin_block_dim`` is checked on the kernel's own IR — a
+        # ``wp.block_dim()`` buried in a non-inlined wp.func would be
+        # missed, but tile/block kernels call it at kernel scope.
+        tile_block_fold=(
+            "builtin_block_dim" in "\n".join(adj.blocks[0].body_forward) or "wp_tile_" in source or coop_chol_n > 0
+        ),
         header=header,
         tid4=uses_tid4,
     )
@@ -7123,7 +7627,7 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
 # v2: added captured-constant values (``Var.constant``) to the key —
 # closure-kernel instantiations previously collided (same kernel.key,
 # args, and IR statements; different baked ``const`` declarations).
-_ARTIFACT_CACHE_VERSION = 2
+_ARTIFACT_CACHE_VERSION = 4
 _codegen_source_hash_cached: str | None = None
 
 
@@ -7192,6 +7696,9 @@ def _artifact_cache_key(kernel, adj) -> str | None:
         str(opts.get("output_arch")),
         const_sig,
         body,
+        # Native dispatch compiles prologue-free artifacts (outputs bind
+        # in place); MLX artifacts carry init shadows. Never mix.
+        f"native={bool(warp.config.metal_native_dispatch)}",
     ):
         h.update(part.encode("utf-8"))
         h.update(b"\x00")
@@ -7950,6 +8457,15 @@ def _wrap_msl_for_native_dispatch(artifact) -> str:
             elif isinstance(arg_var.type, Struct):
                 # Struct arg is serialised as flat float32 storage.
                 add_buffer(f"const constant float* {name}")
+            elif getattr(arg_var.type, "_wp_generic_type_str_", None) in ("vec_t", "quat_t"):
+                # By-value vector param (e.g. mujoco_warp's ``geomgroup:
+                # vec6``). Bound as a small ``setBytes`` blob of N scalars;
+                # declared as a pointer so element extracts (``name[i]``,
+                # the only access pattern the inliner leaves behind) read
+                # scalars without needing the big-vec struct in scope.
+                scalar_cls = arg_var.type._wp_scalar_type_
+                inner = _native_scalar_msl_type(f"wp::{scalar_cls.__name__}")
+                add_buffer(f"const constant {inner}* {name}")
             else:
                 # Scalar input — match MLX's wrapping (``const constant T&``)
                 # so the body's ``name`` references read as the scalar
@@ -8148,6 +8664,11 @@ def _native_pack_scalar_arg(arg_var, value) -> tuple[bytes, int]:
     import ctypes  # noqa: PLC0415
 
     wp_type = arg_var.type
+    # By-value vec/quat params: instances are ctypes arrays of N scalars,
+    # so their raw bytes are exactly the layout the pointer param expects.
+    if getattr(wp_type, "_wp_generic_type_str_", None) in ("vec_t", "quat_t"):
+        inst = value if isinstance(value, wp_type) else wp_type(value)
+        return bytes(inst), ctypes.sizeof(inst)
     # ``warp.float32`` etc. expose a ctypes-compatible ``_type_``;
     # use the underlying ctype to pack.
     ct = getattr(wp_type, "_type_", None)
@@ -8233,9 +8754,14 @@ def launch_metal_kernel_native(kernel, dim, inputs, outputs, device, block_dim: 
         # zeroed the accumulator and step-1's solver entered with the
         # wrong constraint count (``nefc == 0`` instead of 2 for the
         # pendula limits).
-        kernel._metal_native_output_init_shadow_set = frozenset(
-            n[: -len("__init")] for n in artifact.input_names if n.endswith("__init")
-        ) | frozenset(artifact.init_shadow_packed_outputs)
+        # ``seeded_outputs`` covers prologue-free native artifacts: no
+        # physical shadow exists, but the same outputs must not be
+        # zero-filled (they preserve prior contents by binding in place).
+        kernel._metal_native_output_init_shadow_set = (
+            frozenset(n[: -len("__init")] for n in artifact.input_names if n.endswith("__init"))
+            | frozenset(artifact.init_shadow_packed_outputs)
+            | frozenset(getattr(artifact, "seeded_outputs", ()))
+        )
     arg_var_by_name = kernel._metal_native_arg_var_by_name
     out_var_by_name = kernel._metal_native_out_var_by_name
     init_shadow_names = kernel._metal_native_init_shadow_names
@@ -8604,7 +9130,7 @@ def launch_metal_kernel_native(kernel, dim, inputs, outputs, device, block_dim: 
         )
     if any(d <= 0 for d in dims):
         return
-    if len(dims) > 1 and dims[-1] == block_dim and block_dim > 1:
+    if getattr(artifact, "tile_block_fold", True) and len(dims) > 1 and dims[-1] == block_dim and block_dim > 1:
         dims = dims[:-1]
     grid_x = dims[0]
     grid_y = dims[1] if len(dims) >= 2 else 1
@@ -8627,7 +9153,7 @@ def launch_metal_kernel_native(kernel, dim, inputs, outputs, device, block_dim: 
 
     # ---- Dispatch (fire and forget) ----
     try:
-        dispatcher.dispatch(pso, bindings, grid, tg, binding_modes=binding_modes)
+        dispatcher.dispatch(pso, bindings, grid, tg, binding_modes=binding_modes, reads_resident=artifact.uses_bvh)
     except Exception:
         if os.environ.get("WARP_METAL_DUMP_ON_FAIL"):
             import tempfile
@@ -9037,8 +9563,11 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim: int = 2
     # threads each striding through ``for dofid in range(tid, nv, 1)`` and
     # multiply-counts every dof < ``block_dim`` — observed as a 3× scaling
     # of qacc on the freejoint sphere (block_dim=32, nv=6 → dof 2 hit by
-    # threads y=0,1,2).
-    if len(dims) > 1 and dims[-1] == block_dim and block_dim > 1:
+    # threads y=0,1,2). Gated on ``tile_block_fold`` — kernels without
+    # block/tile semantics whose last launch dim coincidentally equals
+    # ``block_dim`` (e.g. a plain 2-D launch of dim=(1, 256)) must NOT
+    # lose that dim.
+    if getattr(artifact, "tile_block_fold", True) and len(dims) > 1 and dims[-1] == block_dim and block_dim > 1:
         dims = dims[:-1]
     grid_x = dims[0]
     grid_y = dims[1] if len(dims) >= 2 else 1
