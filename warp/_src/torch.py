@@ -519,6 +519,19 @@ def to_torch(a: warp.array, requires_grad: bool | None = None):
             mtl_buf = warp._src.context._metal_get_buffer(a.ptr)
             if mtl_buf is not None:
                 t = torch.from_dlpack(warp.to_dlpack(a))
+                # Torch's MPS DLPack import normalises stride metadata, which
+                # erases Warp's zero strides (mujoco_warp's per-world
+                # broadcast convention — see the long comment on the copy
+                # path below). Restore them; for extent-1 dims the memory
+                # layout is identical, only the stride *value* changes, and
+                # consumers like mjlab detect broadcast fields by
+                # ``tensor.stride(0) == 0``.
+                if any(s == 0 for s in a.strides):
+                    torch_stride = list(t.stride())
+                    for i, wp_s in enumerate(a.strides):
+                        if wp_s == 0 and i < len(torch_stride):
+                            torch_stride[i] = 0
+                    t = torch.as_strided(t, t.shape, torch_stride)
                 t.requires_grad = requires_grad
                 return t
 
