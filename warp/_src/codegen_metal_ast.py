@@ -1169,6 +1169,8 @@ def _has_return(nodes: tuple[Node, ...] | list[Node]) -> bool:
 def _rewrite_returns_to_breaks(
     nodes: tuple[Node, ...] | list[Node],
     return_value_dst: str | None = None,
+    ret_flag: str | None = None,
+    in_loop: bool = False,
 ) -> list[Node]:
     """Replace ``return;`` with ``break;`` (used after wrapping in do-while-0).
 
@@ -1178,42 +1180,77 @@ def _rewrite_returns_to_breaks(
     should be assigned before the synthetic break — that's how
     ``var_X = foo(...)`` calls splice in.
 
-    Recurses into ``If`` bodies. Does NOT descend into ``For`` / ``While``
-    — a return inside an inner loop would need a separate flag-based
-    rewrite (``return`` from inside a loop is uncommon enough that we
-    leave it as a future-work hazard; if we hit it the resulting ``break``
-    would only break the inner loop, not the do-while-0 wrapper).
+    Returns nested inside ``For`` / ``While`` bodies can't reach the
+    do-while-0 wrapper with a plain ``break`` (it would only exit the
+    inner loop), so when ``ret_flag`` is set those returns additionally
+    raise the flag and every enclosing loop is followed by an
+    ``if (flag) break;`` guard that propagates the exit outward level by
+    level. mujoco_warp's GJK/EPA helpers return from inside their
+    iteration loops, so this path is load-bearing. The caller declares
+    the flag (``bool <ret_flag> = false;``) only when a loop-nested
+    return exists.
     """
     out: list[Node] = []
     for n in nodes:
         if isinstance(n, Return):
             indent = _leading_indent(n.raw)
-            if n.value is not None:
-                if return_value_dst is None:
-                    # The function returns a value but no caller LHS — drop
-                    # the value (it's unobservable from the caller side)
-                    # and emit just the break.
-                    out.append(Break(raw=f"{indent}break;"))
-                else:
-                    # Synthesize ``var_<dst> = <value>;`` then ``break;``.
-                    out.append(_RawLine(raw=f"{indent}var_{return_value_dst} = {n.value};"))
-                    out.append(Break(raw=f"{indent}break;"))
-            else:
-                out.append(Break(raw=f"{indent}break;"))
+            if n.value is not None and return_value_dst is not None:
+                # Synthesize ``var_<dst> = <value>;`` then break out.
+                out.append(_RawLine(raw=f"{indent}var_{return_value_dst} = {n.value};"))
+            if in_loop and ret_flag is not None:
+                out.append(_RawLine(raw=f"{indent}{ret_flag} = true;"))
+            out.append(Break(raw=f"{indent}break;"))
             continue
         if isinstance(n, If):
             out.append(
                 If(
                     raw=n.raw,
                     cond=n.cond,
-                    body=tuple(_rewrite_returns_to_breaks(n.body, return_value_dst)),
+                    body=tuple(_rewrite_returns_to_breaks(n.body, return_value_dst, ret_flag, in_loop)),
                     raw_open=n.raw_open,
                     raw_close=n.raw_close,
                 )
             )
             continue
+        if isinstance(n, (For, While, _DoWhileZero)) and ret_flag is not None and _has_return(n.body):
+            new_body = tuple(_rewrite_returns_to_breaks(n.body, return_value_dst, ret_flag, in_loop=True))
+            if isinstance(n, For):
+                out.append(
+                    For(
+                        raw=n.raw,
+                        iter_var=n.iter_var,
+                        range_var=n.range_var,
+                        start=n.start,
+                        stop=n.stop,
+                        body=new_body,
+                        step=n.step,
+                    )
+                )
+            elif isinstance(n, While):
+                out.append(While(raw=n.raw, label_k=n.label_k, body=new_body))
+            else:
+                out.append(_DoWhileZero(raw=n.raw, body=new_body))
+            indent = _leading_indent(n.raw) or "    "
+            # Propagate the exit outward: breaks the enclosing loop, or
+            # the do-while-0 wrapper at the top level.
+            out.append(_RawLine(raw=f"{indent}if ({ret_flag}) {{ break; }}"))
+            continue
         out.append(n)
     return out
+
+
+def _has_loop_nested_return(nodes: tuple[Node, ...] | list[Node], in_loop: bool = False) -> bool:
+    """True if any ``Return`` sits inside a ``For``/``While`` body."""
+    for n in nodes:
+        if isinstance(n, Return) and in_loop:
+            return True
+        if isinstance(n, If):
+            if _has_loop_nested_return(n.body, in_loop):
+                return True
+        elif isinstance(n, (For, While, _DoWhileZero)):
+            if _has_loop_nested_return(n.body, True):
+                return True
+    return False
 
 
 # NOTE: ``_DoWhileZero`` is defined near the other structured-body node
@@ -1396,9 +1433,15 @@ def _inline_one_call(
             if isinstance(var.constant, int) and not isinstance(var.constant, bool):
                 const_ints_out[mangled_label] = var.constant
 
-    # If the body contains any return, wrap and convert to break.
+    # If the body contains any return, wrap and convert to break. Returns
+    # nested inside loops additionally need a propagation flag (a plain
+    # break would only exit the inner loop, not the do-while-0 wrapper).
     if _has_return(fn_folded):
-        body_with_breaks = _rewrite_returns_to_breaks(fn_folded, return_value_dst)
+        ret_flag = None
+        if _has_loop_nested_return(fn_folded):
+            ret_flag = f"var_{inline_id}__ret_flag"
+            decls.append(_RawLine(raw=f"    bool {ret_flag} = false;"))
+        body_with_breaks = _rewrite_returns_to_breaks(fn_folded, return_value_dst, ret_flag)
         return [*decls, _DoWhileZero(raw="", body=tuple(body_with_breaks))]
 
     return [*decls, *fn_folded]
@@ -1566,7 +1609,9 @@ def inline_user_calls(
 _UNSUPPORTED_CTYPE_PREFIXES = ("wp::str", "wp::tuple_t")
 
 
-def fold_drop_unsupported_locals(nodes: list[Node], adj) -> tuple[list[Node], set[str]]:
+def fold_drop_unsupported_locals(
+    nodes: list[Node], adj, extra_var_ctypes: dict[str, str] | None = None
+) -> tuple[list[Node], set[str]]:
     """Drop dead-code statements whose values are typed in something MSL
     can't represent.
 
@@ -1576,6 +1621,10 @@ def fold_drop_unsupported_locals(nodes: list[Node], adj) -> tuple[list[Node], se
     never read by the kernel body. Both can be elided entirely: drop the
     assignment lines, drop printf calls, and skip the locals' declarations.
 
+    ``extra_var_ctypes`` carries the inliner's mangled-label ctype map so
+    ``wp.printf`` calls inside inlined ``@wp.func`` bodies (mujoco_warp's
+    EPA overflow warnings) are elided the same as kernel-level ones.
+
     Mirror of ``_preprocess_drop_unsupported_locals`` from the regex
     pipeline.
     """
@@ -1584,6 +1633,9 @@ def fold_drop_unsupported_locals(nodes: list[Node], adj) -> tuple[list[Node], se
         ct = var.ctype()
         if any(ct.startswith(p) for p in _UNSUPPORTED_CTYPE_PREFIXES):
             drop_locals.add(var.label)
+    for label, ct in (extra_var_ctypes or {}).items():
+        if any(ct.startswith(p) for p in _UNSUPPORTED_CTYPE_PREFIXES):
+            drop_locals.add(label)
     skip_decls = set(drop_locals)
 
     if not drop_locals:
@@ -1659,6 +1711,133 @@ def _apply_drop_unsupported(nodes: tuple[Node, ...] | list[Node], drop: set[str]
 # definitions become declaration-skipped aliases.
 
 
+_CONST_CMP_PAT = re.compile(r"^\(\s*var_(\w+)\s*(==|!=|<=|>=|<|>)\s*var_(\w+)\s*\)$")
+_CONST_NOT_PAT = re.compile(r"^!\(?\s*var_(\w+)\s*\)?$")
+_CONST_ANDOR_PAT = re.compile(r"^var_(\w+)\s*(&&|\|\|)\s*var_(\w+)$")
+_CONST_COPY_PAT = re.compile(r"^var_(\w+)$")
+_IF_COND_VAR_PAT = re.compile(r"^\(?\s*var_(\w+)\s*\)?$")
+
+_CMP_OPS = {
+    "==": lambda a, b: a == b,
+    "!=": lambda a, b: a != b,
+    "<": lambda a, b: a < b,
+    "<=": lambda a, b: a <= b,
+    ">": lambda a, b: a > b,
+    ">=": lambda a, b: a >= b,
+}
+
+
+def fold_const_branches(nodes: list[Node], adj, extra_const_ints: dict[str, int] | None = None) -> list[Node]:
+    """Drop ``if`` bodies whose condition is statically known.
+
+    mujoco_warp's kernel builders bake geom types as Python closure
+    constants, so the GJK/EPA helpers are full of
+    ``if geomtype == GeomType.MESH:`` branches that native compilers
+    dead-code-eliminate. Our MSL pipeline must do the same: the dead
+    branches reference struct array fields (``geom.vert``) that are never
+    assigned for non-mesh geoms, which otherwise reach codegen as
+    unresolvable pointer chains — and they roughly double the emitted
+    source of the collision kernels.
+
+    Only single-assignment labels fold (Warp IR temporaries are SSA;
+    anything reassigned — e.g. accumulated ``cond && extra`` chains — is
+    left alone), and only comparisons/copies/negations/conjunctions whose
+    inputs are const ints or already-folded const bools.
+    """
+    const_ints: dict[str, int] = {}
+    for var in adj.variables:
+        if var.constant is not None and isinstance(var.constant, int) and not isinstance(var.constant, bool):
+            const_ints[var.label] = var.constant
+    if extra_const_ints:
+        const_ints.update(extra_const_ints)
+
+    assign_counts: dict[str, int] = {}
+
+    def _count(ns: tuple[Node, ...] | list[Node]) -> None:
+        for n in ns:
+            if isinstance(n, Assign):
+                assign_counts[n.lhs] = assign_counts.get(n.lhs, 0) + 1
+            if isinstance(n, (If, For, While, _DoWhileZero)):
+                _count(n.body)
+
+    _count(nodes)
+
+    const_bools: dict[str, bool] = {}
+
+    def _eval_pass(ns: tuple[Node, ...] | list[Node]) -> bool:
+        changed = False
+        for n in ns:
+            if isinstance(n, Assign) and assign_counts.get(n.lhs) == 1 and n.lhs not in const_bools:
+                raw = n.expr.raw.strip()
+                m = _CONST_CMP_PAT.match(raw)
+                if m and m.group(1) in const_ints and m.group(3) in const_ints:
+                    const_bools[n.lhs] = _CMP_OPS[m.group(2)](const_ints[m.group(1)], const_ints[m.group(3)])
+                    changed = True
+                    continue
+                m = _CONST_NOT_PAT.match(raw)
+                if m and m.group(1) in const_bools:
+                    const_bools[n.lhs] = not const_bools[m.group(1)]
+                    changed = True
+                    continue
+                m = _CONST_ANDOR_PAT.match(raw)
+                if m and m.group(1) in const_bools and m.group(3) in const_bools:
+                    a, b = const_bools[m.group(1)], const_bools[m.group(3)]
+                    const_bools[n.lhs] = (a and b) if m.group(2) == "&&" else (a or b)
+                    changed = True
+                    continue
+                m = _CONST_COPY_PAT.match(raw)
+                if m and m.group(1) in const_bools:
+                    const_bools[n.lhs] = const_bools[m.group(1)]
+                    changed = True
+                    continue
+            if isinstance(n, (If, For, While, _DoWhileZero)):
+                changed |= _eval_pass(n.body)
+        return changed
+
+    while _eval_pass(nodes):
+        pass
+
+    if not const_bools:
+        return nodes
+
+    def _rewrite(ns: tuple[Node, ...] | list[Node]) -> list[Node]:
+        out: list[Node] = []
+        for n in ns:
+            if isinstance(n, If):
+                m = _IF_COND_VAR_PAT.match(n.cond.strip())
+                if m and m.group(1) in const_bools:
+                    if const_bools[m.group(1)]:
+                        out.extend(_rewrite(n.body))
+                    continue
+                out.append(
+                    If(raw=n.raw, cond=n.cond, body=tuple(_rewrite(n.body)), raw_open=n.raw_open, raw_close=n.raw_close)
+                )
+                continue
+            if isinstance(n, For):
+                out.append(
+                    For(
+                        raw=n.raw,
+                        iter_var=n.iter_var,
+                        range_var=n.range_var,
+                        start=n.start,
+                        stop=n.stop,
+                        body=tuple(_rewrite(n.body)),
+                        step=n.step,
+                    )
+                )
+                continue
+            if isinstance(n, While):
+                out.append(While(raw=n.raw, label_k=n.label_k, body=tuple(_rewrite(n.body))))
+                continue
+            if isinstance(n, _DoWhileZero):
+                out.append(_DoWhileZero(raw=n.raw, body=tuple(_rewrite(n.body))))
+                continue
+            out.append(n)
+        return out
+
+    return _rewrite(nodes)
+
+
 def fold_views(nodes: list[Node], adj, extra_const_ints: dict[str, int] | None = None) -> tuple[list[Node], set[str]]:
     """Fold view aliases through the tree.
 
@@ -1685,7 +1864,22 @@ def fold_views(nodes: list[Node], adj, extra_const_ints: dict[str, int] | None =
     view_aliases: dict[str, tuple[str, list[str]]] = {}
     _collect_view_aliases(nodes, view_aliases, slice_aliases, arg_label_set)
 
-    skip_decls: set[str] = set(slice_aliases) | set(view_aliases)
+    # Struct-local ARRAY fields (``pt.vert = epa_vert``): a store of an
+    # array arg (or an already-folded view) into a struct field, followed
+    # by ``ptr = &(s.field); local = wp::load(ptr)`` reads that materialise
+    # a local array value. The struct-splitting machinery can't represent
+    # array fields (they aren't packed into the flat struct buffer), so we
+    # resolve the whole chain here: the load target becomes a view alias
+    # of the backing array, and the ptr/store/load plumbing lines drop.
+    # mujoco_warp's GJK/EPA kernels build their ``Geom``/``Polytope``
+    # scratch entirely this way.
+    from warp._src.types import is_array  # noqa: PLC0415  (lazy — annotation args are ``_ArrayAnnotation``)
+
+    array_arg_labels = {a.label for a in adj.args if is_array(a.type)}
+    field_ptr_backing, field_load_aliases = _collect_field_array_aliases(nodes, view_aliases, array_arg_labels)
+    backed_field_ptrs = set(field_ptr_backing)
+
+    skip_decls: set[str] = set(slice_aliases) | set(view_aliases) | backed_field_ptrs
     if not view_aliases:
         return nodes, skip_decls
 
@@ -1697,8 +1891,22 @@ def fold_views(nodes: list[Node], adj, extra_const_ints: dict[str, int] | None =
     shape_ptr_shift: dict[str, tuple[str, int]] = {}
     shape_val_shift: dict[str, tuple[str, int]] = {}
     _collect_view_shape_aliases(nodes, view_aliases, shape_ptr_shift, shape_val_shift)
+    # ``pt.face.shape[k]`` — same chain but through a backed array-field
+    # pointer: ``&(var_P->shape)`` + load + extract.
+    _collect_field_ptr_shape_aliases(nodes, field_ptr_backing, shape_ptr_shift, shape_val_shift)
 
-    return _apply_view_rewrites(nodes, slice_aliases, view_aliases, shape_val_shift), skip_decls
+    return (
+        _apply_view_rewrites(
+            nodes,
+            slice_aliases,
+            view_aliases,
+            shape_val_shift,
+            backed_field_ptrs,
+            field_load_aliases,
+            field_ptr_backing,
+        ),
+        skip_decls,
+    )
 
 
 def _strip_var_prefix(s: str) -> str | None:
@@ -1754,6 +1962,182 @@ def _collect_view_aliases(
             _collect_view_aliases(n.body, out, slice_aliases, arg_label_set)
 
 
+def _collect_field_array_aliases(
+    nodes: tuple[Node, ...] | list[Node],
+    view_aliases: dict[str, tuple[str, list[str]]],
+    array_arg_labels: set[str],
+) -> tuple[set[str], set[str]]:
+    """Resolve struct-local array fields to their backing arrays.
+
+    Recognised chain (labels may come from inlined ``@wp.func`` bodies):
+
+        var_P = &(var_S.field);          # array-typed struct field ptr
+        wp::store(var_P, var_SRC);       # SRC: array arg or folded view
+        ...
+        var_Q = &(var_S.field);
+        var_A = wp::load(var_Q);         # A used like an array from here
+
+    Every load target ``A`` is registered in ``view_aliases`` with the
+    field's backing ``(arr_name, lead_idx_labels)`` so the standard view
+    rewrites (address / array_store / atomics / shape) apply. A field
+    assigned two DIFFERENT backings is blacklisted — its chain is left
+    untouched so the unsupported-array-field error downstream still
+    fires instead of silently picking one backing. The whole collection
+    runs to fixpoint because a load alias can itself back another field
+    (``pt2.vert = pt.vert``).
+
+    Returns ``(backed_field_ptr_labels, load_alias_labels)`` — the ptr
+    labels whose ``&(...)`` / ``store`` lines drop, and the load targets
+    whose ``wp::load`` lines drop (their declarations are suppressed via
+    the caller's ``skip_decls``).
+    """
+    conflicted: set[tuple[str, str]] = set()
+    while True:
+        field_ptrs, backing, load_aliases, new_conflicts = _collect_field_aliases_round(
+            nodes, view_aliases, array_arg_labels, conflicted
+        )
+        if not new_conflicts:
+            ptr_backing = {p: backing[key] for p, key in field_ptrs.items() if key in backing and key not in conflicted}
+            view_aliases.update(load_aliases)
+            return ptr_backing, set(load_aliases)
+        conflicted |= new_conflicts
+
+
+_COPY_RHS_PAT = re.compile(r"^var_(\w+)$")
+
+
+def _collect_field_aliases_round(
+    nodes: tuple[Node, ...] | list[Node],
+    view_aliases: dict[str, tuple[str, list[str]]],
+    array_arg_labels: set[str],
+    conflicted: set[tuple[str, str]],
+) -> tuple[
+    dict[str, tuple[str, str]],
+    dict[tuple[str, str], tuple[str, list[str]]],
+    dict[str, tuple[str, list[str]]],
+    set[tuple[str, str]],
+]:
+    """One collection round of ``_collect_field_array_aliases`` with the
+    given conflict blacklist; returns (field_ptrs, backing, load_aliases,
+    new_conflicts)."""
+    field_ptrs: dict[str, tuple[str, str]] = {}
+    backing: dict[tuple[str, str], tuple[str, list[str]]] = {}
+    load_aliases: dict[str, tuple[str, list[str]]] = {}
+    # ``var_X = var_Y;`` copy edges, Y -> {X}. Struct return values
+    # come back from the inliner as whole-struct copies, and the
+    # per-field copy expansion downstream skips array fields — so
+    # array-field backings must propagate along these edges.
+    copy_edges: dict[str, set[str]] = {}
+    # ``x = wp.where(c, a, b)`` on struct locals, x -> (a, b). Scalar
+    # fields expand to per-field ternaries downstream; array fields
+    # carry over only when BOTH branches agree on the backing.
+    where_edges: dict[str, tuple[str, str]] = {}
+    new_conflicts: set[tuple[str, str]] = set()
+
+    def _bind(key: tuple[str, str], b: tuple[str, list[str]]) -> bool:
+        prev = backing.get(key)
+        if prev is None:
+            backing[key] = (b[0], list(b[1]))
+            return True
+        if prev[0] != b[0] or list(prev[1]) != list(b[1]):
+            if key in new_conflicts:
+                return False
+            new_conflicts.add(key)
+            return True
+        return False
+
+    def walk(ns: tuple[Node, ...] | list[Node]) -> bool:
+        changed = False
+        for n in ns:
+            if isinstance(n, Assign) and isinstance(n.expr, AddrOf) and n.expr.inner_kind == "field_dot":
+                key = (n.expr.inner_target, n.expr.inner_field or "")
+                if field_ptrs.get(n.lhs) != key:
+                    field_ptrs[n.lhs] = key
+                    changed = True
+            elif isinstance(n, VoidCall) and n.op == "store" and len(n.args) == 2:
+                p = _strip_var_prefix(n.args[0].strip())
+                s = _strip_var_prefix(n.args[1].strip())
+                if p is not None and p in field_ptrs and s is not None:
+                    key = field_ptrs[p]
+                    if key in conflicted:
+                        continue
+                    if s in array_arg_labels:
+                        b: tuple[str, list[str]] | None = (s, [])
+                    else:
+                        b = view_aliases.get(s) or load_aliases.get(s)
+                    if b is not None:
+                        changed |= _bind(key, b)
+            elif (
+                isinstance(n, Assign)
+                and isinstance(n.expr, Builtin)
+                and n.expr.name == "load"
+                and len(n.expr.args) == 1
+            ):
+                p = _strip_var_prefix(n.expr.args[0].strip())
+                if p is not None and p in field_ptrs:
+                    key = field_ptrs[p]
+                    if key in backing and key not in conflicted and n.lhs not in load_aliases:
+                        load_aliases[n.lhs] = backing[key]
+                        changed = True
+            elif (
+                isinstance(n, Assign)
+                and isinstance(n.expr, Builtin)
+                and n.expr.name == "where"
+                and len(n.expr.args) == 3
+            ):
+                wa = _strip_var_prefix(n.expr.args[1].strip())
+                wb = _strip_var_prefix(n.expr.args[2].strip())
+                if wa is not None and wb is not None and n.lhs not in where_edges:
+                    where_edges[n.lhs] = (wa, wb)
+                    changed = True
+            elif isinstance(n, Assign) and not isinstance(n.expr, (AddrOf, Builtin)):
+                m_copy = _COPY_RHS_PAT.match(n.expr.raw.strip())
+                if m_copy:
+                    src = m_copy.group(1)
+                    if n.lhs not in copy_edges.setdefault(src, set()):
+                        copy_edges[src].add(n.lhs)
+                        changed = True
+            if isinstance(n, (If, For, While, _DoWhileZero)):
+                changed |= walk(n.body)
+        return changed
+
+    while True:
+        while walk(nodes):
+            pass
+        # Propagate field backings along struct-copy edges. Only keys
+        # whose struct label has outgoing copies matter; non-struct
+        # copy edges are inert (no field key ever names them).
+        prop_changed = False
+        for (s, f), b in list(backing.items()):
+            for dst in copy_edges.get(s, ()):
+                key2 = (dst, f)
+                if key2 not in conflicted and key2 not in new_conflicts and backing.get(key2) != (b[0], list(b[1])):
+                    prop_changed |= _bind(key2, b)
+        # Where edges: bind fields whose branches agree. A branch with
+        # NO recorded backing is a default-constructed struct (native's
+        # null ``array_t`` — dereferencing it when selected is UB there
+        # too), so a single-sided backing carries over; two DIFFERENT
+        # backings stay unresolved (falls through to the clear error).
+        fields_by_struct: dict[str, list[str]] = {}
+        for s, f in backing:
+            fields_by_struct.setdefault(s, []).append(f)
+        for dst, (wa, wb) in where_edges.items():
+            for f in {*fields_by_struct.get(wa, ()), *fields_by_struct.get(wb, ())}:
+                ba = backing.get((wa, f))
+                bb = backing.get((wb, f))
+                if ba is not None and bb is not None and ba != bb:
+                    continue
+                chosen = ba if ba is not None else bb
+                if chosen is None:
+                    continue
+                key2 = (dst, f)
+                if key2 not in conflicted and key2 not in new_conflicts and backing.get(key2) != chosen:
+                    prop_changed |= _bind(key2, chosen)
+        if not prop_changed:
+            break
+    return field_ptrs, backing, load_aliases, new_conflicts
+
+
 def _collect_view_shape_aliases(
     nodes: tuple[Node, ...] | list[Node],
     view_aliases: dict[str, tuple[str, list[str]]],
@@ -1775,13 +2159,49 @@ def _collect_view_shape_aliases(
             _collect_view_shape_aliases(n.body, view_aliases, ptr_shift, val_shift)
 
 
+def _collect_field_ptr_shape_aliases(
+    nodes: tuple[Node, ...] | list[Node],
+    field_ptr_backing: dict[str, tuple[str, list[str]]],
+    ptr_shift: dict[str, tuple[str, int]],
+    val_shift: dict[str, tuple[str, int]],
+) -> None:
+    """``&(var_P->shape)`` + load where ``P`` is a backed array-field ptr.
+
+    Records the shape-pointer and shape-value locals with the backing
+    array name and the number of folded lead dims, mirroring
+    ``_collect_view_shape_aliases`` so the same extract-shift rewrite
+    applies.
+    """
+    for n in nodes:
+        if isinstance(n, Assign) and isinstance(n.expr, AddrOf):
+            if (
+                n.expr.inner_kind == "field_arrow"
+                and n.expr.inner_field == "shape"
+                and n.expr.inner_target in field_ptr_backing
+            ):
+                arr_name, leads = field_ptr_backing[n.expr.inner_target]
+                ptr_shift[n.lhs] = (arr_name, len(leads))
+        elif isinstance(n, Assign) and isinstance(n.expr, Builtin) and n.expr.name == "load" and len(n.expr.args) == 1:
+            src = _strip_var_prefix(n.expr.args[0].strip())
+            if src is not None and src in ptr_shift:
+                val_shift[n.lhs] = ptr_shift[src]
+        elif isinstance(n, (If, For, While, _DoWhileZero)):
+            _collect_field_ptr_shape_aliases(n.body, field_ptr_backing, ptr_shift, val_shift)
+
+
 def _apply_view_rewrites(
     nodes: tuple[Node, ...] | list[Node],
     slice_aliases: dict[str, str],
     view_aliases: dict[str, tuple[str, list[str]]],
     shape_val_shift: dict[str, tuple[str, int]] | None = None,
+    backed_field_ptrs: set[str] | None = None,
+    field_load_aliases: set[str] | None = None,
+    field_ptr_backing: dict[str, tuple[str, list[str]]] | None = None,
 ) -> list[Node]:
     shape_val_shift = shape_val_shift or {}
+    backed_field_ptrs = backed_field_ptrs or set()
+    field_load_aliases = field_load_aliases or set()
+    field_ptr_backing = field_ptr_backing or {}
     out: list[Node] = []
     for n in nodes:
         # 1. Drop slice_t / view definitions we resolved as aliases.
@@ -1793,6 +2213,46 @@ def _apply_view_rewrites(
         ):
             continue
         if isinstance(n, Assign) and n.lhs in view_aliases and isinstance(n.expr, Builtin) and n.expr.name == "view":
+            continue
+        # 1b. Drop the resolved struct-array-field plumbing (see
+        # ``_collect_field_array_aliases``): the ``&(s.field)`` ptr line,
+        # the backing ``wp::store``, and the ``wp::load`` that the alias
+        # replaces. All array accesses through the load target rewrite via
+        # ``view_aliases`` below.
+        if isinstance(n, Assign) and isinstance(n.expr, AddrOf) and n.lhs in backed_field_ptrs:
+            continue
+        # ``&(var_P->shape)`` where ``P`` is a backed array-field ptr —
+        # repoint at the backing array; the flat-side shape-alias pass
+        # then treats it like a direct arg shape access, and the extract
+        # branch below shifts the dim index by the folded lead count.
+        if (
+            isinstance(n, Assign)
+            and isinstance(n.expr, AddrOf)
+            and n.expr.inner_kind == "field_arrow"
+            and n.expr.inner_field == "shape"
+            and n.expr.inner_target in field_ptr_backing
+        ):
+            arr_name, _leads = field_ptr_backing[n.expr.inner_target]
+            indent = _leading_indent(n.raw)
+            new_expr_raw = f"&(var_{arr_name}.shape)"
+            out.append(
+                Assign(
+                    raw=f"{indent}var_{n.lhs} = {new_expr_raw};",
+                    lhs=n.lhs,
+                    expr=AddrOf(raw=new_expr_raw, inner_kind="shape", inner_target=arr_name, inner_field=None),
+                )
+            )
+            continue
+        if isinstance(n, VoidCall) and n.op == "store" and len(n.args) == 2:
+            p = _strip_var_prefix(n.args[0].strip())
+            if p is not None and p in backed_field_ptrs:
+                continue
+        if (
+            isinstance(n, Assign)
+            and n.lhs in field_load_aliases
+            and isinstance(n.expr, Builtin)
+            and n.expr.name == "load"
+        ):
             continue
 
         # 2. Rewrite address / array_store / atomic_* on a view.
@@ -1956,7 +2416,17 @@ def _apply_view_rewrites(
                 If(
                     raw=n.raw,
                     cond=n.cond,
-                    body=tuple(_apply_view_rewrites(n.body, slice_aliases, view_aliases, shape_val_shift)),
+                    body=tuple(
+                        _apply_view_rewrites(
+                            n.body,
+                            slice_aliases,
+                            view_aliases,
+                            shape_val_shift,
+                            backed_field_ptrs,
+                            field_load_aliases,
+                            field_ptr_backing,
+                        )
+                    ),
                     raw_open=n.raw_open,
                     raw_close=n.raw_close,
                 )
@@ -1970,7 +2440,17 @@ def _apply_view_rewrites(
                     range_var=n.range_var,
                     start=n.start,
                     stop=n.stop,
-                    body=tuple(_apply_view_rewrites(n.body, slice_aliases, view_aliases, shape_val_shift)),
+                    body=tuple(
+                        _apply_view_rewrites(
+                            n.body,
+                            slice_aliases,
+                            view_aliases,
+                            shape_val_shift,
+                            backed_field_ptrs,
+                            field_load_aliases,
+                            field_ptr_backing,
+                        )
+                    ),
                     step=n.step,
                 )
             )
@@ -1980,7 +2460,17 @@ def _apply_view_rewrites(
                 While(
                     raw=n.raw,
                     label_k=n.label_k,
-                    body=tuple(_apply_view_rewrites(n.body, slice_aliases, view_aliases, shape_val_shift)),
+                    body=tuple(
+                        _apply_view_rewrites(
+                            n.body,
+                            slice_aliases,
+                            view_aliases,
+                            shape_val_shift,
+                            backed_field_ptrs,
+                            field_load_aliases,
+                            field_ptr_backing,
+                        )
+                    ),
                 )
             )
             continue
@@ -1988,7 +2478,17 @@ def _apply_view_rewrites(
             out.append(
                 _DoWhileZero(
                     raw=n.raw,
-                    body=tuple(_apply_view_rewrites(n.body, slice_aliases, view_aliases, shape_val_shift)),
+                    body=tuple(
+                        _apply_view_rewrites(
+                            n.body,
+                            slice_aliases,
+                            view_aliases,
+                            shape_val_shift,
+                            backed_field_ptrs,
+                            field_load_aliases,
+                            field_ptr_backing,
+                        )
+                    ),
                 )
             )
             continue
