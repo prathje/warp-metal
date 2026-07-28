@@ -3747,6 +3747,70 @@ class TestMetalQuatBuiltins(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet)
 
+    def test_normalize_zero_length_matches_cpu(self):
+        # Regression: ``wp.normalize`` used to lower to ``metal::normalize``,
+        # whose zero-vector result depends on the math mode the metallib is
+        # compiled with (MLX <= 0.31.x: 0; MLX >= 0.32.0 MTLMathModeSafe:
+        # NaN). Warp semantics are mode-independent: zero vectors normalize
+        # to zero (``vec.h``), zero quats to the identity (``quat.h``) —
+        # and quat vs vec4 must dispatch by static type even though both
+        # erase to ``float4`` in MSL. mujoco_warp's ``quat_integrate`` hits
+        # the zero-vec3 case on every world with zero angular velocity.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.func
+            def helper_qnorm(q: wp.quat) -> wp.quat:
+                return wp.normalize(q)
+
+            @wp.kernel
+            def k(v3: wp.array(dtype=wp.vec3), v4: wp.array(dtype=wp.vec4),
+                  q: wp.array(dtype=wp.quat),
+                  o3: wp.array(dtype=wp.vec3), o4: wp.array(dtype=wp.vec4),
+                  oq: wp.array(dtype=wp.quat), oqf: wp.array(dtype=wp.quat)):
+                tid = wp.tid()
+                o3[tid] = wp.normalize(v3[tid])
+                o4[tid] = wp.normalize(v4[tid])
+                oq[tid] = wp.normalize(q[tid])
+                oqf[tid] = helper_qnorm(q[tid])
+
+            N = 32
+            rng = np.random.default_rng(7)
+            v3n = rng.standard_normal((N, 3)).astype(np.float32)
+            v4n = rng.standard_normal((N, 4)).astype(np.float32)
+            qn = rng.standard_normal((N, 4)).astype(np.float32)
+            v3n[0] = 0.0  # the rows under test: exactly zero length
+            v4n[0] = 0.0
+            qn[0] = 0.0
+
+            outs = {}
+            for dev in ('cpu', 'metal:0'):
+                o3 = wp.zeros(N, dtype=wp.vec3, device=dev)
+                o4 = wp.zeros(N, dtype=wp.vec4, device=dev)
+                oq = wp.zeros(N, dtype=wp.quat, device=dev)
+                oqf = wp.zeros(N, dtype=wp.quat, device=dev)
+                wp.launch(k, dim=N,
+                          inputs=[wp.array(v3n, dtype=wp.vec3, device=dev),
+                                  wp.array(v4n, dtype=wp.vec4, device=dev),
+                                  wp.array(qn, dtype=wp.quat, device=dev)],
+                          outputs=[o3, o4, oq, oqf], device=dev)
+                outs[dev] = (o3.numpy(), o4.numpy(), oq.numpy(), oqf.numpy())
+
+            for c, m in zip(outs['cpu'], outs['metal:0']):
+                assert np.isfinite(m).all(), 'Metal normalize produced non-finite values'
+                np.testing.assert_allclose(c, m, rtol=1e-6, atol=1e-7)
+            # The zero rows pin the exact guard semantics (not just allclose):
+            np.testing.assert_array_equal(outs['metal:0'][0][0], np.zeros(3, np.float32))
+            np.testing.assert_array_equal(outs['metal:0'][1][0], np.zeros(4, np.float32))
+            identity = np.array([0, 0, 0, 1], np.float32)
+            np.testing.assert_array_equal(outs['metal:0'][2][0], identity)
+            np.testing.assert_array_equal(outs['metal:0'][3][0], identity)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
     def test_quat_rotate_inverse_identity_match_cpu(self):
         snippet = textwrap.dedent(
             """

@@ -764,6 +764,52 @@ _DIAG_HELPER_FLOAT3 = (
 )
 
 
+# ``wp.normalize`` must match ``warp/native/vec.h``/``quat.h`` exactly:
+# zero-length input returns the zero vector (identity quat for quats),
+# never NaN — Warp's ``kEps`` is 0.0f, hence the ``l > 0`` guard. Do NOT
+# lower to ``metal::normalize``: which variant it resolves to depends on
+# the math mode the metallib is compiled with, and that changed under us
+# once already (MLX <= 0.31.x compiled custom kernels with
+# ``fastMathEnabled=false`` where ``metal::normalize(0)`` returned 0;
+# MLX >= 0.32.0 uses ``MTLMathModeSafe`` where it is ``0 * rsqrt(0)`` =
+# NaN — that single change NaN'd every zero-angular-velocity
+# ``quat_integrate`` in mujoco_warp). ``metal::precise::sqrt`` keeps the
+# length bit-identical to the CPU's ``sqrtf`` in any math mode. Emitted
+# unconditionally — several helper families (quat, noise, BVH/mesh)
+# reference these, and the block is tiny.
+_NORMALIZE_HELPERS = """\
+inline float2 wp_normalize(float2 v) {
+    float l = metal::precise::sqrt(metal::dot(v, v));
+    return (l > 0.0f) ? (v / l) : float2(0.0f);
+}
+inline float3 wp_normalize(float3 v) {
+    float l = metal::precise::sqrt(metal::dot(v, v));
+    return (l > 0.0f) ? (v / l) : float3(0.0f);
+}
+inline float4 wp_normalize(float4 v) {
+    float l = metal::precise::sqrt(metal::dot(v, v));
+    return (l > 0.0f) ? (v / l) : float4(0.0f);
+}
+inline half2 wp_normalize(half2 v) {
+    half l = metal::sqrt(metal::dot(v, v));
+    return (l > half(0.0f)) ? (v / l) : half2(0.0f);
+}
+inline half3 wp_normalize(half3 v) {
+    half l = metal::sqrt(metal::dot(v, v));
+    return (l > half(0.0f)) ? (v / l) : half3(0.0f);
+}
+inline half4 wp_normalize(half4 v) {
+    half l = metal::sqrt(metal::dot(v, v));
+    return (l > half(0.0f)) ? (v / l) : half4(0.0f);
+}
+inline float4 wp_quat_normalize(float4 q) {
+    float l = metal::precise::sqrt(metal::dot(q, q));
+    // Reciprocal-then-multiply, NOT q / l — matches ``quat.h`` rounding.
+    return (l > 0.0f) ? (q * (1.0f / l)) : float4(0.0f, 0.0f, 0.0f, 1.0f);
+}
+"""
+
+
 # Quaternion helpers. Quats are stored as ``float4`` with (x, y, z, w)
 # layout after the ``vec_t<4>`` normalization; the bodies mirror
 # ``warp/native/quat.h`` exactly (including the ``l > 0`` normalize guard —
@@ -1070,14 +1116,14 @@ inline float2 wp_random_gradient_2d(uint state, int ix, int iy) {
     const uint p1 = 73856093u;
     const uint p2 = 19349663u;
     uint idx = (uint(ix) * p1) ^ (uint(iy) * p2 + state);
-    return metal::normalize(wp_sample_unit_square(idx));
+    return wp_normalize(wp_sample_unit_square(idx));
 }
 inline float3 wp_random_gradient_3d(uint state, int ix, int iy, int iz) {
     const uint p1 = 73856093u;
     const uint p2 = 19349663u;
     const uint p3 = 53471161u;
     uint idx = (uint(ix) * p1) ^ (uint(iy) * p2) ^ (uint(iz) * p3 + state);
-    return metal::normalize(wp_sample_unit_cube(idx));
+    return wp_normalize(wp_sample_unit_cube(idx));
 }
 inline float4 wp_random_gradient_4d(uint state, int ix, int iy, int iz, int it) {
     const uint p1 = 73856093u;
@@ -1085,7 +1131,7 @@ inline float4 wp_random_gradient_4d(uint state, int ix, int iy, int iz, int it) 
     const uint p3 = 53471161u;
     const uint p4 = 10000019u;
     uint idx = (uint(ix) * p1) ^ (uint(iy) * p2) ^ (uint(iz) * p3) ^ (uint(it) * p4 + state);
-    return metal::normalize(wp_sample_unit_hypercube(idx));
+    return wp_normalize(wp_sample_unit_hypercube(idx));
 }
 inline float wp_dot_grid_gradient_1d(uint state, int ix, float dx) {
     return dx * wp_random_gradient_1d(state, ix);
@@ -1983,7 +2029,7 @@ inline bool wp_mesh_query_ray(
         v = min_v;
         sign_out = min_sign;
         t = min_t;
-        normal = metal::normalize(min_normal);
+        normal = wp_normalize(min_normal);
         face = min_face;
         return true;
     }
@@ -2481,11 +2527,11 @@ inline bool wp_mesh_query_point_sign_normal(
                     float len_cq_sq = wp_bvh_length_sq(cq);
                     float len_cr_sq = wp_bvh_length_sq(cr);
                     if (len_cp_sq < epsilon_min_dist_sq) {
-                        weight = metal::acos(wp_bvh_dot3(metal::normalize(e0), metal::normalize(e1)));
+                        weight = metal::acos(wp_bvh_dot3(wp_normalize(e0), wp_normalize(e1)));
                     } else if (len_cq_sq < epsilon_min_dist_sq) {
-                        weight = metal::acos(wp_bvh_dot3(metal::normalize(e2), metal::normalize(-e0)));
+                        weight = metal::acos(wp_bvh_dot3(wp_normalize(e2), wp_normalize(-e0)));
                     } else if (len_cr_sq < epsilon_min_dist_sq) {
-                        weight = metal::acos(wp_bvh_dot3(metal::normalize(-e1), metal::normalize(-e2)));
+                        weight = metal::acos(wp_bvh_dot3(wp_normalize(-e1), wp_normalize(-e2)));
                     } else {
                         float e0cp = wp_bvh_dot3(e0, cp);
                         float e2cq = wp_bvh_dot3(e2, cq);
@@ -2499,7 +2545,7 @@ inline bool wp_mesh_query_point_sign_normal(
                         }
                     }
                     if (dist > min_dist - epsilon_min_dist) {
-                        accumulated_angle_weighted_normal += weight * metal::normalize(normal);
+                        accumulated_angle_weighted_normal += weight * wp_normalize(normal);
                         if (dist < min_dist) {
                             min_dist = dist;
                             min_v = bv;
@@ -2511,7 +2557,7 @@ inline bool wp_mesh_query_point_sign_normal(
                         min_v = bv;
                         min_w = bw;
                         min_face = primitive_index;
-                        accumulated_angle_weighted_normal = weight * metal::normalize(normal);
+                        accumulated_angle_weighted_normal = weight * wp_normalize(normal);
                     }
                 }
             }
@@ -2667,7 +2713,7 @@ inline float3 wp_mesh_eval_face_normal(ulong id, int tri) {
     float3 p = wp_bvh_load_v3(mesh.points, i);
     float3 q = wp_bvh_load_v3(mesh.points, j);
     float3 r = wp_bvh_load_v3(mesh.points, k);
-    return metal::normalize(metal::cross(q - p, r - p));
+    return wp_normalize(metal::cross(q - p, r - p));
 }
 inline float3 wp_mesh_get_point(ulong id, int index) {
     wp_mesh_desc_t mesh = wp_mesh_get_desc(id);
@@ -4155,6 +4201,11 @@ def _build_kernel_header(source: str) -> str:
         parts.append(native_mat_overloads)
     if "wp_diag_float3" in source:
         parts.append(_DIAG_HELPER_FLOAT3)
+    # Always emitted: kernels reference ``wp_normalize``/``wp_quat_normalize``
+    # directly, and the quat/noise/BVH helper families below call
+    # ``wp_normalize`` internally (mirroring native code's guarded
+    # ``normalize``), so it must precede all of them.
+    parts.append(_NORMALIZE_HELPERS)
     if "wp_quat_" in source or "wp_transform_" in source:
         parts.append(_QUAT_HELPERS)
     if "wp_transform_" in source:
@@ -5015,6 +5066,12 @@ for _name in _MATH_BUILTIN_NAMES:
     # (big-vec). Other math builtins fall back to the metal namespace.
     if _name == "dot":
         _INTRINSIC_PATTERNS.append((re.compile(rf"\bwp::{_name}\b"), "wp_dot"))
+    elif _name == "normalize":
+        # Guarded zero-length semantics (see ``_NORMALIZE_HELPERS``) —
+        # ``metal::normalize`` NaNs on zero vectors under some math modes.
+        # Quat-typed operands are intercepted earlier by the type-aware
+        # rewrite in ``generate_msl_kernel`` (``wp_quat_normalize``).
+        _INTRINSIC_PATTERNS.append((re.compile(rf"\bwp::{_name}\b"), "wp_normalize"))
     else:
         _INTRINSIC_PATTERNS.append((re.compile(rf"\bwp::{_name}\b"), f"metal::{_name}"))
 del _name
@@ -7248,6 +7305,7 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
         for m in _quat_decl_pat.finditer(raw):
             quat_var_labels.add(m.group(1))
     _quat_mul_call_pat = re.compile(r"wp::mul\s*\(\s*var_(\w+)\s*,\s*var_(\w+)\s*\)")
+    _quat_normalize_call_pat = re.compile(r"wp::normalize\s*\(\s*var_(\w+)\s*\)")
 
     def _rewrite_quat_mul(text: str) -> str:
         def repl(m: re.Match[str]) -> str:
@@ -7255,7 +7313,19 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
                 return f"wp_quat_mul(var_{m.group(1)}, var_{m.group(2)})"
             return m.group(0)
 
-        return _quat_mul_call_pat.sub(repl, text)
+        text = _quat_mul_call_pat.sub(repl, text)
+
+        # Same type-erasure hazard for ``wp::normalize``: a zero-length quat
+        # normalizes to the identity (0, 0, 0, 1) while a zero vec4 stays
+        # zero (``warp/native/quat.h`` vs ``vec.h``). Dispatch quat-typed
+        # operands to ``wp_quat_normalize`` before the generic intrinsic
+        # pattern lowers the rest to ``wp_normalize``.
+        def repl_normalize(m: re.Match[str]) -> str:
+            if m.group(1) in quat_var_labels:
+                return f"wp_quat_normalize(var_{m.group(1)})"
+            return m.group(0)
+
+        return _quat_normalize_call_pat.sub(repl_normalize, text)
 
     # --- Forward statements --------------------------------------------
     def _finalize(translated: str) -> str:
@@ -8365,7 +8435,7 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
 # v2: added captured-constant values (``Var.constant``) to the key —
 # closure-kernel instantiations previously collided (same kernel.key,
 # args, and IR statements; different baked ``const`` declarations).
-_ARTIFACT_CACHE_VERSION = 5
+_ARTIFACT_CACHE_VERSION = 6
 _codegen_source_hash_cached: str | None = None
 
 
