@@ -126,6 +126,7 @@ from typing import TYPE_CHECKING, Any
 
 from warp._src.codegen_metal_ast import emit as _ast_emit
 from warp._src.codegen_metal_ast import fold as _ast_fold
+from warp._src.codegen_metal_ast import fold_const_branches as _ast_fold_const_branches
 from warp._src.codegen_metal_ast import fold_drop_unsupported_locals as _ast_fold_drop
 from warp._src.codegen_metal_ast import fold_indexref_writes as _ast_fold_indexref
 from warp._src.codegen_metal_ast import fold_multidim_atomics as _ast_fold_multidim_atomics
@@ -233,6 +234,27 @@ def _normalize_quat_t(text: str) -> str:
 
 
 _MSL_VEC_NATIVE_N = (2, 3, 4)
+
+# ``var_P = wp::indexref(var_V, idx);`` — component pointer into a vec
+# lvalue (optionally through ``&``). Array-element forms are folded in the
+# AST phase; this pattern feeds the vec-local alias pass in
+# ``generate_msl_kernel``.
+_INDEXREF_VEC_PAT = re.compile(
+    r"^\s*var_(\w+)\s*=\s*wp::indexref\(\s*&?\(?\s*var_(\w+)\s*\)?\s*,\s*([^;]+?)\s*\)\s*;\s*$"
+)
+
+
+def _vec_ctype_len(ctype: str) -> int | None:
+    """Component count if ``ctype`` is a vec/quat/transform value type (not
+    a pointer), else ``None``."""
+    stripped = ctype.strip()
+    if stripped.endswith("*"):
+        return None
+    stripped = _normalize_quat_t(stripped)
+    m = _WP_VEC_T_PAT.fullmatch(stripped)
+    if m:
+        return int(m.group(1))
+    return None
 
 
 def _msl_vec_name(n: int, msl_scalar: str) -> str:
@@ -2796,8 +2818,20 @@ _MISC_MATH_HELPERS: dict[str, str] = {
     ),
     # ``wp.sign(0) == 1`` — do NOT swap in ``metal::sign`` (returns 0 at 0).
     # The uint instantiation's ``x < 0`` is always false, so it returns 1
-    # like the native uint overloads do.
-    "wp_sign": ("template <typename T>\ninline T wp_sign(T x) { return x < T(0) ? T(-1) : T(1); }"),
+    # like the native uint overloads do. Vec overloads are componentwise
+    # (the scalar template's ternary fails to compile on MSL vector types:
+    # boolN condition with floatN results is rejected; ``metal::select``
+    # keeps the same 0-maps-to-1 semantics since ``0 < 0`` is false).
+    "wp_sign": (
+        "template <typename T>\n"
+        "inline T wp_sign(T x) { return x < T(0) ? T(-1) : T(1); }\n"
+        "inline float2 wp_sign(float2 x) "
+        "{ return metal::select(float2(1.0f), float2(-1.0f), x < float2(0.0f)); }\n"
+        "inline float3 wp_sign(float3 x) "
+        "{ return metal::select(float3(1.0f), float3(-1.0f), x < float3(0.0f)); }\n"
+        "inline float4 wp_sign(float4 x) "
+        "{ return metal::select(float4(1.0f), float4(-1.0f), x < float4(0.0f)); }"
+    ),
     # Warp's step is 1 for x < 0 — the reverse of GLSL/MSL ``step``.
     "wp_step": ("template <typename T>\ninline T wp_step(T x) { return x < T(0) ? T(1) : T(0); }"),
     "wp_nonzero": ("template <typename T>\ninline T wp_nonzero(T x) { return x == T(0) ? T(0) : T(1); }"),
@@ -6686,7 +6720,12 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
     # downstream slice-step recogniser and field-pointer pass can treat
     # them the same as kernel-level ones.
     _ast_nodes, _inlined_const_ints, _inlined_struct_locals, _inlined_var_ctypes = _ast_inline(_ast_nodes, adj)
-    _ast_nodes, _drop_skip = _ast_fold_drop(_ast_nodes, adj)
+    # Drop statically-dead branches (geom-type constants baked by kernel
+    # builders) BEFORE the view/field folds — dead mesh-only branches
+    # reference array struct fields that are never assigned for the live
+    # geom types.
+    _ast_nodes = _ast_fold_const_branches(_ast_nodes, adj, _inlined_const_ints)
+    _ast_nodes, _drop_skip = _ast_fold_drop(_ast_nodes, adj, _inlined_var_ctypes)
     _ast_nodes, _view_skip = _ast_fold_views(_ast_nodes, adj, extra_const_ints=_inlined_const_ints)
     _ast_nodes, _indexref_skip = _ast_fold_indexref(_ast_nodes, adj, _early_vec_arr_info)
     # Flatten multi-dim ``wp::atomic_<op>(arr, i, j, ..., val)`` into the
@@ -7012,6 +7051,11 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
     # Buffer-backed field pointers that may be written through: pointer
     # label -> (buffer, base_expr, finfo). Consulted by the store branch.
     buffer_field_stores: dict[str, tuple[str, str, _StructFieldInfo]] = {}
+    # Vec-typed lvalues that ``wp::indexref`` may take a component pointer
+    # into: pointer/local label -> MSL lvalue expression. Populated with
+    # struct-local vec FIELDS by the field pass below and with plain
+    # vec-typed locals afterwards; consumed by the indexref alias pass.
+    indexref_vec_bases: dict[str, str] = {}
     for label, (arr_name, elem_idx_expr) in struct_refs.items():
         layout = struct_arr_info[arr_name]
         struct_ptr_bases[label] = (arr_name, f"{elem_idx_expr} * {layout.scalars_per_elem}", layout)
@@ -7058,6 +7102,8 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
                     struct_ptr_locals[field_local] = (f"{struct_local}__{field_name}", field_info.sub)
                     continue
                 subscript_map[field_local] = _per_field_local(struct_local, field_name)
+                if field_info.kind == _STRUCT_FIELD_KIND_VEC:
+                    indexref_vec_bases[field_local] = _per_field_local(struct_local, field_name)
                 continue
             # Struct-arg field: the launcher serialises the struct into a
             # flat scalar buffer of length ``scalars_per_elem``; field
@@ -7094,6 +7140,8 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
                 struct_ptr_locals[field_local] = (f"{prefix}__{field_name}", field_info.sub)
                 continue
             subscript_map[field_local] = _per_field_local(prefix, field_name)
+            if field_info.kind == _STRUCT_FIELD_KIND_VEC:
+                indexref_vec_bases[field_local] = _per_field_local(prefix, field_name)
             continue
         if struct_local not in struct_ptr_bases:
             continue
@@ -7108,6 +7156,45 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
             struct_ptr_bases[field_local] = (buf, f"{base_expr} + {field_info.offset}", field_info.sub)
             continue
         _bind_buffer_field(field_local, buf, f"{base_expr} + {field_info.offset}", field_info)
+
+    # ---- ``wp::indexref`` on vec lvalues -------------------------------
+    # ``v[i] = x`` (or a component reference used as an lvalue) with a
+    # non-array base lowers in the IR to
+    # ``var_P = wp::indexref(var_V, var_i);`` followed by loads/stores
+    # through ``var_P``. Array-element bases are folded earlier by
+    # ``fold_indexref_writes``; what reaches here are VEC-typed locals
+    # and struct-local vec fields (e.g. ``geom.size[0] = radius`` in
+    # mujoco_warp's GJK sphere handling). MSL subscripting on float2/3/4
+    # and on our big-vec structs (``operator[]``) is a real lvalue, so
+    # the pointer aliases to ``base[idx]`` in ``subscript_map`` — loads
+    # inline it and the store branch writes through it. Matrix bases are
+    # deliberately NOT aliased (Warp's row reference vs MSL's column
+    # subscript would silently transpose); they keep falling through to
+    # the unsupported-intrinsic guard.
+    for var in adj.variables:
+        n_comps = _vec_ctype_len(var.ctype())
+        if n_comps is not None:
+            indexref_vec_bases.setdefault(var.label, f"var_{var.label}")
+    for arg in adj.args:
+        n_comps = _vec_ctype_len(arg.ctype()) if not isinstance(arg.type, _Struct) else None
+        if n_comps is not None:
+            indexref_vec_bases.setdefault(arg.label, f"var_{arg.label}")
+    for label, ctype in _inlined_var_ctypes.items():
+        if _vec_ctype_len(ctype) is not None:
+            indexref_vec_bases.setdefault(label, f"var_{label}")
+    _var_token_pat = re.compile(r"\bvar_(\w+)\b")
+    for raw in forward_lines:
+        m = _INDEXREF_VEC_PAT.match(raw)
+        if not m:
+            continue
+        ptr_label, base_label, idx_expr = m.group(1), m.group(2), m.group(3)
+        base = indexref_vec_bases.get(base_label)
+        if base is None:
+            continue
+        # Resolve already-aliased locals inside the index expression so
+        # the recorded lvalue is self-contained.
+        idx_resolved = _var_token_pat.sub(lambda mm: subscript_map.get(mm.group(1), mm.group(0)), idx_expr)
+        subscript_map[ptr_label] = f"{base}[{idx_resolved}]"
 
     # --- Local variable declarations -----------------------------------
     body_lines: list[str] = []
@@ -7327,6 +7414,29 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
 
         return _quat_normalize_call_pat.sub(repl_normalize, text)
 
+    # Subscript substitution table keyed by the full ``var_<label>`` token.
+    # ``subscript_map`` is fully populated by the pre-passes above, so one
+    # snapshot serves the whole emission loop. Substitution is a SINGLE
+    # scan per line with a dict lookup per token, iterated to a bounded
+    # fixpoint so chained aliases (a value that itself contains an aliased
+    # token) still resolve — the old per-entry ``re.sub`` loop was
+    # O(len(subscript_map)) regex passes per line, which went quadratic on
+    # mujoco_warp's inlined GJK kernels (65k lines x thousands of aliases
+    # = tens of minutes per kernel).
+    _subscript_by_token = {f"var_{k}": v for k, v in subscript_map.items()}
+    _subscript_token_pat = re.compile(r"\bvar_\w+\b")
+
+    def _substitute_subscripts(text: str) -> str:
+        if "var_" not in text:
+            return text
+        lookup = _subscript_by_token.get
+        for _ in range(4):
+            new = _subscript_token_pat.sub(lambda m: lookup(m.group(0), m.group(0)), text)
+            if new == text:
+                break
+            text = new
+        return text
+
     # --- Forward statements --------------------------------------------
     def _finalize(translated: str) -> str:
         # Quat-quat multiplies must be intercepted before the generic
@@ -7349,8 +7459,7 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
             atomic_output_names,
         )
         # Inline subscripts that the address-collapse produced.
-        for local_label, subscript in subscript_map.items():
-            translated = re.sub(rf"\bvar_{re.escape(local_label)}\b", subscript, translated)
+        translated = _substitute_subscripts(translated)
         # Re-run intrinsic translation in case ``wp::load(var_1)`` became
         # ``wp::load(arr[idx])``.
         translated = _translate_intrinsics(translated)
@@ -7482,6 +7591,13 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
         # referenced via ``wp::load``.
         if struct_field_addr_pat.match(raw):
             continue
+        # Vec-component pointer line (``wp::indexref`` on a vec lvalue) —
+        # aliased to ``base[idx]`` in ``subscript_map`` by the pre-pass;
+        # unaliased matches (e.g. matrix bases) fall through to the
+        # unsupported-intrinsic guard.
+        m_ixr = _INDEXREF_VEC_PAT.match(raw)
+        if m_ixr and m_ixr.group(1) in subscript_map:
+            continue
         # Struct constructor line ``var_X = StructName_<hash>();`` — the
         # per-field locals are zero-initialised at declaration so this is
         # a no-op. Match by checking var_X is a known struct local and the
@@ -7529,6 +7645,39 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
                 dst_local = _per_field_local(dst, fpath)
                 src_local = _per_field_local(src, fpath)
                 body_lines.append(f"{indent}{dst_local} = {src_local};")
+            continue
+        # ``wp::where(cond, a, b)`` on struct locals — Warp's IR merges
+        # early-return values of struct-returning ``@wp.func`` bodies this
+        # way. All three operands are split into per-field locals on Metal,
+        # so a whole-struct ternary can't compile; expand into one ternary
+        # per scalar leaf. Array fields are skipped like in struct copies
+        # (their backings resolve statically in the AST fold; a conditional
+        # array select would be caught there as a conflict).
+        m_struct_where = re.match(
+            r"^(?P<indent>\s*)var_(\w+)\s*=\s*wp::where\s*\(\s*(.+?)\s*,\s*var_(\w+)\s*,\s*var_(\w+)\s*\)\s*;\s*$",
+            raw,
+        )
+        if (
+            m_struct_where
+            and m_struct_where.group(2) in struct_local_layouts
+            and m_struct_where.group(4) in struct_local_layouts
+            and m_struct_where.group(5) in struct_local_layouts
+        ):
+            indent = m_struct_where.group("indent")
+            dst = m_struct_where.group(2)
+            cond = m_struct_where.group(3)
+            src_a = m_struct_where.group(4)
+            src_b = m_struct_where.group(5)
+            dst_layout = struct_local_layouts[dst]
+            a_leaves = {path for path, _off, _fi in _iter_scalar_leaves(struct_local_layouts[src_a])}
+            b_leaves = {path for path, _off, _fi in _iter_scalar_leaves(struct_local_layouts[src_b])}
+            for fpath, _off, _finfo in _iter_scalar_leaves(dst_layout):
+                if fpath not in a_leaves or fpath not in b_leaves:
+                    continue
+                dst_local = _per_field_local(dst, fpath)
+                a_local = _per_field_local(src_a, fpath)
+                b_local = _per_field_local(src_b, fpath)
+                body_lines.append(_finalize(f"{indent}{dst_local} = ({cond}) ? {a_local} : {b_local};"))
             continue
         # Whole-struct load from flat float32 storage into a struct value
         # local: ``t = items[i]`` / ``t = o.inner`` lowers to
@@ -8435,7 +8584,7 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
 # v2: added captured-constant values (``Var.constant``) to the key —
 # closure-kernel instantiations previously collided (same kernel.key,
 # args, and IR statements; different baked ``const`` declarations).
-_ARTIFACT_CACHE_VERSION = 6
+_ARTIFACT_CACHE_VERSION = 7
 _codegen_source_hash_cached: str | None = None
 
 
@@ -9551,29 +9700,9 @@ def launch_metal_kernel_native(kernel, dim, inputs, outputs, device, block_dim: 
         kernel._metal_native_arg_var_by_name = {a.label: a for a in artifact.input_args}
         kernel._metal_native_out_var_by_name = {a.label: a for a in artifact.output_args}
         kernel._metal_native_init_shadow_names = frozenset(n for n in artifact.input_names if n.endswith("__init"))
-        # Outputs whose prior values are preserved by some init-shadow
-        # mechanism — either a per-output ``<name>__init`` input, or a
-        # slot in the packed shadow buffers. Atomic-output kernels that
-        # accumulate across multiple sibling launches (mujoco_warp's
-        # ``_limit_ball`` → ``_limit_slide_hinge`` → ``_limit_tendon``
-        # chain all atomic-adding into ``d.nefc``) rely on this set to
-        # suppress the dispatcher's pre-launch ``fill_zero``; without
-        # the packed outputs being included, every sibling launch
-        # zeroed the accumulator and step-1's solver entered with the
-        # wrong constraint count (``nefc == 0`` instead of 2 for the
-        # pendula limits).
-        # ``seeded_outputs`` covers prologue-free native artifacts: no
-        # physical shadow exists, but the same outputs must not be
-        # zero-filled (they preserve prior contents by binding in place).
-        kernel._metal_native_output_init_shadow_set = (
-            frozenset(n[: -len("__init")] for n in artifact.input_names if n.endswith("__init"))
-            | frozenset(artifact.init_shadow_packed_outputs)
-            | frozenset(getattr(artifact, "seeded_outputs", ()))
-        )
     arg_var_by_name = kernel._metal_native_arg_var_by_name
     out_var_by_name = kernel._metal_native_out_var_by_name
     init_shadow_names = kernel._metal_native_init_shadow_names
-    output_init_shadow_set = kernel._metal_native_output_init_shadow_set
 
     dispatcher = get_dispatcher()
     bindings: list = []
@@ -9906,13 +10035,19 @@ def launch_metal_kernel_native(kernel, dim, inputs, outputs, device, block_dim: 
                 f"device; got {getattr(value, 'device', '?')}"
             )
         mtl = _resolve_mtl(value, kernel.key, name)
-        if artifact.atomic_outputs and name not in output_init_shadow_set and value.ptr is not None and value.size > 0:
-            # Pure accumulator output — must start at zero to match
-            # MLX's ``init_value=0`` behaviour for atomic kernels.
-            from warp._src.types import type_size_in_bytes  # noqa: PLC0415
-
-            nbytes = int(value.size) * type_size_in_bytes(value.dtype)
-            dispatcher.fill_zero(mtl, nbytes)
+        # NO pre-launch zero-fill: outputs bind in place, matching CUDA
+        # semantics where callers zero accumulators explicitly
+        # (``d.nefc.zero_()`` etc.). An earlier version zero-filled
+        # atomic-kernel outputs outside ``output_init_shadow_set`` "for
+        # MLX ``init_value=0`` parity" — but ``non_standard_launch``
+        # kernels (mujoco_warp's narrowphase family, recognised by their
+        # ``_worldid_in`` args) deliberately have an EMPTY seeded set, so
+        # every ``ccd_*`` / primitive-collision launch zero-filled
+        # ``nacon`` and all ``contact_*`` arrays, silently erasing the
+        # contacts written by sibling narrowphase kernels moments before
+        # (observed: hfield box contacts vanished whenever another pair
+        # type launched after). MLX parity is the wrong target here —
+        # CUDA parity is what mujoco_warp is written against.
         bindings.append(mtl)
         # Output buffer -- conservative read-write to handle kernels
         # that both read prior values and write (e.g. ``atomic_add``).

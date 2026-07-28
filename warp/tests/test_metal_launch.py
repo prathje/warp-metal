@@ -5000,6 +5000,83 @@ class TestMetalStructSupport(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet)
 
+    def test_gjk_style_constructs_match_cpu(self):
+        # The constructs mujoco_warp's GJK/EPA narrowphase leans on, none
+        # of which the Metal codegen handled before: array-valued struct
+        # fields (backed by an arg or a view, read AND written through the
+        # struct), ``wp.where`` on struct locals (the IR's early-return
+        # merge), returns from inside loops in a @wp.func (flag-based
+        # do-while exit), dynamic vec-component writes via wp::indexref on
+        # struct fields, and ``wp.sign`` on vectors.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.struct
+            class Scratch:
+                vals: wp.array(dtype=float)
+                total: float
+                n: int
+                size: wp.vec3
+
+            @wp.func
+            def first_above(s: Scratch, thresh: float) -> float:
+                # Return from inside a loop (do-while flag path).
+                for i in range(s.n):
+                    if s.vals[i] > thresh:
+                        return s.vals[i]
+                return -1.0
+
+            @wp.kernel
+            def k(data: wp.array2d(dtype=float), thresh: float,
+                  out_first: wp.array(dtype=float), out_sum: wp.array(dtype=float),
+                  out_size: wp.array(dtype=wp.vec3), out_sign: wp.array(dtype=wp.vec3)):
+                tid = wp.tid()
+                s = Scratch()
+                s.vals = data[tid]          # view-backed array field
+                s.n = 4
+                s.size = wp.vec3(1.0, 2.0, 3.0)
+                j = tid % 3
+                s.size[j] = 9.0             # indexref on a struct vec field
+                s.vals[1] = s.vals[1] + 10.0  # write through the array field
+
+                alt = Scratch()
+                alt.vals = data[tid]
+                alt.n = 2
+                alt.size = wp.vec3(-1.0)
+                # wp.where on struct locals (per-field ternary expansion;
+                # array fields share the same backing on both branches).
+                sel = wp.where(tid % 2 == 0, s, alt)
+
+                total = float(0.0)
+                for i in range(sel.n):
+                    total += sel.vals[i]
+                out_first[tid] = first_above(sel, thresh)
+                out_sum[tid] = total
+                out_size[tid] = sel.size
+                out_sign[tid] = wp.sign(wp.vec3(-2.0, 0.0, 5.0) * float(tid % 3 - 1))
+
+            N = 32
+            rng = np.random.default_rng(11)
+            dn = rng.standard_normal((N, 4)).astype(np.float32)
+            outs = {}
+            for dev in ('cpu', 'metal:0'):
+                data = wp.array(dn.copy(), dtype=float, device=dev)
+                out_first = wp.zeros(N, dtype=float, device=dev)
+                out_sum = wp.zeros(N, dtype=float, device=dev)
+                out_size = wp.zeros(N, dtype=wp.vec3, device=dev)
+                out_sign = wp.zeros(N, dtype=wp.vec3, device=dev)
+                wp.launch(k, dim=N, inputs=[data, 0.5],
+                          outputs=[out_first, out_sum, out_size, out_sign], device=dev)
+                outs[dev] = (out_first.numpy(), out_sum.numpy(), out_size.numpy(),
+                             out_sign.numpy(), data.numpy())
+            for c, m in zip(outs['cpu'], outs['metal:0']):
+                np.testing.assert_array_equal(m, c)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
     def test_nested_struct(self):
         snippet = textwrap.dedent(
             """
@@ -6071,13 +6148,14 @@ class TestMetalGraphCapture(unittest.TestCase):
         _run_with_metal_enabled(self, snippet, timeout=60)
 
     def test_atomic_outputs_in_capture(self):
-        # Two atomic-output flavours must both behave replay == direct:
-        #  * seeded outputs (init shadow) accumulate onto prior values, so
-        #    N replays add N launches' worth — CUDA parity;
-        #  * pure accumulators (``_worldid_in`` non-standard-launch kernels
-        #    skip the shadow prologue) get an implicit pre-launch zero fill,
-        #    which is recorded as a compute dispatch so every replay
-        #    restarts the count from zero.
+        # ALL atomic outputs behave replay == direct with CUDA parity:
+        # outputs bind in place and accumulate onto prior values; callers
+        # zero explicitly when they want a fresh count. This includes
+        # ``_worldid_in`` non-standard-launch kernels (mujoco_warp's
+        # narrowphase family) — an earlier version zero-filled their
+        # outputs before every launch "for MLX init_value=0 parity",
+        # which silently erased contacts written by sibling narrowphase
+        # kernels (see test_atomic_outputs_accumulate_across_kernels).
         snippet = textwrap.dedent(
             """
             import numpy as np
@@ -6116,24 +6194,26 @@ class TestMetalGraphCapture(unittest.TestCase):
             wp.synchronize_device(dev)
             np.testing.assert_array_equal(out.numpy(), per_launch * 4)
 
-            # ---- pure accumulator: implicit zero fill re-runs per replay
+            # ---- non-standard-launch kernels accumulate the same way
             out2 = wp.zeros(4, dtype=wp.int32, device=dev)
             wp.launch(hist_pure, dim=64, inputs=[src], outputs=[out2], device=dev)
             wp.launch(hist_pure, dim=64, inputs=[src], outputs=[out2], device=dev)
             wp.synchronize_device(dev)
-            np.testing.assert_array_equal(out2.numpy(), per_launch)  # no accumulation
+            np.testing.assert_array_equal(out2.numpy(), per_launch * 2)  # accumulates
 
+            out2.zero_()
+            wp.launch(hist_pure, dim=64, inputs=[src], outputs=[out2], device=dev)
             with wp.ScopedDevice(dev):
                 wp.capture_begin()
                 try:
                     wp.launch(hist_pure, dim=64, inputs=[src], outputs=[out2])
                 finally:
                     g2 = wp.capture_end()
-            assert g2._metal_graph.count == 2, g2._metal_graph.count  # fill + kernel
+            assert g2._metal_graph.count == 1, g2._metal_graph.count  # kernel only, no fill
             for _ in range(3):
                 wp.capture_launch(g2)
             wp.synchronize_device(dev)
-            np.testing.assert_array_equal(out2.numpy(), per_launch)
+            np.testing.assert_array_equal(out2.numpy(), per_launch * 4)
             """
         )
         _run_with_metal_enabled(self, snippet, timeout=60)
@@ -6699,6 +6779,53 @@ class TestMetalBvhMesh(unittest.TestCase):
 @unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
 class TestMetalLaunchDimAndParams(unittest.TestCase):
     """Regressions surfaced by mujoco_warp's BVH raycast kernel."""
+
+    def test_atomic_outputs_accumulate_across_kernels(self):
+        # Regression: the native launcher used to pre-zero every output of
+        # atomic kernels outside the artifact's seeded set "for MLX
+        # init_value=0 parity". Kernels with a ``*_worldid_in`` array arg
+        # (mujoco_warp's narrowphase family) deliberately have an empty
+        # seeded set, so each such launch silently ERASED the counters and
+        # contact slots written by sibling kernels — hfield GJK contacts
+        # vanished whenever another pair type launched afterwards. CUDA
+        # semantics: outputs bind in place, callers zero explicitly.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            # In-place cross-kernel accumulation is a native-dispatch
+            # guarantee; the MLX eager path materialises fresh output
+            # buffers per launch and keeps the legacy shadow semantics.
+            if not wp.config.metal_native_dispatch:
+                raise SystemExit(0)
+
+            @wp.kernel
+            def add_a(count: wp.array(dtype=int), slots: wp.array(dtype=float)):
+                i = wp.tid()
+                cid = wp.atomic_add(count, 0, 1)
+                slots[cid] = 1.0
+
+            @wp.kernel
+            def add_b(collision_worldid_in: wp.array(dtype=int),
+                      count: wp.array(dtype=int), slots: wp.array(dtype=float)):
+                i = wp.tid()
+                wid = collision_worldid_in[i]
+                cid = wp.atomic_add(count, 0, 1)
+                slots[cid] = 2.0 + float(wid) * 0.0
+
+            for dev in ('cpu', 'metal:0'):
+                count = wp.zeros(1, dtype=int, device=dev)
+                slots = wp.zeros(16, dtype=float, device=dev)
+                worldids = wp.zeros(4, dtype=int, device=dev)
+                wp.launch(add_a, dim=3, inputs=[], outputs=[count, slots], device=dev)
+                wp.launch(add_b, dim=4, inputs=[worldids], outputs=[count, slots], device=dev)
+                total = count.numpy()[0]
+                written = slots.numpy()
+                assert total == 7, f'{dev}: count {total} != 7 (second launch wiped the first?)'
+                np.testing.assert_array_equal(np.sort(written[:7]), np.array([1, 1, 1, 2, 2, 2, 2], np.float32))
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
 
     def test_2d_launch_last_dim_equals_block_dim(self):
         # A plain 2-D launch whose trailing dim equals the default
