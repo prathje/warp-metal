@@ -169,8 +169,10 @@ def _gpu_address(arr) -> tuple[int, object]:
 
 _BVH_DESC_FMT = "<7Q6i"  # 7 gpu addresses + root/num_nodes/num_leaf_nodes/num_items/leaf_size/pad
 _BVH_DESC_NBYTES = 80
-_MESH_DESC_FMT = "<2Q2i"  # appended to the bvh desc: points/indices addresses + num_points/num_tris
-_MESH_DESC_NBYTES = 104
+# Appended to the bvh desc: points/indices/velocities addresses +
+# num_points/num_tris + average_edge_length (sign_normal epsilon scale) + pad.
+_MESH_DESC_FMT = "<3Q2if4x"
+_MESH_DESC_NBYTES = 120
 
 
 class MetalBvh:
@@ -388,11 +390,12 @@ class MetalMesh:
     """Metal-side ``wp.Mesh``: a MetalBvh over per-triangle AABBs plus a
     mesh descriptor extending the BVH descriptor with points/indices."""
 
-    def __init__(self, points, indices, constructor: int, leaf_size: int, groups):
+    def __init__(self, points, indices, constructor: int, leaf_size: int, groups, velocities=None):
         _require_native_dispatch("wp.Mesh")
         self.device = points.device
         self.points = points
         self.indices = indices
+        self.velocities = velocities
         self.num_points = len(points)
         self.num_tris = int(indices.size // 3)
         if self.num_tris == 0:
@@ -402,9 +405,10 @@ class MetalMesh:
             self.tri_lowers = warp.empty(self.num_tris, dtype=warp.vec3)
             self.tri_uppers = warp.empty(self.num_tris, dtype=warp.vec3)
         self._compute_tri_aabbs()
+        self.average_edge_length = self._compute_average_edge_length()
 
-        # The BVH descriptor sits at offset 0 of a 104-byte mesh descriptor,
-        # so a mesh id doubles as a bvh id for group-root queries.
+        # The BVH descriptor sits at offset 0 of the mesh descriptor, so a
+        # mesh id doubles as a bvh id for group-root queries.
         self.bvh = MetalBvh(
             self.tri_lowers,
             self.tri_uppers,
@@ -416,6 +420,22 @@ class MetalMesh:
         self.id = self.bvh.id
         self._write_mesh_fields()
         self.bvh._dispatcher.sync()
+
+    def _compute_average_edge_length(self) -> float:
+        """Mean edge length over all triangle edges, matching the native
+        builder's scale factor for the ``sign_normal`` epsilon band. Reads
+        the points on the host (syncs)."""
+        pts = self.points.numpy()
+        idx = self.indices.numpy().reshape(-1, 3)
+        p0 = pts[idx[:, 0]]
+        p1 = pts[idx[:, 1]]
+        p2 = pts[idx[:, 2]]
+        total = (
+            np.linalg.norm(p0 - p1, axis=1).sum()
+            + np.linalg.norm(p0 - p2, axis=1).sum()
+            + np.linalg.norm(p2 - p1, axis=1).sum()
+        )
+        return float(total / (self.num_tris * 3))
 
     def _compute_tri_aabbs(self) -> None:
         warp.launch(
@@ -433,7 +453,19 @@ class MetalMesh:
         indices_ga, indices_buf = _gpu_address(self.indices)
         self.bvh._register(points_buf)
         self.bvh._register(indices_buf)
-        tail = struct.pack(_MESH_DESC_FMT, points_ga, indices_ga, self.num_points, self.num_tris)
+        velocities_ga = 0
+        if self.velocities is not None:
+            velocities_ga, velocities_buf = _gpu_address(self.velocities)
+            self.bvh._register(velocities_buf)
+        tail = struct.pack(
+            _MESH_DESC_FMT,
+            points_ga,
+            indices_ga,
+            velocities_ga,
+            self.num_points,
+            self.num_tris,
+            self.average_edge_length,
+        )
         ctypes.memmove(self.bvh._desc_ptr + _BVH_DESC_NBYTES, tail, len(tail))
 
     def set_points(self, points_new) -> None:
@@ -441,9 +473,21 @@ class MetalMesh:
         self._write_mesh_fields()
         self.refit()
 
+    def set_velocities(self, velocities_new) -> None:
+        self.velocities = velocities_new
+        self._write_mesh_fields()
+
     def refit(self) -> None:
         """Recompute triangle AABBs from the current points, then refit the
-        BVH. Capturable (kernel launches only)."""
+        BVH. Capturable (kernel launches only).
+
+        The native refit also refreshes ``average_edge_length`` (the
+        ``sign_normal`` epsilon scale); we match that, except during ICB
+        recording where the host read/write would break capture — the
+        stale value only scales an epsilon band."""
+        if getattr(self.bvh._dispatcher, "_record_state", None) is None:
+            self.average_edge_length = self._compute_average_edge_length()
+            self._write_mesh_fields()
         self._compute_tri_aabbs()
         self.bvh.refit()
 

@@ -5585,10 +5585,12 @@ class TestMetalUnsupportedFeaturesRaise(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet)
 
-    def test_mesh_query_point_kernel_raises(self):
-        # Mesh RAY queries are supported on Metal (see TestMetalBvhMesh);
-        # the point-query family is not yet. On the MLX path even mesh
-        # CREATION raises (BVH residency needs native dispatch).
+    def test_mesh_query_winding_number_kernel_raises(self):
+        # The point/ray/aabb query families work on Metal (see
+        # TestMetalBvhMesh); winding-number sign queries need the
+        # solid-angle node hierarchy and stay unsupported. On the MLX
+        # path even mesh CREATION raises (BVH residency needs native
+        # dispatch).
         snippet = textwrap.dedent(
             """
             import numpy as np
@@ -5597,7 +5599,7 @@ class TestMetalUnsupportedFeaturesRaise(unittest.TestCase):
             @wp.kernel
             def k_mesh(mesh: wp.uint64, pts: wp.array(dtype=wp.vec3), d: wp.array(dtype=wp.float32)):
                 i = wp.tid()
-                q = wp.mesh_query_point(mesh, pts[i], 10.0)
+                q = wp.mesh_query_point_sign_winding_number(mesh, pts[i], 10.0)
                 if q.result:
                     d[i] = 1.0
 
@@ -5613,15 +5615,21 @@ class TestMetalUnsupportedFeaturesRaise(unittest.TestCase):
                 else:
                     raise AssertionError('Mesh creation should have raised on the MLX path')
                 raise SystemExit(0)
+            try:
+                wp.Mesh(points=mesh_pts, indices=tris, support_winding_number=True)
+            except RuntimeError as e:
+                assert 'winding' in str(e), str(e)
+            else:
+                raise AssertionError('support_winding_number mesh creation should have raised')
             mesh = wp.Mesh(points=mesh_pts, indices=tris)
             pts = wp.array(np.zeros((4, 3), np.float32), dtype=wp.vec3, device=dev)
             d = wp.zeros(4, dtype=wp.float32, device=dev)
             try:
                 wp.launch(k_mesh, dim=4, inputs=[mesh.id, pts], outputs=[d], device=dev)
             except Exception as e:
-                assert 'mesh_query_point' in str(e), str(e)
+                assert 'winding_number' in str(e), str(e)
             else:
-                raise AssertionError('mesh query launch should have raised')
+                raise AssertionError('winding-number query launch should have raised')
             """
         )
         _run_with_metal_enabled(self, snippet)
@@ -6457,6 +6465,171 @@ class TestMetalBvhMesh(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet, timeout=180)
 
+    def test_mesh_query_point_family_matches_cpu(self):
+        # Closest-point queries (signed via ray-parity / multi-sample
+        # parity / angle-weighted normals, unsigned, furthest),
+        # mesh_query_aabb iteration, the struct-returning mesh_query_ray,
+        # and the eval/get helpers — all against the CPU reference. Face
+        # indices may differ only where two faces are genuinely
+        # equidistant (FP-contraction tie-breaks); there the reported
+        # distances must agree instead.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            if not wp.config.metal_native_dispatch:
+                raise SystemExit(0)
+
+            verts = [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)]
+            faces = [(0, 2, 4), (2, 1, 4), (1, 3, 4), (3, 0, 4),
+                     (2, 0, 5), (1, 2, 5), (3, 1, 5), (0, 3, 5)]
+            verts = [np.array(v, dtype=np.float64) for v in verts]
+            for _ in range(2):  # subdivide octahedron -> 128-tri ellipsoid
+                new_faces = []
+                cache = {}
+                def midpoint(a, b):
+                    key = (min(a, b), max(a, b))
+                    if key not in cache:
+                        m = verts[a] + verts[b]
+                        cache[key] = len(verts)
+                        verts.append(m / np.linalg.norm(m))
+                    return cache[key]
+                for (a, b, c) in faces:
+                    ab, bc, ca = midpoint(a, b), midpoint(b, c), midpoint(c, a)
+                    new_faces += [(a, ab, ca), (ab, b, bc), (ca, bc, c), (ab, bc, ca)]
+                faces = new_faces
+            pts_np = (np.array(verts) * np.array([1.0, 0.7, 1.3])).astype(np.float32)
+            idx_np = np.array(faces, dtype=np.int32).flatten()
+            n_tris = idx_np.size // 3
+            vel_np = pts_np * np.float32(0.25) + np.float32(0.125)
+
+            rng = np.random.default_rng(7)
+            inside = (rng.standard_normal((24, 3)) * 0.25).astype(np.float32)
+            outside = (rng.standard_normal((24, 3)) * 2.5 + np.array([1.5, 0, 0])).astype(np.float32)
+            near = rng.standard_normal((24, 3)).astype(np.float32)
+            near /= np.linalg.norm(near, axis=1, keepdims=True)
+            near *= rng.uniform(0.9, 1.1, size=(24, 1)).astype(np.float32)
+            query_np = np.concatenate([inside, outside, near])
+            NQ = len(query_np)
+            centers = (rng.standard_normal((16, 3)) * 0.8).astype(np.float32)
+            half = rng.uniform(0.05, 0.6, size=(16, 3)).astype(np.float32)
+
+            @wp.kernel
+            def k_points(mesh: wp.uint64, pts: wp.array(dtype=wp.vec3),
+                         sgn: wp.array2d(dtype=wp.float32), fc: wp.array2d(dtype=wp.int32),
+                         uv: wp.array2d(dtype=wp.vec2), hits: wp.array2d(dtype=wp.int32)):
+                i = wp.tid()
+                q0 = wp.mesh_query_point(mesh, pts[i], 10.0)
+                if q0.result:
+                    hits[i, 0] = 1
+                    sgn[i, 0] = q0.sign
+                    fc[i, 0] = q0.face
+                    uv[i, 0] = wp.vec2(q0.u, q0.v)
+                q1 = wp.mesh_query_point_no_sign(mesh, pts[i], 10.0)
+                if q1.result:
+                    hits[i, 1] = 1
+                    fc[i, 1] = q1.face
+                    uv[i, 1] = wp.vec2(q1.u, q1.v)
+                q2 = wp.mesh_query_furthest_point_no_sign(mesh, pts[i], 0.0)
+                if q2.result:
+                    hits[i, 2] = 1
+                    fc[i, 2] = q2.face
+                    uv[i, 2] = wp.vec2(q2.u, q2.v)
+                q3 = wp.mesh_query_point_sign_parity(mesh, pts[i], 10.0, 3, 0.1)
+                if q3.result:
+                    hits[i, 3] = 1
+                    sgn[i, 3] = q3.sign
+                q4 = wp.mesh_query_point_sign_normal(mesh, pts[i], 10.0)
+                if q4.result:
+                    hits[i, 4] = 1
+                    sgn[i, 4] = q4.sign
+                qr = wp.mesh_query_ray(mesh, pts[i] * 0.0 + wp.vec3(3.0, 0.1, 0.2),
+                                       wp.normalize(pts[i] - wp.vec3(3.0, 0.1, 0.2)), 100.0)
+                if qr.result:
+                    hits[i, 5] = 1
+                    fc[i, 5] = qr.face
+                    sgn[i, 5] = qr.t
+
+            @wp.kernel
+            def k_aabb(mesh: wp.uint64, lo: wp.array(dtype=wp.vec3), hi: wp.array(dtype=wp.vec3),
+                       mask: wp.array2d(dtype=wp.int32)):
+                i = wp.tid()
+                q = wp.mesh_query_aabb(mesh, lo[i], hi[i])
+                idx = wp.int32(0)
+                while wp.mesh_query_aabb_next(q, idx):
+                    mask[i, idx] = 1
+
+            @wp.kernel
+            def k_eval(mesh: wp.uint64, pos: wp.array(dtype=wp.vec3), nrm: wp.array(dtype=wp.vec3),
+                       gpt: wp.array(dtype=wp.vec3), gidx: wp.array(dtype=wp.int32),
+                       gvel: wp.array(dtype=wp.vec3)):
+                i = wp.tid()
+                pos[i] = wp.mesh_eval_position(mesh, i, 0.3, 0.5)
+                nrm[i] = wp.mesh_eval_face_normal(mesh, i)
+                gpt[i] = wp.mesh_get_point(mesh, i * 3 + 1)
+                gidx[i] = wp.mesh_get_index(mesh, i * 3 + 2)
+                gvel[i] = wp.mesh_eval_velocity(mesh, i, 0.2, 0.6)
+
+            outs = {}
+            for dev in ('cpu', 'metal:0'):
+                with wp.ScopedDevice(dev):
+                    mesh = wp.Mesh(points=wp.array(pts_np, dtype=wp.vec3),
+                                   indices=wp.array(idx_np, dtype=wp.int32),
+                                   velocities=wp.array(vel_np, dtype=wp.vec3),
+                                   bvh_constructor='sah', bvh_leaf_size=2)
+                    q = wp.array(query_np, dtype=wp.vec3)
+                    sgn = wp.zeros((NQ, 6), dtype=wp.float32)
+                    fc = wp.zeros((NQ, 6), dtype=wp.int32)
+                    uv = wp.zeros((NQ, 6), dtype=wp.vec2)
+                    hits = wp.zeros((NQ, 6), dtype=wp.int32)
+                    wp.launch(k_points, dim=NQ, inputs=[mesh.id, q], outputs=[sgn, fc, uv, hits])
+                    mask = wp.zeros((16, n_tris), dtype=wp.int32)
+                    wp.launch(k_aabb, dim=16,
+                              inputs=[mesh.id, wp.array(centers - half, dtype=wp.vec3),
+                                      wp.array(centers + half, dtype=wp.vec3)],
+                              outputs=[mask])
+                    pos = wp.zeros(n_tris, dtype=wp.vec3)
+                    nrm = wp.zeros(n_tris, dtype=wp.vec3)
+                    gpt = wp.zeros(n_tris, dtype=wp.vec3)
+                    gidx = wp.zeros(n_tris, dtype=wp.int32)
+                    gvel = wp.zeros(n_tris, dtype=wp.vec3)
+                    wp.launch(k_eval, dim=n_tris, inputs=[mesh.id],
+                              outputs=[pos, nrm, gpt, gidx, gvel])
+                    wp.synchronize_device()
+                    outs[dev] = dict(sgn=sgn.numpy().copy(), fc=fc.numpy().copy(),
+                                     uv=uv.numpy().copy(), hits=hits.numpy().copy(),
+                                     mask=mask.numpy().copy(),
+                                     ev=[a.numpy().copy() for a in (pos, nrm, gpt, gidx, gvel)])
+            c, m = outs['cpu'], outs['metal:0']
+            np.testing.assert_array_equal(c['hits'], m['hits'])
+            np.testing.assert_array_equal(c['sgn'][:, [0, 3, 4]], m['sgn'][:, [0, 3, 4]])  # signs exact
+            np.testing.assert_allclose(m['sgn'][:, 5], c['sgn'][:, 5], rtol=1e-5, atol=1e-6)  # ray t
+            def dist(face, uv, query):
+                tri = pts_np[idx_np.reshape(-1, 3)[face]].astype(np.float64)
+                u = uv[:, 0].astype(np.float64); v = uv[:, 1].astype(np.float64)
+                cp = tri[:, 0] * u[:, None] + tri[:, 1] * v[:, None] + tri[:, 2] * (1 - u - v)[:, None]
+                return np.linalg.norm(cp - query.astype(np.float64), axis=1)
+            for col in (0, 1, 2):  # point / no_sign / furthest
+                diff = c['fc'][:, col] != m['fc'][:, col]
+                assert diff.sum() <= NQ // 10, f"col {col}: {diff.sum()} face diffs"
+                if diff.any():
+                    np.testing.assert_allclose(dist(m['fc'][diff, col], m['uv'][diff, col], query_np[diff]),
+                                               dist(c['fc'][diff, col], c['uv'][diff, col], query_np[diff]),
+                                               rtol=1e-5, atol=1e-6)
+                same = ~diff
+                np.testing.assert_allclose(m['uv'][same, col], c['uv'][same, col], atol=2e-6, rtol=0)
+            np.testing.assert_array_equal(c['fc'][:, 5], m['fc'][:, 5])  # ray faces exact
+            np.testing.assert_array_equal(c['mask'], m['mask'])
+            for a, b, name in zip(c['ev'], m['ev'],
+                                  ['pos', 'nrm', 'gpt', 'gidx', 'gvel']):
+                if name == 'gidx':
+                    np.testing.assert_array_equal(a, b)
+                else:
+                    np.testing.assert_allclose(b, a, atol=2e-6, rtol=0, err_msg=name)
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=240)
+
 
 @unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
 @unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
@@ -6525,7 +6698,6 @@ class TestMetalLaunchDimAndParams(unittest.TestCase):
             """
         )
         _run_with_metal_enabled(self, snippet, timeout=120)
-
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -174,7 +174,16 @@ _SCALAR_CTYPE_TO_MSL: dict[str, str] = {
     "wp::slice_t": "wp_slice_t",
     # BVH traversal state — the MSL struct is emitted with ``_BVH_HELPERS``.
     "wp::bvh_query_t": "wp_bvh_query_t",
+    "wp::mesh_query_aabb_t": "wp_mesh_query_aabb_t",
+    "wp::mesh_query_point_t": "wp_mesh_query_point_t",
+    "wp::mesh_query_ray_t": "wp_mesh_query_ray_t",
 }
+
+# Builtin result structs whose fields kernels read directly (``q.result``,
+# ``q.face``, ...). Locals of these ctypes are materialised as real MSL
+# structs, so field-pointer lines alias to plain member access (see the
+# ``builtin_struct_locals`` pass in ``_generate_kernel_body``).
+_BUILTIN_FIELD_STRUCT_CTYPES = frozenset({"wp::mesh_query_point_t", "wp::mesh_query_ray_t"})
 
 # MSL has built-in vector types ``floatN`` / ``intN`` / ``uintN`` etc. for
 # N in {2, 3, 4}. Larger sizes (Warp's vec5, vec6, vec8) would need a custom
@@ -1665,8 +1674,11 @@ struct wp_mesh_desc_t {
     wp_bvh_desc_t bvh;
     ulong points;
     ulong indices;
+    ulong velocities;
     int num_points;
     int num_tris;
+    float average_edge_length;
+    int pad1;
 };
 inline const device wp_bvh_node_t* wp_bvh_node_ptr(ulong a) { return reinterpret_cast<const device wp_bvh_node_t*>(a); }
 inline const device int* wp_bvh_int_ptr(ulong a) { return reinterpret_cast<const device int*>(a); }
@@ -2024,6 +2036,655 @@ inline bool wp_mesh_query_ray_anyhit(ulong id, float3 start, float3 dir, float m
         }
     }
     return false;
+}
+struct wp_mesh_query_point_t {
+    bool result;
+    float sign;
+    int face;
+    float u;
+    float v;
+};
+struct wp_mesh_query_ray_t {
+    float sign;
+    int face;
+    float t;
+    float u;
+    float v;
+    float3 normal;
+    bool result;
+};
+typedef wp_bvh_query_t wp_mesh_query_aabb_t;
+// Plain non-fused sums, matching the native wp::dot / wp::length_sq
+// (component products summed left-to-right, no fma contraction).
+inline float wp_bvh_dot3(float3 a, float3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+inline float wp_bvh_length_sq(float3 a) { return wp_bvh_dot3(a, a); }
+inline float wp_bvh_distance_to_aabb_sq(float3 p, float3 lower, float3 upper) {
+    float dx = wp_bvh_minf(upper.x, wp_bvh_maxf(lower.x, p.x)) - p.x;
+    float dy = wp_bvh_minf(upper.y, wp_bvh_maxf(lower.y, p.y)) - p.y;
+    float dz = wp_bvh_minf(upper.z, wp_bvh_maxf(lower.z, p.z)) - p.z;
+    return dx * dx + dy * dy + dz * dz;
+}
+inline float wp_bvh_furthest_distance_to_aabb_sq(float3 p, float3 lower, float3 upper) {
+    float dlx = metal::abs(p.x - lower.x);
+    float dux = metal::abs(p.x - upper.x);
+    float cx = (dlx > dux) ? dlx : dux;
+    float dly = metal::abs(p.y - lower.y);
+    float duy = metal::abs(p.y - upper.y);
+    float cy = (dly > duy) ? dly : duy;
+    float dlz = metal::abs(p.z - lower.z);
+    float duz = metal::abs(p.z - upper.z);
+    float cz = (dlz > duz) ? dlz : duz;
+    return cx * cx + cy * cy + cz * cz;
+}
+inline float2 wp_bvh_closest_point_to_triangle(float3 a, float3 b, float3 c, float3 p) {
+    float3 ab = b - a;
+    float3 ac = c - a;
+    float3 ap = p - a;
+    float u, v, w;
+    float d1 = wp_bvh_dot3(ab, ap);
+    float d2 = wp_bvh_dot3(ac, ap);
+    if (d1 <= 0.0f && d2 <= 0.0f) {
+        v = 0.0f;
+        w = 0.0f;
+        u = 1.0f - v - w;
+        return float2(u, v);
+    }
+    float3 bp = p - b;
+    float d3 = wp_bvh_dot3(ab, bp);
+    float d4 = wp_bvh_dot3(ac, bp);
+    if (d3 >= 0.0f && d4 <= d3) {
+        v = 1.0f;
+        w = 0.0f;
+        u = 1.0f - v - w;
+        return float2(u, v);
+    }
+    float vc = d1 * d4 - d3 * d2;
+    if (vc <= 0.0f && d1 >= 0.0f && d3 <= 0.0f) {
+        v = d1 / (d1 - d3);
+        w = 0.0f;
+        u = 1.0f - v - w;
+        return float2(u, v);
+    }
+    float3 cp = p - c;
+    float d5 = wp_bvh_dot3(ab, cp);
+    float d6 = wp_bvh_dot3(ac, cp);
+    if (d6 >= 0.0f && d5 <= d6) {
+        v = 0.0f;
+        w = 1.0f;
+        u = 1.0f - v - w;
+        return float2(u, v);
+    }
+    float vb = d5 * d2 - d1 * d6;
+    if (vb <= 0.0f && d2 >= 0.0f && d6 <= 0.0f) {
+        v = 0.0f;
+        w = d2 / (d2 - d6);
+        u = 1.0f - v - w;
+        return float2(u, v);
+    }
+    float va = d3 * d6 - d5 * d4;
+    if (va <= 0.0f && (d4 - d3) >= 0.0f && (d5 - d6) >= 0.0f) {
+        w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+        v = 1.0f - w;
+        u = 1.0f - v - w;
+        return float2(u, v);
+    }
+    float denom = 1.0f / (va + vb + vc);
+    v = vb * denom;
+    w = vc * denom;
+    u = 1.0f - v - w;
+    return float2(u, v);
+}
+inline float2 wp_bvh_furthest_point_to_triangle(float3 a, float3 b, float3 c, float3 p) {
+    float dist_a = wp_bvh_length_sq(p - a);
+    float dist_b = wp_bvh_length_sq(p - b);
+    float dist_c = wp_bvh_length_sq(p - c);
+    if (dist_a > dist_b && dist_a > dist_c) { return float2(1.0f, 0.0f); }
+    if (dist_b > dist_c) { return float2(0.0f, 1.0f); }
+    return float2(0.0f, 0.0f);
+}
+// Distance-sorted closest-point traversal shared by the mesh_query_point
+// variants that differ only in sign determination.
+inline bool wp_mesh_closest_point_impl(
+    const thread wp_mesh_desc_t& mesh, float3 point, float max_dist,
+    thread int& face_out, thread float& u_out, thread float& v_out)
+{
+    const device wp_bvh_node_t* lowers = wp_bvh_node_ptr(mesh.bvh.node_lowers);
+    const device wp_bvh_node_t* uppers = wp_bvh_node_ptr(mesh.bvh.node_uppers);
+    const device int* prims = wp_bvh_int_ptr(mesh.bvh.primitive_indices);
+    const device int* tri_indices = wp_bvh_int_ptr(mesh.indices);
+    int stack[32];
+    stack[0] = mesh.bvh.root;
+    int count = 1;
+    float min_dist_sq = max_dist * max_dist;
+    int min_face = 0;
+    float min_v = 0.0f;
+    float min_w = 0.0f;
+    while (count) {
+        const int node_index = stack[--count];
+        wp_bvh_node_t lower = lowers[node_index];
+        wp_bvh_node_t upper = uppers[node_index];
+        float node_dist_sq = wp_bvh_distance_to_aabb_sq(
+            point, float3(lower.x, lower.y, lower.z), float3(upper.x, upper.y, upper.z));
+        if (node_dist_sq > min_dist_sq) { continue; }
+        const int left_index = int(lower.bits & 0x7fffffffu);
+        const int right_index = int(upper.bits & 0x7fffffffu);
+        if (lower.bits & 0x80000000u) {
+            for (int pc = left_index; pc < right_index; ++pc) {
+                int primitive_index = prims[pc];
+                int i = tri_indices[primitive_index * 3 + 0];
+                int j = tri_indices[primitive_index * 3 + 1];
+                int k = tri_indices[primitive_index * 3 + 2];
+                float3 p = wp_bvh_load_v3(mesh.points, i);
+                float3 q = wp_bvh_load_v3(mesh.points, j);
+                float3 r = wp_bvh_load_v3(mesh.points, k);
+                float3 e0 = q - p;
+                float3 e1 = r - p;
+                float3 e2 = r - q;
+                float3 normal = metal::cross(e0, e1);
+                if (metal::length(normal) /
+                        (wp_bvh_dot3(e0, e0) + wp_bvh_dot3(e1, e1) + wp_bvh_dot3(e2, e2)) < 1.0e-6f) {
+                    continue;
+                }
+                float2 barycentric = wp_bvh_closest_point_to_triangle(p, q, r, point);
+                float bu = barycentric.x;
+                float bv = barycentric.y;
+                float bw = 1.0f - bu - bv;
+                float3 cpt = bu * p + bv * q + bw * r;
+                float dist_sq = wp_bvh_length_sq(cpt - point);
+                if (dist_sq < min_dist_sq) {
+                    min_dist_sq = dist_sq;
+                    min_v = bv;
+                    min_w = bw;
+                    min_face = primitive_index;
+                }
+            }
+        } else {
+            wp_bvh_node_t ll = lowers[left_index];
+            wp_bvh_node_t lu = uppers[left_index];
+            wp_bvh_node_t rl = lowers[right_index];
+            wp_bvh_node_t ru = uppers[right_index];
+            float left_dist_sq = wp_bvh_distance_to_aabb_sq(
+                point, float3(ll.x, ll.y, ll.z), float3(lu.x, lu.y, lu.z));
+            float right_dist_sq = wp_bvh_distance_to_aabb_sq(
+                point, float3(rl.x, rl.y, rl.z), float3(ru.x, ru.y, ru.z));
+            int idx0 = left_index;
+            int idx1 = right_index;
+            float dist0 = left_dist_sq;
+            float dist1 = right_dist_sq;
+            if (left_dist_sq < right_dist_sq) {
+                idx0 = right_index;
+                idx1 = left_index;
+                dist0 = right_dist_sq;
+                dist1 = left_dist_sq;
+            }
+            if (dist0 < min_dist_sq) { stack[count++] = idx0; }
+            if (dist1 < min_dist_sq) { stack[count++] = idx1; }
+        }
+    }
+    if (min_dist_sq < max_dist * max_dist) {
+        u_out = 1.0f - min_v - min_w;
+        v_out = min_v;
+        face_out = min_face;
+        return true;
+    }
+    return false;
+}
+inline int wp_mesh_query_ray_count_intersections(ulong id, float3 start, float3 dir, int root) {
+    wp_mesh_desc_t mesh = wp_mesh_get_desc(id);
+    const device wp_bvh_node_t* lowers = wp_bvh_node_ptr(mesh.bvh.node_lowers);
+    const device wp_bvh_node_t* uppers = wp_bvh_node_ptr(mesh.bvh.node_uppers);
+    const device int* prims = wp_bvh_int_ptr(mesh.bvh.primitive_indices);
+    const device int* tri_indices = wp_bvh_int_ptr(mesh.indices);
+    int stack[32];
+    stack[0] = root == -1 ? mesh.bvh.root : root;
+    int count = 1;
+    float3 rcp_dir = float3(1.0f / dir.x, 1.0f / dir.y, 1.0f / dir.z);
+    const float eps = 1.0e-3f;
+    int num_hit = 0;
+    float temp_t = 0.0f;
+    while (count) {
+        const int node_index = stack[--count];
+        wp_bvh_node_t lower = lowers[node_index];
+        wp_bvh_node_t upper = uppers[node_index];
+        bool hit = wp_bvh_intersect_ray_aabb(
+            start, rcp_dir, float3(lower.x - eps, lower.y - eps, lower.z - eps),
+            float3(upper.x + eps, upper.y + eps, upper.z + eps), temp_t);
+        if (hit) {
+            if (lower.bits & 0x80000000u) {
+                const int start_index = int(lower.bits & 0x7fffffffu);
+                const int end_index = int(upper.bits & 0x7fffffffu);
+                for (int pc = start_index; pc < end_index; ++pc) {
+                    int primitive_index = prims[pc];
+                    int i = tri_indices[primitive_index * 3 + 0];
+                    int j = tri_indices[primitive_index * 3 + 1];
+                    int k = tri_indices[primitive_index * 3 + 2];
+                    float3 pp = wp_bvh_load_v3(mesh.points, i);
+                    float3 qq = wp_bvh_load_v3(mesh.points, j);
+                    float3 rr = wp_bvh_load_v3(mesh.points, k);
+                    float tri_t = 0.0f;
+                    float tri_u = 0.0f;
+                    float tri_v = 0.0f;
+                    float tri_sign = 0.0f;
+                    float3 n = float3(0.0f);
+                    if (wp_bvh_intersect_ray_tri_woop(start, dir, pp, qq, rr, tri_t, tri_u, tri_v, tri_sign, n)) {
+                        if (tri_t >= 0.0f) { num_hit++; }
+                    }
+                }
+            } else {
+                stack[count++] = int(lower.bits & 0x7fffffffu);
+                stack[count++] = int(upper.bits & 0x7fffffffu);
+            }
+        }
+    }
+    return num_hit;
+}
+inline float wp_mesh_query_inside_ray_tracing(ulong id, float3 p) {
+    float t = 0.0f;
+    float u = 0.0f;
+    float v = 0.0f;
+    float sgn = 0.0f;
+    float3 n = float3(0.0f);
+    int face = 0;
+    int vote = 0;
+    for (int i = 0; i < 3; ++i) {
+        float3 dir = float3(i == 0 ? 1.0f : 0.0f, i == 1 ? 1.0f : 0.0f, i == 2 ? 1.0f : 0.0f);
+        if (wp_mesh_query_ray(id, p, dir, FLT_MAX, t, u, v, sgn, n, face, -1) && sgn < 0.0f) { vote++; }
+    }
+    return vote >= 2 ? -1.0f : 1.0f;
+}
+// Named temporaries pin the perturbation draw order to native's
+// left-to-right vec3 construction (see the _RAND_HELPERS note).
+inline float wp_mesh_query_inside_parity(
+    ulong id, float3 p, float3 base_dir, int n_sample, float perturbation_scale)
+{
+    int vote = 0;
+    uint rand_state = wp_rand_init(42);
+    for (int i = 0; i < n_sample; ++i) {
+        float3 dir;
+        do {
+            float rx = wp_randf(rand_state, -perturbation_scale, perturbation_scale);
+            float ry = wp_randf(rand_state, -perturbation_scale, perturbation_scale);
+            float rz = wp_randf(rand_state, -perturbation_scale, perturbation_scale);
+            dir = base_dir + float3(rx, ry, rz);
+        } while (wp_bvh_length_sq(dir) < 1.0e-8f);
+        if (wp_mesh_query_ray_count_intersections(id, p, dir, -1) % 2) { vote++; }
+    }
+    return (vote * 2 >= n_sample) ? -1.0f : 1.0f;
+}
+inline bool wp_mesh_query_point_no_sign(
+    ulong id, float3 point, float max_dist, thread int& face, thread float& u, thread float& v)
+{
+    wp_mesh_desc_t mesh = wp_mesh_get_desc(id);
+    return wp_mesh_closest_point_impl(mesh, point, max_dist, face, u, v);
+}
+inline bool wp_mesh_query_point(
+    ulong id, float3 point, float max_dist,
+    thread float& inside, thread int& face, thread float& u, thread float& v)
+{
+    wp_mesh_desc_t mesh = wp_mesh_get_desc(id);
+    if (!wp_mesh_closest_point_impl(mesh, point, max_dist, face, u, v)) { return false; }
+    inside = wp_mesh_query_inside_ray_tracing(id, point);
+    return true;
+}
+inline bool wp_mesh_query_point_sign_parity(
+    ulong id, float3 point, float max_dist,
+    thread float& inside, thread int& face, thread float& u, thread float& v,
+    int n_sample, float perturbation_scale)
+{
+    wp_mesh_desc_t mesh = wp_mesh_get_desc(id);
+    if (!wp_mesh_closest_point_impl(mesh, point, max_dist, face, u, v)) { return false; }
+    inside = wp_mesh_query_inside_parity(id, point, float3(1.0f, 1.0f, 1.0f), n_sample, perturbation_scale);
+    return true;
+}
+inline bool wp_mesh_query_furthest_point_no_sign(
+    ulong id, float3 point, float min_dist, thread int& face, thread float& u, thread float& v)
+{
+    wp_mesh_desc_t mesh = wp_mesh_get_desc(id);
+    const device wp_bvh_node_t* lowers = wp_bvh_node_ptr(mesh.bvh.node_lowers);
+    const device wp_bvh_node_t* uppers = wp_bvh_node_ptr(mesh.bvh.node_uppers);
+    const device int* prims = wp_bvh_int_ptr(mesh.bvh.primitive_indices);
+    const device int* tri_indices = wp_bvh_int_ptr(mesh.indices);
+    int stack[32];
+    stack[0] = mesh.bvh.root;
+    int count = 1;
+    float min_dist_sq = min_dist * min_dist;
+    int max_face = 0;
+    float max_v = 0.0f;
+    float max_w = 0.0f;
+    while (count) {
+        const int node_index = stack[--count];
+        wp_bvh_node_t lower = lowers[node_index];
+        wp_bvh_node_t upper = uppers[node_index];
+        float node_dist_sq = wp_bvh_furthest_distance_to_aabb_sq(
+            point, float3(lower.x, lower.y, lower.z), float3(upper.x, upper.y, upper.z));
+        if (node_dist_sq < min_dist_sq) { continue; }
+        const int left_index = int(lower.bits & 0x7fffffffu);
+        const int right_index = int(upper.bits & 0x7fffffffu);
+        if (lower.bits & 0x80000000u) {
+            for (int pc = left_index; pc < right_index; ++pc) {
+                int primitive_index = prims[pc];
+                int i = tri_indices[primitive_index * 3 + 0];
+                int j = tri_indices[primitive_index * 3 + 1];
+                int k = tri_indices[primitive_index * 3 + 2];
+                float3 p = wp_bvh_load_v3(mesh.points, i);
+                float3 q = wp_bvh_load_v3(mesh.points, j);
+                float3 r = wp_bvh_load_v3(mesh.points, k);
+                float3 e0 = q - p;
+                float3 e1 = r - p;
+                float3 e2 = r - q;
+                float3 normal = metal::cross(e0, e1);
+                if (metal::length(normal) /
+                        (wp_bvh_dot3(e0, e0) + wp_bvh_dot3(e1, e1) + wp_bvh_dot3(e2, e2)) < 1.0e-6f) {
+                    continue;
+                }
+                float2 barycentric = wp_bvh_furthest_point_to_triangle(p, q, r, point);
+                float bu = barycentric.x;
+                float bv = barycentric.y;
+                float bw = 1.0f - bu - bv;
+                float3 cpt = bu * p + bv * q + bw * r;
+                float dist_sq = wp_bvh_length_sq(cpt - point);
+                if (dist_sq > min_dist_sq) {
+                    min_dist_sq = dist_sq;
+                    max_v = bv;
+                    max_w = bw;
+                    max_face = primitive_index;
+                }
+            }
+        } else {
+            wp_bvh_node_t ll = lowers[left_index];
+            wp_bvh_node_t lu = uppers[left_index];
+            wp_bvh_node_t rl = lowers[right_index];
+            wp_bvh_node_t ru = uppers[right_index];
+            float left_dist_sq = wp_bvh_furthest_distance_to_aabb_sq(
+                point, float3(ll.x, ll.y, ll.z), float3(lu.x, lu.y, lu.z));
+            float right_dist_sq = wp_bvh_furthest_distance_to_aabb_sq(
+                point, float3(rl.x, rl.y, rl.z), float3(ru.x, ru.y, ru.z));
+            int idx0 = left_index;
+            int idx1 = right_index;
+            float dist0 = left_dist_sq;
+            float dist1 = right_dist_sq;
+            if (left_dist_sq > right_dist_sq) {
+                idx0 = right_index;
+                idx1 = left_index;
+                dist0 = right_dist_sq;
+                dist1 = left_dist_sq;
+            }
+            if (dist0 > min_dist_sq) { stack[count++] = idx0; }
+            if (dist1 > min_dist_sq) { stack[count++] = idx1; }
+        }
+    }
+    if (min_dist_sq > min_dist * min_dist) {
+        u = 1.0f - max_v - max_w;
+        v = max_v;
+        face = max_face;
+        return true;
+    }
+    return false;
+}
+inline bool wp_mesh_query_point_sign_normal(
+    ulong id, float3 point, float max_dist,
+    thread float& inside, thread int& face, thread float& u, thread float& v, float epsilon)
+{
+    wp_mesh_desc_t mesh = wp_mesh_get_desc(id);
+    const device wp_bvh_node_t* lowers = wp_bvh_node_ptr(mesh.bvh.node_lowers);
+    const device wp_bvh_node_t* uppers = wp_bvh_node_ptr(mesh.bvh.node_uppers);
+    const device int* prims = wp_bvh_int_ptr(mesh.bvh.primitive_indices);
+    const device int* tri_indices = wp_bvh_int_ptr(mesh.indices);
+    int stack[32];
+    stack[0] = mesh.bvh.root;
+    int count = 1;
+    float min_dist = max_dist;
+    int min_face = 0;
+    float min_v = 0.0f;
+    float min_w = 0.0f;
+    float3 accumulated_angle_weighted_normal = float3(0.0f);
+    float epsilon_min_dist = mesh.average_edge_length * epsilon;
+    float epsilon_min_dist_sq = epsilon_min_dist * epsilon_min_dist;
+    while (count) {
+        const int node_index = stack[--count];
+        wp_bvh_node_t lower = lowers[node_index];
+        wp_bvh_node_t upper = uppers[node_index];
+        float node_dist_sq = wp_bvh_distance_to_aabb_sq(
+            point, float3(lower.x, lower.y, lower.z), float3(upper.x, upper.y, upper.z));
+        if (node_dist_sq > (min_dist + epsilon_min_dist) * (min_dist + epsilon_min_dist)) { continue; }
+        const int left_index = int(lower.bits & 0x7fffffffu);
+        const int right_index = int(upper.bits & 0x7fffffffu);
+        if (lower.bits & 0x80000000u) {
+            for (int pc = left_index; pc < right_index; ++pc) {
+                int primitive_index = prims[pc];
+                int i = tri_indices[primitive_index * 3 + 0];
+                int j = tri_indices[primitive_index * 3 + 1];
+                int k = tri_indices[primitive_index * 3 + 2];
+                float3 p = wp_bvh_load_v3(mesh.points, i);
+                float3 q = wp_bvh_load_v3(mesh.points, j);
+                float3 r = wp_bvh_load_v3(mesh.points, k);
+                float3 e0 = q - p;
+                float3 e1 = r - p;
+                float3 e2 = r - q;
+                float3 normal = metal::cross(e0, e1);
+                float e0_norm_sq = wp_bvh_dot3(e0, e0);
+                float e1_norm_sq = wp_bvh_dot3(e1, e1);
+                float e2_norm_sq = wp_bvh_dot3(e2, e2);
+                if (metal::length(normal) / (e0_norm_sq + e1_norm_sq + e2_norm_sq) < 1.0e-6f) { continue; }
+                float2 barycentric = wp_bvh_closest_point_to_triangle(p, q, r, point);
+                float bu = barycentric.x;
+                float bv = barycentric.y;
+                float bw = 1.0f - bu - bv;
+                float3 cpt = bu * p + bv * q + bw * r;
+                float dist = metal::sqrt(wp_bvh_length_sq(cpt - point));
+                if (dist < min_dist + epsilon_min_dist) {
+                    float weight = 0.0f;
+                    float3 cp = cpt - p;
+                    float3 cq = cpt - q;
+                    float3 cr = cpt - r;
+                    float len_cp_sq = wp_bvh_length_sq(cp);
+                    float len_cq_sq = wp_bvh_length_sq(cq);
+                    float len_cr_sq = wp_bvh_length_sq(cr);
+                    if (len_cp_sq < epsilon_min_dist_sq) {
+                        weight = metal::acos(wp_bvh_dot3(metal::normalize(e0), metal::normalize(e1)));
+                    } else if (len_cq_sq < epsilon_min_dist_sq) {
+                        weight = metal::acos(wp_bvh_dot3(metal::normalize(e2), metal::normalize(-e0)));
+                    } else if (len_cr_sq < epsilon_min_dist_sq) {
+                        weight = metal::acos(wp_bvh_dot3(metal::normalize(-e1), metal::normalize(-e2)));
+                    } else {
+                        float e0cp = wp_bvh_dot3(e0, cp);
+                        float e2cq = wp_bvh_dot3(e2, cq);
+                        float e1cp = wp_bvh_dot3(e1, cp);
+                        if ((len_cp_sq * e0_norm_sq - e0cp * e0cp < epsilon_min_dist_sq * e0_norm_sq) ||
+                            (len_cq_sq * e2_norm_sq - e2cq * e2cq < epsilon_min_dist_sq * e2_norm_sq) ||
+                            (len_cp_sq * e1_norm_sq - e1cp * e1cp < epsilon_min_dist_sq * e1_norm_sq)) {
+                            weight = 3.14159265359f;
+                        } else {
+                            weight = 2.0f * 3.14159265359f;
+                        }
+                    }
+                    if (dist > min_dist - epsilon_min_dist) {
+                        accumulated_angle_weighted_normal += weight * metal::normalize(normal);
+                        if (dist < min_dist) {
+                            min_dist = dist;
+                            min_v = bv;
+                            min_w = bw;
+                            min_face = primitive_index;
+                        }
+                    } else {
+                        min_dist = dist;
+                        min_v = bv;
+                        min_w = bw;
+                        min_face = primitive_index;
+                        accumulated_angle_weighted_normal = weight * metal::normalize(normal);
+                    }
+                }
+            }
+        } else {
+            wp_bvh_node_t ll = lowers[left_index];
+            wp_bvh_node_t lu = uppers[left_index];
+            wp_bvh_node_t rl = lowers[right_index];
+            wp_bvh_node_t ru = uppers[right_index];
+            float left_dist_sq = wp_bvh_distance_to_aabb_sq(
+                point, float3(ll.x, ll.y, ll.z), float3(lu.x, lu.y, lu.z));
+            float right_dist_sq = wp_bvh_distance_to_aabb_sq(
+                point, float3(rl.x, rl.y, rl.z), float3(ru.x, ru.y, ru.z));
+            int idx0 = left_index;
+            int idx1 = right_index;
+            float dist0 = left_dist_sq;
+            float dist1 = right_dist_sq;
+            if (left_dist_sq < right_dist_sq) {
+                idx0 = right_index;
+                idx1 = left_index;
+                dist0 = right_dist_sq;
+                dist1 = left_dist_sq;
+            }
+            float cull = (min_dist + epsilon_min_dist) * (min_dist + epsilon_min_dist);
+            if (dist0 < cull) { stack[count++] = idx0; }
+            if (dist1 < cull) { stack[count++] = idx1; }
+        }
+    }
+    if (min_dist < max_dist) {
+        u = 1.0f - min_v - min_w;
+        v = min_v;
+        face = min_face;
+        int i = tri_indices[min_face * 3 + 0];
+        int j = tri_indices[min_face * 3 + 1];
+        int k = tri_indices[min_face * 3 + 2];
+        float3 p = wp_bvh_load_v3(mesh.points, i);
+        float3 q = wp_bvh_load_v3(mesh.points, j);
+        float3 r = wp_bvh_load_v3(mesh.points, k);
+        float3 closest_point = p * u + q * v + r * min_w;
+        inside = (wp_bvh_dot3(accumulated_angle_weighted_normal, point - closest_point) > 0.0f) ? 1.0f : -1.0f;
+        return true;
+    }
+    return false;
+}
+inline wp_mesh_query_ray_t wp_mesh_query_ray(ulong id, float3 start, float3 dir, float max_t, int root) {
+    wp_mesh_query_ray_t query;
+    query.sign = 0.0f;
+    query.face = 0;
+    query.t = 0.0f;
+    query.u = 0.0f;
+    query.v = 0.0f;
+    query.normal = float3(0.0f);
+    query.result = wp_mesh_query_ray(
+        id, start, dir, max_t, query.t, query.u, query.v, query.sign, query.normal, query.face, root);
+    return query;
+}
+inline wp_mesh_query_point_t wp_mesh_query_point(ulong id, float3 point, float max_dist) {
+    wp_mesh_query_point_t query;
+    query.result = false;
+    query.sign = 0.0f;
+    query.face = 0;
+    query.u = 0.0f;
+    query.v = 0.0f;
+    query.result = wp_mesh_query_point(id, point, max_dist, query.sign, query.face, query.u, query.v);
+    return query;
+}
+inline wp_mesh_query_point_t wp_mesh_query_point_sign_parity(
+    ulong id, float3 point, float max_dist, int n_sample, float perturbation_scale)
+{
+    wp_mesh_query_point_t query;
+    query.result = false;
+    query.sign = 0.0f;
+    query.face = 0;
+    query.u = 0.0f;
+    query.v = 0.0f;
+    query.result = wp_mesh_query_point_sign_parity(
+        id, point, max_dist, query.sign, query.face, query.u, query.v, n_sample, perturbation_scale);
+    return query;
+}
+inline wp_mesh_query_point_t wp_mesh_query_point_no_sign(ulong id, float3 point, float max_dist) {
+    wp_mesh_query_point_t query;
+    query.result = false;
+    query.sign = 0.0f;
+    query.face = 0;
+    query.u = 0.0f;
+    query.v = 0.0f;
+    query.result = wp_mesh_query_point_no_sign(id, point, max_dist, query.face, query.u, query.v);
+    return query;
+}
+inline wp_mesh_query_point_t wp_mesh_query_furthest_point_no_sign(ulong id, float3 point, float min_dist) {
+    wp_mesh_query_point_t query;
+    query.result = false;
+    query.sign = 0.0f;
+    query.face = 0;
+    query.u = 0.0f;
+    query.v = 0.0f;
+    query.result = wp_mesh_query_furthest_point_no_sign(id, point, min_dist, query.face, query.u, query.v);
+    return query;
+}
+inline wp_mesh_query_point_t wp_mesh_query_point_sign_normal(
+    ulong id, float3 point, float max_dist, float epsilon)
+{
+    wp_mesh_query_point_t query;
+    query.result = false;
+    query.sign = 0.0f;
+    query.face = 0;
+    query.u = 0.0f;
+    query.v = 0.0f;
+    query.result = wp_mesh_query_point_sign_normal(
+        id, point, max_dist, query.sign, query.face, query.u, query.v, epsilon);
+    return query;
+}
+// A mesh descriptor starts with its BVH descriptor, so the generic bvh
+// query machinery reads the right tree straight from a mesh id; item
+// bounds in that descriptor are the per-triangle AABBs, matching the
+// native mesh_query_aabb_next primitive test exactly.
+inline wp_bvh_query_t wp_mesh_query_aabb(ulong id, float3 lower, float3 upper) {
+    return wp_bvh_query_init(id, false, lower, upper, -1);
+}
+inline bool wp_mesh_query_aabb_next(thread wp_bvh_query_t& query, thread int& index) {
+    return wp_bvh_query_next(query, index, FLT_MAX);
+}
+inline float3 wp_mesh_eval_position(ulong id, int tri, float u, float v) {
+    wp_mesh_desc_t mesh = wp_mesh_get_desc(id);
+    if (mesh.points == 0ul) { return float3(0.0f); }
+    const device int* tri_indices = wp_bvh_int_ptr(mesh.indices);
+    int i = tri_indices[tri * 3 + 0];
+    int j = tri_indices[tri * 3 + 1];
+    int k = tri_indices[tri * 3 + 2];
+    float3 p = wp_bvh_load_v3(mesh.points, i);
+    float3 q = wp_bvh_load_v3(mesh.points, j);
+    float3 r = wp_bvh_load_v3(mesh.points, k);
+    return p * u + q * v + r * (1.0f - u - v);
+}
+inline float3 wp_mesh_eval_velocity(ulong id, int tri, float u, float v) {
+    wp_mesh_desc_t mesh = wp_mesh_get_desc(id);
+    if (mesh.velocities == 0ul) { return float3(0.0f); }
+    const device int* tri_indices = wp_bvh_int_ptr(mesh.indices);
+    int i = tri_indices[tri * 3 + 0];
+    int j = tri_indices[tri * 3 + 1];
+    int k = tri_indices[tri * 3 + 2];
+    float3 vp = wp_bvh_load_v3(mesh.velocities, i);
+    float3 vq = wp_bvh_load_v3(mesh.velocities, j);
+    float3 vr = wp_bvh_load_v3(mesh.velocities, k);
+    return vp * u + vq * v + vr * (1.0f - u - v);
+}
+inline float3 wp_mesh_eval_face_normal(ulong id, int tri) {
+    wp_mesh_desc_t mesh = wp_mesh_get_desc(id);
+    if (mesh.points == 0ul) { return float3(0.0f); }
+    const device int* tri_indices = wp_bvh_int_ptr(mesh.indices);
+    int i = tri_indices[tri * 3 + 0];
+    int j = tri_indices[tri * 3 + 1];
+    int k = tri_indices[tri * 3 + 2];
+    float3 p = wp_bvh_load_v3(mesh.points, i);
+    float3 q = wp_bvh_load_v3(mesh.points, j);
+    float3 r = wp_bvh_load_v3(mesh.points, k);
+    return metal::normalize(metal::cross(q - p, r - p));
+}
+inline float3 wp_mesh_get_point(ulong id, int index) {
+    wp_mesh_desc_t mesh = wp_mesh_get_desc(id);
+    if (mesh.points == 0ul) { return float3(0.0f); }
+    int i = wp_bvh_int_ptr(mesh.indices)[index];
+    return wp_bvh_load_v3(mesh.points, i);
+}
+inline float3 wp_mesh_get_velocity(ulong id, int index) {
+    wp_mesh_desc_t mesh = wp_mesh_get_desc(id);
+    if (mesh.velocities == 0ul) { return float3(0.0f); }
+    int i = wp_bvh_int_ptr(mesh.indices)[index];
+    return wp_bvh_load_v3(mesh.velocities, i);
+}
+inline int wp_mesh_get_index(ulong id, int face_vertex_index) {
+    wp_mesh_desc_t mesh = wp_mesh_get_desc(id);
+    if (mesh.indices == 0ul) { return -1; }
+    return wp_bvh_int_ptr(mesh.indices)[face_vertex_index];
 }"""
 
 
@@ -3504,6 +4165,11 @@ def _build_kernel_header(source: str) -> str:
         or "wp_noise" in source
         or "wp_pnoise" in source
         or "wp_curlnoise" in source
+        # ``_BVH_HELPERS`` (emitted below as one block) contains the
+        # parity-sign mesh query, whose body draws perturbation directions
+        # through the shared RNG — so BVH/mesh kernels need it declared.
+        or "wp_bvh_" in source
+        or "wp_mesh_" in source
     ):
         parts.append(_RAND_HELPERS)
     if "wp_noise" in source or "wp_pnoise" in source or "wp_curlnoise" in source:
@@ -4307,6 +4973,21 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bwp::mesh_query_ray_anyhit\b"), "wp_mesh_query_ray_anyhit"),
     (re.compile(r"\bwp::mesh_query_ray\b"), "wp_mesh_query_ray"),
     (re.compile(r"\bwp::mesh_get_group_root\b"), "wp_mesh_get_group_root"),
+    (re.compile(r"\bwp::mesh_query_point_t\b"), "wp_mesh_query_point_t"),
+    (re.compile(r"\bwp::mesh_query_point_sign_parity\b"), "wp_mesh_query_point_sign_parity"),
+    (re.compile(r"\bwp::mesh_query_point_sign_normal\b"), "wp_mesh_query_point_sign_normal"),
+    (re.compile(r"\bwp::mesh_query_point_no_sign\b"), "wp_mesh_query_point_no_sign"),
+    (re.compile(r"\bwp::mesh_query_furthest_point_no_sign\b"), "wp_mesh_query_furthest_point_no_sign"),
+    (re.compile(r"\bwp::mesh_query_point\b"), "wp_mesh_query_point"),
+    (re.compile(r"\bwp::mesh_query_aabb_t\b"), "wp_mesh_query_aabb_t"),
+    (re.compile(r"\bwp::mesh_query_aabb_next\b"), "wp_mesh_query_aabb_next"),
+    (re.compile(r"\bwp::mesh_query_aabb\b"), "wp_mesh_query_aabb"),
+    (re.compile(r"\bwp::mesh_eval_position\b"), "wp_mesh_eval_position"),
+    (re.compile(r"\bwp::mesh_eval_velocity\b"), "wp_mesh_eval_velocity"),
+    (re.compile(r"\bwp::mesh_eval_face_normal\b"), "wp_mesh_eval_face_normal"),
+    (re.compile(r"\bwp::mesh_get_point\b"), "wp_mesh_get_point"),
+    (re.compile(r"\bwp::mesh_get_velocity\b"), "wp_mesh_get_velocity"),
+    (re.compile(r"\bwp::mesh_get_index\b"), "wp_mesh_get_index"),
     # NOTE: ``wp::lower_bound`` is intentionally NOT handled here — its
     # 2-arg form references the array's ``<argname>_shape`` input, which
     # requires the *final* parameter name. It's rewritten inside
@@ -6201,6 +6882,14 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
         if isinstance(arg.type, _Struct):
             struct_arg_layouts[arg.label] = _struct_layout_for(arg.type)
 
+    # Builtin value-struct locals (query results like ``wp.mesh_query_point``).
+    # Unlike ``@wp.struct`` locals they ARE materialised as real MSL structs
+    # (their ctype is in ``_SCALAR_CTYPE_TO_MSL``), so field addresses alias
+    # to plain member access on the local instead of per-field splitting.
+    builtin_struct_locals: set[str] = {
+        var.label for var in adj.variables if var.ctype() in _BUILTIN_FIELD_STRUCT_CTYPES
+    }
+
     def _per_field_local(struct_label: str, field_name: str) -> str:
         # Double underscore separates struct label from field name to avoid
         # clashes with raw Warp local labels (which are integers).
@@ -6242,6 +6931,12 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
         field_name = m.group(4)
 
         if accessor == ".":
+            # Builtin value-struct local (e.g. ``wp_mesh_query_point_t``):
+            # the struct exists as one MSL local, so the field pointer
+            # aliases to direct member access.
+            if struct_local in builtin_struct_locals:
+                subscript_map[field_local] = f"var_{struct_local}.{field_name}"
+                continue
             # Struct-local field: alias to the per-field MSL local.
             if struct_local in struct_local_layouts:
                 layout = struct_local_layouts[struct_local]
@@ -7627,7 +8322,7 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
 # v2: added captured-constant values (``Var.constant``) to the key —
 # closure-kernel instantiations previously collided (same kernel.key,
 # args, and IR statements; different baked ``const`` declarations).
-_ARTIFACT_CACHE_VERSION = 4
+_ARTIFACT_CACHE_VERSION = 5
 _codegen_source_hash_cached: str | None = None
 
 
