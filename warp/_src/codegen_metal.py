@@ -5144,6 +5144,14 @@ _TILE_BUILTIN_TILE_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile\s*<[^()]*>\s*\(
 # With block_dim=1 the tile is a single element; the reduction is a no-op
 # and the output is just the input value.
 _TILE_REDUCE_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_reduce\s*\(\s*[\w:]+\s*,\s*var_(\w+)\s*\)")
+# ``wp::tile_argmin(t)`` / ``wp::tile_argmax(t)`` — index of the extreme
+# element, returned as a 1-element int tile (a plain int local here).
+# Serial single-thread tiles hold one element, so the index is 0; for
+# multi-element tiles we emit a linear scan.
+_TILE_ARGMIN_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_(argmin|argmax)\s*\(\s*var_(\w+)\s*\)")
+# ``wp::tile_min(t)`` / ``wp::tile_max(t)`` — value-reduction forms
+# (distinct from ``tile_reduce(wp::min, t)`` handled above).
+_TILE_MINMAX_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_(min|max)\s*\(\s*var_(\w+)\s*\)")
 # ``wp::tile_zeros<dtype, ...>()`` / ``wp::tile_ones<dtype, ...>()`` —
 # constant-fill register tile. With block_dim=1 it's the corresponding
 # scalar 0 / 1 (or vec ``T(0)`` / ``T(1)``).
@@ -5620,6 +5628,41 @@ def _translate_tile_intrinsics(
         )
 
     line = _TILE_REDUCE_PAT.sub(repl_tile_reduce, line)
+
+    def repl_tile_argminmax(m: re.Match[str]) -> str:
+        lhs = m.group(1)
+        op = m.group(2)
+        in_label = m.group(3)
+        dims = tile_var_dims.get(in_label)
+        n = dims[0] * dims[1] if dims is not None else 1
+        if n == 1:
+            return f"var_{lhs} = 0"
+        cmp = "<" if op == "argmin" else ">"
+        return (
+            f"var_{lhs} = ({{ int _ta_best = 0; "
+            f"for (int _ta_i = 1; _ta_i < {n}; ++_ta_i) "
+            f"if (var_{in_label}.c[_ta_i] {cmp} var_{in_label}.c[_ta_best]) _ta_best = _ta_i; "
+            f"_ta_best; }})"
+        )
+
+    line = _TILE_ARGMIN_PAT.sub(repl_tile_argminmax, line)
+
+    def repl_tile_minmax(m: re.Match[str]) -> str:
+        lhs = m.group(1)
+        op = m.group(2)
+        in_label = m.group(3)
+        dims = tile_var_dims.get(in_label)
+        n = dims[0] * dims[1] if dims is not None else 1
+        if n == 1:
+            return f"var_{lhs} = var_{in_label}"
+        return (
+            f"var_{lhs} = ({{ auto _tm_acc = var_{in_label}.c[0]; "
+            f"for (int _tm_i = 1; _tm_i < {n}; ++_tm_i) "
+            f"_tm_acc = metal::{op}(_tm_acc, var_{in_label}.c[_tm_i]); "
+            f"_tm_acc; }})"
+        )
+
+    line = _TILE_MINMAX_PAT.sub(repl_tile_minmax, line)
 
     def repl_zeros(m: re.Match[str]) -> str:
         return _emit_tile_const_fill(m.group(1), m.group(2), "0")
