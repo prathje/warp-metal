@@ -6699,5 +6699,73 @@ class TestMetalLaunchDimAndParams(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet, timeout=120)
 
+    def test_tile_argmin_strided_reduction(self):
+        # mujoco_warp's no-rc `_ray` kernel pattern: launch_tiled with a
+        # real block_dim, wp.tile / wp.tile_argmin / dynamic tile indexing
+        # inside a thread-strided loop. On Metal the tile dim folds to one
+        # serial thread (block_dim lowers to 1), which must still produce
+        # the identical reduction result.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            N = 37  # deliberately not a multiple of block_dim
+            BIG = 1.0e10
+
+            @wp.kernel
+            def k(vals: wp.array2d(dtype=wp.float32),
+                  out_min: wp.array(dtype=wp.float32),
+                  out_idx: wp.array(dtype=wp.int32),
+                  out_vec: wp.array(dtype=wp.vec3)):
+                row, tid = wp.tid()
+                num_threads = wp.block_dim()
+                min_dist = float(BIG)
+                min_id = int(-1)
+                min_vec = wp.vec3()
+                upper = ((N + num_threads - 1) // num_threads) * num_threads
+                for j in range(tid, upper, num_threads):
+                    if j < N:
+                        dist = vals[row, j]
+                        nrm = wp.vec3(float(j), dist, 0.5)
+                    else:
+                        dist = float(BIG)
+                        nrm = wp.vec3()
+                    tile_dist = wp.tile(dist)
+                    local_min = wp.tile_argmin(tile_dist)
+                    local_min_dist = tile_dist[local_min[0]]
+                    tile_j = wp.tile(j)
+                    tile_nrm = wp.tile(nrm, preserve_type=True)
+                    if local_min_dist < min_dist:
+                        min_dist = local_min_dist
+                        min_id = tile_j[local_min[0]]
+                        min_vec = tile_nrm[local_min[0]]
+                out_min[row] = min_dist
+                out_idx[row] = min_id
+                out_vec[row] = min_vec
+
+            rng = np.random.default_rng(11)
+            rows = 8
+            vals_np = rng.uniform(0.0, 100.0, size=(rows, N)).astype(np.float32)
+            outs = {}
+            for dev in ('cpu', 'metal:0'):
+                vals = wp.array(vals_np, dtype=wp.float32, device=dev)
+                out_min = wp.zeros(rows, dtype=wp.float32, device=dev)
+                out_idx = wp.zeros(rows, dtype=wp.int32, device=dev)
+                out_vec = wp.zeros(rows, dtype=wp.vec3, device=dev)
+                wp.launch_tiled(k, dim=(rows,), inputs=[vals],
+                                outputs=[out_min, out_idx, out_vec],
+                                device=dev, block_dim=32)
+                wp.synchronize_device(dev)
+                outs[dev] = (out_min.numpy().copy(), out_idx.numpy().copy(),
+                             out_vec.numpy().copy())
+            np.testing.assert_allclose(outs['cpu'][0], vals_np.min(axis=1))
+            np.testing.assert_array_equal(outs['cpu'][1], vals_np.argmin(axis=1))
+            for i in range(3):
+                np.testing.assert_array_equal(outs['cpu'][i], outs['metal:0'][i])
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
