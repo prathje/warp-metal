@@ -6890,6 +6890,54 @@ class TestMetalLaunchDimAndParams(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet, timeout=120)
 
+    def test_vec_mat_by_value_params_whole_value(self):
+        # By-value vec3/quat/mat33 kernel params used as WHOLE values
+        # (not just element extracts): the native wrapper reconstructs a
+        # typed local from the raw setBytes blob. mujoco_warp's
+        # ``sap_project`` passes its ``direction_in: wp.vec3`` straight
+        # to ``wp.dot``; mat33 params previously raised KeyError.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            if not wp.config.metal_native_dispatch:
+                # By-value vector params bind via the native setBytes path
+                # only; the MLX launcher has no packing for them.
+                raise SystemExit(0)
+
+            @wp.kernel
+            def k(dirn: wp.vec3, rot: wp.mat33, q: wp.quat,
+                  x: wp.array(dtype=wp.vec3),
+                  out_d: wp.array(dtype=wp.float32),
+                  out_m: wp.array(dtype=wp.vec3),
+                  out_q: wp.array(dtype=wp.vec3),
+                  out_e: wp.array(dtype=wp.float32)):
+                tid = wp.tid()
+                out_d[tid] = wp.dot(dirn, x[tid])
+                out_m[tid] = rot * x[tid] + wp.transpose(rot) * x[tid]
+                out_q[tid] = wp.quat_rotate(q, x[tid])
+                out_e[tid] = dirn[1] + rot[0, 2]
+
+            xn = np.random.default_rng(1).normal(size=(8, 3)).astype(np.float32)
+            dirn = wp.vec3(0.5, -1.5, 2.0)
+            rot = wp.mat33(1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0)
+            q = wp.quat(0.5, 0.5, 0.5, 0.5)
+            outs = {}
+            for dev in ('cpu', 'metal:0'):
+                out_d = wp.zeros(8, dtype=wp.float32, device=dev)
+                out_m = wp.zeros(8, dtype=wp.vec3, device=dev)
+                out_q = wp.zeros(8, dtype=wp.vec3, device=dev)
+                out_e = wp.zeros(8, dtype=wp.float32, device=dev)
+                wp.launch(k, dim=8,
+                          inputs=[dirn, rot, q, wp.array(xn, dtype=wp.vec3, device=dev)],
+                          outputs=[out_d, out_m, out_q, out_e], device=dev)
+                outs[dev] = tuple(o.numpy().copy() for o in (out_d, out_m, out_q, out_e))
+            for a, b in zip(outs['cpu'], outs['metal:0']):
+                np.testing.assert_allclose(a, b, rtol=1e-6, atol=1e-6)
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
     def test_tile_argmin_strided_reduction(self):
         # mujoco_warp's no-rc `_ray` kernel pattern: launch_tiled with a
         # real block_dim, wp.tile / wp.tile_argmin / dynamic tile indexing
