@@ -5198,13 +5198,61 @@ _LOWER_BOUND_2ARG_PAT = re.compile(r"wp::lower_bound\s*\(\s*([A-Za-z_]\w*)\s*,\s
 _SAMPLE_CDF_2ARG_PAT = re.compile(r"wp_sample_cdf\s*\(\s*([^,()]+?)\s*,\s*([A-Za-z_]\w*)\s*\)")
 
 
+# Token-indexed view of ``_INTRINSIC_PATTERNS``, built lazily on first
+# use (the pattern list is appended to during module import). Almost
+# every pattern starts with a literal ``wp::NAME`` (or ``\bNAME``), so a
+# line only needs the patterns whose leading token it actually contains.
+# Running all ~150 patterns per line dominated codegen on 65k-line GJK
+# kernels (~20M ``re.sub`` calls per kernel).
+_INTRINSIC_INDEX: tuple[dict, list, list] | None = None
+_INTRINSIC_PAT_WP_NAME = re.compile(r"^(?:\\b)?wp::(\w+)")
+_INTRINSIC_PAT_WORD = re.compile(r"^\\b(\w+)")
+_WP_CALL_TOKEN_PAT = re.compile(r"wp::(\w+)")
+
+
+def _build_intrinsic_index() -> tuple[dict, list, list]:
+    by_token: dict[str, list] = {}
+    literal_guarded: list = []  # (literal, pat, repl) — non-wp:: leading word
+    always: list = []  # no extractable literal; run unconditionally
+    for pat, repl in _INTRINSIC_PATTERNS:
+        src = pat.pattern
+        m = _INTRINSIC_PAT_WP_NAME.match(src)
+        if m is not None:
+            by_token.setdefault(m.group(1), []).append((pat, repl))
+            continue
+        m = _INTRINSIC_PAT_WORD.match(src)
+        if m is not None:
+            literal_guarded.append((m.group(1), pat, repl))
+        else:
+            always.append((pat, repl))
+    return by_token, literal_guarded, always
+
+
 def _translate_intrinsics(line: str) -> str:
-    """Apply intrinsic substitutions until convergence."""
+    """Apply intrinsic substitutions until convergence.
+
+    Fixpoint semantics match the original run-every-pattern loop: each
+    round applies (in list order within a token) every pattern whose
+    leading literal occurs in the line, and rounds repeat until the
+    line stops changing — so rewrites that surface new ``wp::`` calls
+    still get picked up on the next round.
+    """
+    global _INTRINSIC_INDEX
+    if _INTRINSIC_INDEX is None:
+        _INTRINSIC_INDEX = _build_intrinsic_index()
+    by_token, literal_guarded, always = _INTRINSIC_INDEX
     prev = None
     while prev != line:
         prev = line
-        for pat, repl in _INTRINSIC_PATTERNS:
+        for pat, repl in always:
             line = pat.sub(repl, line)
+        for word, pat, repl in literal_guarded:
+            if word in line:
+                line = pat.sub(repl, line)
+        if "wp::" in line:
+            for token in dict.fromkeys(_WP_CALL_TOKEN_PAT.findall(line)):
+                for pat, repl in by_token.get(token, ()):
+                    line = pat.sub(repl, line)
     return line
 
 
@@ -7437,6 +7485,14 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
             text = new
         return text
 
+    # One combined pattern for the ``var_<argname>`` -> ``<argname>``
+    # rename below — a per-arg ``re.sub`` inside the per-line ``_finalize``
+    # was O(lines x args) and dominated codegen on arg-heavy GJK kernels.
+    # The trailing ``\b`` keeps alternation order irrelevant: a shorter
+    # label that prefixes a longer one fails the boundary and backtracks.
+    _arg_label_alt = "|".join(re.escape(arg.label) for arg in adj.args)
+    _arg_rename_pat = re.compile(rf"\bvar_({_arg_label_alt})\b") if _arg_label_alt else None
+
     # --- Forward statements --------------------------------------------
     def _finalize(translated: str) -> str:
         # Quat-quat multiplies must be intercepted before the generic
@@ -7530,8 +7586,8 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
         # Rename ``var_<argname>`` -> ``<argname>`` so the body matches the
         # MLX-generated function signature (which uses the names from
         # ``input_names``/``output_names`` directly).
-        for arg in adj.args:
-            translated = re.sub(rf"\bvar_{re.escape(arg.label)}\b", arg.label, translated)
+        if _arg_rename_pat is not None:
+            translated = _arg_rename_pat.sub(lambda m: m.group(1), translated)
         # ``wp::lower_bound`` — rewritten here (not in the intrinsic
         # table) because the 2-arg form references ``<argname>_shape``,
         # which only exists under the array's final parameter name.
@@ -8466,20 +8522,20 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
             for s_idx, sa in enumerate(packable_scalars if do_int_pack else []):
                 scalar_info[sa.label] = (K + s_idx, sa.type is bool)
             # Rewrite every access of a packed array, then every read of
-            # a packed scalar.
-            new_src_lines = []
-            for line in source.splitlines(keepends=True):
-                if do_int_pack:
-                    for k, name in enumerate(ints_packed_arrs):
-                        line = _replace_packed_int_array_access(line, name, k)
-                    for s_label, (off, is_bool) in scalar_info.items():
-                        repl = f"((bool)__ints_packed[{off}])" if is_bool else f"__ints_packed[{off}]"
-                        line = re.sub(rf"\b{re.escape(s_label)}\b", repl, line)
-                if do_float_pack:
-                    for k, name in enumerate(floats_packed_arrs):
-                        line = _replace_packed_float_array_access(line, name, K + S + k)
-                new_src_lines.append(line)
-            source = "".join(new_src_lines)
+            # a packed scalar. One whole-source pass per name — the
+            # bracket-balancing scanners are line-agnostic, and the
+            # per-line × per-name loop this replaces dominated codegen
+            # time on 65k-line GJK kernels (re.escape + pattern lookup
+            # per call).
+            if do_int_pack:
+                for k, name in enumerate(ints_packed_arrs):
+                    source = _replace_packed_int_array_access(source, name, k)
+                for s_label, (off, is_bool) in scalar_info.items():
+                    repl = f"((bool)__ints_packed[{off}])" if is_bool else f"__ints_packed[{off}]"
+                    source = re.sub(rf"\b{re.escape(s_label)}\b", repl, source)
+            if do_float_pack:
+                for k, name in enumerate(floats_packed_arrs):
+                    source = _replace_packed_float_array_access(source, name, K + S + k)
             input_args = [a for a in input_args if a.label not in packed_set]
 
     # Rewrite ``__init_shadow_offsets[i]`` (synthetic placeholder used
