@@ -9388,6 +9388,10 @@ def _wrap_msl_for_native_dispatch(artifact) -> str:
         params.append(f"  {decl} [[buffer({slot})]]")
         slot += 1
 
+    # Lines inserted at the top of the kernel body — reconstruct typed
+    # locals for by-value vec/mat params bound as raw scalar blobs.
+    value_prologue: list[str] = []
+
     # Real inputs (kernel-signature order). Array inputs stay in
     # ``const constant`` — same qualifier MLX uses — so Apple's MSL
     # compiler reaches the same FMA / fast-math fusion decisions and
@@ -9415,14 +9419,45 @@ def _wrap_msl_for_native_dispatch(artifact) -> str:
                 # Struct arg is serialised as flat float32 storage.
                 add_buffer(f"const constant float* {name}")
             elif getattr(arg_var.type, "_wp_generic_type_str_", None) in ("vec_t", "quat_t"):
-                # By-value vector param (e.g. mujoco_warp's ``geomgroup:
-                # vec6``). Bound as a small ``setBytes`` blob of N scalars;
-                # declared as a pointer so element extracts (``name[i]``,
-                # the only access pattern the inliner leaves behind) read
-                # scalars without needing the big-vec struct in scope.
+                # By-value vector param. Bound as a small ``setBytes`` blob
+                # of N scalars, declared as a raw scalar pointer (a
+                # ``constant floatN*`` would read with MSL's 16-byte vector
+                # stride, not the packed layout the blob carries). For
+                # native MSL sizes a typed local is reconstructed in the
+                # prologue so whole-value uses (``wp_dot(param, v)`` in
+                # mujoco_warp's ``sap_project``) compile; big vecs (vec5/
+                # vec6/vec8) keep the pointer form — the inliner only
+                # leaves element extracts (``name[i]``) behind for those.
                 scalar_cls = arg_var.type._wp_scalar_type_
                 inner = _native_scalar_msl_type(f"wp::{scalar_cls.__name__}")
-                add_buffer(f"const constant {inner}* {name}")
+                n = arg_var.type._length_
+                if n in _MSL_VEC_NATIVE_N:
+                    add_buffer(f"const constant {inner}* {name}__bytes")
+                    elems = ", ".join(f"{name}__bytes[{i}]" for i in range(n))
+                    value_prologue.append(f"    const {inner}{n} {name} = {inner}{n}({elems});")
+                else:
+                    add_buffer(f"const constant {inner}* {name}")
+            elif getattr(arg_var.type, "_wp_generic_type_str_", None) == "mat_t":
+                # By-value matrix param (e.g. a pose passed as ``wp.mat33``).
+                # The blob is Warp row-major scalars; MSL ``floatRxC`` is
+                # column-major, so the prologue gathers each column with a
+                # stride-``cols`` walk (same convention as mat array loads).
+                rows, cols = arg_var.type._shape_
+                scalar_cls = arg_var.type._wp_scalar_type_
+                inner = _native_scalar_msl_type(f"wp::{scalar_cls.__name__}")
+                if rows != cols or rows not in _MSL_VEC_NATIVE_N:
+                    raise MetalCodegenError(
+                        f"Native dispatch: by-value mat_t<{rows}, {cols}> kernel param {name!r} is not "
+                        f"supported (only square sizes 2-4); pass it through a wp.array instead."
+                    )
+                add_buffer(f"const constant {inner}* {name}__bytes")
+                col_ctors = []
+                for k in range(cols):
+                    col = ", ".join(f"{name}__bytes[{r * cols + k}]" for r in range(rows))
+                    col_ctors.append(f"{inner}{rows}({col})")
+                value_prologue.append(
+                    f"    const {inner}{rows}x{cols} {name} = {inner}{rows}x{cols}({', '.join(col_ctors)});"
+                )
             else:
                 # Scalar input — match MLX's wrapping (``const constant T&``)
                 # so the body's ``name`` references read as the scalar
@@ -9507,13 +9542,14 @@ def _wrap_msl_for_native_dispatch(artifact) -> str:
     # large qpos drift on pendulum joints (the
     # ``test_pendula_multi_step_warmstart_drift`` failure).
     body = _strip_init_prologue(artifact.source)
+    prologue = ("\n".join(value_prologue) + "\n") if value_prologue else ""
     return (
         "#include <metal_stdlib>\n"
         "#include <metal_atomic>\n"
         "using namespace metal;\n"
         f"{artifact.header}\n"
         f"{signature} {{\n"
-        f"{body}\n"
+        f"{prologue}{body}\n"
         "}\n"
     )
 
@@ -9621,9 +9657,10 @@ def _native_pack_scalar_arg(arg_var, value) -> tuple[bytes, int]:
     import ctypes  # noqa: PLC0415
 
     wp_type = arg_var.type
-    # By-value vec/quat params: instances are ctypes arrays of N scalars,
-    # so their raw bytes are exactly the layout the pointer param expects.
-    if getattr(wp_type, "_wp_generic_type_str_", None) in ("vec_t", "quat_t"):
+    # By-value vec/quat/mat params: instances are ctypes arrays of scalars
+    # (mats in Warp row-major order), so their raw bytes are exactly the
+    # layout the ``{name}__bytes`` scalar-pointer param expects.
+    if getattr(wp_type, "_wp_generic_type_str_", None) in ("vec_t", "quat_t", "mat_t"):
         inst = value if isinstance(value, wp_type) else wp_type(value)
         return bytes(inst), ctypes.sizeof(inst)
     # ``warp.float32`` etc. expose a ctypes-compatible ``_type_``;
