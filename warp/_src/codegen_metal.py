@@ -4182,6 +4182,50 @@ def _emit_tile_cholesky_solve(n: int, k: int, msl_scalar: str) -> str:
     return "\n".join(parts)
 
 
+def _emit_tile_cholesky_solve_coop(n: int, msl_scalar: str) -> str:
+    """Emit ``wp_tile_NxN_<scalar>_cholesky_solve_coop_1`` — 32-lane
+    SIMD-cooperative solve of ``L L^T x = b`` for a vector RHS.
+
+    Called by all 32 threads of the SIMD group (same convention as
+    ``_cholesky_coop``). Row ``i`` of each substitution sweep has a serial
+    dependency on the rows before it, but its dot product parallelises:
+    each lane accumulates a strided slice of ``L[i,:] * x`` and
+    ``metal::simd_sum`` reduces and broadcasts the total, so every lane
+    maintains an identical private copy of ``x`` with no threadgroup
+    memory or barriers. Accumulation order differs from the single-thread
+    variant (tree reduction vs serial), so results drift by ~1 ulp per
+    element — the same class of difference as the cooperative
+    factorization's lane-distributed updates.
+    """
+    L_name = f"wp_tile_{n}x{n}_{msl_scalar}"
+    B_name = f"wp_tile_{n}x1_{msl_scalar}"
+    parts: list[str] = []
+    parts.append(f"inline {B_name} {L_name}_cholesky_solve_coop_1({L_name} L, {B_name} b, uint lane) {{")
+    parts.append(f"    {B_name} x = b;")
+    # Forward: L y = b. Same Apple-MSL unroll bug avoidance as the
+    # single-thread variant — keep the outer loop at runtime.
+    parts.append("    #pragma clang loop unroll(disable)")
+    parts.append(f"    for (int i = 0; i < {n}; ++i) {{")
+    parts.append(f"        {msl_scalar} s = ({msl_scalar})0;")
+    parts.append(f"        for (int kk = (int)lane; kk < i; kk += 32) s = metal::fma(-L.c[i*{n} + kk], x.c[kk], s);")
+    parts.append("        s = metal::simd_sum(s);")
+    parts.append(f"        x.c[i] = (x.c[i] + s) / L.c[i*{n} + i];")
+    parts.append("    }")
+    # Backward: L^T x = y.
+    parts.append("    #pragma clang loop unroll(disable)")
+    parts.append(f"    for (int i = {n} - 1; i >= 0; --i) {{")
+    parts.append(f"        {msl_scalar} s = ({msl_scalar})0;")
+    parts.append(
+        f"        for (int kk = i + 1 + (int)lane; kk < {n}; kk += 32) s = metal::fma(-L.c[kk*{n} + i], x.c[kk], s);"
+    )
+    parts.append("        s = metal::simd_sum(s);")
+    parts.append(f"        x.c[i] = (x.c[i] + s) / L.c[i*{n} + i];")
+    parts.append("    }")
+    parts.append("    return x;")
+    parts.append("}")
+    return "\n".join(parts)
+
+
 def _build_kernel_header(source: str) -> str:
     """Scan ``source`` for helpers we need to emit (big-vec structs,
     big-mat structs, spatial helpers, diag helper, ``wp_mat_extract``
@@ -4389,6 +4433,14 @@ def _build_kernel_header(source: str) -> str:
             seen_solve.add((rows, k, m.group(3)))
     for n, k, scalar in sorted(seen_solve):
         parts.append(_emit_tile_cholesky_solve(n, k, scalar))
+    coop_cholesky_solve_pat = re.compile(r"\bwp_tile_(\d+)x(\d+)_(\w+)_cholesky_solve_coop_1\b")
+    seen_coop_solve: set[tuple[int, str]] = set()
+    for m in coop_cholesky_solve_pat.finditer(source):
+        rows, cols = int(m.group(1)), int(m.group(2))
+        if rows == cols:
+            seen_coop_solve.add((rows, m.group(3)))
+    for n, scalar in sorted(seen_coop_solve):
+        parts.append(_emit_tile_cholesky_solve_coop(n, scalar))
     # mujoco_warp ``@wp.func`` helpers referenced by ``tile_map``.
     user_func_defs = _emit_referenced_user_funcs(source)
     if user_func_defs:
@@ -5704,6 +5756,15 @@ def _translate_tile_intrinsics(
         # L*L^T*x = b with scalar L is x = b / (L*L).
         if n == 1 and k == 1:
             return f"var_{lhs} = {b_arg} / ({L_arg} * {L_arg})"
+        # Vector-RHS solves in the cooperative range distribute each
+        # substitution row's dot product across the 32 lanes (simd_sum
+        # reduce + broadcast; no smem). This also fires in kernels that
+        # only *load* a cached factor without factorizing — the pre-scan
+        # marks those cooperative too.
+        if coop_chol_seen is not None and _COOP_CHOL_MIN_N <= n <= _COOP_CHOL_MAX_N and k == 1:
+            coop_chol_seen.add((n, msl_scalar))
+            helper = f"wp_tile_{n}x{n}_{msl_scalar}_cholesky_solve_coop_1"
+            return f"var_{lhs} = {helper}({L_arg}, {b_arg}, _coop_lane)"
         helper = f"wp_tile_{n}x{n}_{msl_scalar}_cholesky_solve_{k}"
         return f"var_{lhs} = {helper}({L_arg}, {b_arg})"
 
@@ -7397,6 +7458,7 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
     # already been lowered to the single-thread form.
     _chol_pat_pre = re.compile(r"\bwp::tile_cholesky\s*<[^()]*>\s*\(([^)]*)\)")
     _chol_inplace_pat_pre = re.compile(r"\bwp::tile_cholesky_inplace\s*<[^()]*>\s*\(([^)]*)\)")
+    _chol_solve_pat_pre = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_cholesky_solve\s*<[^()]*>\s*\(([^)]*)\)")
     is_coop_kernel = False
     pre_coop_chol_n = 0
     for raw in forward_lines:
@@ -7418,6 +7480,30 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
                 if dims and dims[0] == dims[1] and _COOP_CHOL_MIN_N <= dims[0] <= _COOP_CHOL_MAX_N:
                     is_coop_kernel = True
                     pre_coop_chol_n = max(pre_coop_chol_n, dims[0])
+        # Vector-RHS ``tile_cholesky_solve`` in the cooperative range also
+        # marks the kernel cooperative — a kernel can solve from a cached
+        # factor without ever factorizing (mujoco_warp's
+        # update_gradient_cholesky_solve_cached), and the coop solve
+        # helper needs ``_coop_lane`` and the 32-thread launch. The
+        # condition mirrors ``repl_cholesky_solve``'s coop branch exactly.
+        for m in _chol_solve_pat_pre.finditer(raw):
+            args = [a.strip() for a in m.group(2).split(",")]
+            if len(args) >= 4:
+                L_arg = args[1]
+                b_arg = args[2]
+                L_label = L_arg[len("var_") :] if L_arg.startswith("var_") else L_arg
+                b_label = b_arg[len("var_") :] if b_arg.startswith("var_") else b_arg
+                L_dims = tile_var_dims.get(L_label)
+                b_dims = tile_var_dims.get(b_label) or tile_var_dims.get(m.group(1))
+                if (
+                    L_dims
+                    and b_dims
+                    and L_dims[0] == L_dims[1]
+                    and b_dims[1] == 1
+                    and _COOP_CHOL_MIN_N <= L_dims[0] <= _COOP_CHOL_MAX_N
+                ):
+                    is_coop_kernel = True
+                    pre_coop_chol_n = max(pre_coop_chol_n, L_dims[0])
 
     # ---- Quaternion-typed locals --------------------------------------
     # Quats are stored as ``vec_t<4>``/``float4``, but ``wp::mul`` on two
@@ -8640,7 +8726,7 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
 # v2: added captured-constant values (``Var.constant``) to the key —
 # closure-kernel instantiations previously collided (same kernel.key,
 # args, and IR statements; different baked ``const`` declarations).
-_ARTIFACT_CACHE_VERSION = 7
+_ARTIFACT_CACHE_VERSION = 8
 _codegen_source_hash_cached: str | None = None
 
 
