@@ -87,6 +87,22 @@ kernel void wp_tile1(device const uchar* pat [[buffer(0)]],
                      uint tid [[thread_position_in_grid]]) {
     dst[off + tid] = pat[tid % patlen];
 }
+
+// Gate for conditionally-executed graph regions. One thread per chunk of
+// the gated region: copies the chunk's full execution range, zeroing its
+// length when the int32 flag reads 0. The replay encoder points each
+// chunk's ``executeCommandsInBuffer:indirectBuffer:`` at ``ranges``, so
+// the command processor resolves skip-vs-run on the GPU timeline — the
+// Metal equivalent of a CUDA conditional graph node.
+struct WpExecRange { uint location; uint length; };
+kernel void wp_icb_gate(device const int* flag [[buffer(0)]],
+                        device WpExecRange* ranges [[buffer(1)]],
+                        const device WpExecRange* full [[buffer(2)]],
+                        uint tid [[thread_position_in_grid]]) {
+    WpExecRange r = full[tid];
+    if (flag[0] == 0) { r.length = 0u; }
+    ranges[tid] = r;
+}
 """
 
 
@@ -128,6 +144,7 @@ class MetalGraph:
         "_count",
         "_icb",
         "_owned_buffers",
+        "_regions",
         "_resources",
         "_signature",
     )
@@ -140,6 +157,7 @@ class MetalGraph:
         owned_buffers: list,
         signature: Any = None,
         chunks: list[tuple[int, int]] | None = None,
+        regions: list[tuple] | None = None,
     ):
         self._icb = icb
         self._count = count
@@ -168,6 +186,14 @@ class MetalGraph:
         # command). When ``chunks`` is ``None`` the replay falls back
         # to per-command ranges with barriers (safe but slow).
         self._chunks = chunks
+        # GPU-conditional regions (see ``begin_gated_region``). Each
+        # entry is ``(chunk_lo, chunk_hi, flag_buf, flag_offset,
+        # ranges_buf, full_buf)``: at replay a ``wp_icb_gate`` dispatch
+        # reads the int32 flag and writes ``ranges_buf`` with either the
+        # chunks' real execution ranges or zero-length ones, and every
+        # chunk in ``[chunk_lo, chunk_hi)`` executes via
+        # ``executeCommandsInBuffer:indirectBuffer:`` against it.
+        self._regions = regions
 
     @property
     def count(self) -> int:
@@ -1177,6 +1203,13 @@ class MetalDispatcher:
             # unless someone actually told us which bindings are
             # read-only vs written.
             "has_modes": False,
+            # GPU-conditional regions: closed entries are
+            # ``(cmd_lo, cmd_hi, flag_buf, flag_offset)`` command-index
+            # ranges; ``region_open`` holds the in-progress
+            # ``(cmd_lo, flag_buf, flag_offset)`` between
+            # ``begin_gated_region`` and ``end_gated_region``.
+            "regions": [],
+            "region_open": None,
         }
 
     def end_record(self) -> MetalGraph:
@@ -1185,17 +1218,30 @@ class MetalDispatcher:
             raise MetalDispatchError("Not currently recording an ICB graph")
         st = self._record_state
         self._record_state = None
+        if st["region_open"] is not None:
+            raise MetalDispatchError("end_record() with a gated region still open; call end_gated_region() first")
         # Close the still-open chunk. Only emit chunk info if at least
         # one dispatch passed ``binding_modes``; otherwise the chunks
         # would all conservatively collapse to length-1 anyway and we
         # gain nothing -- falling back to the per-command-range replay
         # is simpler and identical in behaviour.
         chunks: list[tuple[int, int]] | None
-        if st["has_modes"] and st["count"] > st["chunk_start"]:
-            st["chunks"].append((st["chunk_start"], st["count"] - st["chunk_start"]))
-            chunks = st["chunks"]
+        if st["has_modes"]:
+            if st["count"] > st["chunk_start"]:
+                st["chunks"].append((st["chunk_start"], st["count"] - st["chunk_start"]))
+            chunks = st["chunks"] or None
         else:
             chunks = None
+        regions = None
+        if st["regions"]:
+            if chunks is None:
+                # No ``binding_modes`` ever recorded, so ``st["chunks"]``
+                # holds region-boundary closes without any conflict
+                # analysis inside them — unsafe to execute concurrently.
+                # Synthesize the per-command fallback explicitly so gated
+                # regions still map onto executable ranges.
+                chunks = [(i, 1) for i in range(st["count"])]
+            regions = self._build_gated_regions(st["regions"], chunks, st["owned_buffers"])
         return MetalGraph(
             icb=st["icb"],
             count=st["count"],
@@ -1203,7 +1249,93 @@ class MetalDispatcher:
             owned_buffers=st["owned_buffers"],
             signature=st["signature"],
             chunks=chunks,
+            regions=regions,
         )
+
+    @staticmethod
+    def _close_open_chunk(st) -> None:
+        """Close the recording's open dependency chunk (region boundaries)."""
+        if st["count"] > st["chunk_start"]:
+            st["chunks"].append((st["chunk_start"], st["count"] - st["chunk_start"]))
+            st["chunk_start"] = st["count"]
+            st["chunk_reads"] = set()
+            st["chunk_writes"] = set()
+
+    def begin_gated_region(self, flag_buf, flag_offset: int = 0) -> None:
+        """Start a GPU-conditional region inside an active recording.
+
+        Every dispatch recorded until the matching
+        :meth:`end_gated_region` executes on replay only while the
+        int32 at byte ``flag_offset`` of ``flag_buf`` reads nonzero —
+        evaluated on the GPU timeline at the region's position in the
+        graph, so a command *earlier in the same graph* (or an earlier
+        replay) can flip the flag and skip the region's work. This is
+        the Metal equivalent of a CUDA conditional graph node; the
+        canonical use is an iterative solver whose per-world
+        convergence kernel decrements a "worlds still solving" counter.
+
+        Skipped regions still cost their inter-chunk barriers plus one
+        tiny gate dispatch, but no kernel threads launch — the
+        ``executeCommandsInBuffer:indirectBuffer:`` ranges collapse to
+        zero length.
+
+        Regions cannot nest. An empty region (no dispatches recorded
+        inside) is dropped silently.
+        """
+        st = self._record_state
+        if st is None:
+            raise MetalDispatchError("begin_gated_region() is only valid while recording")
+        if st["region_open"] is not None:
+            raise MetalDispatchError("Gated regions cannot nest")
+        # Region boundaries must coincide with chunk boundaries: the
+        # gate's range table covers whole chunks only.
+        self._close_open_chunk(st)
+        st["region_open"] = (st["count"], flag_buf, flag_offset)
+
+    def end_gated_region(self) -> None:
+        """Close the gated region opened by :meth:`begin_gated_region`."""
+        st = self._record_state
+        if st is None or st["region_open"] is None:
+            raise MetalDispatchError("end_gated_region() without a matching begin_gated_region()")
+        cmd_lo, flag_buf, flag_offset = st["region_open"]
+        st["region_open"] = None
+        if st["count"] == cmd_lo:
+            return
+        self._close_open_chunk(st)
+        st["regions"].append((cmd_lo, st["count"], flag_buf, flag_offset))
+
+    def _build_gated_regions(self, cmd_regions: list, chunks: list, owned_buffers: list) -> list:
+        """Map recorded command-index regions onto chunk indices and
+        allocate each region's execution-range buffers.
+
+        ``full_buf`` holds the chunks' real ``{location, length}``
+        ranges (immutable); ``ranges_buf`` is the gate kernel's output
+        the replay encoder actually points
+        ``executeCommandsInBuffer:indirectBuffer:`` at. Both live as
+        long as the graph via ``owned_buffers``.
+        """
+        Metal = self._Metal
+        regions = []
+        for cmd_lo, cmd_hi, flag_buf, flag_offset in cmd_regions:
+            # begin/end_gated_region close the open chunk, so region
+            # bounds align exactly with chunk starts.
+            chunk_lo = next(i for i, (s, _n) in enumerate(chunks) if s == cmd_lo)
+            chunk_hi = chunk_lo
+            while chunk_hi < len(chunks) and chunks[chunk_hi][0] < cmd_hi:
+                chunk_hi += 1
+            n = chunk_hi - chunk_lo
+            full_buf, full_addr = self.alloc(8 * n)
+            ranges_buf, _ = self.alloc(8 * n)
+            packed = (ctypes.c_uint32 * (2 * n)).from_address(full_addr)
+            for j in range(n):
+                start, length = chunks[chunk_lo + j]
+                packed[2 * j] = start
+                packed[2 * j + 1] = length
+            owned_buffers.extend((full_buf, ranges_buf))
+            gate_grid = Metal.MTLSizeMake(n, 1, 1)
+            gate_tg = Metal.MTLSizeMake(min(n, 64), 1, 1)
+            regions.append((chunk_lo, chunk_hi, flag_buf, flag_offset, ranges_buf, full_buf, gate_grid, gate_tg))
+        return regions
 
     def replay(self, graph: MetalGraph) -> None:
         """Execute ``graph`` on the GPU (fire-and-forget).
@@ -1265,7 +1397,42 @@ class MetalDispatcher:
         scope = self._barrier_scope_buffers
         icb = graph._icb
         chunks = graph._chunks
-        if chunks is not None:
+        if chunks is not None and graph._regions:
+            # Region-aware walk: chunks inside a gated region execute
+            # via GPU-resolved indirect ranges, preceded (once per
+            # region) by the gate dispatch that writes them. The gate
+            # must observe flag writes from earlier commands in this
+            # same encoder — memoryBarrierWithScope: covers both that
+            # and the command processor's later range read (verified
+            # empirically; see test_metal_launch.py gate tests).
+            gate_pso = self._device_op("wp_icb_gate")
+            exec_indirect = encoder.executeCommandsInBuffer_indirectBuffer_indirectBufferOffset_
+            regions = graph._regions
+            nregions = len(regions)
+            ridx = 0
+            last = len(chunks) - 1
+            for i, (start, length) in enumerate(chunks):
+                if ridx < nregions:
+                    reg = regions[ridx]
+                    if i == reg[0]:
+                        _lo, _hi, flag_buf, flag_off, ranges_buf, full_buf, gate_grid, gate_tg = reg
+                        encoder.setComputePipelineState_(gate_pso)
+                        encoder.setBuffer_offset_atIndex_(flag_buf, flag_off, 0)
+                        encoder.setBuffer_offset_atIndex_(ranges_buf, 0, 1)
+                        encoder.setBuffer_offset_atIndex_(full_buf, 0, 2)
+                        encoder.dispatchThreads_threadsPerThreadgroup_(gate_grid, gate_tg)
+                        encoder.memoryBarrierWithScope_(scope)
+                    if reg[0] <= i < reg[1]:
+                        exec_indirect(icb, reg[4], (i - reg[0]) * 8)
+                        if i + 1 == reg[1]:
+                            ridx += 1
+                        if i < last:
+                            encoder.memoryBarrierWithScope_(scope)
+                        continue
+                encoder.executeCommandsInBuffer_withRange_(icb, nsrange(start, length))
+                if i < last:
+                    encoder.memoryBarrierWithScope_(scope)
+        elif chunks is not None:
             last = len(chunks) - 1
             for i, (start, length) in enumerate(chunks):
                 encoder.executeCommandsInBuffer_withRange_(icb, nsrange(start, length))
