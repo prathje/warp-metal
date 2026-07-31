@@ -315,7 +315,7 @@ class MetalDispatcher:
         # time. In practice that step is ~25× cheaper than PSO
         # construction on a real kernel, and Metal's in-process library
         # cache handles repeated-source compiles within one run.
-        self._archive_url = None
+        self._archive_path = None
         self._archive = None
         self._archive_dirty = False
         try:
@@ -446,12 +446,34 @@ class MetalDispatcher:
     # MTLBinaryArchive helpers
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _archive_salt() -> str:
+        """Content hash of the Metal codegen + dispatch sources.
+
+        The archive filename embeds this salt so a codegen change starts
+        a FRESH archive instead of appending to the old one. Without the
+        salt every codegen iteration re-added its full PSO set to one
+        ever-growing file — observed at 4.1 GB after a few iterations,
+        at which point Apple's ``serializeToURL:`` segfaulted the
+        interpreter at shutdown.
+        """
+        import warp._src.codegen_metal as _cg  # noqa: PLC0415
+        import warp._src.codegen_metal_ast as _cga  # noqa: PLC0415
+
+        h = hashlib.sha256()
+        for mod_file in (_cg.__file__, _cga.__file__, __file__):
+            with open(mod_file, "rb") as f:
+                h.update(f.read())
+        return h.hexdigest()[:16]
+
     def _init_binary_archive(self) -> None:
         """Open the on-disk PSO archive, creating one if it doesn't exist.
 
-        Archive lives at ``<warp.config.kernel_cache_dir>/metal_pso_archive``
+        Archive lives at ``<warp.config.kernel_cache_dir>/metal_pso_archive_<salt>``
         — same versioned cache root the CUDA path uses, so a Warp
-        upgrade naturally invalidates the archive.
+        upgrade naturally invalidates the archive; the salt (see
+        :meth:`_archive_salt`) does the same for codegen changes. Stale
+        archives from other salts are deleted here to bound disk usage.
         """
         import warp.config as _wp_cfg  # noqa: PLC0415
 
@@ -459,8 +481,30 @@ class MetalDispatcher:
         if not cache_dir:
             # ``warp.init()`` not yet called — archive disabled.
             return
-        archive_path = os.path.join(cache_dir, "metal_pso_archive")
+        archive_path = os.path.join(cache_dir, f"metal_pso_archive_{self._archive_salt()}")
         os.makedirs(cache_dir, exist_ok=True)
+
+        # Drop archives from previous codegen versions (including the
+        # legacy unsalted ``metal_pso_archive`` and any orphaned
+        # serialize temp files) — they'd never be read again.
+        import glob  # noqa: PLC0415
+
+        for old in glob.glob(os.path.join(cache_dir, "metal_pso_archive*")):
+            if old != archive_path:
+                try:
+                    os.remove(old)
+                except OSError:
+                    pass
+
+        # Size sanity cap: a runaway archive is worse than a cold cache
+        # (multi-GB serialize at every exit, and Apple's serializer has
+        # been observed to crash on very large files).
+        max_bytes = int(os.environ.get("WARP_METAL_PSO_ARCHIVE_MAX_MB", "1024") or "0") * 1024 * 1024
+        if max_bytes > 0 and os.path.exists(archive_path) and os.path.getsize(archive_path) > max_bytes:
+            try:
+                os.remove(archive_path)
+            except OSError:
+                pass
 
         Metal = self._Metal
         try:
@@ -480,18 +524,25 @@ class MetalDispatcher:
             # Treat as a soft failure — disable archiving for this run.
             raise MetalDispatchError(f"newBinaryArchiveWithDescriptor failed for {archive_path!r}: {err}")
         self._archive = archive
-        self._archive_url = Foundation.NSURL.fileURLWithPath_(archive_path)
+        self._archive_path = archive_path
 
     def _serialize_archive_if_dirty(self) -> None:
         """Write the archive to disk if any new PSO was added this run.
 
         Called from ``atexit``; failures are logged but never raised so
-        a stale cache can't crash the interpreter at shutdown.
+        a stale cache can't crash the interpreter at shutdown. The write
+        goes to a temp file first and is renamed into place so a process
+        killed mid-serialize (training runs, test timeouts) can't leave
+        a truncated archive for the next process to choke on.
         """
-        if self._archive is None or self._archive_url is None or not self._archive_dirty:
+        if self._archive is None or self._archive_path is None or not self._archive_dirty:
             return
         try:
-            ok, err = self._archive.serializeToURL_error_(self._archive_url, None)
+            import Foundation  # noqa: PLC0415
+
+            tmp_path = f"{self._archive_path}.tmp.{os.getpid()}"
+            tmp_url = Foundation.NSURL.fileURLWithPath_(tmp_path)
+            ok, err = self._archive.serializeToURL_error_(tmp_url, None)
             if not ok:
                 import warnings  # noqa: PLC0415
 
@@ -499,7 +550,12 @@ class MetalDispatcher:
                     f"MetalDispatcher: failed to serialize binary archive: {err}",
                     stacklevel=2,
                 )
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
             else:
+                os.replace(tmp_path, self._archive_path)
                 self._archive_dirty = False
         except Exception as exc:
             import warnings  # noqa: PLC0415
