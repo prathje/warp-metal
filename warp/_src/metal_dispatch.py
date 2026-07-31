@@ -844,6 +844,7 @@ class MetalDispatcher:
         threadgroup: tuple[int, int, int],
         binding_modes: list | None = None,
         reads_resident: bool = False,
+        extra_resources: list | None = None,
     ) -> None:
         """Encode one compute dispatch onto the in-flight command buffer.
 
@@ -869,6 +870,15 @@ class MetalDispatcher:
         list and read set so replay gets residency and RAW barriers
         against refit kernels that write those buffers.
 
+        ``extra_resources`` is an optional list of ``(mtl_buffer, mode)``
+        pairs for buffers the kernel accesses through raw ``gpuAddress``
+        pointers (the ``__arg_ptrs`` bindless table) rather than bound
+        argument slots. Each buffer is made resident for the dispatch
+        (``useResource:usage:``) and participates in ICB dependency
+        chunking with the given mode (``"r"`` / ``"w"`` / ``"rw"``), so
+        RAW hazards against kernels that write those buffers through
+        normal bindings still get barriers on replay.
+
         The caller is responsible for ordering bindings to match the
         kernel's signature.
 
@@ -888,7 +898,15 @@ class MetalDispatcher:
         # Recording path: write the dispatch into an ICB slot. No
         # encoder commands hit the live cmd buffer until replay.
         if self._record_state is not None:
-            self._record_dispatch(pso, bindings, grid, threadgroup, binding_modes, reads_resident=reads_resident)
+            self._record_dispatch(
+                pso,
+                bindings,
+                grid,
+                threadgroup,
+                binding_modes,
+                reads_resident=reads_resident,
+                extra_resources=extra_resources,
+            )
             if self._profile_dispatch:
                 self._bump_stats(pso, grid, _time.perf_counter_ns() - _prof_t0)
             return
@@ -903,6 +921,22 @@ class MetalDispatcher:
                 raise MetalDispatchError("MTLCommandBuffer computeCommandEncoder returned None")
         encoder = self._encoder
         self._apply_resident_resources(encoder)
+        if extra_resources:
+            # Bindless (``__arg_ptrs``) accesses: the buffers are not bound
+            # to argument slots, so the encoder must be told explicitly to
+            # make them resident before the dispatch. ``useResource`` is
+            # encoder-scoped, so repeats across dispatches on the same
+            # encoder are redundant but harmless.
+            usage_r = Metal.MTLResourceUsageRead
+            usage_w = Metal.MTLResourceUsageWrite
+            for buf, mode in extra_resources:
+                usage = usage_r if mode == "r" else (usage_w if mode == "w" else (usage_r | usage_w))
+                encoder.useResource_usage_(buf, usage)
+                # Retain until the command buffer completes — bindless
+                # buffers never enter the bound-buffer runs below, so
+                # they'd otherwise miss the in-flight ref that keeps
+                # transient allocations alive while the GPU reads them.
+                self._inflight_refs.append(buf)
         encoder.setComputePipelineState_(pso)
         # Batch-bind buffers. ``setBytes`` entries are passed one at a
         # time (each pushes a separate small allocation into the
@@ -1257,6 +1291,7 @@ class MetalDispatcher:
         threadgroup: tuple[int, int, int],
         binding_modes: list | None = None,
         reads_resident: bool = False,
+        extra_resources: list | None = None,
     ) -> None:
         """Encode one dispatch into the active recording's next ICB slot.
 
@@ -1297,6 +1332,16 @@ class MetalDispatcher:
             # replay declares them via ``useResource``.
             for r in self._resident_resources:
                 cmd_reads.add(id(r))
+        if extra_resources:
+            # Bindless (``__arg_ptrs``) buffers: precise per-buffer modes,
+            # folded exactly like bound-argument modes so RAW/WAR/WAW
+            # hazards against other commands get chunk barriers.
+            for buf, mode in extra_resources:
+                ptr = id(buf)
+                if mode in ("r", "rw"):
+                    cmd_reads.add(ptr)
+                if mode in ("w", "rw"):
+                    cmd_writes.add(ptr)
         if binding_modes is not None:
             st["has_modes"] = True
             # A short modes list would silently drop trailing buffers from
@@ -1346,6 +1391,12 @@ class MetalDispatcher:
                 if rid not in res_set:
                     res_set.add(rid)
                     resources.append(r)
+        if extra_resources:
+            for buf, _mode in extra_resources:
+                bid = id(buf)
+                if bid not in res_set:
+                    res_set.add(bid)
+                    resources.append(buf)
         for idx, entry in enumerate(bindings):
             if isinstance(entry, tuple) and len(entry) == 2:
                 # setBytes equivalent: stash the data in a fresh
