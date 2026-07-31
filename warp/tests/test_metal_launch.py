@@ -7271,5 +7271,149 @@ class TestMetalPackedArgs(unittest.TestCase):
         _run_with_metal_enabled(self, snippet, timeout=120)
 
 
+@unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
+@unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
+class TestMetalGatedRegion(unittest.TestCase):
+    """GPU-conditional graph regions (``begin_gated_region`` /
+    ``end_gated_region``) — the Metal equivalent of CUDA conditional
+    graph nodes. Commands inside a region execute on replay only while
+    an int32 flag is nonzero, resolved on the GPU timeline via
+    ``executeCommandsInBuffer:indirectBuffer:``. Native dispatch only."""
+
+    def test_gated_region_host_flag(self):
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            if not wp.config.metal_native_dispatch:
+                raise SystemExit(0)
+
+            dev = 'metal:0'
+
+            @wp.kernel
+            def incr(a: wp.array(dtype=wp.float32)):
+                i = wp.tid()
+                a[i] = a[i] + 1.0
+
+            with wp.ScopedDevice(dev):
+                a = wp.zeros(32, dtype=wp.float32)
+                b = wp.zeros(32, dtype=wp.float32)
+                flag = wp.array(np.array([1], dtype=np.int32))
+                wp.launch(incr, dim=32, inputs=[a])  # warm module
+                wp.synchronize_device()
+                a.zero_()
+                wp.synchronize_device()
+
+                from warp._src.context import _metal_get_buffer
+                from warp._src.metal_dispatch import MetalDispatchError, get_dispatcher
+
+                disp = get_dispatcher()
+                flag_buf = _metal_get_buffer(flag.ptr)
+
+                # Region API misuse raises.
+                try:
+                    disp.begin_gated_region(flag_buf)
+                    raise AssertionError('expected MetalDispatchError outside recording')
+                except MetalDispatchError:
+                    pass
+
+                # Graph: incr(a); gated[ incr(b); incr(b) ]; incr(a)
+                disp.begin_record(max_commands=64, signature='gate-host-flag')
+                wp.launch(incr, dim=32, inputs=[a])
+                disp.begin_gated_region(flag_buf)
+                try:
+                    disp.begin_gated_region(flag_buf)
+                    raise AssertionError('expected MetalDispatchError on nesting')
+                except MetalDispatchError:
+                    pass
+                wp.launch(incr, dim=32, inputs=[b])
+                wp.launch(incr, dim=32, inputs=[b])
+                disp.end_gated_region()
+                # Empty region is dropped silently.
+                disp.begin_gated_region(flag_buf)
+                disp.end_gated_region()
+                wp.launch(incr, dim=32, inputs=[a])
+                g = disp.end_record()
+
+                disp.replay(g)
+                wp.synchronize_device()
+                np.testing.assert_allclose(a.numpy(), 2.0)
+                np.testing.assert_allclose(b.numpy(), 2.0)
+
+                flag.fill_(0)
+                disp.replay(g)
+                wp.synchronize_device()
+                np.testing.assert_allclose(a.numpy(), 4.0)  # ungated commands still run
+                np.testing.assert_allclose(b.numpy(), 2.0)  # gated region skipped
+
+                flag.fill_(1)
+                disp.replay(g)
+                wp.synchronize_device()
+                np.testing.assert_allclose(a.numpy(), 6.0)
+                np.testing.assert_allclose(b.numpy(), 4.0)  # region re-enabled
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
+    def test_gated_region_flag_written_in_graph(self):
+        # The solver pattern: a command inside the graph decrements the
+        # flag; later replays must observe the GPU-written value and
+        # skip. Exercises the barrier between flag write -> gate ->
+        # command-processor range read within one encoder.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            if not wp.config.metal_native_dispatch:
+                raise SystemExit(0)
+
+            dev = 'metal:0'
+
+            @wp.kernel
+            def incr(a: wp.array(dtype=wp.float32)):
+                i = wp.tid()
+                a[i] = a[i] + 1.0
+
+            @wp.kernel
+            def decr_flag(flag: wp.array(dtype=wp.int32)):
+                if flag[0] > 0:
+                    flag[0] = flag[0] - 1
+
+            with wp.ScopedDevice(dev):
+                b = wp.zeros(32, dtype=wp.float32)
+                flag = wp.array(np.array([2], dtype=np.int32))
+                wp.launch(incr, dim=32, inputs=[b])  # warm modules
+                wp.launch(decr_flag, dim=1, inputs=[flag])
+                wp.synchronize_device()
+                b.zero_()
+                flag.fill_(2)
+                wp.synchronize_device()
+
+                from warp._src.context import _metal_get_buffer
+                from warp._src.metal_dispatch import get_dispatcher
+
+                disp = get_dispatcher()
+                flag_buf = _metal_get_buffer(flag.ptr)
+
+                disp.begin_record(max_commands=64, signature='gate-graph-flag')
+                wp.launch(decr_flag, dim=1, inputs=[flag])
+                disp.begin_gated_region(flag_buf)
+                wp.launch(incr, dim=32, inputs=[b])
+                disp.end_gated_region()
+                g = disp.end_record()
+
+                for _ in range(4):
+                    disp.replay(g)
+                wp.synchronize_device()
+                # replay 1: flag 2->1, gate reads 1 -> region runs
+                # replay 2: flag 1->0, gate reads 0 -> skipped
+                # replays 3, 4: flag stays 0 -> skipped
+                np.testing.assert_allclose(b.numpy(), 1.0)
+                assert flag.numpy()[0] == 0, flag.numpy()
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
