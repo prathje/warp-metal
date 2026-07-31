@@ -1037,6 +1037,50 @@ class TestMetalLaunch(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet)
 
+    def test_native_mat_row_extract_matches_cpu(self):
+        # Square native matrices (``float3x3``) are column-major in MSL, so
+        # ``m[i]`` yields a COLUMN unless row access dispatches through the
+        # ``wp_extract`` / ``wp_index_store`` overloads. Before that
+        # dispatch existed, every ``mat[i]`` row read silently transposed —
+        # mujoco_warp's ``_cdof`` free-joint branch produced a transposed
+        # rotation block, corrupting G1 free-fall dynamics on Metal.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k_rows(a: wp.array(dtype=wp.mat33), out: wp.array2d(dtype=float)):
+                tid = wp.tid()
+                m = a[0]
+                t = wp.transpose(m)
+                r0 = m[0]
+                r1 = t[1]
+                m[2] = wp.vec3(30.0, 31.0, 32.0)
+                m[0] += wp.vec3(1.0, 1.0, 1.0)
+                for j in range(3):
+                    out[tid, j] = r0[j]
+                    out[tid, 3 + j] = r1[j]
+                    out[tid, 6 + j] = m[2][j]
+                    out[tid, 9 + j] = m[0][j]
+
+            A = np.arange(9, dtype=np.float32).reshape(1, 3, 3)
+            N = 4
+            results = {}
+            for dev in ('cpu', 'metal:0'):
+                a = wp.array(A, dtype=wp.mat33, device=dev)
+                out = wp.zeros((N, 12), dtype=float, device=dev)
+                wp.launch(k_rows, dim=N, inputs=[a], outputs=[out], device=dev)
+                results[dev] = out.numpy()
+            np.testing.assert_array_equal(results['cpu'], results['metal:0'])
+            expected = np.tile(
+                [0, 1, 2, 1, 4, 7, 30, 31, 32, 1, 2, 3], (N, 1)
+            ).astype(np.float32)
+            np.testing.assert_allclose(results['cpu'], expected, atol=1e-6)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
     def test_obb_sat_pattern_matches_cpu(self):
         # Reproduces the exact SAT (separating-axis test) pattern from
         # mujoco_warp's ``_obb_filter``: build a ``mat23`` of world
