@@ -8875,9 +8875,46 @@ def _codegen_source_hash() -> str:
     return _codegen_source_hash_cached
 
 
+_artifact_cache_swept = False
+
+
+def _sweep_stale_artifact_dirs(base: str, keep: str) -> None:
+    """Delete artifact subdirectories from other codegen versions (and
+    loose ``.pkl`` files from the old flat layout) under ``base``.
+
+    Every entry's key hashes ``_ARTIFACT_CACHE_VERSION`` and the codegen
+    source, so entries outside the current salt directory can never be
+    read again — without this sweep the cache grew without bound
+    (observed at 226 MB / 13k orphaned pickles after a dev cycle).
+    Best-effort: a concurrent process on a different codegen version
+    just regenerates its artifacts.
+    """
+    import shutil  # noqa: PLC0415
+
+    try:
+        entries = os.listdir(base)
+    except OSError:
+        return
+    for name in entries:
+        if name == keep:
+            continue
+        path = os.path.join(base, name)
+        try:
+            if os.path.isdir(path):
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                os.unlink(path)
+        except OSError:
+            pass
+
+
 def _artifact_cache_path(key: str) -> str | None:
     """Directory-qualified path for a cache entry, or ``None`` if caching
-    is unavailable (no kernel cache dir yet) or disabled."""
+    is unavailable (no kernel cache dir yet) or disabled.
+
+    Entries live in a per-codegen-version salt directory
+    (``metal_artifacts/v<N>_<source-hash>/``); stale sibling directories
+    are swept once per process."""
     if os.environ.get("WARP_METAL_DISABLE_ARTIFACT_CACHE") == "1":
         return None
     import warp.config as _wp_cfg  # noqa: PLC0415
@@ -8885,7 +8922,13 @@ def _artifact_cache_path(key: str) -> str | None:
     cache_dir = getattr(_wp_cfg, "kernel_cache_dir", None)
     if not cache_dir:
         return None
-    return os.path.join(cache_dir, "metal_artifacts", f"{key}.pkl")
+    base = os.path.join(cache_dir, "metal_artifacts")
+    salt = f"v{_ARTIFACT_CACHE_VERSION}_{_codegen_source_hash()[:16]}"
+    global _artifact_cache_swept
+    if not _artifact_cache_swept:
+        _artifact_cache_swept = True
+        _sweep_stale_artifact_dirs(base, salt)
+    return os.path.join(base, salt, f"{key}.pkl")
 
 
 def _artifact_cache_key(kernel, adj) -> str | None:
