@@ -6878,6 +6878,26 @@ def _ensure_adj_built(kernel):
     return adj
 
 
+def _artifact_display_name(kernel, adj) -> str:
+    """MSL entry-point suffix for a kernel: the def name, qualified by its
+    enclosing factory for closure kernels.
+
+    ``@wp.kernel(module="unique")`` factory closures are all literally
+    named ``kernel``, which turns command-stream profiles into a wall of
+    ``custom_kernel_kernel`` entries. The function ``__qualname__``
+    carries the factory name (``solve_search_update_done.<locals>.kernel``),
+    so fold it in. Entry names don't need to be unique across sources —
+    PSO and artifact caches key on the source hash — this is purely for
+    debuggability of profiles and error messages.
+    """
+    name = adj.fun_name
+    qualname = getattr(getattr(kernel, "func", None), "__qualname__", "")
+    parts = [p for p in qualname.split(".") if p != "<locals>"]
+    if len(parts) > 1:
+        name = re.sub(r"\W", "_", "_".join(parts))
+    return name
+
+
 def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
     """Build an MSL artifact for a Warp ``Kernel`` object.
 
@@ -6886,6 +6906,7 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
     here defensively in case it hasn't run yet.
     """
     adj = _ensure_adj_built(kernel)
+    artifact_name = _artifact_display_name(kernel, adj)
 
     # Preprocess via the AST pipeline (see ``warp._src.codegen_metal_ast``):
     #   parse → structural fold (for/while/if) → drop unsupported locals
@@ -8652,7 +8673,7 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
         # short-circuits when it sees an empty ``input_names`` /
         # ``output_names``.
         return MetalKernelArtifact(
-            name=adj.fun_name,
+            name=artifact_name,
             source="",
             input_names=[],
             output_names=[],
@@ -8792,7 +8813,7 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
     header = _build_kernel_header(source)
 
     return MetalKernelArtifact(
-        name=adj.fun_name,
+        name=artifact_name,
         source=source,
         input_names=base_input_names + init_input_names + extra_input_names,
         output_names=[a.label for a in output_args],
