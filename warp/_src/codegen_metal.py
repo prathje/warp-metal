@@ -584,6 +584,15 @@ def _emit_big_mat_struct(name: str, rows: int, cols: int, msl_scalar: str) -> st
         f"inline void wp_mat_elem_store(thread {name}& m, int row, int col, {msl_scalar} v) "
         f"{{ m.c[row * {cols} + col] = v; }}"
     )
+    # Single-index row read/write for ``wp::extract(m, i)`` and the 3-arg
+    # ``*_inplace(m, i, v)`` forms. Concrete overloads so the row comes back
+    # by value — the generic ``wp_extract`` template would deduce the row-ref
+    # proxy type, which dangles once the by-value matrix copy dies.
+    row_get = row_make.replace("c[i", "m.c[i")
+    body.append(f"inline {row_type} wp_extract({name} m, int i) {{ return {row_get}; }}")
+    vcomp = "v[{j}]" if row_type == f"{msl_scalar}{cols}" else "v.c[{j}]"
+    row_stores = "; ".join(f"m.c[i * {cols} + {j}] = {vcomp.format(j=j)}" for j in range(cols))
+    body.append(f"inline void wp_index_store(thread {name}& m, int i, {row_type} v) {{ {row_stores}; }}")
 
     # ---- Arithmetic ----------------------------------------------------
     # Element-wise binary ops, scalar scale, and matrix products. The vec
@@ -736,6 +745,57 @@ def _emit_native_mat_extract_overloads(source: str) -> str:
                 f"    return ret;\n"
                 f"}}"
             )
+    return "\n".join(parts)
+
+
+# Matched against the translated source (like ``_emit_slice_t_struct``):
+# by header-assembly time ``wp::extract`` / ``wp::*_inplace`` have already
+# been rewritten to ``wp_extract(`` / ``wp_index_store(`` calls.
+_WP_EXTRACT_NEEDED_PAT = re.compile(r"\bwp_(extract|index_store)\s*\(")
+
+# ``wp_extract(<arr>_shape, k)`` after subscript substitution — fold back to
+# the ``<arr>_shape[k]`` subscript form the packed-shape rewrite expects.
+# The ``(?!var_)`` guard keeps ordinary ``var_*`` locals (which happen to
+# end in ``_shape`` only if a user named one that way) out of the fold.
+_SHAPE_EXTRACT_FOLD_PAT = re.compile(r"\bwp_extract\s*\(\s*((?!var_)\w+_shape)\s*,\s*([^()]+?)\s*\)")
+
+
+def _emit_wp_extract_helpers(source: str) -> str:
+    """Emit ``wp_extract`` / ``wp_index_store`` single-index helpers.
+
+    ``wp::extract(x, i)`` and the 3-arg ``*_inplace(x, i, v)`` forms mean
+    "component i" for vectors but "row i" for matrices, and the regex
+    translator has no type information. Overload resolution supplies it
+    instead:
+
+    - A by-value template forwards to ``x[i]`` — correct for native MSL
+      vectors, quats (normalized to ``float4``), and the big-vec structs.
+    - Square native matrices get concrete overloads that read/write the
+      logical ROW. Native MSL matrices are column-major (warp ``(r, c)``
+      lives at ``m[c][r]``), so ``m[i]`` is a column — the source of a
+      silent transpose bug in row reads/writes before these overloads.
+    - Big-mat structs emit their own concrete overloads next to their
+      struct definition (their row-ref proxy must not escape through the
+      template's ``auto`` return, which would dangle).
+
+    Non-square small mats use the custom row-major structs, so only the
+    square native sizes need the swap here.
+    """
+    if not _WP_EXTRACT_NEEDED_PAT.search(source):
+        return ""
+    parts: list[str] = [
+        "template <typename T> inline auto wp_extract(T v, int i) { return v[i]; }",
+        "template <typename T, typename V> inline void wp_index_store(thread T& t, int i, V v) { t[i] = v; }",
+    ]
+    seen: set[tuple[str, int]] = set()
+    for m in _NATIVE_MAT_NAME_PAT.finditer(source):
+        if m.group(2) == m.group(3):
+            seen.add((m.group(1), int(m.group(2))))
+    for scalar, n in sorted(seen):
+        row = ", ".join(f"m[{c}][i]" for c in range(n))
+        parts.append(f"inline {scalar}{n} wp_extract({scalar}{n}x{n} m, int i) {{ return {scalar}{n}({row}); }}")
+        stores = " ".join(f"m[{c}][i] = v[{c}];" for c in range(n))
+        parts.append(f"inline void wp_index_store(thread {scalar}{n}x{n}& m, int i, {scalar}{n} v) {{ {stores} }}")
     return "\n".join(parts)
 
 
@@ -4277,6 +4337,9 @@ def _build_kernel_header(source: str) -> str:
     native_mat_overloads = _emit_native_mat_extract_overloads(source)
     if native_mat_overloads:
         parts.append(native_mat_overloads)
+    extract_helpers = _emit_wp_extract_helpers(source)
+    if extract_helpers:
+        parts.append(extract_helpers)
     if "wp_diag_float3" in source:
         parts.append(_DIAG_HELPER_FLOAT3)
     # Always emitted: kernels reference ``wp_normalize``/``wp_quat_normalize``
@@ -4913,9 +4976,19 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         re.compile(r"wp::extract\s*\(\s*([^,()]+?)\s*,\s*([^,()]+?)\s*,\s*([^,()]+?)\s*\)"),
         r"wp_mat_extract(\1, \2, \3)",
     ),
-    # ``wp::extract(vec, idx)`` returns the i-th component. MSL vector types
-    # support the C-style ``[i]`` subscript directly.
-    (re.compile(r"wp::extract\s*\(\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)"), r"\1[\2]"),
+    # ``wp::extract(<arg>_shape, k)`` — ``arr.shape[k]`` reads whose shape_t
+    # local was aliased to the bare ``<arg>_shape`` identifier (no ``var_``
+    # prefix) by the shape-bookkeeping pass. Must stay in ``name[k]`` form:
+    # a later pass rewrites that subscript to the packed-shape buffer read.
+    (re.compile(r"wp::extract\s*\(\s*((?!var_)\w+_shape)\s*,\s*([^()]+?)\s*\)"), r"\1[\2]"),
+    # ``wp::extract(x, idx)`` — component of a vec OR row of a mat. The
+    # regex can't see types, so dispatch to the overloaded ``wp_extract``
+    # helper: a generic template returns ``x[idx]`` (vecs, big-vec structs),
+    # while square-native-mat overloads return the logical ROW. MSL's
+    # ``m[i]`` on a column-major ``floatNxN`` yields column ``i``, which
+    # silently transposed every ``mat[i]`` row read before this dispatch
+    # existed (mujoco_warp's ``_cdof`` free-joint branch, contact frames).
+    (re.compile(r"wp::extract\s*\(\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)"), r"wp_extract(\1, \2)"),
     # ``wp::where(cond, a, b)`` is a select. MSL has ``select(b, a, cond)``
     # but the C-style ternary works for both scalar and vector operands and
     # avoids the surprising arg-order swap.
@@ -7602,6 +7675,12 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
         )
         # Inline subscripts that the address-collapse produced.
         translated = _substitute_subscripts(translated)
+        # ``arr.shape[k]`` reads reach here as ``wp_extract(<arr>_shape, k)``
+        # (the shape_t local was substituted with the bare ``<arr>_shape``
+        # alias just above). Fold them back to ``<arr>_shape[k]`` — the
+        # packed-shape rewrite downstream matches on that subscript form,
+        # and no ``wp_extract`` overload exists for the shape buffer.
+        translated = _SHAPE_EXTRACT_FOLD_PAT.sub(r"\1[\2]", translated)
         # Re-run intrinsic translation in case ``wp::load(var_1)`` became
         # ``wp::load(arr[idx])``.
         translated = _translate_intrinsics(translated)
@@ -7923,7 +8002,18 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
             vec = m_elem.group("vec")
             idx = m_elem.group("idx")
             value = m_elem.group("val")
-            body_lines.append(_finalize(f"{indent}var_{vec}[var_{idx}] {op} {value};"))
+            # Route through ``wp_index_store`` rather than ``t[i] op= v``:
+            # the target may be a matrix (row assignment), where MSL's
+            # column-major ``m[i]`` would silently write a column.
+            if op == "=":
+                body_lines.append(_finalize(f"{indent}wp_index_store(var_{vec}, var_{idx}, {value});"))
+            else:
+                body_lines.append(
+                    _finalize(
+                        f"{indent}wp_index_store(var_{vec}, var_{idx}, "
+                        f"wp_extract(var_{vec}, var_{idx}) {op[:-1]} ({value}));"
+                    )
+                )
             continue
         store_pat = re.compile(
             r"^(?P<indent>\s*)wp::(?P<op>store|assign_inplace|add_inplace|sub_inplace|"
@@ -8726,7 +8816,7 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
 # v2: added captured-constant values (``Var.constant``) to the key —
 # closure-kernel instantiations previously collided (same kernel.key,
 # args, and IR statements; different baked ``const`` declarations).
-_ARTIFACT_CACHE_VERSION = 8
+_ARTIFACT_CACHE_VERSION = 9
 _codegen_source_hash_cached: str | None = None
 
 
