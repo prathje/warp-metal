@@ -1081,6 +1081,66 @@ class TestMetalLaunch(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet)
 
+    def test_func_param_by_value_matches_cpu(self):
+        # ``@wp.func`` params are by VALUE in Warp's C++ codegen. The Metal
+        # inliner binds params to the caller's variable, so a callee that
+        # mutates its param (struct field write, vec/mat element write)
+        # must get a by-value copy — otherwise the write leaks back into
+        # the caller. mujoco_warp's ``ccd()`` zeroes ``geom.size`` for the
+        # capsule shrink and returns early on shallow contact; the leaked
+        # zero radius made every hfield prism after the first miss its
+        # contact on Metal (G1 dropped through / bounced off the terrain).
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.struct
+            class S:
+                size: wp.vec3
+                margin: float
+
+            @wp.func
+            def shrink(s: S) -> float:
+                r = s.size[0]
+                s.size = wp.vec3(0.0, s.size[1], s.size[2])
+                s.margin = 0.0
+                return r
+
+            @wp.func
+            def vmut(v: wp.vec3, m: wp.mat33) -> float:
+                v[2] += 1.0
+                m[0] = wp.vec3(1.0, 2.0, 3.0)
+                return v[2] + m[0][0]
+
+            @wp.kernel
+            def k(out: wp.array(dtype=float)):
+                tid = wp.tid()
+                s = S()
+                s.size = wp.vec3(0.5, 1.0, 2.0)
+                s.margin = 0.25
+                total = float(0.0)
+                for _ in range(3):
+                    total += shrink(s)
+                v = wp.vec3(7.0)
+                m = wp.mat33(0.0)
+                total += vmut(v, m) * 10.0
+                # by-value semantics: s, v, m unchanged in the caller
+                out[tid] = total + s.size[0] + s.margin + v[2] + m[0][1]
+
+            N = 4
+            results = {}
+            for dev in ('cpu', 'metal:0'):
+                out = wp.zeros(N, dtype=float, device=dev)
+                wp.launch(k, dim=N, inputs=[], outputs=[out], device=dev)
+                results[dev] = out.numpy()
+            np.testing.assert_array_equal(results['cpu'], results['metal:0'])
+            # total = 0.5*3 + (8+1)*10 = 91.5; tail = 0.5 + 0.25 + 7 + 0 = 7.75
+            np.testing.assert_allclose(results['cpu'], np.full(N, 99.25, np.float32), atol=1e-5)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
     def test_obb_sat_pattern_matches_cpu(self):
         # Reproduces the exact SAT (separating-axis test) pattern from
         # mujoco_warp's ``_obb_filter``: build a ``mat23`` of world
