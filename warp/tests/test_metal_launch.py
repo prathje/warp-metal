@@ -7110,5 +7110,166 @@ class TestMetalLaunchDimAndParams(unittest.TestCase):
         _run_with_metal_enabled(self, snippet, timeout=120)
 
 
+@unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
+@unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
+class TestMetalPackedArgs(unittest.TestCase):
+    """Kernels whose argument count exceeds Metal's 31-buffer slot cap.
+
+    Over the cap, read-only int32-1D / float-element arrays and int/bool
+    scalars get packed: the MLX path copies their data into
+    ``__ints_packed`` / ``__floats_packed`` slabs, the native path
+    transports them bindlessly via a ``__arg_ptrs`` gpuAddress table.
+    These tests pin both transports (the suite runs in each mode) —
+    before this coverage the packed path was only exercised indirectly
+    through mujoco_warp integration tests.
+    """
+
+    def test_over_31_args_matches_cpu(self):
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            @wp.kernel
+            def k_many(
+                ia0: wp.array(dtype=int), ia1: wp.array(dtype=int), ia2: wp.array(dtype=int),
+                ia3: wp.array(dtype=int), ia4: wp.array(dtype=int), ia5: wp.array(dtype=int),
+                ia6: wp.array(dtype=int), ia7: wp.array(dtype=int), ia8: wp.array(dtype=int),
+                ia9: wp.array(dtype=int),
+                fa0: wp.array(dtype=float), fa1: wp.array(dtype=float), fa2: wp.array(dtype=float),
+                fa3: wp.array(dtype=float), fa4: wp.array(dtype=float), fa5: wp.array(dtype=float),
+                fa6: wp.array(dtype=float), fa7: wp.array(dtype=float), fa8: wp.array(dtype=float),
+                fa9: wp.array(dtype=float),
+                va0: wp.array(dtype=wp.vec3), va1: wp.array(dtype=wp.vec3),
+                va2: wp.array(dtype=wp.vec3), va3: wp.array(dtype=wp.vec3),
+                s0: int, s1: int, flag: bool,
+                out_i: wp.array(dtype=int),
+                out_f: wp.array(dtype=float),
+                out_v: wp.array(dtype=float),
+            ):
+                tid = wp.tid()
+                acc_i = ia0[tid] + ia1[tid] + ia2[tid] + ia3[tid] + ia4[tid]
+                acc_i += ia5[tid] + ia6[tid] + ia7[tid] + ia8[tid] + ia9[tid]
+                acc_i += s0
+                if flag:
+                    acc_i += s1
+                out_i[tid] = acc_i
+                acc_f = fa0[tid] + fa1[tid] + fa2[tid] + fa3[tid] + fa4[tid]
+                acc_f += fa5[tid] + fa6[tid] + fa7[tid] + fa8[tid] + fa9[tid]
+                out_f[tid] = acc_f
+                out_v[tid] = va0[tid][0] + va1[tid][1] + va2[tid][2] + wp.dot(
+                    va3[tid], wp.vec3(1.0, 2.0, 3.0)
+                )
+
+            N = 33
+            rng = np.random.default_rng(7)
+            ia_np = [rng.integers(-100, 100, N).astype(np.int32) for _ in range(10)]
+            fa_np = [rng.standard_normal(N).astype(np.float32) for _ in range(10)]
+            va_np = [rng.standard_normal((N, 3)).astype(np.float32) for _ in range(4)]
+
+            results = {}
+            for dev in ('cpu', 'metal:0'):
+                ia = [wp.array(a, dtype=int, device=dev) for a in ia_np]
+                fa = [wp.array(a, dtype=float, device=dev) for a in fa_np]
+                va = [wp.array(a, dtype=wp.vec3, device=dev) for a in va_np]
+                out_i = wp.zeros(N, dtype=int, device=dev)
+                out_f = wp.zeros(N, dtype=float, device=dev)
+                out_v = wp.zeros(N, dtype=float, device=dev)
+                wp.launch(k_many, dim=N,
+                          inputs=[*ia, *fa, *va, 11, 31, True],
+                          outputs=[out_i, out_f, out_v], device=dev)
+                wp.synchronize_device(dev)
+                results[dev] = (out_i.numpy().copy(), out_f.numpy().copy(), out_v.numpy().copy())
+
+            expected_i = np.sum(ia_np, axis=0) + 11 + 31
+            expected_f = np.sum(fa_np, axis=0)
+            expected_v = (va_np[0][:, 0] + va_np[1][:, 1] + va_np[2][:, 2]
+                          + va_np[3] @ np.array([1.0, 2.0, 3.0], dtype=np.float32))
+            np.testing.assert_array_equal(results['cpu'][0], expected_i)
+            np.testing.assert_allclose(results['cpu'][1], expected_f, rtol=1e-6, atol=1e-6)
+            np.testing.assert_allclose(results['cpu'][2], expected_v, rtol=1e-5, atol=1e-5)
+            np.testing.assert_array_equal(results['metal:0'][0], results['cpu'][0])
+            np.testing.assert_allclose(results['metal:0'][1], results['cpu'][1], rtol=1e-6, atol=1e-6)
+            np.testing.assert_allclose(results['metal:0'][2], results['cpu'][2], rtol=1e-6, atol=1e-6)
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
+    def test_packed_args_graph_capture_sees_live_data(self):
+        # Native-only: a packed (bindless) input read inside a captured
+        # graph must see LIVE data on every replay — both writes made by
+        # earlier kernels in the same replay (RAW ordering through the
+        # ``extra_resources`` dependency chunks) and host writes made
+        # between replays (CUDA-graph pointer semantics; the old slab
+        # transport needed recorded refresh copies to approximate this).
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            if not wp.config.metal_native_dispatch:
+                raise SystemExit(0)
+
+            dev = 'metal:0'
+
+            @wp.kernel
+            def bump(x: wp.array(dtype=float)):
+                i = wp.tid()
+                x[i] = x[i] + 1.0
+
+            @wp.kernel
+            def k_packed(
+                ia0: wp.array(dtype=int), ia1: wp.array(dtype=int), ia2: wp.array(dtype=int),
+                ia3: wp.array(dtype=int), ia4: wp.array(dtype=int), ia5: wp.array(dtype=int),
+                ia6: wp.array(dtype=int), ia7: wp.array(dtype=int), ia8: wp.array(dtype=int),
+                ia9: wp.array(dtype=int), ia10: wp.array(dtype=int), ia11: wp.array(dtype=int),
+                ia12: wp.array(dtype=int), ia13: wp.array(dtype=int), ia14: wp.array(dtype=int),
+                ia15: wp.array(dtype=int), ia16: wp.array(dtype=int), ia17: wp.array(dtype=int),
+                ia18: wp.array(dtype=int), ia19: wp.array(dtype=int), ia20: wp.array(dtype=int),
+                ia21: wp.array(dtype=int), ia22: wp.array(dtype=int), ia23: wp.array(dtype=int),
+                ia24: wp.array(dtype=int), ia25: wp.array(dtype=int), ia26: wp.array(dtype=int),
+                ia27: wp.array(dtype=int),
+                xf: wp.array(dtype=float),
+                out: wp.array(dtype=float),
+            ):
+                tid = wp.tid()
+                acc = ia0[tid] + ia1[tid] + ia2[tid] + ia3[tid] + ia4[tid] + ia5[tid]
+                acc += ia6[tid] + ia7[tid] + ia8[tid] + ia9[tid] + ia10[tid] + ia11[tid]
+                acc += ia12[tid] + ia13[tid] + ia14[tid] + ia15[tid] + ia16[tid] + ia17[tid]
+                acc += ia18[tid] + ia19[tid] + ia20[tid] + ia21[tid] + ia22[tid] + ia23[tid]
+                acc += ia24[tid] + ia25[tid] + ia26[tid] + ia27[tid]
+                out[tid] = xf[tid] + float(acc)
+
+            N = 16
+            ia = [wp.zeros(N, dtype=int, device=dev) for _ in range(28)]
+            xf = wp.zeros(N, dtype=float, device=dev)
+            out = wp.zeros(N, dtype=float, device=dev)
+
+            # warm modules outside the capture
+            wp.launch(bump, dim=N, inputs=[xf], device=dev)
+            wp.launch(k_packed, dim=N, inputs=[*ia, xf], outputs=[out], device=dev)
+            wp.synchronize_device(dev)
+            xf.zero_()
+
+            with wp.ScopedDevice(dev):
+                with wp.ScopedCapture() as cap:
+                    wp.launch(bump, dim=N, inputs=[xf])
+                    wp.launch(k_packed, dim=N, inputs=[*ia, xf], outputs=[out])
+
+            for _ in range(3):
+                wp.capture_launch(cap.graph)
+            wp.synchronize_device(dev)
+            # in-replay RAW: k_packed must see xf AFTER bump each time
+            np.testing.assert_allclose(xf.numpy(), 3.0)
+            np.testing.assert_allclose(out.numpy(), 3.0)
+
+            # host write between replays must be visible to the packed read
+            xf.fill_(100.0)
+            wp.capture_launch(cap.graph)
+            wp.synchronize_device(dev)
+            np.testing.assert_allclose(out.numpy(), 101.0)
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

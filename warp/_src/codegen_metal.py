@@ -6679,6 +6679,17 @@ class MetalKernelArtifact:
     # serves both the int and float packers). Codegen rewrites:
     #   - ``arr_k[expr]`` -> ``__floats_packed[__ints_packed[Ki + S + k] + (expr)]``
     floats_packed_arrs: tuple[str, ...] = ()
+    # Native-dispatch bindless transport for the packed arrays above.
+    # When ``True`` the packed arrays' DATA never rides in a slab:
+    # the launcher binds one ``__arg_ptrs`` buffer of ``gpuAddress``
+    # values (int arrays first, then float arrays, in tuple order) and
+    # the native wrapper's prologue casts each entry to a typed
+    # ``device`` pointer under the array's original name — body
+    # accesses compile unchanged. ``__ints_packed`` then carries ONLY
+    # the packed scalars (``[s_0..s_{S-1}]``, no offsets, no data).
+    # Always ``False`` for MLX-path artifacts (mx.fast.metal_kernel
+    # has no way to pass raw device addresses).
+    ptr_table: bool = False
     # ``True`` if the kernel emits an output-init prologue and therefore
     # needs every body thread that shares a worldid to be in the same
     # threadgroup so the post-prologue ``threadgroup_barrier`` actually
@@ -8669,6 +8680,7 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
     ints_packed_arrs: list[str] = []
     ints_packed_scalars: list[str] = []
     floats_packed_arrs: list[str] = []
+    use_ptr_table = False
     shapes_buf_count = 1 if _shape_arrs_seen else 0
     total_slots = len(input_args) + len(output_args) + len(init_input_names) + shapes_buf_count
     if total_slots > 30:
@@ -8694,24 +8706,40 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
             packed_set = set(ints_packed_arrs) | set(ints_packed_scalars) | set(floats_packed_arrs)
             K = len(ints_packed_arrs)
             S = len(ints_packed_scalars)
-            scalar_info: dict[str, tuple[int, bool]] = {}
-            for s_idx, sa in enumerate(packable_scalars if do_int_pack else []):
-                scalar_info[sa.label] = (K + s_idx, sa.type is bool)
-            # Rewrite every access of a packed array, then every read of
-            # a packed scalar. One whole-source pass per name — the
-            # bracket-balancing scanners are line-agnostic, and the
-            # per-line × per-name loop this replaces dominated codegen
-            # time on 65k-line GJK kernels (re.escape + pattern lookup
-            # per call).
-            if do_int_pack:
-                for k, name in enumerate(ints_packed_arrs):
-                    source = _replace_packed_int_array_access(source, name, k)
-                for s_label, (off, is_bool) in scalar_info.items():
-                    repl = f"((bool)__ints_packed[{off}])" if is_bool else f"__ints_packed[{off}]"
-                    source = re.sub(rf"\b{re.escape(s_label)}\b", repl, source)
-            if do_float_pack:
-                for k, name in enumerate(floats_packed_arrs):
-                    source = _replace_packed_float_array_access(source, name, K + S + k)
+            if _wp_cfg.metal_native_dispatch:
+                # Native dispatch transports packed ARRAYS bindlessly: the
+                # launcher binds one tiny ``__arg_ptrs`` buffer of
+                # ``gpuAddress`` values and the wrapper's prologue casts
+                # each entry back to a typed device pointer under the
+                # array's original name — so the body compiles unchanged,
+                # with NO access rewriting, NO per-launch data-slab
+                # memmove, and (critically) no recorded slab-refresh
+                # copies inside graph captures (169 ICB commands/step on
+                # mjwarp G1). Only scalars still ride in ``__ints_packed``,
+                # which shrinks to a scalars-only layout ``[s_0..s_{S-1}]``.
+                use_ptr_table = True
+                if do_int_pack:
+                    for s_idx, sa in enumerate(packable_scalars):
+                        repl = f"((bool)__ints_packed[{s_idx}])" if sa.type is bool else f"__ints_packed[{s_idx}]"
+                        source = re.sub(rf"\b{re.escape(sa.label)}\b", repl, source)
+            else:
+                # MLX path: rewrite every access of a packed array, then
+                # every read of a packed scalar. One whole-source pass per
+                # name — the bracket-balancing scanners are line-agnostic,
+                # and the per-line × per-name loop this replaces dominated
+                # codegen time on 65k-line GJK kernels (re.escape + pattern
+                # lookup per call).
+                if do_int_pack:
+                    for k, name in enumerate(ints_packed_arrs):
+                        source = _replace_packed_int_array_access(source, name, k)
+                    for s_idx, sa in enumerate(packable_scalars):
+                        repl = (
+                            f"((bool)__ints_packed[{K + s_idx}])" if sa.type is bool else f"__ints_packed[{K + s_idx}]"
+                        )
+                        source = re.sub(rf"\b{re.escape(sa.label)}\b", repl, source)
+                if do_float_pack:
+                    for k, name in enumerate(floats_packed_arrs):
+                        source = _replace_packed_float_array_access(source, name, K + S + k)
             input_args = [a for a in input_args if a.label not in packed_set]
 
     # Rewrite ``__init_shadow_offsets[i]`` (synthetic placeholder used
@@ -8734,16 +8762,24 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
     # Synthetic packed-buffer inputs the launcher fills at dispatch time.
     # Order matters — must match the input-build order in the launcher.
     extra_input_names: list[str] = []
-    needs_ints_packed = (
-        bool(ints_packed_arrs)
-        or bool(ints_packed_scalars)
-        or bool(floats_packed_arrs)
-        or use_packed_init_shadows  # init_shadow_offsets live in __ints_packed
-    )
-    if needs_ints_packed:
-        extra_input_names.append("__ints_packed")
-    if floats_packed_arrs:
-        extra_input_names.append("__floats_packed")
+    if use_ptr_table:
+        # Bindless transport: ``__ints_packed`` carries only scalars,
+        # ``__arg_ptrs`` carries one gpuAddress per packed array.
+        if ints_packed_scalars:
+            extra_input_names.append("__ints_packed")
+        if ints_packed_arrs or floats_packed_arrs:
+            extra_input_names.append("__arg_ptrs")
+    else:
+        needs_ints_packed = (
+            bool(ints_packed_arrs)
+            or bool(ints_packed_scalars)
+            or bool(floats_packed_arrs)
+            or use_packed_init_shadows  # init_shadow_offsets live in __ints_packed
+        )
+        if needs_ints_packed:
+            extra_input_names.append("__ints_packed")
+        if floats_packed_arrs:
+            extra_input_names.append("__floats_packed")
     if init_shadow_floats:
         extra_input_names.append("__init_shadows_floats")
     if init_shadow_ints:
@@ -8769,6 +8805,7 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
         ints_packed_arrs=tuple(ints_packed_arrs),
         ints_packed_scalars=tuple(ints_packed_scalars),
         floats_packed_arrs=tuple(floats_packed_arrs),
+        ptr_table=use_ptr_table,
         # Keyed on ``seeded_outputs`` (not ``init_outputs``, which native
         # dispatch clears): the launcher's threadgroup reshape for these
         # kernels doubles as the thing that keeps multi-dim atomic-add
@@ -8816,7 +8853,8 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
 # v2: added captured-constant values (``Var.constant``) to the key —
 # closure-kernel instantiations previously collided (same kernel.key,
 # args, and IR statements; different baked ``const`` declarations).
-_ARTIFACT_CACHE_VERSION = 10
+# v11: native packed arrays go bindless (``ptr_table`` / ``__arg_ptrs``).
+_ARTIFACT_CACHE_VERSION = 11
 _codegen_source_hash_cached: str | None = None
 
 
@@ -9724,14 +9762,35 @@ def _wrap_msl_for_native_dispatch(artifact) -> str:
 
     # Packed buffers (variable, in launch-path order):
     #   __ints_packed                (int32)   if any int/scalar/float/init pack
+    #   __arg_ptrs                   (ulong)   bindless table (ptr_table only)
     #   __floats_packed              (float)   if floats_packed_arrs
     #   __init_shadows_floats        (float)   if init_shadow_floats
     #   __init_shadows_ints          (int32)   if init_shadow_ints
     has_packed_init = bool(artifact.init_shadow_packed_outputs)
-    if artifact.ints_packed_arrs or artifact.ints_packed_scalars or artifact.floats_packed_arrs or has_packed_init:
-        add_buffer("const constant int* __ints_packed")
-    if artifact.floats_packed_arrs:
-        add_buffer("const constant float* __floats_packed")
+    if artifact.ptr_table:
+        # Bindless transport: scalars-only ``__ints_packed``, plus one
+        # ``gpuAddress`` per packed array in ``__arg_ptrs``. The prologue
+        # rebinds each address to a typed pointer under the array's
+        # original parameter name, so the body needs no rewriting. The
+        # pointers live in the ``device`` address space (a raw address
+        # can't be lifted into ``constant``); with fastMath disabled the
+        # arithmetic is identical to a bound-argument read.
+        if artifact.ints_packed_scalars:
+            add_buffer("const constant int* __ints_packed")
+        table_names = list(artifact.ints_packed_arrs) + list(artifact.floats_packed_arrs)
+        if table_names:
+            add_buffer("const constant ulong* __arg_ptrs")
+            n_ints = len(artifact.ints_packed_arrs)
+            for k, name in enumerate(table_names):
+                inner = "int" if k < n_ints else "float"
+                value_prologue.append(
+                    f"    const device {inner}* {name} = reinterpret_cast<const device {inner}*>(__arg_ptrs[{k}]);"
+                )
+    else:
+        if artifact.ints_packed_arrs or artifact.ints_packed_scalars or artifact.floats_packed_arrs or has_packed_init:
+            add_buffer("const constant int* __ints_packed")
+        if artifact.floats_packed_arrs:
+            add_buffer("const constant float* __floats_packed")
     if artifact.init_shadow_floats:
         add_buffer("const constant float* __init_shadows_floats")
     if artifact.init_shadow_ints:
@@ -10101,13 +10160,51 @@ def launch_metal_kernel_native(kernel, dim, inputs, outputs, device, block_dim: 
             # buffer, which correctly aggregates to read-write.
             binding_modes.append("r")
 
-    # 3) Packed buffers. Reuses the MLX path's layout logic, just writes
-    # to MTLBuffers instead of mx.arrays.
+    # 3) Packed buffers.
+    #
+    # ``ptr_table`` artifacts (native codegen) transport packed arrays
+    # bindlessly: one small ``__arg_ptrs`` buffer of gpuAddress values
+    # replaces the data slabs entirely. No per-launch memmove of array
+    # bytes, and inside an ICB recording no slab-refresh copy commands
+    # — the kernel reads the live arrays through their addresses, so
+    # replays see current data by construction (same semantics as a
+    # bound argument). The referenced buffers are passed to ``dispatch``
+    # as ``extra_resources`` for residency + dependency chunking.
     has_packed_init = bool(artifact.init_shadow_packed_outputs)
     needs_ints_packed = bool(
         artifact.ints_packed_arrs or artifact.ints_packed_scalars or artifact.floats_packed_arrs or has_packed_init
     )
-    if needs_ints_packed:
+    extra_resources: list | None = None
+    if artifact.ptr_table:
+        if artifact.ints_packed_scalars:
+            # Scalars-only ``__ints_packed`` layout (see the artifact
+            # field docs). Values are baked per launch — and baked into
+            # the graph during recording, matching CUDA graph semantics
+            # for by-value kernel params.
+            svals = np.empty(len(artifact.ints_packed_scalars), dtype=np.int32)
+            for j, scalar_name in enumerate(artifact.ints_packed_scalars):
+                idx, _ = arg_by_name[scalar_name]
+                svals[j] = int(fwd_args[idx])
+            data = svals.tobytes()
+            bindings.append((data, len(data)))
+            binding_modes.append(None)
+        table_names = list(artifact.ints_packed_arrs) + list(artifact.floats_packed_arrs)
+        if table_names:
+            table = np.empty(len(table_names), dtype=np.uint64)
+            extra_resources = []
+            for k, arr_name in enumerate(table_names):
+                idx, _ = arg_by_name[arr_name]
+                value = fwd_args[idx]
+                mtl = _resolve_mtl(value, kernel.key, arr_name)
+                # ``_resolve_mtl`` maps ``value.ptr`` (the array's start)
+                # to its MTLBuffer, so the buffer's gpuAddress IS the
+                # array's device address — no view-offset arithmetic.
+                table[k] = int(mtl.gpuAddress())
+                extra_resources.append((mtl, "r"))
+            data = table.tobytes()
+            bindings.append((data, len(data)))
+            binding_modes.append(None)
+    elif needs_ints_packed:
         K = len(artifact.ints_packed_arrs)
         S = len(artifact.ints_packed_scalars)
         F = len(artifact.floats_packed_arrs)
@@ -10365,7 +10462,15 @@ def launch_metal_kernel_native(kernel, dim, inputs, outputs, device, block_dim: 
 
     # ---- Dispatch (fire and forget) ----
     try:
-        dispatcher.dispatch(pso, bindings, grid, tg, binding_modes=binding_modes, reads_resident=artifact.uses_bvh)
+        dispatcher.dispatch(
+            pso,
+            bindings,
+            grid,
+            tg,
+            binding_modes=binding_modes,
+            reads_resident=artifact.uses_bvh,
+            extra_resources=extra_resources,
+        )
     except Exception:
         if os.environ.get("WARP_METAL_DUMP_ON_FAIL"):
             import tempfile
