@@ -1018,6 +1018,45 @@ def _next_inline_id() -> int:
     return _INLINE_ID_COUNTER[0]
 
 
+# Mutation detection for by-value parameter copies (see
+# ``_find_mutated_locals``). Address-derivation lines bind a pointer local
+# to a base local; mutating intrinsics write through a local or pointer.
+_ADDR_CHAIN_PAT = re.compile(r"^\s*var_(\w+)\s*=\s*&\s*\(\s*var_(\w+)\s*(?:->|\.)")
+_INDEXREF_PAT = re.compile(r"^\s*var_(\w+)\s*=\s*wp::indexref\s*\(\s*var_(\w+)\s*[,)]")
+_MUT_TARGET_PAT = re.compile(
+    r"wp::(?:store|assign|assign_inplace|add_inplace|sub_inplace|mul_inplace|div_inplace)\s*\(\s*var_(\w+)\b"
+)
+
+
+def _find_mutated_locals(fn_lines: list[str]) -> set[str]:
+    """Labels of locals (incl. params) a function body writes through.
+
+    Warp's IR mutates a local either directly (``wp::assign_inplace(var_p,
+    i, v)``) or through a derived pointer (``var_X = &(var_p.field);
+    wp::store(var_X, v)``, possibly chained through ``->`` accesses or
+    ``wp::indexref``). Walk pointer derivations back to their root local
+    and collect every root that a mutating intrinsic targets. Used to
+    decide which inlined-function params need a by-value copy — an aliased
+    param that the callee mutates would otherwise leak the write back into
+    the caller's variable (C++ Warp passes params by value).
+    """
+    parent: dict[str, str] = {}
+    for raw in fn_lines:
+        m = _ADDR_CHAIN_PAT.match(raw) or _INDEXREF_PAT.match(raw)
+        if m:
+            parent[m.group(1)] = m.group(2)
+    mutated: set[str] = set()
+    for raw in fn_lines:
+        for m in _MUT_TARGET_PAT.finditer(raw):
+            v = m.group(1)
+            seen: set[str] = set()
+            while v in parent and v not in seen:
+                seen.add(v)
+                v = parent[v]
+            mutated.add(v)
+    return mutated
+
+
 def _substitute_var_refs(line: str, subs: dict[str, str]) -> str:
     """Replace every ``var_<X>`` or ``ret_<i>`` token in ``line`` per ``subs``.
 
@@ -1330,6 +1369,47 @@ def _inline_one_call(
     subs: dict[str, str] = {}
     for pname, caller_arg in zip(fn_param_labels, caller_args[:n_params], strict=True):
         subs[f"var_{pname}"] = caller_arg
+    # By-value semantics for mutated value-type params. Binding a param to
+    # the caller's variable is an ALIAS: if the callee writes the param
+    # (e.g. mujoco_warp's ``ccd()`` zeroing ``geom.size`` for the capsule
+    # shrink), the write would leak back into the caller — C++ Warp passes
+    # params by value, so the same kernel silently diverges on Metal
+    # (G1 hfield: every prism after the first saw a zero-radius capsule).
+    # Detect mutated params and bind them to a fresh copy instead. Array /
+    # tile params keep the alias (reference semantics — matching CUDA).
+    from warp._src.codegen import Struct  # noqa: PLC0415
+    from warp._src.codegen_metal import _msl_var_type  # noqa: PLC0415
+
+    mutated_locals = _find_mutated_locals(fn_lines)
+    param_copy_decls: list[Node] = []
+    for i, (pname, caller_arg) in enumerate(zip(fn_param_labels, caller_args[:n_params], strict=True)):
+        if pname not in mutated_locals:
+            continue
+        arg_var = fn_overload.adj.args[i]
+        ctype = arg_var.ctype()
+        if ctype.endswith("*") or "array_t" in ctype or "tile_t" in ctype:
+            continue
+        copy_label = f"{inline_id}__argcopy_{pname}"
+        if isinstance(arg_var.type, Struct):
+            # Struct locals are split into per-field MSL locals; register
+            # the copy so declarations are emitted, and let the whole-
+            # struct-copy pass expand ``var_copy = caller_arg;`` per field.
+            # The copy statement must be a parsed ``Assign`` node — the
+            # array-field backing pass propagates backings along
+            # ``var_X = var_Y;`` copy edges and skips raw lines.
+            struct_locals_out[copy_label] = arg_var.type
+            param_copy_decls.extend(parse([f"    var_{copy_label} = {caller_arg};"]))
+        else:
+            try:
+                msl_type = _msl_var_type(ctype)
+            except Exception:
+                continue  # unknown type: keep the alias (pre-existing behavior)
+            param_copy_decls.append(_RawLine(raw=f"    {msl_type} var_{copy_label} = {caller_arg};"))
+        subs[f"var_{pname}"] = f"var_{copy_label}"
+        try:
+            var_types[copy_label] = ctype
+        except Exception:
+            pass
     # Map each ret_<i> to the corresponding extra caller arg.
     for i in range(n_returns):
         subs[f"ret_{i}"] = caller_args[n_params + i]
@@ -1386,8 +1466,6 @@ def _inline_one_call(
 
     # Record any Struct-typed locals so the kernel-level field-pointer
     # pass can resolve field accesses on inlined struct instances.
-    from warp._src.codegen import Struct  # noqa: PLC0415
-
     for var in fn_overload.adj.variables:
         if var.label in fn_param_set:
             continue
@@ -1399,9 +1477,10 @@ def _inline_one_call(
     # kernel's ``adj.variables`` table, so the standard declaration loop in
     # ``generate_msl_kernel`` doesn't see them. We emit them as raw lines
     # at the splice point.
-    from warp._src.codegen_metal import _msl_constant_str, _msl_var_type  # noqa: PLC0415
+    from warp._src.codegen_metal import _msl_constant_str  # noqa: PLC0415
 
-    decls: list[Node] = []
+    # Param copies first: the callee body reads them from its first line.
+    decls: list[Node] = [*param_copy_decls]
     for var in fn_overload.adj.variables:
         if var.label in fn_param_set:
             continue

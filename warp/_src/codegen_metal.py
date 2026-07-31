@@ -8816,7 +8816,7 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
 # v2: added captured-constant values (``Var.constant``) to the key —
 # closure-kernel instantiations previously collided (same kernel.key,
 # args, and IR statements; different baked ``const`` declarations).
-_ARTIFACT_CACHE_VERSION = 9
+_ARTIFACT_CACHE_VERSION = 10
 _codegen_source_hash_cached: str | None = None
 
 
