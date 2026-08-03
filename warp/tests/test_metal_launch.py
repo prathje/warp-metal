@@ -7415,5 +7415,73 @@ class TestMetalGatedRegion(unittest.TestCase):
         _run_with_metal_enabled(self, snippet, timeout=120)
 
 
+class TestMetalReplayTimed(unittest.TestCase):
+    """Per-command GPU timing for captured graphs (``replay_timed``).
+
+    Each command runs in its own fence-chained compute-pass encoder
+    with stage-boundary timestamp samples, so kernel GPU cost is
+    separated from dispatch overhead. Native dispatch only."""
+
+    def test_replay_timed_attribution_and_semantics(self):
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            if not wp.config.metal_native_dispatch:
+                raise SystemExit(0)
+
+            dev = 'metal:0'
+
+            @wp.kernel
+            def busy(a: wp.array(dtype=wp.float32)):
+                i = wp.tid()
+                acc = float(0.0)
+                for k in range(20000):
+                    acc = acc + wp.sin(float(k) * 1.0e-3 + float(i))
+                a[i] = a[i] + wp.max(acc - acc, 1.0)  # +1.0, keeps loop live
+
+            @wp.kernel
+            def tiny(b: wp.array(dtype=wp.float32)):
+                i = wp.tid()
+                b[i] = b[i] + 1.0
+
+            with wp.ScopedDevice(dev):
+                a = wp.zeros(2048, dtype=wp.float32)
+                b = wp.zeros(32, dtype=wp.float32)
+                wp.launch(busy, dim=2048, inputs=[a])  # warm modules
+                wp.launch(tiny, dim=32, inputs=[b])
+                wp.synchronize_device()
+                a.zero_()
+                b.zero_()
+                wp.synchronize_device()
+
+                from warp._src.metal_dispatch import get_dispatcher
+
+                disp = get_dispatcher()
+                disp.begin_record(max_commands=8, signature='timed')
+                wp.launch(busy, dim=2048, inputs=[a])
+                wp.launch(tiny, dim=32, inputs=[b])
+                wp.launch(tiny, dim=32, inputs=[b])
+                g = disp.end_record()
+
+                rows = disp.replay_timed(g, iters=3)
+                # Timed replay has full execution semantics: 3 iters ran.
+                np.testing.assert_allclose(a.numpy(), 3.0)
+                np.testing.assert_allclose(b.numpy(), 6.0)
+
+                assert len(rows) == 3, rows
+                names = [r[0] for r in rows]
+                assert 'busy' in names[0], names
+                assert 'tiny' in names[1] and 'tiny' in names[2], names
+                durs = [r[1] for r in rows]
+                assert all(d > 0.0 for d in durs), durs
+                # The math-heavy kernel must dominate the trivial ones by
+                # a wide margin — attribution, not just plumbing.
+                assert durs[0] > 5.0 * max(durs[1], durs[2]), durs
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
