@@ -143,6 +143,7 @@ class MetalGraph:
         "_chunks",
         "_count",
         "_icb",
+        "_names",
         "_owned_buffers",
         "_regions",
         "_resources",
@@ -158,6 +159,7 @@ class MetalGraph:
         signature: Any = None,
         chunks: list[tuple[int, int]] | None = None,
         regions: list[tuple] | None = None,
+        names: list[str] | None = None,
     ):
         self._icb = icb
         self._count = count
@@ -194,6 +196,10 @@ class MetalGraph:
         # chunk in ``[chunk_lo, chunk_hi)`` executes via
         # ``executeCommandsInBuffer:indirectBuffer:`` against it.
         self._regions = regions
+        # Per-command kernel entry names, parallel to the ICB slots.
+        # Only used for diagnostics (``replay_timed`` attribution);
+        # ``None`` for graphs recorded before names were tracked.
+        self._names = names
 
     @property
     def count(self) -> int:
@@ -1210,6 +1216,9 @@ class MetalDispatcher:
             # ``begin_gated_region`` and ``end_gated_region``.
             "regions": [],
             "region_open": None,
+            # Per-command kernel entry names for diagnostics
+            # (``replay_timed`` attribution).
+            "names": [],
         }
 
     def end_record(self) -> MetalGraph:
@@ -1250,6 +1259,7 @@ class MetalDispatcher:
             signature=st["signature"],
             chunks=chunks,
             regions=regions,
+            names=st["names"],
         )
 
     @staticmethod
@@ -1450,6 +1460,104 @@ class MetalDispatcher:
             self.flush()
             self._dispatch_count = 0
 
+    # Hardware bound on ``MTLCounterSampleBuffer`` length is 32 KiB =
+    # 4096 uint64 timestamps = 2048 encoders (verified empirically on
+    # M3 Max). Batch profiled commands so any graph size works.
+    _TIMED_BATCH = 2048
+
+    def replay_timed(self, graph: MetalGraph, iters: int = 1) -> list[tuple[str, float]]:
+        """Execute ``graph`` once per ``iters`` with per-command GPU timing.
+
+        Diagnostics-only replay: each ICB command runs in its own
+        compute-pass encoder with GPU timestamp samples at the encoder
+        stage boundaries, fence-chained so commands serialize exactly
+        like the per-command-barrier replay. Returns one
+        ``(entry_name, gpu_ns)`` row per command in graph order, with
+        durations averaged over ``iters``.
+
+        Compared to :meth:`replay` this measures pure GPU execution
+        time per kernel — kernel cost separated from the Python /
+        encoder dispatch overhead ``dispatch_stats`` mixes in. Expect
+        a per-encoder floor of ~5-10 µs (stage-boundary sampling wraps
+        the whole encoder); rows at the floor are dispatch-bound, rows
+        above it are real GPU work.
+
+        Caveats: gated regions are ignored (every command executes,
+        ungated), and timing runs synchronously (``waitUntilCompleted``
+        per batch of ≤2048 commands). Apple GPUs only support
+        stage-boundary counter sampling; raises
+        :class:`MetalDispatchError` where even that is unavailable.
+        """
+        if self._record_state is not None:
+            raise MetalDispatchError("Cannot replay while a recording is open")
+        if graph.count == 0:
+            return []
+        Metal = self._Metal
+        if not self._device.supportsCounterSampling_(Metal.MTLCounterSamplingPointAtStageBoundary):
+            raise MetalDispatchError("Device does not support stage-boundary counter sampling")
+        ts_set = None
+        for cs in self._device.counterSets():
+            if str(cs.name()) == "timestamp":
+                ts_set = cs
+                break
+        if ts_set is None:
+            raise MetalDispatchError("Device exposes no timestamp counter set")
+        # Drain in-flight work so the timed run measures only the graph.
+        self.sync()
+
+        names = graph._names or ["<unknown>"] * graph.count
+        totals = [0.0] * graph.count
+        usage = Metal.MTLResourceUsageRead | Metal.MTLResourceUsageWrite
+        fence = self._device.newFence()
+        sdesc = Metal.MTLCounterSampleBufferDescriptor.alloc().init()
+        sdesc.setCounterSet_(ts_set)
+        sdesc.setStorageMode_(Metal.MTLStorageModeShared)
+        nsrange = self._NSMakeRange
+
+        for _ in range(iters):
+            for batch_lo in range(0, graph.count, self._TIMED_BATCH):
+                batch_n = min(self._TIMED_BATCH, graph.count - batch_lo)
+                sdesc.setSampleCount_(2 * batch_n)
+                sbuf, err = self._device.newCounterSampleBufferWithDescriptor_error_(sdesc, None)
+                if sbuf is None:
+                    raise MetalDispatchError(f"newCounterSampleBufferWithDescriptor failed: {err}")
+                cmd_buf = self._command_queue.commandBuffer()
+                if cmd_buf is None:
+                    raise MetalDispatchError("MTLCommandQueue commandBuffer returned None")
+                for j in range(batch_n):
+                    pdesc = Metal.MTLComputePassDescriptor.computePassDescriptor()
+                    att = pdesc.sampleBufferAttachments().objectAtIndexedSubscript_(0)
+                    att.setSampleBuffer_(sbuf)
+                    att.setStartOfEncoderSampleIndex_(2 * j)
+                    att.setEndOfEncoderSampleIndex_(2 * j + 1)
+                    encoder = cmd_buf.computeCommandEncoderWithDescriptor_(pdesc)
+                    if encoder is None:
+                        raise MetalDispatchError("computeCommandEncoderWithDescriptor returned None")
+                    if j > 0:
+                        encoder.waitForFence_(fence)
+                    for r in graph._resources:
+                        encoder.useResource_usage_(r, usage)
+                    self._apply_resident_resources(encoder)
+                    encoder.executeCommandsInBuffer_withRange_(graph._icb, nsrange(batch_lo + j, 1))
+                    encoder.updateFence_(fence)
+                    encoder.endEncoding()
+                # Correlated CPU/GPU timestamp pairs around execution
+                # turn raw GPU ticks into nanoseconds (identity on
+                # Apple silicon, but don't bake that assumption in).
+                cpu_a, gpu_a = self._device.sampleTimestamps_gpuTimestamp_(None, None)
+                cmd_buf.commit()
+                cmd_buf.waitUntilCompleted()
+                cpu_b, gpu_b = self._device.sampleTimestamps_gpuTimestamp_(None, None)
+                scale = (cpu_b - cpu_a) / (gpu_b - gpu_a) if gpu_b != gpu_a else 1.0
+                data = sbuf.resolveCounterRange_(nsrange(0, 2 * batch_n))
+                if data is None:
+                    raise MetalDispatchError("resolveCounterRange returned None")
+                stamps = (ctypes.c_uint64 * (2 * batch_n)).from_buffer_copy(data.bytes().tobytes())
+                for j in range(batch_n):
+                    totals[batch_lo + j] += (stamps[2 * j + 1] - stamps[2 * j]) * scale
+
+        return [(names[i], totals[i] / iters) for i in range(graph.count)]
+
     def _record_dispatch(
         self,
         pso,
@@ -1595,4 +1703,5 @@ class MetalDispatcher:
             Metal.MTLSizeMake(gx, gy, gz),
             Metal.MTLSizeMake(tx, ty, tz),
         )
+        st["names"].append(self._pso_name.get(id(pso), "<unknown>"))
         st["count"] += 1
