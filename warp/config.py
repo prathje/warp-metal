@@ -282,6 +282,16 @@ of the 32 cooperating lanes. At N=35 the private form costs 4.9 KB per lane
 (157 KB per threadgroup, which spills to device-backed scratch) and is ~23x
 slower. Any tile with an unsupported use keeps the private representation,
 so this only ever adds a fast path.
+
+Scope: promotion currently only happens in kernels that already dispatch 32
+cooperating lanes per tile, which today means kernels containing a
+``tile_cholesky`` or vector-RHS ``tile_cholesky_solve`` on a square tile of
+24 <= N <= 88. A kernel whose tile work is, say, only ``tile_load`` and
+``tile_store`` keeps the private representation because it is launched one
+thread per tile. Widening that would mean running such kernels with 32 lanes,
+which would also execute their scalar body 32 times over -- the
+multiply-counting hazard that ``block_dim()`` lowering to ``1`` exists to
+avoid -- so it needs per-kernel analysis rather than a blanket switch.
 """
 
 disable_metal_solver_icb_capture: bool = False
