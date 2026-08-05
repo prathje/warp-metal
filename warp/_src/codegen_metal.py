@@ -4286,6 +4286,304 @@ def _emit_tile_cholesky_solve_coop(n: int, msl_scalar: str) -> str:
     return "\n".join(parts)
 
 
+# --- Threadgroup-resident ("smem-backed") tiles ------------------------
+# The cooperative helpers above still take and return the tile *by value*
+# as a private struct: ``A`` arrives as a per-lane ``float[N*N]`` filled by
+# 32 redundant device loads, and ``_cholesky_coop`` ends by having every
+# lane read the whole result back into its own private ``L``. At N=35
+# that is 4.9 KB x 32 lanes = 157 KB of per-threadgroup private storage,
+# which spills to device-backed scratch — twice (once for A, once for L).
+#
+# The helpers below instead keep the tile resident in threadgroup memory
+# for its whole lifetime: ``tile_load`` writes device -> smem directly,
+# the factorization runs in place, and ``tile_store`` / the solve read
+# smem. Measured 23x faster at 128+ worlds with bit-identical results
+# (the arithmetic below is deliberately identical to the by-value coop
+# variants — same fma order, same clamp, same precise::sqrt).
+#
+# NB: an earlier attempt at cooperative load/store (commits 02bfba9e,
+# 38f74e5d — see the note above ``_emit_tile_load_coop``) was reverted
+# because it kept the private round-trip: write smem -> barrier -> read
+# back into each thread's private struct. That optimizes filling the
+# private copy instead of removing it, so it bought a barrier for
+# nothing. The win requires eliminating the private struct end-to-end.
+
+
+def _emit_tile_cholesky_smem(n: int, msl_scalar: str) -> str:
+    """Emit ``wp_tile_NxN_<scalar>_cholesky_smem`` — in-place cooperative
+    Cholesky on a threadgroup-resident tile.
+
+    Same algorithm as :func:`_emit_tile_cholesky_coop` with the leading
+    private->smem stage and the trailing smem->private readback removed:
+    the tile is already in ``smem`` and stays there. Called by all 32
+    lanes of the SIMD group; ``lane`` is ``thread_position_in_threadgroup.x``.
+
+    The strict upper triangle is zeroed at the end because the by-value
+    variant did that during its readback, and consumers (``tile_store``)
+    rely on seeing a clean lower-triangular factor.
+    """
+    name = f"wp_tile_{n}x{n}_{msl_scalar}"
+    nn = n * n
+    parts: list[str] = []
+    parts.append(f"inline void {name}_cholesky_smem(threadgroup {msl_scalar}* smem, uint lane) {{")
+    # A previous cooperative op may still be reading smem.
+    parts.append("    threadgroup_barrier(metal::mem_flags::mem_threadgroup);")
+    parts.append(f"    for (int j = 0; j < {n}; ++j) {{")
+    parts.append("        if ((int)lane == (j & 31)) {")
+    parts.append(f"            {msl_scalar} d = smem[j*{n} + j];")
+    parts.append("            for (int k = 0; k < j; ++k) {")
+    parts.append(f"                {msl_scalar} ljk = smem[j*{n} + k];")
+    parts.append("                d = metal::fma(-ljk, ljk, d);")
+    parts.append("            }")
+    parts.append(f"            d = metal::max(d, ({msl_scalar})1e-30);")
+    parts.append(f"            smem[j*{n} + j] = metal::precise::sqrt(d);")
+    parts.append("        }")
+    parts.append("        threadgroup_barrier(metal::mem_flags::mem_threadgroup);")
+    parts.append(f"        {msl_scalar} pivot = smem[j*{n} + j];")
+    parts.append(f"        for (int i = (int)lane; i < {n}; i += 32) {{")
+    parts.append("            if (i > j) {")
+    parts.append(f"                {msl_scalar} s = smem[i*{n} + j];")
+    parts.append(f"                for (int k = 0; k < j; ++k) s = metal::fma(-smem[i*{n} + k], smem[j*{n} + k], s);")
+    parts.append(f"                smem[i*{n} + j] = s / pivot;")
+    parts.append("            }")
+    parts.append("        }")
+    parts.append("        threadgroup_barrier(metal::mem_flags::mem_threadgroup);")
+    parts.append("    }")
+    parts.append(f"    for (uint e = lane; e < {nn}u; e += 32u) {{")
+    parts.append(f"        uint i = e / {n}u;")
+    parts.append(f"        uint j = e - i * {n}u;")
+    parts.append(f"        if (j > i) smem[e] = ({msl_scalar})0;")
+    parts.append("    }")
+    parts.append("    threadgroup_barrier(metal::mem_flags::mem_threadgroup);")
+    parts.append("}")
+    return "\n".join(parts)
+
+
+def _emit_tile_cholesky_solve_smem_1(n: int, msl_scalar: str) -> str:
+    """Emit ``wp_tile_NxN_<scalar>_cholesky_solve_smem_1`` — vector-RHS
+    solve reading ``L`` from a threadgroup-resident tile.
+
+    Identical to :func:`_emit_tile_cholesky_solve_coop` except ``L`` is a
+    ``threadgroup`` pointer rather than a per-lane private struct, so the
+    32 lanes share one copy of the factor instead of holding 32. ``x``
+    stays private and redundant per lane (it is only N floats, and
+    ``metal::simd_sum`` keeps every lane's copy identical).
+    """
+    B_name = f"wp_tile_{n}x1_{msl_scalar}"
+    L_name = f"wp_tile_{n}x{n}_{msl_scalar}"
+    parts: list[str] = []
+    parts.append(
+        f"inline {B_name} {L_name}_cholesky_solve_smem_1(threadgroup const {msl_scalar}* L, {B_name} b, uint lane) {{"
+    )
+    parts.append(f"    {B_name} x = b;")
+    parts.append("    #pragma clang loop unroll(disable)")
+    parts.append(f"    for (int i = 0; i < {n}; ++i) {{")
+    parts.append(f"        {msl_scalar} s = ({msl_scalar})0;")
+    parts.append(f"        for (int kk = (int)lane; kk < i; kk += 32) s = metal::fma(-L[i*{n} + kk], x.c[kk], s);")
+    parts.append("        s = metal::simd_sum(s);")
+    parts.append(f"        x.c[i] = (x.c[i] + s) / L[i*{n} + i];")
+    parts.append("    }")
+    parts.append("    #pragma clang loop unroll(disable)")
+    parts.append(f"    for (int i = {n} - 1; i >= 0; --i) {{")
+    parts.append(f"        {msl_scalar} s = ({msl_scalar})0;")
+    parts.append(
+        f"        for (int kk = i + 1 + (int)lane; kk < {n}; kk += 32) s = metal::fma(-L[kk*{n} + i], x.c[kk], s);"
+    )
+    parts.append("        s = metal::simd_sum(s);")
+    parts.append(f"        x.c[i] = (x.c[i] + s) / L[i*{n} + i];")
+    parts.append("    }")
+    parts.append("    return x;")
+    parts.append("}")
+    return "\n".join(parts)
+
+
+# Apple Silicon caps threadgroup memory at 32 KB per threadgroup.
+_SMEM_ARENA_MAX_FLOATS = 8192
+
+# Kernel-scope threadgroup buffer holding every resident tile.
+_SMEM_ARENA_NAME = "wp_tile_smem_arena"
+
+
+def _threadgroup_tiles_enabled() -> bool:
+    """Whether tiles may be promoted to threadgroup memory.
+
+    Reads :data:`warp.config.metal_threadgroup_tiles` lazily — importing
+    ``warp.config`` at module scope would be a circular import.
+    """
+    import warp.config as _wp_cfg  # noqa: PLC0415
+
+    return bool(getattr(_wp_cfg, "metal_threadgroup_tiles", True))
+
+
+_SMEM_LOAD_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_load\s*<")
+# ``tile_cholesky<`` won't match ``tile_cholesky_solve<`` / ``_inplace<``
+# because those continue with ``_`` where this needs ``<``.
+_SMEM_CHOL_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_cholesky\s*<[^()]*>\s*\(([^)]*)\)")
+_SMEM_SOLVE_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_cholesky_solve\s*<[^()]*>\s*\(([^)]*)\)")
+_SMEM_STORE_PAT = re.compile(r"\bwp::tile_store\s*<[^()]*>\s*\(([^)]*)\)")
+
+
+def _plan_smem_tiles(
+    forward_lines: list[str],
+    tile_var_dims: dict[str, tuple[int, int, str]],
+    tile_var_vec_n: dict[str, int],
+    reserved_floats: int = 0,
+) -> tuple[dict[str, tuple[int, int, int, str]], int]:
+    """Decide which tile locals can live in threadgroup memory.
+
+    Returns ``(plan, arena_floats)`` where ``plan`` maps a tile local's
+    label to ``(arena_offset, rows, cols, msl_scalar)``. Labels absent
+    from ``plan`` keep the existing private-struct representation, so
+    this is purely additive — anything not provably safe is left alone.
+
+    A label is only promoted when *every* appearance of it in the kernel
+    is one of the four positions the threadgroup-resident helpers
+    support: produced by ``tile_load`` or ``tile_cholesky``, consumed as
+    ``tile_cholesky``'s input, as ``tile_cholesky_solve``'s ``L``, or as
+    ``tile_store``'s source. Any other use (``tile_map``, ``tile_view``,
+    ``tile_matmul``, ``tile_extract``, a transpose alias, ...) disqualifies
+    it, because those translators still expect a private struct.
+
+    Tiles are grouped into *chains* that share one arena slot: a
+    ``tile_load`` result and the ``tile_cholesky`` factor computed from it
+    alias the same storage (the factorization is in place), which is what
+    keeps the arena down to one N*N slot for the common
+    load -> factorize -> solve -> store shape.
+    """
+    candidates = {
+        label
+        for label, (rows, cols, _scalar) in tile_var_dims.items()
+        if rows == cols and _COOP_CHOL_MIN_N <= rows <= _COOP_CHOL_MAX_N and not tile_var_vec_n.get(label)
+    }
+    if not candidates:
+        return {}, 0
+
+    cand_pat = re.compile(r"\bvar_(" + "|".join(re.escape(c) for c in sorted(candidates)) + r")\b")
+
+    def _label_of(arg: str) -> str:
+        arg = arg.strip()
+        return arg[len("var_") :] if arg.startswith("var_") else arg
+
+    # roles[label] = set of (line_idx, role); present[label] = line indices
+    roles: dict[str, set[tuple[int, str]]] = {c: set() for c in candidates}
+    present: dict[str, list[int]] = {c: [] for c in candidates}
+    # How many times a supported position accounts for ``label`` on a line.
+    # Compared against the actual occurrence count so that an appearance in
+    # any *other* position disqualifies the tile. A tile can legitimately
+    # appear twice on one line: ``tile_cholesky``'s result is both the LHS
+    # and the trailing out-param (``var_6 = wp::tile_cholesky<false>(...,
+    # var_3, var_6)``).
+    expected: dict[tuple[str, int], int] = {}
+    actual: dict[tuple[str, int], int] = {}
+    # producers[label] = line_idx of its tile_load, if any
+    load_of: dict[str, int] = {}
+    chol_edges: list[tuple[int, str, str]] = []  # (line_idx, dst, src)
+
+    def _account(label: str, idx: int, role: str | None = None) -> None:
+        expected[(label, idx)] = expected.get((label, idx), 0) + 1
+        if role is not None:
+            roles[label].add((idx, role))
+
+    for idx, raw in enumerate(forward_lines):
+        found = cand_pat.findall(raw)
+        if not found:
+            continue
+        for label in set(found):
+            present[label].append(idx)
+            actual[(label, idx)] = found.count(label)
+
+        m = _SMEM_LOAD_PAT.search(raw)
+        if m is not None and m.group(1) in candidates:
+            _account(m.group(1), idx, "load_dst")
+            load_of[m.group(1)] = idx
+        m = _SMEM_CHOL_PAT.search(raw)
+        if m is not None:
+            args = [a.strip() for a in m.group(2).split(",")]
+            dst = m.group(1)
+            # cuBLASDx-LTO signature: three leading padding args, the input,
+            # then the destination (same local as the LHS).
+            src = _label_of(args[3]) if len(args) >= 5 else ""
+            if dst in candidates:
+                _account(dst, idx, "chol_dst")
+                if len(args) >= 5 and _label_of(args[4]) == dst:
+                    _account(dst, idx)
+            if src in candidates:
+                _account(src, idx, "chol_src")
+            if dst in candidates and src in candidates:
+                chol_edges.append((idx, dst, src))
+        m = _SMEM_SOLVE_PAT.search(raw)
+        if m is not None:
+            args = [a.strip() for a in m.group(2).split(",")]
+            if len(args) >= 4:
+                L_label = _label_of(args[1])
+                if L_label in candidates:
+                    _account(L_label, idx, "solve_L")
+        m = _SMEM_STORE_PAT.search(raw)
+        if m is not None:
+            args = [a.strip() for a in m.group(1).split(",")]
+            if args:
+                src_label = _label_of(args[-1])
+                if src_label in candidates:
+                    _account(src_label, idx, "store_src")
+
+    def _fully_accounted(label: str) -> bool:
+        """Every occurrence of ``label`` sits in a supported position."""
+        if not roles[label]:
+            return False
+        return all(actual[(label, idx)] == expected.get((label, idx), 0) for idx in present[label])
+
+    chains: list[list[str]] = []
+    claimed: set[str] = set()
+
+    # load -> cholesky chains (the factor aliases the loaded tile).
+    for idx, dst, src in chol_edges:
+        if dst in claimed or src in claimed:
+            continue
+        if tile_var_dims[dst] != tile_var_dims[src]:
+            continue
+        if not (_fully_accounted(src) and _fully_accounted(dst)):
+            continue
+        # ``src`` must be a freshly loaded tile whose only consumer is this
+        # factorization, and it must be dead afterwards — the factorization
+        # overwrites it in place.
+        if roles[src] != {(load_of.get(src, -1), "load_dst"), (idx, "chol_src")}:
+            continue
+        if any(i > idx for i in present[src]):
+            continue
+        if any(r not in ("chol_dst", "solve_L", "store_src") for _i, r in roles[dst]):
+            continue
+        chains.append([src, dst])
+        claimed.update((src, dst))
+
+    # load-only chains (e.g. a cached factor loaded then solved against).
+    for label in sorted(candidates - claimed):
+        if not _fully_accounted(label):
+            continue
+        label_roles = {r for _i, r in roles[label]}
+        if "load_dst" not in label_roles:
+            continue
+        if any(r not in ("load_dst", "solve_L", "store_src") for r in label_roles):
+            continue
+        chains.append([label])
+        claimed.add(label)
+
+    plan: dict[str, tuple[int, int, int, str]] = {}
+    offset = 0
+    for chain in chains:
+        rows, cols, scalar = tile_var_dims[chain[0]]
+        if scalar != "float":
+            # The arena is a ``threadgroup float`` buffer; other scalar
+            # widths would need their own arena.
+            continue
+        size = rows * cols
+        if reserved_floats + offset + size > _SMEM_ARENA_MAX_FLOATS:
+            continue
+        for label in chain:
+            plan[label] = (offset, rows, cols, scalar)
+        offset += size
+    return plan, offset
+
+
 def _build_kernel_header(source: str) -> str:
     """Scan ``source`` for helpers we need to emit (big-vec structs,
     big-mat structs, spatial helpers, diag helper, ``wp_mat_extract``
@@ -4504,6 +4802,23 @@ def _build_kernel_header(source: str) -> str:
             seen_coop_solve.add((rows, m.group(3)))
     for n, scalar in sorted(seen_coop_solve):
         parts.append(_emit_tile_cholesky_solve_coop(n, scalar))
+    # Threadgroup-resident variants (see ``_emit_tile_cholesky_smem``).
+    smem_cholesky_pat = re.compile(r"\bwp_tile_(\d+)x(\d+)_(\w+)_cholesky_smem\b")
+    seen_smem_cholesky: set[tuple[int, str]] = set()
+    for m in smem_cholesky_pat.finditer(source):
+        rows, cols = int(m.group(1)), int(m.group(2))
+        if rows == cols:
+            seen_smem_cholesky.add((rows, m.group(3)))
+    for n, scalar in sorted(seen_smem_cholesky):
+        parts.append(_emit_tile_cholesky_smem(n, scalar))
+    smem_solve_pat = re.compile(r"\bwp_tile_(\d+)x(\d+)_(\w+)_cholesky_solve_smem_1\b")
+    seen_smem_solve: set[tuple[int, str]] = set()
+    for m in smem_solve_pat.finditer(source):
+        rows, cols = int(m.group(1)), int(m.group(2))
+        if rows == cols:
+            seen_smem_solve.add((rows, m.group(3)))
+    for n, scalar in sorted(seen_smem_solve):
+        parts.append(_emit_tile_cholesky_solve_smem_1(n, scalar))
     # mujoco_warp ``@wp.func`` helpers referenced by ``tile_map``.
     user_func_defs = _emit_referenced_user_funcs(source)
     if user_func_defs:
@@ -5614,11 +5929,14 @@ def _translate_tile_intrinsics(
     transpose_aliases: dict[str, str] | None = None,
     tile_var_vec_n: dict[str, int] | None = None,
     atomic_output_names: set[str] | None = None,
+    smem_tiles: dict[str, tuple[int, int, int, str]] | None = None,
 ) -> str:
     if tile_var_vec_n is None:
         tile_var_vec_n = {}
     if atomic_output_names is None:
         atomic_output_names = set()
+    if smem_tiles is None:
+        smem_tiles = {}
     """Lower ``wp::tile_*`` calls to ``wp_tile_RxC_<scalar>_*`` helper calls.
 
     ``tile_var_dims`` maps each tile local label to ``(rows, cols, msl_scalar)``
@@ -5687,13 +6005,27 @@ def _translate_tile_intrinsics(
         if vec_n_elem > 0:
             helper = f"wp_tile_{rows}x{cols}_vec{vec_n_elem}_{msl_scalar}_load"
             return f"var_{lhs} = {helper}({arr}, {base_expr}, {row_stride}, {row_off}, {col_off})"
-        # NB: cooperative tile_load was tried but a SIMD-cooperative
-        # threadgroup-memory round-trip (write smem → barrier → read
-        # smem into each thread's private struct) ran *slower* than
-        # the single-thread emit at the sizes we ship. The 32-lane
-        # redundant device reads land in L1 (the 16 KB at N=64 fits),
-        # so the barriers + smem traffic of cooperation is pure
-        # overhead. Keeping single-thread emit even in coop kernels.
+        # Threadgroup-resident destination: load device → smem directly,
+        # every lane taking a strided slice, and never materialize a
+        # private struct. See ``_emit_tile_cholesky_smem``.
+        if lhs in smem_tiles:
+            off, srows, scols, _sc = smem_tiles[lhs]
+            n = srows * scols
+            slot = f"({_SMEM_ARENA_NAME} + {off})"
+            return (
+                "do { threadgroup_barrier(metal::mem_flags::mem_threadgroup); "
+                f"for (uint _tl_e = _coop_lane; _tl_e < {n}u; _tl_e += 32u) {{ "
+                f"uint _tl_i = _tl_e / {scols}u; uint _tl_j = _tl_e - _tl_i * {scols}u; "
+                f"{slot}[_tl_e] = {arr}[{base_expr} + (({row_off}) + (int)_tl_i) * ({row_stride}) "
+                f"+ (({col_off}) + (int)_tl_j)]; }} "
+                "threadgroup_barrier(metal::mem_flags::mem_threadgroup); } while (0)"
+            )
+        # NB: cooperative tile_load into a *private* struct was tried and
+        # reverted (write smem → barrier → read back per thread) — it
+        # optimized filling the private copy rather than removing it. The
+        # smem-resident path above is the version that pays off; this
+        # single-thread emit remains for non-resident tiles, where the 32
+        # redundant device reads land in L1 (16 KB at N=64 fits).
         helper = f"wp_tile_{rows}x{cols}_{msl_scalar}_load"
         return f"var_{lhs} = {helper}({arr}, {base_expr}, {row_stride}, {row_off}, {col_off})"
 
@@ -5755,23 +6087,44 @@ def _translate_tile_intrinsics(
         # Emit an inline loop with ``atomic_store_explicit`` per
         # element instead.
         arr_name = arr[len("var_") :] if arr.startswith("var_") else arr
+        # Threadgroup-resident source: write smem → device cooperatively,
+        # with no private struct to read from. Checked *before* the generic
+        # atomic branch below, which reads ``.c[...]`` off a private struct
+        # this tile no longer has — it handles atomic targets itself.
+        if tile_label in smem_tiles:
+            off, srows, scols, _sc = smem_tiles[tile_label]
+            n = srows * scols
+            slot = f"({_SMEM_ARENA_NAME} + {off})"
+            target = f"{arr}[{base_expr} + (({row_off}) + (int)_ts_i) * ({row_stride}) + (({col_off}) + (int)_ts_j)]"
+            write = (
+                f"atomic_store_explicit(&{target}, {slot}[_ts_e], memory_order_relaxed);"
+                if arr_name in atomic_output_names
+                else f"{target} = {slot}[_ts_e];"
+            )
+            return (
+                "do { threadgroup_barrier(metal::mem_flags::mem_threadgroup); "
+                f"for (uint _ts_e = _coop_lane; _ts_e < {n}u; _ts_e += 32u) {{ "
+                f"uint _ts_i = _ts_e / {scols}u; uint _ts_j = _ts_e - _ts_i * {scols}u; "
+                f"{write} }} "
+                "threadgroup_barrier(metal::mem_flags::mem_threadgroup); } while (0)"
+            )
+        # If the target output is atomic-typed (the kernel uses
+        # ``wp.atomic_*`` somewhere), the helper signature
+        # ``device <scalar>*`` won't accept ``device atomic<scalar>*``.
+        # Emit an inline loop with ``atomic_store_explicit`` per element.
         if arr_name in atomic_output_names:
-            n = rows * cols
-            store = (
+            return (
                 f"{{ for (int _ts_i = 0; _ts_i < {rows}; ++_ts_i) "
                 f"for (int _ts_j = 0; _ts_j < {cols}; ++_ts_j) "
                 f"atomic_store_explicit("
                 f"&{arr}[{base_expr} + (({row_off}) + _ts_i) * ({row_stride}) + (({col_off}) + _ts_j)], "
                 f"{tile_var}.c[_ts_i * {cols} + _ts_j], memory_order_relaxed); }}"
             )
-            return store
-        # NB: cooperative tile_store (each lane writes its strided
-        # slice with no smem) was tried but added latency without
-        # measurable bandwidth savings — Metal's SIMD-group write
-        # coalescing already collapses 32 redundant identical writes
-        # to the same address into a single transaction. Keep single-
-        # thread emit; revisit when we add larger-tile workloads where
-        # write coalescing breaks down.
+        # NB: cooperative tile_store from a *private* struct was tried and
+        # reverted — Metal's SIMD-group write coalescing already collapses
+        # 32 redundant identical writes into one transaction, so it added
+        # latency for no bandwidth saving. The smem-resident path above is
+        # different: there is no private struct to broadcast from.
         helper = f"wp_tile_{rows}x{cols}_{msl_scalar}_store"
         return f"{helper}({arr}, {base_expr}, {row_stride}, {row_off}, {col_off}, {tile_var})"
 
@@ -5799,6 +6152,14 @@ def _translate_tile_intrinsics(
         # variant: 32 lanes share one ``wp_tile_chol_smem`` scratch
         # in threadgroup memory, factor cooperatively, then read the
         # result back into each thread's private struct.
+        # Threadgroup-resident: the input tile is already in the arena and
+        # the factor replaces it in place, so no private struct is
+        # materialized on either side. ``_plan_smem_tiles`` guarantees the
+        # input is dead after this call and that both labels share a slot.
+        if lhs in smem_tiles and in_label in smem_tiles and smem_tiles[lhs][0] == smem_tiles[in_label][0]:
+            off = smem_tiles[lhs][0]
+            helper = f"wp_tile_{rows}x{cols}_{msl_scalar}_cholesky_smem"
+            return f"{helper}({_SMEM_ARENA_NAME} + {off}, _coop_lane)"
         if coop_chol_seen is not None and _COOP_CHOL_MIN_N <= rows <= _COOP_CHOL_MAX_N:
             coop_chol_seen.add((rows, msl_scalar))
             helper = f"wp_tile_{rows}x{cols}_{msl_scalar}_cholesky_coop"
@@ -5834,6 +6195,12 @@ def _translate_tile_intrinsics(
         # reduce + broadcast; no smem). This also fires in kernels that
         # only *load* a cached factor without factorizing — the pre-scan
         # marks those cooperative too.
+        # Threadgroup-resident factor: all 32 lanes read one shared copy of
+        # ``L`` from the arena instead of each holding a private N*N struct.
+        if L_label in smem_tiles and k == 1:
+            off = smem_tiles[L_label][0]
+            helper = f"wp_tile_{n}x{n}_{msl_scalar}_cholesky_solve_smem_1"
+            return f"var_{lhs} = {helper}({_SMEM_ARENA_NAME} + {off}, {b_arg}, _coop_lane)"
         if coop_chol_seen is not None and _COOP_CHOL_MIN_N <= n <= _COOP_CHOL_MAX_N and k == 1:
             coop_chol_seen.add((n, msl_scalar))
             helper = f"wp_tile_{n}x{n}_{msl_scalar}_cholesky_solve_coop_1"
@@ -7610,6 +7977,24 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
                     is_coop_kernel = True
                     pre_coop_chol_n = max(pre_coop_chol_n, L_dims[0])
 
+    # ---- Threadgroup-resident tiles -----------------------------------
+    # Promote whole tiles into threadgroup memory so the cooperative
+    # helpers stop round-tripping them through per-lane private structs
+    # (see ``_emit_tile_cholesky_smem``). Only meaningful in cooperative
+    # kernels, which are the ones dispatched with 32 lanes per tile —
+    # ``_coop_lane`` and the arena are declared by the coop prelude.
+    smem_tiles: dict[str, tuple[int, int, int, str]] = {}
+    smem_arena_floats = 0
+    if is_coop_kernel and _threadgroup_tiles_enabled():
+        # The by-value ``cholesky_coop`` path still needs its own scratch
+        # for any tile that stays private, so reserve that first.
+        smem_tiles, smem_arena_floats = _plan_smem_tiles(
+            forward_lines,
+            tile_var_dims,
+            tile_var_vec_n,
+            reserved_floats=pre_coop_chol_n * pre_coop_chol_n,
+        )
+
     # ---- Quaternion-typed locals --------------------------------------
     # Quats are stored as ``vec_t<4>``/``float4``, but ``wp::mul`` on two
     # quats is the Hamilton product — MSL's ``float4 * float4`` is
@@ -7704,6 +8089,7 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
             transpose_aliases,
             tile_var_vec_n,
             atomic_output_names,
+            smem_tiles,
         )
         # Inline subscripts that the address-collapse produced.
         translated = _substitute_subscripts(translated)
@@ -8602,10 +8988,25 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
         # cooperative load/store helpers reuse the same buffer
         # since their tiles are always ≤ ``coop_chol_n × coop_chol_n``
         # in any kernel that goes cooperative.
-        coop_prelude = [
-            f"    threadgroup float wp_tile_chol_smem[{coop_chol_n * coop_chol_n}];",
-            "    uint _coop_lane = thread_position_in_threadgroup.x;",
-        ]
+        coop_prelude = ["    uint _coop_lane = thread_position_in_threadgroup.x;"]
+        # ``wp_tile_chol_smem`` is the scratch the *by-value* cooperative
+        # helpers stage through. When every tile in the kernel became
+        # threadgroup-resident nothing references it, and declaring it
+        # anyway would waste N*N floats of the 32 KB threadgroup budget
+        # (which is what limits occupancy and caps the resident tile size).
+        if any("wp_tile_chol_smem" in ln for ln in body_lines):
+            coop_prelude.insert(0, f"    threadgroup float wp_tile_chol_smem[{coop_chol_n * coop_chol_n}];")
+        # Threadgroup-resident tiles live here for their whole lifetime
+        # instead of being copied in and out of per-lane private structs.
+        if smem_arena_floats > 0:
+            coop_prelude.insert(0, f"    threadgroup float {_SMEM_ARENA_NAME}[{smem_arena_floats}];")
+            # Their private declarations are now dead — and at 4.9 KB each
+            # they would still reserve scratch, which is the cost we are
+            # removing. ``_plan_smem_tiles`` proved nothing else reads them.
+            dead_decls = set()
+            for label, (_off, rows, cols, scalar) in smem_tiles.items():
+                dead_decls.add(f"    wp_tile_{rows}x{cols}_{scalar} var_{label};")
+            body_lines = [ln for ln in body_lines if ln not in dead_decls]
         body_lines = coop_prelude + body_lines
         # The launcher dispatches cooperative kernels with
         # ``grid=(32 * nworld, ...)`` and ``threadgroup=(32, 1, 1)``,
@@ -8875,7 +9276,7 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
 # closure-kernel instantiations previously collided (same kernel.key,
 # args, and IR statements; different baked ``const`` declarations).
 # v11: native packed arrays go bindless (``ptr_table`` / ``__arg_ptrs``).
-_ARTIFACT_CACHE_VERSION = 11
+_ARTIFACT_CACHE_VERSION = 12
 _codegen_source_hash_cached: str | None = None
 
 
@@ -8990,6 +9391,10 @@ def _artifact_cache_key(kernel, adj) -> str | None:
         # Native dispatch compiles prologue-free artifacts (outputs bind
         # in place); MLX artifacts carry init shadows. Never mix.
         f"native={bool(warp.config.metal_native_dispatch)}",
+        # Changes the emitted MSL (threadgroup-resident vs private tiles),
+        # so a cached artifact from the other setting must not be reused —
+        # this knob is an A/B switch and gets toggled between runs.
+        f"tgtiles={_threadgroup_tiles_enabled()}",
     ):
         h.update(part.encode("utf-8"))
         h.update(b"\x00")
