@@ -263,6 +263,27 @@ and is ≈30× faster on dispatch-bound workloads.
 Set before :func:`warp.init`. Requires ``pyobjc-framework-metal``.
 """
 
+metal_threadgroup_tiles: bool = _os.environ.get("WARP_METAL_THREADGROUP_TILES", "").strip().lower() not in (
+    "0",
+    "false",
+    "off",
+)
+"""Keep Warp tiles resident in Metal threadgroup memory.
+
+Defaults to ``True``; set the ``WARP_METAL_THREADGROUP_TILES`` environment
+variable to ``0`` to disable (an A/B kill switch).
+
+When ``True``, a tile whose every use is supported — produced by
+:func:`warp.tile_load` or :func:`warp.tile_cholesky`, consumed as
+``tile_cholesky``'s input, ``tile_cholesky_solve``'s factor, or
+:func:`warp.tile_store`'s source — lives in threadgroup memory for its whole
+lifetime instead of being copied through a per-thread private struct in each
+of the 32 cooperating lanes. At N=35 the private form costs 4.9 KB per lane
+(157 KB per threadgroup, which spills to device-backed scratch) and is ~23x
+slower. Any tile with an unsupported use keeps the private representation,
+so this only ever adds a fast path.
+"""
+
 disable_metal_solver_icb_capture: bool = False
 """Disable the mujoco_warp solver's MTLIndirectCommandBuffer fast path.
 

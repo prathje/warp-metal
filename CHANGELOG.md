@@ -6,6 +6,10 @@
 
 - Expose CUDA graph capture mode via `ScopedCapture` / `capture_begin()`
   ([GH-1410](https://github.com/NVIDIA/warp/issues/1410)).
+- Keep Warp tiles resident in Metal threadgroup memory across `tile_load`, `tile_cholesky`,
+  `tile_cholesky_solve`, and `tile_store` instead of copying them through a per-thread private struct in every
+  cooperating lane, up to ~23x faster for a 35x35 factorize-and-solve. Add `warp.config.metal_threadgroup_tiles`
+  (environment variable `WARP_METAL_THREADGROUP_TILES`) to disable it.
 
 ### Removed
 

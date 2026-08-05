@@ -3502,6 +3502,191 @@ class TestMetalLaunch(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet, timeout=180)
 
+    def test_tile_threadgroup_resident_is_used_and_matches_cpu(self):
+        # Threadgroup-resident tiles: the load -> cholesky -> solve ->
+        # store chain at the mujoco_warp G1 size (nv=35) should keep the
+        # tile in threadgroup memory for its whole lifetime rather than
+        # copying it through a 4.9 KB private struct in each of the 32
+        # cooperating lanes (~23x slower at scale).
+        #
+        # Asserts on the *emitted MSL* as well as the numbers, because a
+        # silent fallback to the private path would still be correct and
+        # would make this test pass on values alone.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            N = wp.constant(35)
+
+            @wp.kernel
+            def k(A: wp.array2d(dtype=wp.float32),
+                  y: wp.array(dtype=wp.float32),
+                  L_out: wp.array2d(dtype=wp.float32),
+                  x_out: wp.array(dtype=wp.float32)):
+                a = wp.tile_load(A, shape=(N, N), storage="shared")
+                rhs = wp.tile_load(y, shape=N, storage="shared")
+                L = wp.tile_cholesky(a)
+                x = wp.tile_cholesky_solve(L, rhs)
+                wp.tile_store(L_out, L)
+                wp.tile_store(x_out, x)
+
+            rng = np.random.default_rng(35)
+            M = rng.standard_normal((35, 35)).astype(np.float32)
+            A_h = (M @ M.T + 35.0 * np.eye(35, dtype=np.float32))
+            y_h = rng.standard_normal(35).astype(np.float32)
+            x_np = np.linalg.solve(A_h.astype(np.float64),
+                                   y_h.astype(np.float64)).astype(np.float32)
+            results = {}
+            for dev in ("cpu", "metal:0"):
+                A = wp.array(A_h, dtype=wp.float32, device=dev)
+                y = wp.array(y_h, dtype=wp.float32, device=dev)
+                Lo = wp.zeros((35, 35), dtype=wp.float32, device=dev)
+                xo = wp.zeros(35, dtype=wp.float32, device=dev)
+                wp.launch_tiled(k, dim=[1], inputs=[A, y], outputs=[Lo, xo],
+                                block_dim=1, device=dev)
+                results[dev] = (Lo.numpy(), xo.numpy())
+
+            Lm = results['metal:0'][0]
+            recon = Lm.astype(np.float64) @ Lm.T.astype(np.float64)
+            np.testing.assert_allclose(recon, A_h.astype(np.float64), atol=1e-4)
+            np.testing.assert_allclose(results['metal:0'][1], x_np, atol=1e-4)
+            np.testing.assert_allclose(results['cpu'][0], results['metal:0'][0], atol=1e-5)
+            np.testing.assert_allclose(results['cpu'][1], results['metal:0'][1], atol=1e-5)
+
+            # The tile must actually be threadgroup-resident.
+            src = k._metal_artifact.source + (k._metal_artifact.header or "")
+            assert "wp_tile_smem_arena" in src, "tile was not promoted to threadgroup memory"
+            assert "_cholesky_smem" in src, "factorization did not use the smem-resident helper"
+            assert "_cholesky_solve_smem_1" in src, "solve did not use the smem-resident helper"
+            # The 35x35 tile must no longer be materialized per lane --
+            # that 4.9 KB copy is the whole cost being removed. The 35x1
+            # RHS / result vectors legitimately stay private (35 floats
+            # each, far too small to spill).
+            assert "float c[1225]" not in src, "the 35x35 private tile struct is still materialized"
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=180)
+
+    def test_tile_threadgroup_resident_matches_private_path_bitwise(self):
+        # The threadgroup-resident path is an optimization behind
+        # ``wp.config.metal_threadgroup_tiles``, so it must not perturb
+        # results at all. The smem helpers reuse the by-value helpers'
+        # exact arithmetic (same fma order, same 1e-30 clamp, same
+        # precise::sqrt) specifically so this can be asserted bitwise.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            N = wp.constant(35)
+
+            # Two distinct kernel objects with identical bodies: each builds
+            # its own artifact on first launch, so toggling the flag between
+            # the two launches is what exercises both paths.
+            @wp.kernel
+            def k_on(A: wp.array2d(dtype=wp.float32),
+                     y: wp.array(dtype=wp.float32),
+                     L_out: wp.array2d(dtype=wp.float32),
+                     x_out: wp.array(dtype=wp.float32)):
+                a = wp.tile_load(A, shape=(N, N), storage="shared")
+                rhs = wp.tile_load(y, shape=N, storage="shared")
+                L = wp.tile_cholesky(a)
+                x = wp.tile_cholesky_solve(L, rhs)
+                wp.tile_store(L_out, L)
+                wp.tile_store(x_out, x)
+
+            @wp.kernel
+            def k_off(A: wp.array2d(dtype=wp.float32),
+                      y: wp.array(dtype=wp.float32),
+                      L_out: wp.array2d(dtype=wp.float32),
+                      x_out: wp.array(dtype=wp.float32)):
+                a = wp.tile_load(A, shape=(N, N), storage="shared")
+                rhs = wp.tile_load(y, shape=N, storage="shared")
+                L = wp.tile_cholesky(a)
+                x = wp.tile_cholesky_solve(L, rhs)
+                wp.tile_store(L_out, L)
+                wp.tile_store(x_out, x)
+
+            rng = np.random.default_rng(7)
+            M = rng.standard_normal((35, 35)).astype(np.float32)
+            A_h = (M @ M.T + 35.0 * np.eye(35, dtype=np.float32))
+            y_h = rng.standard_normal(35).astype(np.float32)
+
+            def run(enabled):
+                wp.config.metal_threadgroup_tiles = enabled
+                k = k_on if enabled else k_off
+                A = wp.array(A_h, dtype=wp.float32, device="metal:0")
+                y = wp.array(y_h, dtype=wp.float32, device="metal:0")
+                Lo = wp.zeros((35, 35), dtype=wp.float32, device="metal:0")
+                xo = wp.zeros(35, dtype=wp.float32, device="metal:0")
+                wp.launch_tiled(k, dim=[1], inputs=[A, y], outputs=[Lo, xo],
+                                block_dim=1, device="metal:0")
+                src = k._metal_artifact.source + (k._metal_artifact.header or "")
+                return Lo.numpy(), xo.numpy(), src
+
+            L_on, x_on, src_on = run(True)
+            L_off, x_off, src_off = run(False)
+
+            # Confirm the two runs really took different paths, else the
+            # bitwise comparison below would be vacuous.
+            assert "wp_tile_smem_arena" in src_on, "resident path not taken with flag on"
+            assert "wp_tile_smem_arena" not in src_off, "resident path taken with flag off"
+            assert "_cholesky_coop" in src_off, "flag off did not use the by-value coop helper"
+
+            np.testing.assert_array_equal(L_on, L_off)
+            np.testing.assert_array_equal(x_on, x_off)
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=180)
+
+    def test_tile_live_after_cholesky_not_promoted(self):
+        # The resident factor aliases the loaded tile's storage, so the
+        # factorization runs *in place*. That is only sound when the input
+        # is dead afterwards. Here the input is stored too, so it is still
+        # live past the cholesky and promotion must be declined -- if the
+        # liveness guard in ``_plan_smem_tiles`` regressed, ``A_out`` would
+        # come back holding the factor instead of the original matrix.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            N = wp.constant(32)
+
+            @wp.kernel
+            def k(A: wp.array2d(dtype=wp.float32),
+                  A_out: wp.array2d(dtype=wp.float32),
+                  L_out: wp.array2d(dtype=wp.float32)):
+                a = wp.tile_load(A, shape=(N, N), storage="shared")
+                L = wp.tile_cholesky(a)
+                wp.tile_store(L_out, L)
+                wp.tile_store(A_out, a)
+
+            rng = np.random.default_rng(3)
+            M = rng.standard_normal((32, 32)).astype(np.float32)
+            A_h = (M @ M.T + 32.0 * np.eye(32, dtype=np.float32))
+            results = {}
+            for dev in ("cpu", "metal:0"):
+                A = wp.array(A_h, dtype=wp.float32, device=dev)
+                Ao = wp.zeros((32, 32), dtype=wp.float32, device=dev)
+                Lo = wp.zeros((32, 32), dtype=wp.float32, device=dev)
+                wp.launch_tiled(k, dim=[1], inputs=[A], outputs=[Ao, Lo],
+                                block_dim=1, device=dev)
+                results[dev] = (Ao.numpy(), Lo.numpy())
+
+            # The still-live input must survive unmodified.
+            np.testing.assert_array_equal(results['metal:0'][0], A_h)
+            np.testing.assert_allclose(results['cpu'][0], results['metal:0'][0], atol=1e-5)
+            np.testing.assert_allclose(results['cpu'][1], results['metal:0'][1], atol=1e-5)
+            # 32x32 = 1024 floats; the private struct must still be there.
+            src = k._metal_artifact.source + (k._metal_artifact.header or "")
+            assert "float c[1024]" in src, "expected the private tile struct to survive"
+            assert "wp_tile_smem_arena" not in src, "promoted a tile that is live after the cholesky"
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=180)
+
     def test_three_tile_cholesky_inplace_calls_match_cpu(self):
         # Regression for the Metal-compiler inline bug: when the
         # ``cholesky_inplace`` (or ``lower_solve_inplace`` /
