@@ -7305,6 +7305,74 @@ class TestMetalBvhMesh(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet, timeout=180)
 
+    def test_query_iterator_for_loops_match_cpu(self):
+        # Python-style ``for x in <query>`` iteration (Warp's iter_cmp /
+        # iter_next protocol) over mesh_query_aabb — including a mid-loop
+        # ``break``, a nested ``if``, and an iterator loop inside a
+        # ``@wp.func`` helper (the inliner folds function bodies
+        # separately from the kernel body). BvhQuery registers no
+        # ``iter_next`` overload upstream, so only mesh (and, once
+        # ported, hash-grid) queries are iterable — same as CUDA.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            if not wp.config.metal_native_dispatch:
+                raise SystemExit(0)  # Bvh/Mesh are native-dispatch-only on Metal
+
+            rng = np.random.default_rng(7)
+            N = 48
+            pts_np = rng.uniform(-3.0, 3.0, size=(N * 3, 3)).astype(np.float32)
+            idx_np = np.arange(N * 3, dtype=np.int32)
+            NQ = 32
+            q_lo = rng.uniform(-4.0, 3.0, size=(NQ, 3)).astype(np.float32)
+            q_hi = q_lo + rng.uniform(0.3, 2.5, size=(NQ, 3)).astype(np.float32)
+
+            @wp.func
+            def count_mesh_hits(mesh: wp.uint64, lo: wp.vec3, hi: wp.vec3) -> int:
+                n = int(0)
+                for f in wp.mesh_query_aabb(mesh, lo, hi):
+                    if f >= 0:
+                        n += 1
+                return n
+
+            @wp.kernel
+            def it_mesh(mesh: wp.uint64, lo: wp.array(dtype=wp.vec3), hi: wp.array(dtype=wp.vec3),
+                        mask: wp.array2d(dtype=wp.int32), counts: wp.array(dtype=wp.int32),
+                        first: wp.array(dtype=wp.int32)):
+                tid = wp.tid()
+                for f in wp.mesh_query_aabb(mesh, lo[tid], hi[tid]):
+                    mask[tid, f] = 1
+                counts[tid] = count_mesh_hits(mesh, lo[tid], hi[tid])
+                # mid-loop break: record only the first visited face
+                for f in wp.mesh_query_aabb(mesh, lo[tid], hi[tid]):
+                    first[tid] = f
+                    break
+
+            outs = {}
+            for dev in ('cpu', 'metal:0'):
+                with wp.ScopedDevice(dev):
+                    mesh = wp.Mesh(points=wp.array(pts_np, dtype=wp.vec3),
+                                   indices=wp.array(idx_np, dtype=wp.int32))
+                    mask = wp.zeros((NQ, N * 3), dtype=wp.int32)
+                    counts = wp.zeros(NQ, dtype=wp.int32)
+                    first = wp.full(NQ, -2, dtype=wp.int32)
+                    wp.launch(it_mesh, dim=NQ,
+                              inputs=[mesh.id, wp.array(q_lo, dtype=wp.vec3), wp.array(q_hi, dtype=wp.vec3)],
+                              outputs=[mask, counts, first])
+                    wp.synchronize_device()
+                    outs[dev] = (mask.numpy().copy(), counts.numpy().copy(), first.numpy().copy())
+            np.testing.assert_array_equal(outs['cpu'][0], outs['metal:0'][0])
+            np.testing.assert_array_equal(outs['cpu'][1], outs['metal:0'][1])
+            # visitation order is traversal-defined but both sides use the
+            # same host-built SAH tree, so the first hit matches exactly
+            np.testing.assert_array_equal(outs['cpu'][2], outs['metal:0'][2])
+            # iterator counts must agree with the mask row sums
+            np.testing.assert_array_equal(outs['metal:0'][1], outs['metal:0'][0].sum(axis=1))
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=180)
+
     def test_mesh_query_point_family_matches_cpu(self):
         # Closest-point queries (signed via ray-parity / multi-sample
         # parity / angle-weighted normals, unsigned, furthest),

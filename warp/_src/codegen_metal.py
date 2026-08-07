@@ -133,6 +133,7 @@ from warp._src.codegen_metal_ast import fold_multidim_atomics as _ast_fold_multi
 from warp._src.codegen_metal_ast import fold_views as _ast_fold_views
 from warp._src.codegen_metal_ast import inline_user_calls as _ast_inline
 from warp._src.codegen_metal_ast import parse as _ast_parse
+from warp._src.codegen_metal_ast import query_iterator_vars as _ast_query_iterator_vars
 
 if TYPE_CHECKING:
     pass
@@ -1977,6 +1978,16 @@ inline bool wp_bvh_query_next(thread wp_bvh_query_t& query, thread int& index, f
     }
     return false;
 }
+// Python-style ``for x in query`` iterator protocol, matching the native
+// iter_cmp / iter_next over bvh_query_t / mesh_query_aabb_t (both are the
+// unified wp_bvh_query_t here): iter_cmp ADVANCES the query — storing the
+// hit in ``bounds_nr`` exactly as wp_bvh_query_next does — and returns
+// whether an item was found; iter_next reads the stored hit back.
+inline bool wp_iter_cmp(thread wp_bvh_query_t& query) {
+    int index = -1;
+    return wp_bvh_query_next(query, index, FLT_MAX);
+}
+inline int wp_iter_next(thread wp_bvh_query_t& query) { return query.bounds_nr; }
 inline int wp_bvh_ray_max_dim(float3 a) {
     float x = metal::abs(a.x);
     float y = metal::abs(a.y);
@@ -7489,7 +7500,7 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
             _early_vec_arr_info[arg.label] = v_info
 
     _ast_nodes = _ast_parse(adj.blocks[0].body_forward)
-    _ast_nodes, _struct_skip = _ast_fold(_ast_nodes)
+    _ast_nodes, _struct_skip = _ast_fold(_ast_nodes, query_iter_vars=_ast_query_iterator_vars(adj))
     # Inline ``@wp.func`` user-function calls into the kernel body before
     # the view / indexref / drop folds run, so those folds see the spliced-
     # in writes (otherwise kernels that write outputs only via helper
