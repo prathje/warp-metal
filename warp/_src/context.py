@@ -10619,7 +10619,7 @@ def copy(
             # FIXME: We can't use a temporary CPU allocation during graph capture,
             # because launching the graph will crash after the allocation is
             # garbage-collected.
-            if src.device.is_cpu and stream.is_capturing:
+            if src.device.is_cpu and stream is not None and stream.is_capturing:
                 raise RuntimeError("Failed to allocate a CPU staging buffer during graph capture")
             # This involves an allocation and a kernel launch, which must run on the source device.
             if src.device.is_cuda and stream != src.device.stream:
@@ -10635,7 +10635,7 @@ def copy(
             # FIXME: We can't use a temporary CPU allocation during graph capture,
             # because launching the graph will crash after the allocation is
             # garbage-collected.
-            if dest.device.is_cpu and stream.is_capturing:
+            if dest.device.is_cpu and stream is not None and stream.is_capturing:
                 raise RuntimeError("Failed to allocate a CPU staging buffer during graph capture")
             # The allocation must run on the destination device
             if dest.device.is_cuda and stream != dest.device.stream:
