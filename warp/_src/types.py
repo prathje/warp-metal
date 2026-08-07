@@ -6508,6 +6508,12 @@ class Volume:
             return
         self.device = data.device
 
+        if getattr(self.device, "is_metal", False):
+            raise RuntimeError(
+                "wp.Volume is not supported on Metal devices yet. "
+                "Create the volume on the 'cpu' device to sample it with CPU kernels."
+            )
+
         owner = False
         if self.device.is_cpu:
             self.id = self.runtime.core.wp_volume_create_host(
@@ -8113,6 +8119,12 @@ class HashGrid:
             raise TypeError("HashGrid dimensions must be integers") from e
 
         self._validate_cell_count(self._dim_x, self._dim_y, self._dim_z)
+
+        if getattr(self.device, "is_metal", False):
+            raise RuntimeError(
+                "wp.HashGrid is not supported on Metal devices yet. "
+                "Create the grid on the 'cpu' device to query it with CPU kernels."
+            )
 
         if self.device.is_cpu:
             self.id = self._native_func("create")(self._type_id, self._dim_x, self._dim_y, self._dim_z)
