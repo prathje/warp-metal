@@ -9020,6 +9020,9 @@ def synchronize():
         # restore the original context to avoid side effects
         runtime.core.wp_cuda_context_set_current(saved_context)
 
+    for device in runtime.metal_devices:
+        synchronize_device(device)
+
 
 def synchronize_device(device: DeviceLike = None):
     """Synchronize the calling CPU thread with any outstanding CUDA work on the specified device
