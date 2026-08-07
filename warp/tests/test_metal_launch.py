@@ -5846,6 +5846,27 @@ class TestMetalArrayViews(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet)
 
+    def test_non_contiguous_host_to_metal_copy(self):
+        # wp.copy's cross-device staging path assumed a CUDA stream exists
+        # whenever src/dest live on different devices; on Metal the stream is
+        # None and constructing a wp.array from a non-contiguous NumPy view
+        # raised AttributeError (GH: found via example_tile_mlp).
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+            import warp as wp
+
+            with wp.ScopedDevice('metal:0'):
+                src = np.arange(12, dtype=np.float32).reshape(3, 4).T  # non-contiguous view
+                a = wp.array(src, dtype=float)
+                np.testing.assert_array_equal(a.numpy(), src)
+
+                b = wp.array(np.arange(12, dtype=np.float32).reshape(3, 4), dtype=float)
+                np.testing.assert_array_equal(b.transpose().contiguous().numpy(), b.numpy().T)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
 
 @unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
 @unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
