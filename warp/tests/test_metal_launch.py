@@ -6249,6 +6249,206 @@ class TestMetalUnsupportedFeaturesRaise(unittest.TestCase):
 
 @unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
 @unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
+class TestMetalCoopTiles(unittest.TestCase):
+    """Distributed cooperative register tiles: eligible launch-tiled
+    kernels build their IR at the honest block_dim and dispatch one
+    32-lane threadgroup per block. ``wp.tile()`` register tiles hold one
+    element per lane; ``tile_reduce`` lowers to ``simd_*`` reductions."""
+
+    def test_linesearch_pattern_matches_cpu(self):
+        # The mujoco_warp ``linesearch_iterative`` shape: strided loops
+        # partitioned by wp.block_dim(), vec3/mat33/scalar accumulators
+        # packed with wp.tile() and cross-lane tile_reduce.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            @wp.kernel
+            def ls_like(vals: wp.array2d(dtype=wp.vec3), nefc: wp.array(dtype=wp.int32),
+                        out: wp.array(dtype=wp.vec3), outm: wp.array(dtype=wp.mat33),
+                        outs: wp.array(dtype=wp.float32)):
+                worldid, tid = wp.tid()
+                n = nefc[worldid]
+                acc = wp.vec3(0.0)
+                accm = wp.mat33(0.0)
+                smin = float(1.0e30)
+                for i in range(tid, n, wp.block_dim()):
+                    v = vals[worldid, i]
+                    acc += v
+                    accm += wp.outer(v, v)
+                    smin = wp.min(smin, wp.length_sq(v))
+                t = wp.tile(acc, preserve_type=True)
+                tot = wp.tile_reduce(wp.add, t)
+                tm = wp.tile(accm, preserve_type=True)
+                totm = wp.tile_reduce(wp.add, tm)
+                ts = wp.tile(smin)
+                tsmin = wp.tile_reduce(wp.min, ts)
+                if tid == 0:
+                    out[worldid] = tot[0]
+                    outm[worldid] = totm[0]
+                    outs[worldid] = tsmin[0]
+
+            def run(dev):
+                rng = np.random.default_rng(7)
+                nworld, maxn = 5, 101
+                vals_np = rng.standard_normal((nworld, maxn, 3)).astype(np.float32)
+                nefc_np = np.array([101, 64, 1, 33, 97], np.int32)
+                vals = wp.array(vals_np, dtype=wp.vec3, device=dev)
+                nefc = wp.array(nefc_np, device=dev)
+                out = wp.zeros(nworld, dtype=wp.vec3, device=dev)
+                outm = wp.zeros(nworld, dtype=wp.mat33, device=dev)
+                outs = wp.zeros(nworld, dtype=wp.float32, device=dev)
+                wp.launch_tiled(ls_like, dim=nworld, inputs=[vals, nefc],
+                                outputs=[out, outm, outs], device=dev, block_dim=32)
+                wp.synchronize_device(dev)
+                return out.numpy(), outm.numpy(), outs.numpy()
+
+            o_c, om_c, os_c = run('cpu')
+            o_m, om_m, os_m = run('metal:0')
+            np.testing.assert_allclose(o_m, o_c, rtol=1e-5, atol=1e-5)
+            np.testing.assert_allclose(om_m, om_c, rtol=1e-4, atol=1e-4)
+            np.testing.assert_allclose(os_m, os_c, rtol=1e-6, atol=1e-6)
+            art = ls_like._metal_artifact
+            assert art.coop_block_n == 32, art.coop_block_n
+            assert 'simd_sum' in art.source and 'simd_min' in art.source
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
+    def test_strided_atomic_runs_real_lanes(self):
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            @wp.kernel
+            def strided_atomic(vals: wp.array2d(dtype=wp.float32), n: int,
+                               out: wp.array(dtype=wp.float32)):
+                wid, tid = wp.tid()
+                for i in range(tid, n, wp.block_dim()):
+                    wp.atomic_add(out, wid, vals[wid, i])
+
+            rng = np.random.default_rng(3)
+            vals_np = rng.standard_normal((4, 77)).astype(np.float32)
+            vals = wp.array(vals_np, device='metal:0')
+            out = wp.zeros(4, dtype=wp.float32, device='metal:0')
+            wp.launch_tiled(strided_atomic, dim=4, inputs=[vals, 77], outputs=[out],
+                            device='metal:0', block_dim=32)
+            wp.synchronize_device('metal:0')
+            np.testing.assert_allclose(out.numpy(), vals_np.sum(axis=1), rtol=1e-4, atol=1e-4)
+            assert strided_atomic._metal_artifact.coop_block_n == 32
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
+    def test_unsupported_tile_op_keeps_serial_path(self):
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            @wp.kernel
+            def uses_load(a: wp.array2d(dtype=wp.float32), out: wp.array2d(dtype=wp.float32)):
+                wid, tid = wp.tid()
+                t = wp.tile_load(a[wid], shape=(8,))
+                s = wp.tile_reduce(wp.add, t)
+                if tid == 0:
+                    out[wid, 0] = s[0]
+
+            a = wp.array(np.arange(16, dtype=np.float32).reshape(2, 8), device='metal:0')
+            out = wp.zeros((2, 1), dtype=wp.float32, device='metal:0')
+            wp.launch_tiled(uses_load, dim=2, inputs=[a], outputs=[out],
+                            device='metal:0', block_dim=32)
+            np.testing.assert_allclose(out.numpy()[:, 0], [28.0, 92.0])
+            assert uses_load._metal_artifact.coop_block_n == 0
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
+
+@unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
+@unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
+class TestMetalInplaceOutputs(unittest.TestCase):
+    """MLX-path partial-writer kernels (top-level early return) write
+    their outputs in place through const-cast input aliases; unwritten
+    elements must keep their previous values, matching CUDA. The
+    regression this guards: an early-return kernel whose outputs were
+    neither seedable nor written copied stale MLX pool bytes over shared
+    arrays (mujoco_warp's ``_efc_contact_update`` wiping friction and
+    equality ``efc`` rows in contact-free scenes)."""
+
+    def test_partial_writer_preserves_unwritten_rows(self):
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            @wp.kernel
+            def partial(sel_worldid_in: wp.array(dtype=wp.int32),
+                        a: wp.array(dtype=wp.float32), b: wp.array(dtype=wp.float32),
+                        c: wp.array(dtype=wp.int32), d: wp.array(dtype=wp.float32),
+                        e: wp.array(dtype=wp.float32), f: wp.array(dtype=wp.float32),
+                        g: wp.array(dtype=wp.float32), h: wp.array(dtype=wp.int32)):
+                i = wp.tid()
+                if sel_worldid_in[i] == 0:
+                    return
+                a[i] = 1.0
+                b[i] = 2.0
+                c[i] = 3
+                d[i] = 4.0
+                e[i] = 5.0
+                f[i] = 6.0
+                g[i] = 7.0
+                h[i] = 8
+
+            dev = 'metal:0'
+            n = 8
+            sel = wp.array(np.array([0, 1, 0, 1, 0, 0, 1, 0], np.int32), device=dev)
+            fl = [wp.array(np.full(n, 100.0 + k, np.float32), device=dev) for k in range(6)]
+            ci = wp.array(np.full(n, -7, np.int32), device=dev)
+            hi = wp.array(np.full(n, -9, np.int32), device=dev)
+            outs = [fl[0], fl[1], ci, fl[2], fl[3], fl[4], fl[5], hi]
+            wp.launch(partial, dim=n, inputs=[sel], outputs=outs, device=dev)
+            wp.synchronize_device(dev)
+            m = np.array([0, 1, 0, 1, 0, 0, 1, 0], bool)
+            for arr, wr, keep in ((fl[0], 1.0, 100.0), (fl[1], 2.0, 101.0), (ci, 3, -7),
+                                  (fl[2], 4.0, 102.0), (fl[3], 5.0, 103.0), (fl[4], 6.0, 104.0),
+                                  (fl[5], 7.0, 105.0), (hi, 8, -9)):
+                got = arr.numpy()
+                np.testing.assert_allclose(got[m], wr)
+                np.testing.assert_allclose(got[~m], keep)
+            if not wp.config.metal_native_dispatch:
+                assert partial._metal_artifact.inplace_arrays, 'expected the in-place path'
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
+    def test_small_array_staged_roundtrip(self):
+        # Arrays under MLX's 32-byte setBytes threshold go through a
+        # padded staging buffer with host-side pre-seed.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            @wp.kernel
+            def bump(sel_worldid_in: wp.array(dtype=wp.int32), tiny: wp.array(dtype=wp.float32)):
+                i = wp.tid()
+                if sel_worldid_in[i] == 0:
+                    return
+                tiny[i] = 42.0
+
+            dev = 'metal:0'
+            sel = wp.array(np.array([0, 1, 0], np.int32), device=dev)
+            tiny = wp.array(np.array([1.0, 2.0, 3.0], np.float32), device=dev)
+            wp.launch(bump, dim=3, inputs=[sel], outputs=[tiny], device=dev)
+            wp.synchronize_device(dev)
+            np.testing.assert_allclose(tiny.numpy(), [1.0, 42.0, 3.0])
+            if not wp.config.metal_native_dispatch:
+                assert bump._metal_artifact.inplace_arrays == ('tiny',)
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
+
+@unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
+@unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
 class TestMetalConstBufferCache(unittest.TestCase):
     """The native launcher caches constant per-launch buffers (packed
     shapes, struct args) keyed on their contents. Repeated launches must
