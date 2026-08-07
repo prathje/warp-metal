@@ -8495,6 +8495,21 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
                 if finfo.kind == _STRUCT_FIELD_KIND_SCALAR:
                     slot = f"{buf}[{base_expr}]"
                     writes.append(f"{indent}{slot} = {_slot_rhs(slot, value)};")
+                elif finfo.kind == _STRUCT_FIELD_KIND_SCALAR64:
+                    # Split the 64-bit value across two 4-byte slots
+                    # (little-endian: low word first). The temp is required:
+                    # compound ops read-modify-write through the field's
+                    # read expr, and the first slot write would corrupt a
+                    # re-evaluated read.
+                    full = value
+                    if op != "=":
+                        read = _struct_field_read_expr(buf, base_expr, finfo)
+                        full = f"({read} {op[:-1]} ({value}))"
+                    writes.append(
+                        f"{indent}{{ ulong _wp_s64 = ulong({full}); "
+                        f"{buf}[{base_expr}] = as_type<float>(uint(_wp_s64 & 0xffffffffull)); "
+                        f"{buf}[({base_expr}) + 1] = as_type<float>(uint(_wp_s64 >> 32)); }}"
+                    )
                 elif finfo.kind == _STRUCT_FIELD_KIND_VEC:
                     for k in range(finfo.size):
                         slot = f"{buf}[({base_expr}) + {k}]"
@@ -8674,6 +8689,19 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
                         if finfo.kind == _STRUCT_FIELD_KIND_SCALAR:
                             body_lines.append(
                                 _finalize(_emit_scalar_write(f"{base} + {off}", _struct_bitcast_write(src, cast)))
+                            )
+                        elif finfo.kind == _STRUCT_FIELD_KIND_SCALAR64:
+                            body_lines.append(
+                                _finalize(
+                                    _emit_scalar_write(
+                                        f"{base} + {off}", f"as_type<float>(uint(ulong({src}) & 0xffffffffull))"
+                                    )
+                                )
+                            )
+                            body_lines.append(
+                                _finalize(
+                                    _emit_scalar_write(f"{base} + {off} + 1", f"as_type<float>(uint(ulong({src}) >> 32))")
+                                )
                             )
                         elif finfo.kind == _STRUCT_FIELD_KIND_VEC:
                             for k in range(finfo.size):
@@ -8932,7 +8960,8 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
             #   struct -> (*shape, scalars)
             # So the per-world stride uses one extra dim beyond ``ndim``
             # for any non-scalar element type — *not* two for mats.
-            inner_extra = 1 if (v_info is not None or m_info is not None) else 0
+            s_info = _struct_dtype_info(arg_var)
+            inner_extra = 1 if (v_info is not None or m_info is not None or s_info is not None) else 0
             stride_terms = [f"{out_name}_shape[{k}]" for k in range(1, ndim + inner_extra)]
             stride_expr = " * ".join(stride_terms) if stride_terms else "1"
             if use_packed_init_shadows:
@@ -9800,6 +9829,7 @@ def _mat_dtype_info(arg) -> tuple[int, int, str] | None:
 # values into arrays. Those raise ``MetalCodegenError``.
 
 _STRUCT_FIELD_KIND_SCALAR = "scalar"
+_STRUCT_FIELD_KIND_SCALAR64 = "scalar64"
 _STRUCT_FIELD_KIND_VEC = "vec"
 _STRUCT_FIELD_KIND_MAT = "mat"
 _STRUCT_FIELD_KIND_STRUCT = "struct"
@@ -9913,6 +9943,13 @@ def _classify_struct_field(fname: str, ftype) -> _StructFieldInfo:
             f"MSL codegen does not yet support struct field {fname!r} of type {ftype!r} "
             f"(no MSL scalar mapping for {scalar_ctype})"
         )
+    if msl in ("long", "ulong"):
+        # 64-bit integer field (e.g. a BVH/Mesh id): occupies two 4-byte
+        # slots in the flat float32 view; reads/writes reassemble/split
+        # the value with 32-bit bitcasts (little-endian: low word first).
+        return _StructFieldInfo(
+            name=fname, offset=0, size=2, kind=_STRUCT_FIELD_KIND_SCALAR64, msl_type=msl, scalar_msl=msl
+        )
     if msl not in _STRUCT_SCALAR_MSL_4BYTE:
         raise MetalCodegenError(
             f"MSL codegen: struct field {fname!r} of type {ftype!r} is not 4 bytes — struct "
@@ -9922,15 +9959,31 @@ def _classify_struct_field(fname: str, ftype) -> _StructFieldInfo:
 
 
 def _struct_layout_for(struct_cls) -> _StructLayout:
-    """Build a ``_StructLayout`` for a Warp ``Struct`` instance."""
+    """Build a ``_StructLayout`` for a Warp ``Struct`` instance.
+
+    Field offsets come from the real ctypes layout (the launcher serialises
+    ``bytes(struct._ctype)``), so alignment padding — e.g. before an
+    8-byte-aligned uint64 field — is accounted for. Every leaf is 4- or
+    8-byte, so all offsets and the total size are multiples of 4.
+    """
+    import ctypes  # noqa: PLC0415
+
     layout = _StructLayout(name=getattr(struct_cls, "key", "anonymous_struct"))
-    offset = 0
+    ctype = getattr(struct_cls, "ctype", None)
     for fname, fvar in getattr(struct_cls, "vars", {}).items():
         finfo = _classify_struct_field(fname, fvar.type)
-        finfo.offset = offset
+        byte_off = getattr(ctype, fname).offset if ctype is not None else None
+        if byte_off is None or byte_off % 4 != 0:
+            raise MetalCodegenError(
+                f"MSL codegen: struct field {fname!r} of {layout.name!r} has byte offset "
+                f"{byte_off} — flat float32 struct storage needs 4-byte-aligned fields"
+            )
+        finfo.offset = byte_off // 4
         layout.fields[fname] = finfo
-        offset += finfo.size
-    layout.scalars_per_elem = offset
+    total = ctypes.sizeof(ctype) if ctype is not None else 0
+    if total % 4 != 0:
+        raise MetalCodegenError(f"MSL codegen: struct {layout.name!r} has size {total}, not a multiple of 4")
+    layout.scalars_per_elem = total // 4
     return layout
 
 
@@ -9969,6 +10022,11 @@ def _struct_field_read_expr(buf: str, base_expr: str, finfo: _StructFieldInfo) -
     offset already folded in by the caller)."""
     if finfo.kind == _STRUCT_FIELD_KIND_SCALAR:
         return _struct_bitcast_read(f"{buf}[{base_expr}]", finfo.scalar_msl)
+    if finfo.kind == _STRUCT_FIELD_KIND_SCALAR64:
+        lo = f"as_type<uint>({buf}[{base_expr}])"
+        hi = f"as_type<uint>({buf}[({base_expr}) + 1])"
+        bits = f"((ulong({hi}) << 32) | ulong({lo}))"
+        return bits if finfo.scalar_msl == "ulong" else f"as_type<{finfo.scalar_msl}>({bits})"
     if finfo.kind == _STRUCT_FIELD_KIND_VEC:
         comps = [_struct_bitcast_read(f"{buf}[({base_expr}) + {k}]", finfo.scalar_msl) for k in range(finfo.size)]
         ctor = finfo.msl_type if finfo.size in _MSL_VEC_NATIVE_N else f"{finfo.msl_type}_make"
