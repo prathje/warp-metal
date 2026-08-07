@@ -1130,6 +1130,11 @@ class MetalDispatcher:
             cb.waitUntilCompleted()
         self._pending_commits = []
 
+    def has_pending_work(self) -> bool:
+        """Return ``True`` if any recorded-but-unsynced GPU work exists
+        (an open command buffer or committed-but-undrained buffers)."""
+        return self._cmd_buf is not None or bool(self._pending_commits)
+
     # ------------------------------------------------------------------
     # Indirect-command-buffer graph capture & replay
     # ------------------------------------------------------------------
