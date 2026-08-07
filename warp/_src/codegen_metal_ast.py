@@ -683,17 +683,126 @@ def _leading_indent(s: str) -> str:
     return m.group(1) if m else ""
 
 
-def fold(nodes: list[Node]) -> tuple[list[Node], set[str]]:
+def fold(nodes: list[Node], query_iter_vars: dict[str, str] | None = None) -> tuple[list[Node], set[str]]:
     """Fold for/while/if patterns into structured nodes.
 
     Returns ``(folded_nodes, vars_to_skip_decl)`` where the second value
     lists the local labels whose top-level declaration must be suppressed
     (the ``wp::range_t`` iterator object and the for-loop induction
     variable, both of which the synthetic ``for`` line declares inline).
+
+    ``query_iter_vars`` maps local labels of spatial-query-typed iterator
+    objects to their ctype (see :func:`query_iterator_vars`); it lets the
+    fold recognize Python-style ``for x in <query>`` loops, which share
+    the label / ``iter_cmp`` / ``iter_next`` shape with ``range`` loops
+    but iterate an opaque query object instead of a ``wp::range_t``.
     """
     skip: set[str] = set()
-    folded, _ = _fold_range(nodes, 0, len(nodes), end_label=None, skip=skip)
+    folded, _ = _fold_range(nodes, 0, len(nodes), end_label=None, skip=skip, query_iter_vars=query_iter_vars)
     return folded, skip
+
+
+# Query-object ctypes whose Python-style iterator protocol the MSL header
+# implements (``wp_iter_cmp`` / ``wp_iter_next`` over the unified
+# ``wp_bvh_query_t``). ``hash_grid_query_t`` is recognized separately so
+# the fold can raise a targeted unsupported-type error instead of the
+# generic remaining-intrinsic one.
+_ITER_QUERY_SUPPORTED_CTYPES = frozenset({"wp::bvh_query_t", "wp::mesh_query_aabb_t"})
+
+_ITER_NEXT_LINE = re.compile(r"^\s*var_(\w+)\s*=\s*wp::iter_next\s*\(\s*var_(\w+)\s*\)\s*;\s*$")
+
+
+def query_iterator_vars(adj, subs: dict[str, str] | None = None) -> dict[str, str]:
+    """Map local labels of query-typed iterator objects to their ctype.
+
+    Feeds :func:`fold`'s ``query_iter_vars`` — the iterator object's IR
+    type is what tells the fold whether the MSL header's ``wp_iter_cmp``
+    / ``wp_iter_next`` protocol applies to a ``for x in <iter>`` loop.
+    ``subs`` is the inliner's substitution map; when given, labels are
+    translated to their post-inline (mangled or caller-bound) names.
+    """
+    out: dict[str, str] = {}
+    for var in list(getattr(adj, "args", ())) + list(adj.variables):
+        try:
+            ctype = var.ctype()
+        except Exception:
+            continue
+        if ctype not in _ITER_QUERY_SUPPORTED_CTYPES and not ctype.startswith("wp::hash_grid_query_t"):
+            continue
+        name = f"var_{var.label}"
+        if subs is not None:
+            name = subs.get(name, name)
+        if name.startswith("var_"):
+            out[name[len("var_") :]] = ctype
+    return out
+
+
+def _try_fold_query_for(
+    nodes: list[Node],
+    i: int,
+    end: int,
+    skip: set[str],
+    query_iter_vars: dict[str, str] | None,
+) -> tuple[While, int] | None:
+    """Fold the 3-line iterator opener over a spatial query object.
+
+    Python's ``for f in wp.mesh_query_aabb(...)`` lowers to the same
+    label / ``iter_cmp`` / ``iter_next`` shape as ``range`` loops, but the
+    iterator is constructed by an ordinary preceding assignment (any
+    expression) rather than a ``wp::range`` call, so ``_match_for_opener``
+    doesn't claim it. Native semantics: ``iter_cmp`` ADVANCES the query
+    and returns whether an item was found; ``iter_next`` reads the stored
+    hit back. The loop therefore lowers to the exact goto semantics as a
+    ``While`` whose body leads with two raw MSL lines:
+
+        while (true) {
+            if (!wp_iter_cmp(var_Q)) { break; }
+            var_Y = wp_iter_next(var_Q);
+            ...
+        }
+
+    ``continue`` inside the body returns to the condition, which advances
+    the query — identical to ``goto start_for_K`` in the flat IR.
+
+    Returns ``(while_node, next_index)`` or ``None`` when the shape does
+    not match. Raises for recognized-but-unsupported iterator types
+    (``hash_grid_query_t``) so the user gets a targeted message.
+    """
+    if not query_iter_vars or i + 2 >= end:
+        return None
+    n0 = nodes[i]
+    if not isinstance(n0, Label) or not n0.name.startswith("start_for_"):
+        return None
+    k_suffix = n0.name[len("start_for_") :]
+    n1 = nodes[i + 1]
+    if not isinstance(n1, ForIterCmp) or n1.end_label != f"end_for_{k_suffix}":
+        return None
+    n2 = nodes[i + 2]
+    if not isinstance(n2, Assign):
+        return None
+    m = _ITER_NEXT_LINE.match(n2.raw)
+    if m is None or m.group(2) != n1.iter_var:
+        return None
+    query_var = n1.iter_var
+    ctype = query_iter_vars.get(query_var)
+    if ctype is None:
+        return None
+    if ctype not in _ITER_QUERY_SUPPORTED_CTYPES:
+        from warp._src.codegen_metal import MetalCodegenError  # noqa: PLC0415
+
+        raise MetalCodegenError(f"MSL codegen: 'for ... in' iteration over {ctype!r} is not supported on Metal yet")
+    iter_var = m.group(1)
+    body_nodes, after = _fold_range(
+        nodes, i + 3, end, end_label=f"end_for_{k_suffix}", skip=skip, query_iter_vars=query_iter_vars
+    )
+    body_nodes = _drop_goto(body_nodes, f"start_for_{k_suffix}", end_target=f"end_for_{k_suffix}")
+    if body_nodes and isinstance(body_nodes[-1], Continue):
+        body_nodes = body_nodes[:-1]
+    pre = (
+        _RawLine(raw=f"if (!wp_iter_cmp(var_{query_var})) {{ break; }}"),
+        _RawLine(raw=f"var_{iter_var} = wp_iter_next(var_{query_var});"),
+    )
+    return While(raw=n0.raw, label_k=f"qfor_{k_suffix}", body=pre + tuple(body_nodes)), after
 
 
 def _match_for_opener(nodes: list[Node], i: int) -> tuple[Node, str, str, str, str, str, str] | None:
@@ -754,6 +863,7 @@ def _fold_range(
     end: int,
     end_label: str | None,
     skip: set[str],
+    query_iter_vars: dict[str, str] | None = None,
 ) -> tuple[list[Node], int]:
     """Fold ``nodes[start:end]`` into structured form.
 
@@ -774,7 +884,9 @@ def _fold_range(
         opener = _match_for_opener(nodes, i)
         if opener is not None:
             range_node, range_var, start_expr, stop_expr, step_expr, iter_var, k_suffix = opener
-            body_nodes, after = _fold_range(nodes, i + 4, end, end_label=f"end_for_{k_suffix}", skip=skip)
+            body_nodes, after = _fold_range(
+                nodes, i + 4, end, end_label=f"end_for_{k_suffix}", skip=skip, query_iter_vars=query_iter_vars
+            )
             # Rewrite ``goto start_for_K`` → ``continue;`` and
             # ``goto end_for_K`` → ``break;`` in the body. The trailing
             # implicit ``goto start_for_K`` becomes a redundant
@@ -802,10 +914,21 @@ def _fold_range(
             i = after
             continue
 
+        # Python-style iterator loop over a spatial query object
+        # (3-line opener: ``start_for_K:;`` / ``iter_cmp`` / ``iter_next``).
+        qfold = _try_fold_query_for(nodes, i, end, skip, query_iter_vars)
+        if qfold is not None:
+            qnode, after = qfold
+            out.append(qnode)
+            i = after
+            continue
+
         # While-loop opener (``start_while_K:;``).
         if isinstance(n, Label) and n.name.startswith("start_while_"):
             k_suffix = n.name[len("start_while_") :]
-            body_nodes, after = _fold_range(nodes, i + 1, end, end_label=f"end_while_{k_suffix}", skip=skip)
+            body_nodes, after = _fold_range(
+                nodes, i + 1, end, end_label=f"end_while_{k_suffix}", skip=skip, query_iter_vars=query_iter_vars
+            )
             # Rewrite mid-body break/continue/cond-test into structural forms
             # so the resulting While body has no remaining ``goto`` references
             # to this loop's labels.
@@ -826,7 +949,7 @@ def _fold_range(
 
         # If-block (no else — Warp lowers ``if/else`` to two separate ifs).
         if isinstance(n, BlockOpen):
-            body_nodes, after = _fold_if_body(nodes, i + 1, end, skip)
+            body_nodes, after = _fold_if_body(nodes, i + 1, end, skip, query_iter_vars=query_iter_vars)
             close_node = nodes[after]
             if not isinstance(close_node, BlockClose):
                 raise MetalASTParseError(f"if-body terminated by unexpected node {type(close_node).__name__}")
@@ -850,7 +973,13 @@ def _fold_range(
     return out, end
 
 
-def _fold_if_body(nodes: list[Node], start: int, end: int, skip: set[str]) -> tuple[list[Node], int]:
+def _fold_if_body(
+    nodes: list[Node],
+    start: int,
+    end: int,
+    skip: set[str],
+    query_iter_vars: dict[str, str] | None = None,
+) -> tuple[list[Node], int]:
     """Fold an if-body, stopping at the matching BlockClose.
 
     Recurses into nested for/while/if. Returns the folded body and the
@@ -866,7 +995,9 @@ def _fold_if_body(nodes: list[Node], start: int, end: int, skip: set[str]) -> tu
         opener = _match_for_opener(nodes, i)
         if opener is not None:
             range_node, range_var, start_expr, stop_expr, step_expr, iter_var, k_suffix = opener
-            body_nodes, after = _fold_range(nodes, i + 4, end, end_label=f"end_for_{k_suffix}", skip=skip)
+            body_nodes, after = _fold_range(
+                nodes, i + 4, end, end_label=f"end_for_{k_suffix}", skip=skip, query_iter_vars=query_iter_vars
+            )
             # Drop the trailing ``goto start_for_K`` (which ``_drop_goto``
             # rewrote to a redundant ``continue;``) and convert mid-body
             # ``goto end_for_K`` to ``break;``. Matches the top-level
@@ -894,9 +1025,18 @@ def _fold_if_body(nodes: list[Node], start: int, end: int, skip: set[str]) -> tu
             i = after
             continue
 
+        qfold = _try_fold_query_for(nodes, i, end, skip, query_iter_vars)
+        if qfold is not None:
+            qnode, after = qfold
+            out.append(qnode)
+            i = after
+            continue
+
         if isinstance(n, Label) and n.name.startswith("start_while_"):
             k_suffix = n.name[len("start_while_") :]
-            body_nodes, after = _fold_range(nodes, i + 1, end, end_label=f"end_while_{k_suffix}", skip=skip)
+            body_nodes, after = _fold_range(
+                nodes, i + 1, end, end_label=f"end_while_{k_suffix}", skip=skip, query_iter_vars=query_iter_vars
+            )
             body_nodes = _rewrite_while_body(body_nodes, k_suffix)
             out.append(
                 While(
@@ -909,7 +1049,7 @@ def _fold_if_body(nodes: list[Node], start: int, end: int, skip: set[str]) -> tu
             continue
 
         if isinstance(n, BlockOpen):
-            inner, after = _fold_if_body(nodes, i + 1, end, skip)
+            inner, after = _fold_if_body(nodes, i + 1, end, skip, query_iter_vars=query_iter_vars)
             close_node = nodes[after]
             if not isinstance(close_node, BlockClose):
                 raise MetalASTParseError(f"if-body terminated by unexpected node {type(close_node).__name__}")
@@ -1422,9 +1562,11 @@ def _inline_one_call(
 
     substituted_lines = [_substitute_var_refs(line, subs) for line in fn_lines]
 
-    # Parse + structurally fold the substituted body.
+    # Parse + structurally fold the substituted body. Query-iterator vars
+    # are computed against the SUBSTITUTED names (mangled locals / caller-
+    # bound params) so ``for x in <query>`` loops inside helpers fold too.
     fn_nodes = parse(substituted_lines)
-    fn_folded, fold_skip = fold(fn_nodes)
+    fn_folded, fold_skip = fold(fn_nodes, query_iter_vars=query_iterator_vars(fn_overload.adj, subs))
 
     # Recursively inline nested user calls.
     #
