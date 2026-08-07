@@ -294,6 +294,29 @@ multiply-counting hazard that ``block_dim()`` lowering to ``1`` exists to
 avoid -- so it needs per-kernel analysis rather than a blanket switch.
 """
 
+metal_coop_tiles: bool = _os.environ.get("WARP_METAL_COOP_TILES", "").strip().lower() not in (
+    "0",
+    "false",
+    "off",
+)
+"""Run eligible ``wp.launch_tiled`` kernels with real cooperating lanes.
+
+Defaults to ``True``; set the ``WARP_METAL_COOP_TILES`` environment
+variable to ``0`` to disable (an A/B kill switch).
+
+A kernel launched via :func:`warp.launch_tiled` with ``block_dim=32`` whose
+tile usage is limited to ``wp.tile()`` register-tile construction,
+``wp.tile_reduce`` (``wp.add``/``wp.min``/``wp.max``), and
+``wp.tile_extract`` of the reduce result is compiled with an honest
+``block_dim`` and dispatched as one 32-lane threadgroup per tile:
+``wp.block_dim()`` lowers to ``32``, per-lane strided loops partition work
+exactly as on CUDA, register tiles hold one element per lane, and
+reductions lower to ``simd_sum``/``simd_min``/``simd_max``. Semantics match
+CUDA thread-for-thread, so the multiply-counting hazard of the serial model
+does not apply. Kernels outside the supported pattern keep the serial
+(one-thread-per-tile) model.
+"""
+
 disable_metal_solver_icb_capture: bool = False
 """Disable the mujoco_warp solver's MTLIndirectCommandBuffer fast path.
 

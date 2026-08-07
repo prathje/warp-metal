@@ -4415,6 +4415,122 @@ def _threadgroup_tiles_enabled() -> bool:
     return bool(getattr(_wp_cfg, "metal_threadgroup_tiles", True))
 
 
+def _coop_tiles_enabled() -> bool:
+    """Whether eligible launch-tiled kernels may run with real lanes.
+
+    Reads :data:`warp.config.metal_coop_tiles` lazily — importing
+    ``warp.config`` at module scope would be a circular import.
+    """
+    import warp.config as _wp_cfg  # noqa: PLC0415
+
+    return bool(getattr(_wp_cfg, "metal_coop_tiles", True))
+
+
+# The one block width the distributed-tile path supports: one full Apple
+# SIMD group, so cross-lane reductions are single ``simd_*`` intrinsics
+# and ``threadgroup == simdgroup`` (no extra smem staging needed).
+_COOP_BLOCK_DIM = 32
+
+_COOP_TILE_CTOR_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile\s*<")
+_COOP_TILE_REDUCE_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_reduce\s*\(\s*([\w:]+)\s*,\s*var_(\w+)\s*\)")
+_COOP_TILE_OTHER_PAT = re.compile(r"\bwp::tile_(\w+)")
+# ``wp::min``/``wp::max`` may already be rewritten to ``metal::`` forms
+# by the time a line reaches the tile translator — accept both.
+_COOP_REDUCE_OPS = ("wp::add", "wp::min", "wp::max", "metal::min", "metal::max")
+_COOP_SIMD_FN = {
+    "wp::add": "simd_sum",
+    "wp::min": "simd_min",
+    "wp::max": "simd_max",
+    "metal::min": "simd_min",
+    "metal::max": "simd_max",
+}
+_COOP_NATIVE_ELEM_PAT = re.compile(r"^(float|half|int|uint|short|ushort)([234])?$")
+_COOP_NATIVE_MAT_PAT = re.compile(r"^(float|half)([234])x([234])$")
+_COOP_CUSTOM_ELEM_PAT = re.compile(r"^wp_(?:vec(\d+)|mat(\d+)x(\d+))_\w+$")
+
+
+def _coop_reduce_expr(val: str, elem_msl: str, simd_fn: str) -> str:
+    """Cross-lane reduction of one distributed-tile element per lane.
+
+    ``metal::simd_sum``/``simd_min``/``simd_max`` accept scalars and native
+    vectors directly; native matrices reduce per column vector; custom
+    ``wp_vecN``/``wp_matRxC`` structs reduce component-wise in a statement
+    expression (compile-time trip count → uniform control flow, as SIMD
+    functions require).
+    """
+    if _COOP_NATIVE_ELEM_PAT.match(elem_msl):
+        return f"metal::{simd_fn}({val})"
+    m = _COOP_NATIVE_MAT_PAT.match(elem_msl)
+    if m:
+        ncols = int(m.group(2))
+        cols = ", ".join(f"metal::{simd_fn}({val}[{c}])" for c in range(ncols))
+        return f"{elem_msl}({cols})"
+    m = _COOP_CUSTOM_ELEM_PAT.match(elem_msl)
+    if m:
+        n = int(m.group(1)) if m.group(1) else int(m.group(2)) * int(m.group(3))
+        return (
+            f"({{ {elem_msl} _cr = {val}; "
+            f"for (int _cr_i = 0; _cr_i < {n}; ++_cr_i) _cr.c[_cr_i] = metal::{simd_fn}(_cr.c[_cr_i]); "
+            f"_cr; }})"
+        )
+    raise MetalCodegenError(f"distributed tile_reduce: unsupported element type {elem_msl!r}")
+
+
+def _coop_block_eligible(adj) -> bool:
+    """Decide whether a kernel can be rebuilt with an honest ``block_dim``
+    and dispatched as one 32-lane threadgroup per launch-tiled block.
+
+    The scan runs on the serial (``block_dim=1``) IR. Semantics of the
+    honest build match CUDA thread-for-thread, so the checks below are
+    about whether every tile intrinsic present has a distributed-lane
+    lowering — anything else keeps the serial model:
+
+    - only 2-D ``wp.tid()`` (launch dims are ``(D, block_dim)``);
+    - register tiles come only from ``wp.tile()`` (one element per lane);
+    - ``tile_reduce`` uses add/min/max over those tiles (→ ``simd_*``);
+    - ``tile_extract`` reads only reduce results (1-element tiles) —
+      extracting lane ``i`` of a distributed tile would need a shuffle;
+    - the kernel actually uses block-cooperative features (``wp.tile``,
+      ``wp.block_dim()`` or ``WP_TILE_SYNC``), so plain kernels are
+      untouched.
+    """
+    try:
+        text = "\n".join(adj.blocks[0].body_forward)
+    except Exception:
+        return False
+    if "builtin_tid2d(" not in text:
+        return False
+    if re.search(r"builtin_tid1d\s*\(|builtin_tid3d\s*\(|builtin_tid4d\s*\(", text):
+        return False
+    ctor_labels = set(_COOP_TILE_CTOR_PAT.findall(text))
+    if not ctor_labels and "builtin_block_dim" not in text and "WP_TILE_SYNC" not in text:
+        return False
+    reduce_labels: set[str] = set()
+    for m in _COOP_TILE_REDUCE_PAT.finditer(text):
+        if m.group(2) not in _COOP_REDUCE_OPS or m.group(3) not in ctor_labels:
+            return False
+        reduce_labels.add(m.group(1))
+    for m in _COOP_TILE_OTHER_PAT.finditer(text):
+        op = m.group(1)
+        if op == "reduce":
+            continue
+        if op == "extract":
+            continue  # sources validated below
+        return False
+    for m in re.finditer(r"wp::tile_extract\s*\(\s*var_(\w+)", text):
+        if m.group(1) not in reduce_labels:
+            return False
+    # Tile-typed locals produced any other way (e.g. returned from a
+    # ``@wp.func``) have no distributed lowering.
+    for v in adj.variables:
+        parsed = _parse_tile_ctype(v.ctype())
+        if parsed is None:
+            continue
+        if str(v.label) not in ctor_labels and str(v.label) not in reduce_labels:
+            return False
+    return True
+
+
 _SMEM_LOAD_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_load\s*<")
 # ``tile_cholesky<`` won't match ``tile_cholesky_solve<`` / ``_inplace<``
 # because those continue with ``_`` where this needs ``<``.
@@ -5933,6 +6049,7 @@ def _translate_tile_intrinsics(
     tile_var_vec_n: dict[str, int] | None = None,
     atomic_output_names: set[str] | None = None,
     smem_tiles: dict[str, tuple[int, int, int, str]] | None = None,
+    distributed_tiles: dict[str, str] | None = None,
 ) -> str:
     if tile_var_vec_n is None:
         tile_var_vec_n = {}
@@ -5940,6 +6057,8 @@ def _translate_tile_intrinsics(
         atomic_output_names = set()
     if smem_tiles is None:
         smem_tiles = {}
+    if distributed_tiles is None:
+        distributed_tiles = {}
     """Lower ``wp::tile_*`` calls to ``wp_tile_RxC_<scalar>_*`` helper calls.
 
     ``tile_var_dims`` maps each tile local label to ``(rows, cols, msl_scalar)``
@@ -6239,6 +6358,15 @@ def _translate_tile_intrinsics(
         op_match = re.search(r"wp::tile_reduce\s*\(\s*([\w:]+)\s*,\s*var_\w+\s*\)", full)
         op_fn = op_match.group(1) if op_match else "wp::add"
         in_label = m.group(2)
+        if in_label in distributed_tiles:
+            # Distributed register tile: each lane holds one element, so
+            # the reduce is a cross-lane SIMD reduction. The result tile
+            # is 1-element (a plain local); ``simd_*`` broadcasts to all
+            # lanes, matching CUDA's broadcast-result semantics.
+            simd_fn = _COOP_SIMD_FN.get(op_fn)
+            if simd_fn is None:
+                raise MetalCodegenError(f"distributed tile_reduce only supports wp.add/wp.min/wp.max; got {op_fn!r}")
+            return f"var_{lhs} = {_coop_reduce_expr(f'var_{in_label}', distributed_tiles[in_label], simd_fn)}"
         dims = tile_var_dims.get(in_label)
         if dims is None:
             return f"var_{lhs} = var_{in_label}"
@@ -7101,6 +7229,15 @@ class MetalKernelArtifact:
     # wp_tile_chol_smem[N*N]`` scratch at top scope. Zero means
     # single-thread (legacy) tile primitives only.
     coop_chol_n: int = 0
+    # When non-zero, the kernel was built with an honest ``block_dim`` (its
+    # IR shapes ``wp.tile()`` register tiles as ``(block_dim,)`` and
+    # ``wp.block_dim()`` lowers to this value) and must be dispatched with
+    # ``grid = (dim0, coop_block_n)`` / ``threadgroup = (1, coop_block_n, 1)``
+    # so each launch-tiled block becomes one threadgroup of real lanes.
+    # Distributed register tiles hold one element per lane; cross-lane
+    # reductions lower to ``simd_*`` intrinsics. Zero means the serial
+    # model (``block_dim() == 1``, trailing launch dim folded away).
+    coop_block_n: int = 0
     # Init-shadow packing: when an atomic kernel has too many init
     # outputs to fit per-output ``__init`` shadow buffers under
     # Metal's 31-buffer cap, we pack them into one float buffer
@@ -7113,6 +7250,14 @@ class MetalKernelArtifact:
     init_shadow_packed_outputs: tuple[str, ...] = ()
     init_shadow_floats: tuple[str, ...] = ()
     init_shadow_ints: tuple[str, ...] = ()
+    # MLX-path in-place outputs: arrays the kernel writes THROUGH a
+    # ``<name>__rw`` const-cast input alias instead of an MLX output
+    # buffer. Used for partial-writer kernels (top-level early return)
+    # whose outputs cannot be race-free seeded by the init prologue —
+    # unwritten elements keep their previous values, matching CUDA's
+    # in-place semantics. Empty on native-dispatch artifacts (outputs
+    # bind in place there anyway).
+    inplace_arrays: tuple[str, ...] = ()
     # Outputs whose prior contents the kernel logically preserves. On the
     # MLX path these get physical ``__init`` shadows / packed shadows; on
     # the native path outputs bind in place so no shadow is emitted, but
@@ -7223,13 +7368,19 @@ def _strip_comments_and_directives(line: str) -> str | None:
     return line
 
 
-def _ensure_adj_built(kernel):
+def _ensure_adj_built(kernel, block_dim: int | None = None):
     """Build the kernel's forward IR if it hasn't been already; return the adj.
 
     Split out of ``generate_msl_kernel`` so the artifact-cache wrapper can
     compute its key (which needs ``adj.blocks``) without duplicating the
     build policy. Idempotent — safe to call before the uncached generator
     runs the same block again.
+
+    ``block_dim`` is the launch's block width. When it is
+    ``_COOP_BLOCK_DIM`` and the kernel passes ``_coop_block_eligible``,
+    the IR is REBUILT once at the honest block_dim and
+    ``adj._metal_coop_block_n`` records it — the distributed-tile
+    codegen and launcher geometry key off that marker.
     """
     adj = kernel.adj
 
@@ -7257,6 +7408,22 @@ def _ensure_adj_built(kernel):
                 "block_dim": 1,
             },
         )
+    # Distributed-tile upgrade: launched at the coop width, eligible tile
+    # pattern → rebuild once at the honest block_dim. ``Adjoint.build``
+    # fully resets IR state, so a re-run is safe; the checked flag keeps
+    # this a one-time decision per kernel object.
+    if block_dim == _COOP_BLOCK_DIM and not getattr(adj, "_metal_coop_block_checked", False) and _coop_tiles_enabled():
+        adj._metal_coop_block_checked = True
+        if _coop_block_eligible(adj):
+            adj.build(
+                builder=None,
+                default_builder_options={
+                    "enable_backward": False,
+                    "output_arch": None,
+                    "block_dim": _COOP_BLOCK_DIM,
+                },
+            )
+            adj._metal_coop_block_n = _COOP_BLOCK_DIM
     # When the kernel is part of a registered module (``module="unique"``),
     # ``adj.build`` sets ``adj.builder_options`` to the module's options
     # dict, which our default options dict can't reach. Backfill the keys
@@ -7344,6 +7511,14 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
     # atomics for vec-typed arrays.
     _ast_nodes = _ast_fold_multidim_atomics(_ast_nodes, adj, _early_vec_arr_info)
     forward_lines = _ast_emit(_ast_nodes)
+
+    # Distributed-tile mode: the IR was rebuilt at the honest block width
+    # (see ``_ensure_adj_built``). ``wp.block_dim()`` must lower to that
+    # width — pre-substitute here so the static pattern table's ``-> 1``
+    # rule (the serial model) never sees it.
+    coop_block_n = getattr(adj, "_metal_coop_block_n", 0)
+    if coop_block_n > 0:
+        forward_lines = [ln.replace("builtin_block_dim()", str(coop_block_n)) for ln in forward_lines]
 
     # Negative-step Python ``range`` (e.g. ``range(start, -1, -16)`` in
     # mujoco_warp's blocked-Cholesky backward sub) emits as
@@ -7807,6 +7982,30 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
         idx_resolved = _var_token_pat.sub(lambda mm: subscript_map.get(mm.group(1), mm.group(0)), idx_expr)
         subscript_map[ptr_label] = f"{base}[{idx_resolved}]"
 
+    # --- Distributed register tiles (coop-block mode) -------------------
+    # Labels built by ``wp.tile()`` whose type is a ``(coop_block_n,)``
+    # register tile. Each lane holds exactly one element (CUDA's register-
+    # tile model), so the local is declared as the bare ELEMENT type and
+    # ``wp::tile<>()`` stays an identity assign. Maps label → element MSL
+    # type; consumed by the declaration loop and ``tile_reduce`` lowering.
+    distributed_tiles: dict[str, str] = {}
+    if coop_block_n > 0:
+        _ctor_labels = set()
+        for raw in forward_lines:
+            _ctor_labels.update(_COOP_TILE_CTOR_PAT.findall(raw))
+        _all_ctypes: dict[str, str] = {str(v.label): v.ctype() for v in adj.variables}
+        _all_ctypes.update(_inlined_var_ctypes)
+        for label in _ctor_labels:
+            ctype = _all_ctypes.get(label)
+            if ctype is None:
+                continue
+            parsed = _parse_tile_ctype(ctype)
+            if parsed is None:
+                continue
+            kind, dtype_ctype, rows, cols = parsed
+            if kind == "register" and rows == coop_block_n and cols == 1:
+                distributed_tiles[label] = _msl_scalar_type(dtype_ctype)
+
     # --- Local variable declarations -----------------------------------
     body_lines: list[str] = []
     # Set when the body uses 4-D ``wp.tid()`` — the launcher then folds
@@ -7858,6 +8057,12 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
         # know about ``wp::range_t``). The for-loop translation should already
         # have added these to ``vars_to_skip_decl``, but guard defensively.
         if var.ctype() == "wp::range_t":
+            continue
+        if str(var.label) in distributed_tiles:
+            # Distributed register tile: one element per lane, declared as
+            # the bare element type (``_msl_var_type`` has no struct for
+            # mat-element tiles and must not emit one here anyway).
+            body_lines.append(f"    {distributed_tiles[str(var.label)]} var_{var.label};")
             continue
         ctype = var.ctype()
         msl_type = _msl_var_type(ctype)
@@ -7963,7 +8168,12 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
     _chol_solve_pat_pre = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_cholesky_solve\s*<[^()]*>\s*\(([^)]*)\)")
     is_coop_kernel = False
     pre_coop_chol_n = 0
-    for raw in forward_lines:
+    # Distributed-tile (coop-block) kernels have their own launch geometry
+    # (one threadgroup per launch-tiled block, honest tid mapping) that is
+    # incompatible with the coop-Cholesky rewrite below (which redundantly
+    # runs all 32 lanes at one worldid). Eligibility already excludes
+    # cholesky-bearing kernels from coop-block mode, so just skip the scan.
+    for raw in forward_lines if coop_block_n == 0 else ():
         for m in _chol_pat_pre.finditer(raw):
             args = [a.strip() for a in m.group(1).split(",")]
             if len(args) >= 5:
@@ -8120,6 +8330,7 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
             tile_var_vec_n,
             atomic_output_names,
             smem_tiles,
+            distributed_tiles,
         )
         # Inline subscripts that the address-collapse produced.
         translated = _substitute_subscripts(translated)
@@ -8700,7 +8911,9 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
                             )
                             body_lines.append(
                                 _finalize(
-                                    _emit_scalar_write(f"{base} + {off} + 1", f"as_type<float>(uint(ulong({src}) >> 32))")
+                                    _emit_scalar_write(
+                                        f"{base} + {off} + 1", f"as_type<float>(uint(ulong({src}) >> 32))"
+                                    )
                                 )
                             )
                         elif finfo.kind == _STRUCT_FIELD_KIND_VEC:
@@ -8859,18 +9072,18 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
     # The signal is a top-level ``return;`` (not nested inside a
     # ``do { ... } while (0);`` block — those are the inliner's
     # break-as-return wrappers, not actual conditional skips).
+    depth = 0
+    has_early_return = False
+    for raw in forward_lines:
+        stripped = raw.strip()
+        if stripped.startswith("do "):
+            depth += 1
+        elif stripped.startswith("} while"):
+            depth = max(0, depth - 1)
+        elif stripped == "return;" and depth == 0:
+            has_early_return = True
+            break
     if not non_standard_launch:
-        depth = 0
-        has_early_return = False
-        for raw in forward_lines:
-            stripped = raw.strip()
-            if stripped.startswith("do "):
-                depth += 1
-            elif stripped.startswith("} while"):
-                depth = max(0, depth - 1)
-            elif stripped == "return;" and depth == 0:
-                has_early_return = True
-                break
         if has_early_return:
             # Tentatively add every output not already seeded.
             tentative = list(init_outputs)
@@ -8903,6 +9116,33 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
     seeded_outputs = tuple(init_outputs)
     if _wp_cfg.metal_native_dispatch:
         init_outputs = []
+
+    # ---- MLX in-place outputs (unseedable partial writers) -------------
+    # A kernel with a top-level early return writes only SOME elements of
+    # its outputs. On MLX, outputs are fresh pool buffers, so unwritten
+    # elements surface stale pool bytes unless seeded — and prologue
+    # seeding is only race-free when thread x equals the output row it
+    # seeds (the worldid launch convention). Kernels partitioned by other
+    # ids (contact id) or whose seed set overflowed the buffer budget were
+    # left UNSEEDED, and their copy-back clobbered shared arrays with pool
+    # garbage (observed: ``_efc_contact_update`` wiping every friction /
+    # equality ``efc`` row in scenes with zero contacts). Fix: bind those
+    # outputs IN PLACE — the kernel writes straight into the caller's
+    # buffer through a const-cast alias (MLX ``view().reshape()`` inputs
+    # alias the registered buffer; write-through verified), so unwritten
+    # elements keep their previous values, exactly like CUDA. Non-atomic
+    # kernels only; atomic kernels keep the zero-init + seed machinery.
+    mlx_inplace_arrays: list[str] = []
+    if not _wp_cfg.metal_native_dispatch and has_early_return and not has_atomic:
+        mlx_inplace_arrays = [a.label for a in output_args if a.label not in init_outputs]
+    if mlx_inplace_arrays:
+        inplace_set = set(mlx_inplace_arrays)
+        alias_lines = []
+        for a in output_args:
+            if a.label in inplace_set:
+                inner = _msl_array_inner_msl_type(a)
+                alias_lines.append(f"    device {inner}* {a.label} = (device {inner}*)({a.label}__rw);")
+        body_lines = alias_lines + body_lines
 
     # ---- Decide between per-output __init shadows and packed shadows --
     # When the kernel has many init outputs (e.g. mujoco_warp's
@@ -9240,6 +9480,9 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
         )
 
     base_input_names = [a.label for a in input_args]
+    # In-place outputs bind as ``<name>__rw`` array inputs right after the
+    # real inputs (the body's const-cast alias makes them writable).
+    inplace_input_names = [f"{n}__rw" for n in mlx_inplace_arrays]
     # Synthetic packed-buffer inputs the launcher fills at dispatch time.
     # Order matters — must match the input-build order in the launcher.
     extra_input_names: list[str] = []
@@ -9272,11 +9515,19 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
 
     header = _build_kernel_header(source)
 
+    inplace_set = set(mlx_inplace_arrays)
+    final_output_names = [a.label for a in output_args if a.label not in inplace_set]
+    if not final_output_names and mlx_inplace_arrays:
+        # ``mx.fast.metal_kernel`` requires at least one output — and
+        # materialising it is what forces the launch to execute. The
+        # launcher binds a 1-element placeholder and skips its copy-back.
+        final_output_names = ["__wp_unused_out"]
+
     return MetalKernelArtifact(
         name=artifact_name,
         source=source,
-        input_names=base_input_names + init_input_names + extra_input_names,
-        output_names=[a.label for a in output_args],
+        input_names=base_input_names + inplace_input_names + init_input_names + extra_input_names,
+        output_names=final_output_names,
         input_args=input_args,
         output_args=output_args,
         atomic_outputs=has_atomic,
@@ -9294,9 +9545,11 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
         # broke replay-vs-direct bit-exactness on mjwarp G1.
         needs_init_barrier=bool(seeded_outputs),
         coop_chol_n=coop_chol_n,
+        coop_block_n=coop_block_n,
         init_shadow_packed_outputs=tuple(init_outputs) if use_packed_init_shadows else (),
         init_shadow_floats=tuple(init_shadow_floats),
         init_shadow_ints=tuple(init_shadow_ints),
+        inplace_arrays=tuple(mlx_inplace_arrays),
         seeded_outputs=seeded_outputs,
         uses_bvh=("wp_bvh_" in source or "wp_mesh_" in source),
         # NB: ``builtin_block_dim`` is checked on the kernel's own IR — a
@@ -9454,6 +9707,9 @@ def _artifact_cache_key(kernel, adj) -> str | None:
         # so a cached artifact from the other setting must not be reused —
         # this knob is an A/B switch and gets toggled between runs.
         f"tgtiles={_threadgroup_tiles_enabled()}",
+        # Distributed-tile builds share neither IR nor launch geometry
+        # with serial builds of the same kernel.
+        f"coopblock={getattr(adj, '_metal_coop_block_n', 0)}",
     ):
         h.update(part.encode("utf-8"))
         h.update(b"\x00")
@@ -9521,14 +9777,17 @@ def _store_cached_artifact(key: str, artifact: MetalKernelArtifact) -> None:
         pass
 
 
-def generate_msl_kernel(kernel) -> MetalKernelArtifact:
+def generate_msl_kernel(kernel, block_dim: int | None = None) -> MetalKernelArtifact:
     """Return the MSL artifact for a Warp ``Kernel``, using the on-disk
     cache when possible.
+
+    ``block_dim`` is the launch's block width — it decides whether the IR
+    is rebuilt for the distributed-tile path (see ``_ensure_adj_built``).
 
     See ``_generate_msl_kernel_uncached`` for the actual translation
     pipeline and ``_artifact_cache_key`` for what invalidates entries.
     """
-    adj = _ensure_adj_built(kernel)
+    adj = _ensure_adj_built(kernel, block_dim=block_dim)
     key = _artifact_cache_key(kernel, adj)
     if key is not None:
         cached = _load_cached_artifact(key, adj)
@@ -10436,7 +10695,21 @@ def _strip_init_prologue(source: str) -> str:
 _METAL_NOOP_PSO = object()
 
 
-def _get_or_build_metal_kernel_native(kernel):
+def _coop_upgrade_pending(kernel, artifact, block_dim: int | None) -> bool:
+    """True when a cached serial artifact should be re-evaluated because
+    this is the first launch at the cooperative block width (the coop
+    eligibility check is one-time per kernel and keyed off the launch's
+    ``block_dim``, which earlier launches may not have hit)."""
+    return (
+        block_dim == _COOP_BLOCK_DIM
+        and artifact is not None
+        and getattr(artifact, "coop_block_n", 0) == 0
+        and not getattr(kernel.adj, "_metal_coop_block_checked", False)
+        and _coop_tiles_enabled()
+    )
+
+
+def _get_or_build_metal_kernel_native(kernel, block_dim: int | None = None):
     """Return ``(artifact, pso)`` for a Warp kernel under native dispatch.
 
     Caches the PSO on the kernel object so subsequent launches skip
@@ -10447,8 +10720,12 @@ def _get_or_build_metal_kernel_native(kernel):
 
     artifact = getattr(kernel, "_metal_artifact", None)
     pso = getattr(kernel, "_metal_native_pso", None)
+    if _coop_upgrade_pending(kernel, artifact, block_dim):
+        artifact = None
+        pso = None
+        kernel._metal_native_pso = None
     if artifact is None:
-        artifact = generate_msl_kernel(kernel)
+        artifact = generate_msl_kernel(kernel, block_dim=block_dim)
         kernel._metal_artifact = artifact
     if pso is None:
         if not artifact.input_names and not artifact.output_names:
@@ -10463,7 +10740,7 @@ def _get_or_build_metal_kernel_native(kernel):
     return artifact, pso
 
 
-def _get_or_build_metal_kernel(kernel):
+def _get_or_build_metal_kernel(kernel, block_dim: int | None = None):
     """Return ``(artifact, mlx_kernel)`` for a Warp kernel, building+caching on first use.
 
     The cache lives on the Warp ``Kernel`` object via two attributes;
@@ -10474,8 +10751,11 @@ def _get_or_build_metal_kernel(kernel):
 
     artifact = getattr(kernel, "_metal_artifact", None)
     mlx_kernel = getattr(kernel, "_metal_mlx_kernel", None)
+    if _coop_upgrade_pending(kernel, artifact, block_dim):
+        artifact = None
+        mlx_kernel = None
     if artifact is None or mlx_kernel is None:
-        artifact = generate_msl_kernel(kernel)
+        artifact = generate_msl_kernel(kernel, block_dim=block_dim)
         # No-op kernel (every arg pruned as unused — see
         # ``generate_msl_kernel``); we don't compile a Metal kernel for
         # it. The launcher short-circuits when it sees the empty
@@ -10565,7 +10845,7 @@ def launch_metal_kernel_native(kernel, dim, inputs, outputs, device, block_dim: 
 
     _reject_unsupported_launch_args(kernel)
 
-    artifact, pso = _get_or_build_metal_kernel_native(kernel)
+    artifact, pso = _get_or_build_metal_kernel_native(kernel, block_dim=block_dim)
     if pso is None:
         return
 
@@ -10996,26 +11276,39 @@ def launch_metal_kernel_native(kernel, dim, inputs, outputs, device, block_dim: 
         )
     if any(d <= 0 for d in dims):
         return
-    if getattr(artifact, "tile_block_fold", True) and len(dims) > 1 and dims[-1] == block_dim and block_dim > 1:
-        dims = dims[:-1]
-    grid_x = dims[0]
-    grid_y = dims[1] if len(dims) >= 2 else 1
-    grid_z = dims[2] if len(dims) >= 3 else 1
-    grid = (grid_x, grid_y, grid_z)
-    if len(dims) == 1:
-        tg = (min(256, grid_x), 1, 1)
-    elif len(dims) == 2:
-        tg = (min(256, grid_x), 1, 1)
+    coop_block_n = getattr(artifact, "coop_block_n", 0)
+    if coop_block_n > 0:
+        # Distributed-tile kernel: the IR was built at an honest
+        # ``block_dim``, so the trailing launch dim is REAL lanes — one
+        # threadgroup per launch-tiled block, ``tid() = (block, lane)``.
+        if len(dims) != 2 or dims[-1] != coop_block_n:
+            raise RuntimeError(
+                f"Kernel '{kernel.key}' was compiled for cooperative tiles with "
+                f"block_dim={coop_block_n} but launched with dim={dim}, block_dim={block_dim}"
+            )
+        grid = (dims[0], coop_block_n, 1)
+        tg = (1, coop_block_n, 1)
     else:
-        tg = (min(64, grid_x), 1, 1)
-    if artifact.coop_chol_n > 0:
-        grid_x = grid_x * 32
+        if getattr(artifact, "tile_block_fold", True) and len(dims) > 1 and dims[-1] == block_dim and block_dim > 1:
+            dims = dims[:-1]
+        grid_x = dims[0]
+        grid_y = dims[1] if len(dims) >= 2 else 1
+        grid_z = dims[2] if len(dims) >= 3 else 1
         grid = (grid_x, grid_y, grid_z)
-        tg = (32, 1, 1)
-    if artifact.needs_init_barrier and grid_y * grid_z > 1:
-        if grid_y * grid_z <= 1024:
-            tg = (1, grid_y, grid_z)
-        # else: keep default tg and accept potential race (matches MLX path's behaviour).
+        if len(dims) == 1:
+            tg = (min(256, grid_x), 1, 1)
+        elif len(dims) == 2:
+            tg = (min(256, grid_x), 1, 1)
+        else:
+            tg = (min(64, grid_x), 1, 1)
+        if artifact.coop_chol_n > 0:
+            grid_x = grid_x * 32
+            grid = (grid_x, grid_y, grid_z)
+            tg = (32, 1, 1)
+        if artifact.needs_init_barrier and grid_y * grid_z > 1:
+            if grid_y * grid_z <= 1024:
+                tg = (1, grid_y, grid_z)
+            # else: keep default tg and accept potential race (matches MLX path's behaviour).
 
     # ---- Dispatch (fire and forget) ----
     try:
@@ -11081,6 +11374,8 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim: int = 2
     if _wp_cfg.metal_native_dispatch:
         return launch_metal_kernel_native(kernel, dim, inputs, outputs, device, block_dim=block_dim)
 
+    import ctypes  # noqa: PLC0415
+
     import mlx.core as mx  # noqa: PLC0415
     import numpy as np  # noqa: PLC0415
 
@@ -11100,7 +11395,7 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim: int = 2
 
     _reject_unsupported_launch_args(kernel)
 
-    artifact, mlx_kernel = _get_or_build_metal_kernel(kernel)
+    artifact, mlx_kernel = _get_or_build_metal_kernel(kernel, block_dim=block_dim)
     # No-op kernel (the prune step found every declared output is
     # unreferenced for this specialisation). Nothing to dispatch.
     if mlx_kernel is None:
@@ -11179,6 +11474,49 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim: int = 2
             # Scalar input — convert to a 0-D mx.array literal.
             mx_dtype = _wp_dtype_to_mx_dtype(arg_var.type)
             mlx_inputs.append(mx.array(value, dtype=mx_dtype))
+
+    # In-place outputs: bind the caller's buffer as a ``<name>__rw``
+    # input — the kernel writes through a const-cast alias, so unwritten
+    # elements keep their previous values (CUDA in-place semantics).
+    # MLX passes inputs under 32 bytes via ``setBytes`` (constant address
+    # space, by value) — the cast won't compile and writes couldn't land
+    # anyway. Small arrays go through a padded staging buffer instead:
+    # host-seeded from the current content before launch (race-free) and
+    # copied back after the launch completes.
+    inplace_staged: list[tuple] = []  # (staging mx.array, dest wp.array, n_scalars)
+    for arr_name in getattr(artifact, "inplace_arrays", ()):
+        idx, _ = arg_by_name[arr_name]
+        value = fwd_args[idx]
+        if not getattr(value, "device", None) or not value.device.is_metal:
+            raise RuntimeError(
+                f"Kernel '{kernel.key}' in-place output '{arr_name}' must be a wp.array on a "
+                f"Metal device; got {getattr(value, 'device', '?')}"
+            )
+        mx_dtype, view_shape = _array_view_dtype_and_shape(value)
+        sz = int(np.prod(view_shape)) if view_shape else 0
+        if value.ptr is None or sz == 0:
+            # Placeholder padded past the setBytes threshold so the MSL
+            # signature stays ``device`` across launches.
+            mlx_inputs.append(mx.zeros((16,), dtype=mx_dtype))
+            continue
+        nbytes = sz * mx_dtype.size
+        if nbytes < 32:
+            np_dtype = np.dtype(str(mx_dtype).split(".")[-1])
+            staged_np = np.zeros(max(16, sz), dtype=np_dtype)
+            src = (ctypes.c_byte * nbytes).from_address(value.ptr)
+            staged_np[:sz] = np.frombuffer(src, dtype=np_dtype)
+            staging = mx.array(staged_np)
+            mx.eval(staging)
+            mlx_inputs.append(staging)
+            inplace_staged.append((staging, value, sz))
+            continue
+        mx_buf = _metal_get_buffer(value.ptr)
+        if mx_buf is None:
+            raise RuntimeError(
+                f"Kernel '{kernel.key}' in-place output '{arr_name}' has no registered MLX "
+                f"buffer (ptr={value.ptr}). Was it allocated by Warp's Metal allocator?"
+            )
+        mlx_inputs.append(mx_buf.view(mx_dtype).reshape(view_shape))
 
     # Append init-shadow buffers for atomic outputs. Each ``<name>__init``
     # input carries the user's current array data so the kernel prologue
@@ -11380,6 +11718,14 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim: int = 2
     output_dtypes: list = []
     output_dest_arrays: list = []
     for output_name in artifact.output_names:
+        if output_name == "__wp_unused_out":
+            # Placeholder for all-in-place kernels: mx.fast.metal_kernel
+            # needs at least one output, and materialising it forces the
+            # launch to execute. Nothing copies back (dest is None).
+            output_shapes.append((1,))
+            output_dtypes.append(mx.float32)
+            output_dest_arrays.append(None)
+            continue
         idx, arg_var = arg_by_name[output_name]
         value = fwd_args[idx]
         if not _is_array_arg(arg_var):
@@ -11441,7 +11787,18 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim: int = 2
     # block/tile semantics whose last launch dim coincidentally equals
     # ``block_dim`` (e.g. a plain 2-D launch of dim=(1, 256)) must NOT
     # lose that dim.
-    if getattr(artifact, "tile_block_fold", True) and len(dims) > 1 and dims[-1] == block_dim and block_dim > 1:
+    coop_block_n = getattr(artifact, "coop_block_n", 0)
+    if coop_block_n > 0:
+        # Distributed-tile kernel (see ``_coop_block_eligible``): the IR
+        # was built at the honest ``block_dim``, so the trailing dim is
+        # REAL lanes — one threadgroup per launch-tiled block.
+        if len(dims) != 2 or dims[-1] != coop_block_n:
+            raise RuntimeError(
+                f"Kernel '{kernel.key}' was compiled for cooperative tiles with "
+                f"block_dim={coop_block_n} but launched with dim={dim}, block_dim={block_dim}"
+            )
+        dims = (dims[0], coop_block_n)
+    elif getattr(artifact, "tile_block_fold", True) and len(dims) > 1 and dims[-1] == block_dim and block_dim > 1:
         dims = dims[:-1]
     grid_x = dims[0]
     grid_y = dims[1] if len(dims) >= 2 else 1
@@ -11452,9 +11809,11 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim: int = 2
     # — which we lower to literal ``1`` in the IR — agrees with the
     # actual threadgroup width. The kernel's ``for tid in range(0, N, 1)``
     # loop then iterates everything serially. The launch's ``block_dim``
-    # parameter is intentionally ignored here; once we implement real
-    # cooperative tiles this will switch back to honoring it.
-    if len(dims) == 1:
+    # parameter is intentionally ignored here; distributed-tile kernels
+    # (``coop_block_n > 0``) instead group each block's lanes on y.
+    if coop_block_n > 0:
+        tg = (1, coop_block_n, 1)
+    elif len(dims) == 1:
         tg = (min(256, grid_x), 1, 1)
     elif len(dims) == 2:
         tg = (min(256, grid_x), 1, 1)
@@ -11546,6 +11905,12 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim: int = 2
     # handler.
     try:
         for o_mx, dest in zip(out_mx_list, output_dest_arrays, strict=True):
+            if dest is None:
+                # ``__wp_unused_out`` placeholder — materialise it (this is
+                # what forces the in-place kernel to execute) but nothing
+                # copies back.
+                np.array(o_mx, copy=False)
+                continue
             # Skip zero-element user buffers — they hit the placeholder path
             # above (we ran the kernel with a 1-element MLX buffer to satisfy
             # Apple's MTLBuffer API, but the user's wp.array is genuinely
@@ -11557,6 +11922,14 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim: int = 2
             nbytes = np_view.nbytes
             if not runtime.core.wp_memcpy_h2h(dest.ptr, src_ptr, nbytes):
                 raise RuntimeError(f"Failed to copy Metal kernel output back into wp.array (kernel '{kernel.key}')")
+        # Staged small in-place arrays: the kernel wrote into the padded
+        # staging buffer (outputs materialised above, so the launch has
+        # completed); copy the live prefix back into the caller's array.
+        for staging, dest, sz in inplace_staged:
+            np_view = np.array(staging, copy=False)[:sz]
+            src_ptr = int(np_view.__array_interface__["data"][0])
+            if not runtime.core.wp_memcpy_h2h(dest.ptr, src_ptr, np_view.nbytes):
+                raise RuntimeError(f"Failed to copy staged in-place output back into wp.array (kernel '{kernel.key}')")
     except Exception:
         if os.environ.get("WARP_METAL_DUMP_ON_FAIL"):
             import tempfile
