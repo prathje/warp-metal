@@ -5773,10 +5773,13 @@ _TILE_SORT_PAT = re.compile(r"\bwp::tile_sort\s*\(\s*var_(\w+)\s*,\s*var_(\w+)\s
 # ``diag_vec`` to the diagonal of ``M_tile``, returning the result.
 # The mujoco_warp dense-Euler kernel uses this for ``qM + dt*damping``.
 _TILE_DIAG_ADD_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_diag_add\s*\(([^)]*)\)")
-# ``wp::tile_extract(tile, idx)`` — read the i-th element of a tile. For a
-# 1-element tile the only valid index is 0 and the result is the scalar
-# value itself.
-_TILE_EXTRACT_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_extract\s*\(\s*var_(\w+)\s*,\s*[^)]+?\s*\)")
+# ``wp::tile_extract(tile, idx)`` / ``wp::tile_extract(tile, i, j)`` —
+# read one element of a tile. For a 1-element tile the only valid index
+# is 0 and the result is the value itself; multi-element tiles index the
+# flat ``c[]`` storage (vec-element tiles rebuild the vec from its
+# ``n_elem`` consecutive scalar components, mirroring the tile_map
+# accessors).
+_TILE_EXTRACT_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_extract\s*\(\s*var_(\w+)\s*,\s*([^)]+?)\s*\)")
 # ``wp::tile_assign(dst, src, offset_tuple)`` — copy ``src`` into ``dst``
 # at ``offset``. With single-element tiles ``offset=(0,0)`` and the call
 # is just ``dst = src``.
@@ -6760,8 +6763,35 @@ def _translate_tile_intrinsics(
         return f"var_{lhs} = var_{in_label}"
 
     line = _TILE_BROADCAST_PAT.sub(_repl_tile_broadcast, line)
-    # ``var_X = wp::tile_extract(var_t, idx)`` with shape (1,) → ``var_X = var_t``.
-    line = _TILE_EXTRACT_PAT.sub(r"var_\1 = var_\2", line)
+
+    def _repl_tile_extract(m: re.Match[str]) -> str:
+        # ``var_X = wp::tile_extract(var_t, idx[, jdx])``. Shape (1,)
+        # tiles collapsed to plain values via ``_msl_var_type``, so the
+        # identity assignment is correct there. Multi-element tiles read
+        # the flat ``c[]`` storage; vec-element tiles rebuild the vec
+        # from its consecutive scalar components (same accessor shape as
+        # the tile_map lowering above).
+        lhs, t_label, idx = m.group(1), m.group(2), m.group(3).strip()
+        dims = tile_var_dims.get(t_label)
+        if dims is None:
+            return f"var_{lhs} = var_{t_label}"
+        rows, cols, scalar = dims
+        if rows * cols == 1:
+            return f"var_{lhs} = var_{t_label}"
+        if "," in idx:
+            i, j = (s.strip() for s in idx.split(",", 1))
+            elem = f"(({i}) * {cols} + ({j}))"
+        else:
+            elem = f"({idx})"
+        vec_n = tile_var_vec_n.get(t_label, 0)
+        if vec_n > 0:
+            comps = [f"var_{t_label}.c[{elem} * {vec_n} + {k}]" for k in range(vec_n)]
+            if vec_n in _MSL_VEC_NATIVE_N:
+                return f"var_{lhs} = {scalar}{vec_n}({', '.join(comps)})"
+            return f"var_{lhs} = wp_vec{vec_n}_{scalar}_make({', '.join(comps)})"
+        return f"var_{lhs} = var_{t_label}.c[{elem}]"
+
+    line = _TILE_EXTRACT_PAT.sub(_repl_tile_extract, line)
 
     def repl_view(m: re.Match[str]) -> str:
         # ``var_X = wp::tile_view<wp::tile_shared_t<dtype, layout<shape<R,C>, ...>>, ...>>(parent, row_off, col_off)``

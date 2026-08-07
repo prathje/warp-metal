@@ -3299,6 +3299,57 @@ class TestMetalLaunch(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet)
 
+    def test_tile_extract_multi_element_matches_cpu(self):
+        # ``t[idx]`` on a multi-element tile used to lower as an identity
+        # assignment (only valid for 1-element tiles), which failed MSL
+        # compilation — example_tile_nbody's ``pi = k_tile[idx]`` on a
+        # vec3-element tile hit it. Covers scalar 1-D, vec3 1-D (runtime
+        # index), and scalar 2-D (i, j) extraction.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(pts: wp.array(dtype=wp.vec3), sc: wp.array(dtype=wp.float32),
+                  m2d: wp.array2d(dtype=wp.float32),
+                  out_v: wp.array(dtype=wp.vec3), out_s: wp.array(dtype=wp.float32),
+                  out_m: wp.array(dtype=wp.float32)):
+                i = wp.tid()
+                tv = wp.tile_load(pts, shape=8)
+                out_v[i] = tv[7 - i]
+                ts = wp.tile_load(sc, shape=8)
+                acc = float(0.0)
+                for j in range(8):
+                    acc += ts[j] * float(j + 1)
+                out_s[i] = acc
+                tm = wp.tile_load(m2d, shape=(4, 4))
+                out_m[i] = tm[i // 4, i % 4]
+
+            rng = np.random.default_rng(7)
+            pts_h = rng.standard_normal((8, 3)).astype(np.float32)
+            sc_h = rng.standard_normal(8).astype(np.float32)
+            m_h = rng.standard_normal((4, 4)).astype(np.float32)
+            results = {}
+            for dev in ("cpu", "metal:0"):
+                out_v = wp.zeros(8, dtype=wp.vec3, device=dev)
+                out_s = wp.zeros(8, dtype=wp.float32, device=dev)
+                out_m = wp.zeros(16, dtype=wp.float32, device=dev)
+                wp.launch(k, dim=8,
+                          inputs=[wp.array(pts_h, dtype=wp.vec3, device=dev),
+                                  wp.array(sc_h, dtype=wp.float32, device=dev),
+                                  wp.array(m_h, dtype=wp.float32, device=dev)],
+                          outputs=[out_v, out_s, out_m], block_dim=8, device=dev)
+                results[dev] = (out_v.numpy(), out_s.numpy(), out_m.numpy())
+            np.testing.assert_array_equal(results['metal:0'][0], results['cpu'][0])
+            np.testing.assert_allclose(results['metal:0'][1], results['cpu'][1], rtol=1e-6)
+            np.testing.assert_array_equal(results['metal:0'][2], results['cpu'][2])
+            np.testing.assert_array_equal(results['cpu'][0], pts_h[::-1])
+            np.testing.assert_array_equal(results['cpu'][2].reshape(4, 4)[:2], m_h[:2])
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
     def test_tile_cholesky_solve_n6_matches_cpu(self):
         # Freejoint mass-matrix size: N=6 SPD with a vector RHS.
         # mujoco_warp's simple (non-blocked) path goes through this
