@@ -5264,6 +5264,89 @@ class TestMetalStructSupport(unittest.TestCase):
     field silently read as 0, zeroing every term it multiplied).
     """
 
+    def test_struct_uint64_fields(self):
+        # 64-bit int fields (BVH/Mesh ids) span two 4-byte slots in the
+        # flat float32 view; offsets follow the real ctypes layout, so
+        # the 8-byte alignment padding before ``mesh`` must be honored.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            @wp.struct
+            class Inner:
+                id64: wp.uint64
+                w: wp.float32
+
+            @wp.struct
+            class Rec:
+                a: wp.float32
+                mesh: wp.uint64
+                b: wp.int32
+                inner: Inner
+
+            @wp.kernel
+            def rw_records(recs: wp.array(dtype=Rec), out: wp.array(dtype=wp.float32)):
+                i = wp.tid()
+                r = recs[i]
+                out[i] = r.a + r.inner.w + wp.float32(r.mesh >> wp.uint64(32)) + wp.float32(r.b)
+                r2 = Rec()
+                r2.a = r.a * 2.0
+                r2.mesh = wp.uint64(0xDEADBEEF12345678)
+                r2.b = r.b + 1
+                r2.inner.id64 = r.inner.id64
+                r2.inner.w = r.inner.w
+                recs[i] = r2
+
+            @wp.struct
+            class Scene:
+                mesh: wp.uint64
+                offset: wp.vec3
+
+            @wp.kernel
+            def query_via_struct(scene: Scene, pts: wp.array(dtype=wp.vec3), d: wp.array(dtype=wp.float32)):
+                i = wp.tid()
+                q = wp.mesh_query_point(scene.mesh, pts[i] + scene.offset, 10.0)
+                if q.result:
+                    p = wp.mesh_eval_position(scene.mesh, q.face, q.u, q.v)
+                    d[i] = wp.length(p - (pts[i] + scene.offset))
+
+            dev = 'metal:0'
+            n = 4
+            host = wp.zeros(n, dtype=Rec, device='cpu').numpy()
+            for i in range(n):
+                host[i]['a'] = float(i + 1)
+                host[i]['mesh'] = (7 << 32) | (i + 100)
+                host[i]['b'] = i
+                host[i]['inner']['id64'] = 0xABCDEF0011223344
+                host[i]['inner']['w'] = 0.5
+            recs = wp.array(host, dtype=Rec, device=dev)
+            out = wp.zeros(n, dtype=wp.float32, device=dev)
+            wp.launch(rw_records, dim=n, inputs=[recs], outputs=[out], device=dev)
+            np.testing.assert_allclose(out.numpy(), [8.5, 10.5, 12.5, 14.5])
+            res = recs.numpy()
+            for i in range(n):
+                assert res[i]['mesh'] == 0xDEADBEEF12345678, hex(res[i]['mesh'])
+                assert res[i]['inner']['id64'] == 0xABCDEF0011223344
+                assert res[i]['b'] == i + 1
+                np.testing.assert_allclose(res[i]['a'], 2.0 * (i + 1))
+
+            if wp.config.metal_native_dispatch:
+                mesh_pts = wp.array(np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0]], np.float32),
+                                    dtype=wp.vec3, device=dev)
+                tris = wp.array(np.array([0, 1, 2], np.int32), device=dev)
+                mesh = wp.Mesh(points=mesh_pts, indices=tris)
+                scene = Scene()
+                scene.mesh = mesh.id
+                scene.offset = wp.vec3(0.0, 0.0, 0.5)
+                pts = wp.array(np.array([[0.2, 0.2, 0.0], [0.5, 0.1, 0.5]], np.float32),
+                               dtype=wp.vec3, device=dev)
+                d = wp.zeros(2, dtype=wp.float32, device=dev)
+                wp.launch(query_via_struct, dim=2, inputs=[scene, pts], outputs=[d], device=dev)
+                np.testing.assert_allclose(d.numpy(), [0.5, 1.0], atol=1e-6)
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
     def test_struct_param_with_int_field(self):
         snippet = textwrap.dedent(
             """
@@ -6087,6 +6170,33 @@ class TestMetalUnsupportedFeaturesRaise(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet)
 
+    def test_hashgrid_and_volume_creation_raise(self):
+        # HashGrid/Volume construction used to fall through to the CUDA
+        # native constructors with a null context and crash the process.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+            import warp as wp
+
+            dev = 'metal:0'
+            try:
+                wp.HashGrid(8, 8, 8, device=dev)
+            except RuntimeError as e:
+                assert 'Metal' in str(e), str(e)
+            else:
+                raise AssertionError('HashGrid creation should have raised on Metal')
+
+            data = wp.array(np.zeros(1024, np.uint8), device=dev)
+            try:
+                wp.Volume(data)
+            except RuntimeError as e:
+                assert 'Metal' in str(e), str(e)
+            else:
+                raise AssertionError('Volume creation should have raised on Metal')
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
     def test_mesh_query_winding_number_kernel_raises(self):
         # The point/ray/aabb query families work on Metal (see
         # TestMetalBvhMesh); winding-number sign queries need the
@@ -6622,6 +6732,31 @@ class TestMetalHostOpOrdering(unittest.TestCase):
             """
         )
         _run_with_metal_enabled(self, snippet)
+
+    def test_global_synchronize_drains_metal(self):
+        # ``wp.synchronize()`` used to return without touching Metal
+        # devices, leaving queued native-dispatch work in flight.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            dev = 'metal:0'
+
+            @wp.kernel
+            def fill3(a: wp.array(dtype=wp.float32)):
+                i = wp.tid()
+                a[i] = 3.0
+
+            a = wp.zeros(1 << 16, dtype=wp.float32, device=dev)
+            wp.launch(fill3, dim=1 << 16, inputs=[a], device=dev)
+            wp.synchronize()
+            if wp.config.metal_native_dispatch:
+                from warp._src.metal_dispatch import get_dispatcher
+                assert not get_dispatcher().has_pending_work(), 'synchronize() left work queued'
+            np.testing.assert_allclose(a.numpy(), 3.0)
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=60)
 
 
 @unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
