@@ -5264,6 +5264,63 @@ class TestMetalStructSupport(unittest.TestCase):
     field silently read as 0, zeroing every term it multiplied).
     """
 
+    def test_empty_structs(self):
+        # ctypes pads empty structures to 1 byte; the layout must treat
+        # them as zero-size payloads. wp.fem instantiates plenty (e.g.
+        # WholeGeometryPartition's CellArg and single-field Fields
+        # wrappers around it) — both a bare empty struct arg and a struct
+        # whose only field is an empty struct must launch, and an empty
+        # struct field mixed with real fields must not shift the real
+        # fields' offsets.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            @wp.struct
+            class Empty:
+                pass
+
+            @wp.struct
+            class OnlyEmpty:
+                e: Empty
+
+            @wp.struct
+            class Mixed:
+                e: Empty
+                n: int
+                x: float
+
+            @wp.kernel
+            def k_empty(e: Empty, out: wp.array(dtype=wp.int32)):
+                i = wp.tid()
+                out[i] = i + 1
+
+            @wp.kernel
+            def k_only(o: OnlyEmpty, out: wp.array(dtype=wp.int32)):
+                i = wp.tid()
+                out[i] = i + 2
+
+            @wp.kernel
+            def k_mixed(m: Mixed, out: wp.array(dtype=wp.float32)):
+                i = wp.tid()
+                out[i] = float(m.n) + m.x * float(i)
+
+            dev = 'metal:0'
+            out_i = wp.zeros(4, dtype=wp.int32, device=dev)
+            wp.launch(k_empty, dim=4, inputs=[Empty()], outputs=[out_i], device=dev)
+            np.testing.assert_array_equal(out_i.numpy(), np.arange(1, 5))
+            wp.launch(k_only, dim=4, inputs=[OnlyEmpty()], outputs=[out_i], device=dev)
+            np.testing.assert_array_equal(out_i.numpy(), np.arange(2, 6))
+            m = Mixed()
+            m.n = 7
+            m.x = 0.5
+            out_f = wp.zeros(4, dtype=wp.float32, device=dev)
+            wp.launch(k_mixed, dim=4, inputs=[m], outputs=[out_f], device=dev)
+            np.testing.assert_allclose(out_f.numpy(), 7.0 + 0.5 * np.arange(4))
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
     def test_struct_uint64_fields(self):
         # 64-bit int fields (BVH/Mesh ids) span two 4-byte slots in the
         # flat float32 view; offsets follow the real ctypes layout, so

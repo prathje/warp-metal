@@ -10380,6 +10380,14 @@ def _struct_layout_for(struct_cls) -> _StructLayout:
         finfo.offset = byte_off // 4
         layout.fields[fname] = finfo
     total = ctypes.sizeof(ctype) if ctype is not None else 0
+    if total == 1 and all(f.size == 0 for f in layout.fields.values()):
+        # ctypes pads empty structures to 1 byte; there is nothing to pack.
+        # Covers no fields at all AND fields that are themselves empty
+        # structs (recursively size 0). wp.fem instantiates plenty of both
+        # (e.g. WholeGeometryPartition's CellArg, single-field Fields
+        # wrappers around it), so they must round-trip as zero-size
+        # payloads.
+        total = 0
     if total % 4 != 0:
         raise MetalCodegenError(f"MSL codegen: struct {layout.name!r} has size {total}, not a multiple of 4")
     layout.scalars_per_elem = total // 4
@@ -11135,6 +11143,8 @@ def launch_metal_kernel_native(kernel, dim, inputs, outputs, device, block_dim: 
                 if ctype_inst is None:
                     raise RuntimeError(f"Kernel '{kernel.key}' arg {name!r}: struct value lacks ``_ctype``")
                 raw = bytes(ctype_inst)
+                if layout.scalars_per_elem == 0:
+                    raw = b""  # ctypes pads empty structs to 1 byte; nothing to bind
                 if len(raw) != 4 * layout.scalars_per_elem:
                     raise RuntimeError(
                         f"Kernel '{kernel.key}' arg {name!r}: struct serialisation produced "
@@ -11634,6 +11644,8 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim: int = 2
                     f"``StructInstance`` (e.g. one constructed via ``MyStruct()``)"
                 )
             raw = bytes(ctype_inst)
+            if layout.scalars_per_elem == 0:
+                raw = b""  # ctypes pads empty structs to 1 byte; nothing to bind
             np_buf = np.frombuffer(raw, dtype=np.float32).copy()
             if np_buf.size != layout.scalars_per_elem:
                 raise RuntimeError(
