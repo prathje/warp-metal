@@ -703,11 +703,12 @@ def fold(nodes: list[Node], query_iter_vars: dict[str, str] | None = None) -> tu
 
 
 # Query-object ctypes whose Python-style iterator protocol the MSL header
-# implements (``wp_iter_cmp`` / ``wp_iter_next`` over the unified
-# ``wp_bvh_query_t``). ``hash_grid_query_t`` is recognized separately so
-# the fold can raise a targeted unsupported-type error instead of the
-# generic remaining-intrinsic one.
-_ITER_QUERY_SUPPORTED_CTYPES = frozenset({"wp::bvh_query_t", "wp::mesh_query_aabb_t"})
+# implements (``wp_iter_cmp`` / ``wp_iter_next`` overloads on the unified
+# ``wp_bvh_query_t`` and on ``wp_hash_grid_query_t``). The float16/float64
+# hash-grid variants (``_h`` / ``_d``) are recognized separately so the
+# fold can raise a targeted unsupported-type error instead of the generic
+# remaining-intrinsic one.
+_ITER_QUERY_SUPPORTED_CTYPES = frozenset({"wp::bvh_query_t", "wp::mesh_query_aabb_t", "wp::hash_grid_query_f"})
 
 _ITER_NEXT_LINE = re.compile(r"^\s*var_(\w+)\s*=\s*wp::iter_next\s*\(\s*var_(\w+)\s*\)\s*;\s*$")
 
@@ -727,7 +728,7 @@ def query_iterator_vars(adj, subs: dict[str, str] | None = None) -> dict[str, st
             ctype = var.ctype()
         except Exception:
             continue
-        if ctype not in _ITER_QUERY_SUPPORTED_CTYPES and not ctype.startswith("wp::hash_grid_query_t"):
+        if ctype not in _ITER_QUERY_SUPPORTED_CTYPES and not ctype.startswith("wp::hash_grid_query_"):
             continue
         name = f"var_{var.label}"
         if subs is not None:

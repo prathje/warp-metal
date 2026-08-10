@@ -6994,10 +6994,17 @@ class HashGrid:
         self.device = self.runtime.get_device(device)
 
         if getattr(self.device, "is_metal", False):
-            raise RuntimeError(
-                "wp.HashGrid is not supported on Metal devices yet. "
-                "Create the grid on the 'cpu' device to query it with CPU kernels."
-            )
+            if dtype is not float32:
+                raise RuntimeError(
+                    "wp.HashGrid on Metal only supports float32 grids "
+                    "(the MSL port instantiates the float32 variant only)."
+                )
+            from warp._src.metal_hashgrid import MetalHashGrid  # noqa: PLC0415
+
+            self._metal = MetalHashGrid(dim_x, dim_y, dim_z, self.device)
+            self.id = self._metal.id
+            self.reserved = False
+            return
 
         if self.device.is_cpu:
             self.id = self._native_func("create")(self._type_id, dim_x, dim_y, dim_z)
@@ -7029,15 +7036,29 @@ class HashGrid:
         if points.ndim > 1:
             points = points.contiguous().flatten()
 
+        if getattr(self, "_metal", None) is not None:
+            self._metal.build(points, radius)
+            self.reserved = True
+            return
+
         self._native_func("update")(self.id, self._type_id, radius, ctypes.byref(points.__ctype__()))
         self.reserved = True
 
     def reserve(self, num_points):
+        if getattr(self, "_metal", None) is not None:
+            # The Metal build allocates exactly-sized tables on every
+            # ``build()``; there is nothing to pre-reserve.
+            self.reserved = True
+            return
         self._native_func("reserve")(self.id, self._type_id, num_points)
         self.reserved = True
 
     def __del__(self):
         if not self.id:
+            return
+
+        if getattr(self, "_metal", None) is not None:
+            self._metal.release()
             return
 
         try:
