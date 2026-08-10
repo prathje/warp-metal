@@ -8121,10 +8121,17 @@ class HashGrid:
         self._validate_cell_count(self._dim_x, self._dim_y, self._dim_z)
 
         if getattr(self.device, "is_metal", False):
-            raise RuntimeError(
-                "wp.HashGrid is not supported on Metal devices yet. "
-                "Create the grid on the 'cpu' device to query it with CPU kernels."
-            )
+            if dtype is not float32:
+                raise RuntimeError(
+                    "wp.HashGrid on Metal only supports float32 grids "
+                    "(the MSL port instantiates the float32 variant only)."
+                )
+            from warp._src.metal_hashgrid import MetalHashGrid  # noqa: PLC0415
+
+            self._metal = MetalHashGrid(dim_x, dim_y, dim_z, self.device)
+            self.id = self._metal.id
+            self.reserved = False
+            return
 
         if self.device.is_cpu:
             self.id = self._native_func("create")(self._type_id, self._dim_x, self._dim_y, self._dim_z)
@@ -8189,6 +8196,13 @@ class HashGrid:
         if points.ndim > 1:
             points = points.contiguous().flatten()
 
+        if getattr(self, "_metal", None) is not None:
+            if groups is not None:
+                raise NotImplementedError("wp.HashGrid.build(groups=...) is not supported on Metal devices yet")
+            self._metal.build(points, radius)
+            self.reserved = True
+            return
+
         groups_arg = None
         if groups is not None:
             if groups.ndim > 1:
@@ -8217,6 +8231,12 @@ class HashGrid:
             num_points (int): Number of points the grid should accommodate.
             with_groups (bool): Also reserve the buffers used by grouped builds (with ``groups``).
         """
+        if getattr(self, "_metal", None) is not None:
+            # The Metal build allocates exactly-sized tables on every
+            # ``build()``; there is nothing to pre-reserve.
+            self.reserved = True
+            return
+
         if self.device.is_cpu and warp._src.context._get_apic_capture_for_device(self.device) is not None:
             raise NotImplementedError(
                 "HashGrid.reserve() cannot be called during CPU graph capture; reserve before capture"
@@ -8227,6 +8247,10 @@ class HashGrid:
 
     def __del__(self):
         if not self.id:
+            return
+
+        if getattr(self, "_metal", None) is not None:
+            self._metal.release()
             return
 
         try:

@@ -6171,20 +6171,31 @@ class TestMetalUnsupportedFeaturesRaise(unittest.TestCase):
         _run_with_metal_enabled(self, snippet)
 
     def test_hashgrid_and_volume_creation_raise(self):
-        # HashGrid/Volume construction used to fall through to the CUDA
-        # native constructors with a null context and crash the process.
+        # Volume construction used to fall through to the CUDA native
+        # constructors with a null context and crash the process. HashGrid
+        # is supported on the native-dispatch path (see
+        # TestMetalHashGrid); on the MLX path and for non-float32 dtypes
+        # it raises cleanly.
         snippet = textwrap.dedent(
             """
             import numpy as np
             import warp as wp
 
             dev = 'metal:0'
-            try:
-                wp.HashGrid(8, 8, 8, device=dev)
-            except RuntimeError as e:
-                assert 'Metal' in str(e), str(e)
+            if not wp.config.metal_native_dispatch:
+                try:
+                    wp.HashGrid(8, 8, 8, device=dev)
+                except RuntimeError as e:
+                    assert 'native dispatch' in str(e), str(e)
+                else:
+                    raise AssertionError('HashGrid creation should have raised on the MLX path')
             else:
-                raise AssertionError('HashGrid creation should have raised on Metal')
+                try:
+                    wp.HashGrid(8, 8, 8, device=dev, dtype=wp.float64)
+                except RuntimeError as e:
+                    assert 'float32' in str(e), str(e)
+                else:
+                    raise AssertionError('float64 HashGrid creation should have raised on Metal')
 
             data = wp.array(np.zeros(1024, np.uint8), device=dev)
             try:
@@ -7534,6 +7545,98 @@ class TestMetalBvhMesh(unittest.TestCase):
                     np.testing.assert_array_equal(a, b)
                 else:
                     np.testing.assert_allclose(b, a, atol=2e-6, rtol=0, err_msg=name)
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=240)
+
+
+@unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
+@unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
+class TestMetalHashGrid(unittest.TestCase):
+    """``wp.HashGrid`` on Metal: host-built cell tables queried through a
+    descriptor buffer (native dispatch only, float32 grids)."""
+
+    def test_hash_grid_queries_match_cpu(self):
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            if not wp.config.metal_native_dispatch:
+                raise SystemExit(0)  # HashGrid is native-dispatch-only on Metal
+
+            rng = np.random.default_rng(3)
+            N = 400
+            pts_np = rng.uniform(-4.0, 4.0, size=(N, 3)).astype(np.float32)
+            radius = 0.7
+
+            @wp.kernel
+            def neighbors(grid: wp.uint64, pts: wp.array(dtype=wp.vec3), radius: float,
+                          mask: wp.array2d(dtype=wp.int32), counts: wp.array(dtype=wp.int32)):
+                i = wp.tid()
+                p = pts[i]
+                n = int(0)
+                for j in wp.hash_grid_query(grid, p, radius):
+                    if wp.length(pts[j] - p) <= radius:
+                        mask[i, j] = 1
+                        n += 1
+                counts[i] = n
+
+            @wp.kernel
+            def neighbors_while(grid: wp.uint64, pts: wp.array(dtype=wp.vec3), radius: float,
+                                counts: wp.array(dtype=wp.int32), pid: wp.array(dtype=wp.int32)):
+                i = wp.tid()
+                p = pts[i]
+                q = wp.hash_grid_query(grid, p, radius)
+                j = int(0)
+                n = int(0)
+                while wp.hash_grid_query_next(q, j):
+                    if wp.length(pts[j] - p) <= radius:
+                        n += 1
+                counts[i] = n
+                # ``i`` is a raw sort-order index here; both devices use the
+                # same stable sort, so the ids match exactly.
+                pid[i] = wp.hash_grid_point_id(grid, i)
+
+            outs = {}
+            for dev in ('cpu', 'metal:0'):
+                with wp.ScopedDevice(dev):
+                    grid = wp.HashGrid(16, 16, 16)
+                    pts = wp.array(pts_np, dtype=wp.vec3)
+
+                    # Unbuilt grid: queries return no results on both devices.
+                    counts0 = wp.full(N, -1, dtype=wp.int32)
+                    pid0 = wp.zeros(N, dtype=wp.int32)
+                    wp.launch(neighbors_while, dim=N, inputs=[grid.id, pts, radius],
+                              outputs=[counts0, pid0])
+
+                    grid.build(pts, radius)
+                    mask = wp.zeros((N, N), dtype=wp.int32)
+                    counts = wp.zeros(N, dtype=wp.int32)
+                    wp.launch(neighbors, dim=N, inputs=[grid.id, pts, radius],
+                              outputs=[mask, counts])
+                    counts_w = wp.zeros(N, dtype=wp.int32)
+                    pid = wp.zeros(N, dtype=wp.int32)
+                    wp.launch(neighbors_while, dim=N, inputs=[grid.id, pts, radius],
+                              outputs=[counts_w, pid])
+
+                    # Rebuild with moved points — the id (descriptor) is stable.
+                    pts2 = wp.array(pts_np * 0.5 + 1.0, dtype=wp.vec3)
+                    grid.build(pts2, radius)
+                    counts2 = wp.zeros(N, dtype=wp.int32)
+                    pid2 = wp.zeros(N, dtype=wp.int32)
+                    wp.launch(neighbors_while, dim=N, inputs=[grid.id, pts2, radius],
+                              outputs=[counts2, pid2])
+                    wp.synchronize_device()
+                    outs[dev] = (counts0.numpy().copy(), mask.numpy().copy(), counts.numpy().copy(),
+                                 counts_w.numpy().copy(), pid.numpy().copy(),
+                                 counts2.numpy().copy(), pid2.numpy().copy())
+
+            for a, b in zip(outs['cpu'], outs['metal:0']):
+                np.testing.assert_array_equal(a, b)
+            assert (outs['metal:0'][0] == 0).all()  # unbuilt grid found nothing
+            np.testing.assert_array_equal(outs['metal:0'][2], outs['metal:0'][3])  # for == while
+            np.testing.assert_array_equal(outs['metal:0'][2], outs['metal:0'][1].sum(axis=1))
+            assert outs['metal:0'][2].sum() > N  # points actually found neighbors
             """
         )
         _run_with_metal_enabled(self, snippet, timeout=240)

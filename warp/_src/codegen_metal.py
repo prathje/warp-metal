@@ -179,6 +179,9 @@ _SCALAR_CTYPE_TO_MSL: dict[str, str] = {
     "wp::mesh_query_aabb_t": "wp_mesh_query_aabb_t",
     "wp::mesh_query_point_t": "wp_mesh_query_point_t",
     "wp::mesh_query_ray_t": "wp_mesh_query_ray_t",
+    # Hash-grid traversal state (float32 grids only) — the MSL struct is
+    # emitted with ``_HASHGRID_HELPERS``.
+    "wp::hash_grid_query_f": "wp_hash_grid_query_t",
 }
 
 # Builtin result structs whose fields kernels read directly (``q.result``,
@@ -2827,6 +2830,124 @@ inline int wp_mesh_get_index(ulong id, int face_vertex_index) {
 }"""
 
 
+# Port of ``warp/native/hashgrid.h`` (float32 instantiation only). Like the
+# BVH port, a grid id is the gpuAddress of a descriptor buffer packed by
+# ``warp/_src/metal_hashgrid.py`` — MSL reads the cell tables through the
+# gpuAddresses stored in it. Layout must match ``_HASH_GRID_DESC_FMT``
+# ("<4Q6i2f", 64 bytes): 8-byte-aligned ulongs first, then six ints (one is
+# padding), then the two cell-width floats. An unbuilt grid has
+# ``point_cells == 0`` and queries return no results, matching native.
+_HASHGRID_HELPERS = """\
+struct wp_hash_grid_desc_t {
+    ulong point_cells;
+    ulong point_ids;
+    ulong cell_starts;
+    ulong cell_ends;
+    int dim_x;
+    int dim_y;
+    int dim_z;
+    int num_points;
+    int max_points;
+    int _pad0;
+    float cell_width;
+    float cell_width_inv;
+};
+inline const device int* wp_hgrid_int_ptr(ulong addr) { return reinterpret_cast<const device int*>(addr); }
+inline wp_hash_grid_desc_t wp_hash_grid_get_desc(ulong id) {
+    return *reinterpret_cast<const device wp_hash_grid_desc_t*>(id);
+}
+inline int wp_hash_grid_index(const thread wp_hash_grid_desc_t& grid, int x, int y, int z) {
+    const int origin = 1 << 20;
+    x = metal::max(0, x + origin);
+    y = metal::max(0, y + origin);
+    z = metal::max(0, z + origin);
+    int cx = x % grid.dim_x;
+    int cy = y % grid.dim_y;
+    int cz = z % grid.dim_z;
+    return cz * (grid.dim_x * grid.dim_y) + cy * grid.dim_x + cx;
+}
+struct wp_hash_grid_query_t {
+    int x_start;
+    int y_start;
+    int z_start;
+    int x_end;
+    int y_end;
+    int z_end;
+    int x;
+    int y;
+    int z;
+    int cell_index;
+    int cell_end;
+    int current;
+    wp_hash_grid_desc_t grid;
+};
+inline wp_hash_grid_query_t wp_hash_grid_query(ulong id, float3 pos, float radius) {
+    wp_hash_grid_query_t query;
+    query.grid = wp_hash_grid_get_desc(id);
+    query.current = 0;
+    const float cell_width_inv = query.grid.cell_width_inv;
+    query.x_start = int(metal::floor((pos.x - radius) * cell_width_inv));
+    query.y_start = int(metal::floor((pos.y - radius) * cell_width_inv));
+    query.z_start = int(metal::floor((pos.z - radius) * cell_width_inv));
+    query.x_end = metal::min(int(metal::floor((pos.x + radius) * cell_width_inv)),
+                             query.x_start + query.grid.dim_x - 1);
+    query.y_end = metal::min(int(metal::floor((pos.y + radius) * cell_width_inv)),
+                             query.y_start + query.grid.dim_y - 1);
+    query.z_end = metal::min(int(metal::floor((pos.z + radius) * cell_width_inv)),
+                             query.z_start + query.grid.dim_z - 1);
+    query.x = query.x_start;
+    query.y = query.y_start;
+    query.z = query.z_start;
+    if (query.grid.cell_starts != 0ul) {
+        const int cell = wp_hash_grid_index(query.grid, query.x, query.y, query.z);
+        query.cell_index = wp_hgrid_int_ptr(query.grid.cell_starts)[cell];
+        query.cell_end = wp_hgrid_int_ptr(query.grid.cell_ends)[cell];
+    } else {
+        query.cell_index = 0;
+        query.cell_end = 0;
+    }
+    return query;
+}
+inline bool wp_hash_grid_query_next(thread wp_hash_grid_query_t& query, thread int& index) {
+    if (query.grid.point_cells == 0ul) { return false; }
+    const device int* point_ids = wp_hgrid_int_ptr(query.grid.point_ids);
+    const device int* cell_starts = wp_hgrid_int_ptr(query.grid.cell_starts);
+    const device int* cell_ends = wp_hgrid_int_ptr(query.grid.cell_ends);
+    while (true) {
+        if (query.cell_index < query.cell_end) {
+            index = point_ids[query.cell_index++];
+            return true;
+        }
+        query.x++;
+        if (query.x > query.x_end) {
+            query.x = query.x_start;
+            query.y++;
+        }
+        if (query.y > query.y_end) {
+            query.y = query.y_start;
+            query.z++;
+        }
+        if (query.z > query.z_end) {
+            return false;
+        }
+        const int cell = wp_hash_grid_index(query.grid, query.x, query.y, query.z);
+        query.cell_index = cell_starts[cell];
+        query.cell_end = cell_ends[cell];
+    }
+}
+// Python-style ``for x in query`` protocol (same shape as the bvh_query_t
+// overloads): iter_cmp ADVANCES the query, iter_next reads the hit back.
+inline bool wp_iter_cmp(thread wp_hash_grid_query_t& query) {
+    return wp_hash_grid_query_next(query, query.current);
+}
+inline int wp_iter_next(thread wp_hash_grid_query_t& query) { return query.current; }
+inline int wp_hash_grid_point_id(ulong id, thread int& index) {
+    wp_hash_grid_desc_t grid = wp_hash_grid_get_desc(id);
+    if (grid.point_ids == 0ul) { return -1; }
+    return wp_hgrid_int_ptr(grid.point_ids)[index];
+}"""
+
+
 # Interpolation / misc math / small linear-algebra helpers. Each piece is
 # emitted only when the translated source references it (see
 # ``_emit_misc_math_helpers``). Bodies mirror the Warp native
@@ -4797,6 +4918,8 @@ def _build_kernel_header(source: str) -> str:
         parts.append(_INTERSECT_HELPERS)
     if "wp_bvh_" in source or "wp_mesh_" in source:
         parts.append(_BVH_HELPERS)
+    if "wp_hash_grid_" in source:
+        parts.append(_HASHGRID_HELPERS)
     misc_math = _emit_misc_math_helpers(source)
     if misc_math:
         parts.append(misc_math)
@@ -5640,6 +5763,12 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bwp::mesh_get_point\b"), "wp_mesh_get_point"),
     (re.compile(r"\bwp::mesh_get_velocity\b"), "wp_mesh_get_velocity"),
     (re.compile(r"\bwp::mesh_get_index\b"), "wp_mesh_get_index"),
+    # Hash-grid queries — descriptor-buffer port of warp/native/hashgrid.h
+    # (see ``_HASHGRID_HELPERS``); ids come from ``warp/_src/metal_hashgrid.py``.
+    # Longest names first so ``hash_grid_query`` doesn't clobber the others.
+    (re.compile(r"\bwp::hash_grid_query_next\b"), "wp_hash_grid_query_next"),
+    (re.compile(r"\bwp::hash_grid_point_id\b"), "wp_hash_grid_point_id"),
+    (re.compile(r"\bwp::hash_grid_query\b"), "wp_hash_grid_query"),
     # NOTE: ``wp::lower_bound`` is intentionally NOT handled here — its
     # 2-arg form references the array's ``<argname>_shape`` input, which
     # requires the *final* parameter name. It's rewritten inside
@@ -9562,7 +9691,7 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
         init_shadow_ints=tuple(init_shadow_ints),
         inplace_arrays=tuple(mlx_inplace_arrays),
         seeded_outputs=seeded_outputs,
-        uses_bvh=("wp_bvh_" in source or "wp_mesh_" in source),
+        uses_bvh=("wp_bvh_" in source or "wp_mesh_" in source or "wp_hash_grid_" in source),
         # NB: ``builtin_block_dim`` is checked on the kernel's own IR — a
         # ``wp.block_dim()`` buried in a non-inlined wp.func would be
         # missed, but tile/block kernels call it at kernel scope.
