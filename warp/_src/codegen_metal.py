@@ -10948,6 +10948,36 @@ def _native_pack_scalar_arg(arg_var, value) -> tuple[bytes, int]:
     return bytes(packed), ctypes.sizeof(packed)
 
 
+def _normalize_none_array_args(kernel, fwd_args: list, device) -> None:
+    """Replace ``None`` passed for array-typed kernel args with a zero-size
+    placeholder ``wp.array`` (in place).
+
+    CUDA/CPU launches accept ``None`` for unused array slots and bind a
+    null ``array_t`` (data=0, shape=0) — e.g. ``warp/_src/marching_cubes.py``
+    launches its two-pass kernels with ``None`` for whichever outputs the
+    pass doesn't produce. Both Metal launchers already handle zero-size
+    arrays everywhere (placeholder MTLBuffer / zero-element MLX input /
+    zeroed packed shapes), so a cached zero-size array per (arg, dtype)
+    gives the same semantics: the kernel must not index the array, exactly
+    as on CUDA.
+    """
+    cache = getattr(kernel, "_metal_none_arg_cache", None)
+    for i, arg_var in enumerate(kernel.adj.args):
+        if fwd_args[i] is not None or not _is_array_arg(arg_var):
+            continue
+        if cache is None:
+            cache = {}
+            kernel._metal_none_arg_cache = cache
+        placeholder = cache.get(i)
+        if placeholder is None or placeholder.device != device:
+            import warp  # noqa: PLC0415
+
+            arr_type = arg_var.type
+            placeholder = warp.zeros(shape=(0,) * arr_type.ndim, dtype=arr_type.dtype, device=device)
+            cache[i] = placeholder
+        fwd_args[i] = placeholder
+
+
 def launch_metal_kernel_native(kernel, dim, inputs, outputs, device, block_dim: int = 256):
     """CUDA-style native Metal dispatch.
 
@@ -10996,6 +11026,7 @@ def launch_metal_kernel_native(kernel, dim, inputs, outputs, device, block_dim: 
             f"Error launching kernel '{kernel.key}', passed {len(fwd_args)} arguments "
             f"but kernel requires {n_kernel_args}."
         )
+    _normalize_none_array_args(kernel, fwd_args, device)
     # Per-kernel metadata dicts are reused across launches — caching
     # them on the kernel object shaves ~10 µs/launch off the hot path.
     arg_by_name = getattr(kernel, "_metal_native_arg_by_name", None)
@@ -11547,6 +11578,7 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim: int = 2
             f"Error launching kernel '{kernel.key}', passed {len(fwd_args)} arguments "
             f"but kernel requires {len(kernel.adj.args)}."
         )
+    _normalize_none_array_args(kernel, fwd_args, device)
 
     arg_by_name = {a.label: (i, a) for i, a in enumerate(kernel.adj.args)}
 

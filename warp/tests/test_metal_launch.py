@@ -7694,6 +7694,49 @@ class TestMetalLaunchDimAndParams(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet)
 
+    def test_none_array_args_bind_null(self):
+        # CUDA/CPU launches accept ``None`` for unused array slots and bind
+        # a null array_t — warp/_src/marching_cubes.py launches its two-pass
+        # count/write kernels this way. Metal must accept the same launches
+        # (binding a zero-size placeholder) as long as the kernel doesn't
+        # index the null array.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            @wp.kernel
+            def two_pass(x: wp.array(dtype=wp.float32), opt: wp.array(dtype=wp.float32),
+                         count_only: int,
+                         counts: wp.array(dtype=wp.int32), out: wp.array(dtype=wp.float32)):
+                i = wp.tid()
+                if count_only == 1:
+                    counts[i] = i + 1
+                else:
+                    out[i] = x[i] + opt[0]
+
+            N = 32
+            x_np = np.arange(N, dtype=np.float32)
+            outs = {}
+            for dev in ('cpu', 'metal:0'):
+                with wp.ScopedDevice(dev):
+                    x = wp.array(x_np, dtype=wp.float32)
+                    opt = wp.array(np.array([10.0], np.float32), dtype=wp.float32)
+                    counts = wp.zeros(N, dtype=wp.int32)
+                    out = wp.zeros(N, dtype=wp.float32)
+                    # pass 1: count only — opt and out slots unused
+                    wp.launch(two_pass, dim=N, inputs=[x, None, 1], outputs=[counts, None])
+                    # pass 2: write — counts slot unused
+                    wp.launch(two_pass, dim=N, inputs=[x, opt, 0], outputs=[None, out])
+                    wp.synchronize_device()
+                    outs[dev] = (counts.numpy().copy(), out.numpy().copy())
+            np.testing.assert_array_equal(outs['cpu'][0], outs['metal:0'][0])
+            np.testing.assert_array_equal(outs['cpu'][1], outs['metal:0'][1])
+            np.testing.assert_array_equal(outs['metal:0'][0], np.arange(1, N + 1))
+            np.testing.assert_allclose(outs['metal:0'][1], x_np + 10.0)
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=180)
+
     def test_2d_launch_last_dim_equals_block_dim(self):
         # A plain 2-D launch whose trailing dim equals the default
         # block_dim (256) must NOT be folded away — the launch_tiled
