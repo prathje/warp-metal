@@ -6317,6 +6317,177 @@ class TestMetalUnsupportedFeaturesRaise(unittest.TestCase):
 
 @unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
 @unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
+class TestMetalNegativeStepLoops(unittest.TestCase):
+    """Negative-step Python ``range`` loops (``range(hi, -1, -step)``).
+
+    The AST emitter writes ``i < stop`` unconditionally and the fix-up
+    pass resolved constant steps from ``const int`` lines that don't
+    exist at that stage — so every negative-step loop silently ran ZERO
+    iterations on Metal (blocked-Cholesky backward substitution returned
+    the unsolved RHS). Steps now resolve from ``adj.variables``.
+    """
+
+    def test_negative_step_range(self):
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            @wp.kernel
+            def k_neg(nact: wp.array(dtype=wp.int32), out: wp.array(dtype=wp.int32)):
+                i = wp.tid()
+                c = int(0)
+                acc = int(0)
+                # dynamic start, constant negative step
+                for j in range(nact[0] - 16, -1, -16):
+                    acc += j
+                    c += 1
+                out[2 * i + 0] = acc
+                out[2 * i + 1] = c
+
+            outs = {}
+            for dev in ('cpu', 'metal:0'):
+                with wp.ScopedDevice(dev):
+                    na = wp.array(np.array([64], np.int32), dtype=wp.int32)
+                    out = wp.full(2, -7, dtype=wp.int32)
+                    wp.launch(k_neg, dim=1, inputs=[na], outputs=[out])
+                    wp.synchronize_device()
+                    outs[dev] = out.numpy().copy()
+            np.testing.assert_array_equal(outs['cpu'], outs['metal:0'])
+            np.testing.assert_array_equal(outs['metal:0'], [48 + 32 + 16 + 0, 4])
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+
+@unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
+@unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
+class TestMetalSerialTileOps(unittest.TestCase):
+    """Serial-tile-model ops used by the blocked-Cholesky examples:
+    per-element tile assignment, and the transpose→solve→transpose idiom
+    whose fused ``_inplace_transposed`` rewrite must refresh the stale
+    transpose copy for downstream reads. Combined forward+backward
+    substitution in ONE kernel guards the Metal-compiler miscompile that
+    by-value 1KB tile-struct params used to trigger (helpers now take
+    ``const thread&``)."""
+
+    def test_blocked_cholesky_solve_roundtrip(self):
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            BS = 16
+            N = 64
+
+            @wp.kernel
+            def k_factor(A: wp.array2d(dtype=float), L: wp.array2d(dtype=float),
+                         nact: wp.array(dtype=int)):
+                _t, tb = wp.tid()
+                ntpb = wp.block_dim()
+                nn = ((nact[0] + BS - 1) // BS) * BS
+                for k in range(0, nn, BS):
+                    a_kk = wp.tile_load(A, shape=(BS, BS), offset=(k, k), storage="shared")
+                    if k + BS > nact[0]:
+                        # per-element tile assignment (identity padding)
+                        nit = (BS * BS + ntpb - 1) // ntpb
+                        for i in range(nit):
+                            li = (tb + i * ntpb) % (BS * BS)
+                            r = li // BS
+                            c = li % BS
+                            v = a_kk[r, c]
+                            if k + r >= nact[0] or k + c >= nact[0]:
+                                v = wp.where(r == c, float(1), float(0))
+                            a_kk[r, c] = v
+                    if k > 0:
+                        for j in range(0, k, BS):
+                            lb = wp.tile_load(L, shape=(BS, BS), offset=(k, j))
+                            lbt = wp.tile_transpose(lb)
+                            wp.tile_matmul(lb, lbt, a_kk, alpha=-1.0)
+                    l_kk = wp.tile_cholesky(a_kk)
+                    wp.tile_store(L, l_kk, offset=(k, k))
+                    for i in range(k + BS, nn, BS):
+                        a_ik = wp.tile_load(A, shape=(BS, BS), offset=(i, k), storage="shared")
+                        if i + BS > nact[0] or k + BS > nact[0]:
+                            nit = (BS * BS + ntpb - 1) // ntpb
+                            for ii in range(nit):
+                                li = (tb + ii * ntpb) % (BS * BS)
+                                r = li // BS
+                                c = li % BS
+                                v = a_ik[r, c]
+                                if i + r >= nact[0] or k + c >= nact[0]:
+                                    v = wp.where(i + r == k + c, float(1), float(0))
+                                a_ik[r, c] = v
+                        if k > 0:
+                            for j in range(0, k, BS):
+                                lt = wp.tile_load(L, shape=(BS, BS), offset=(i, j))
+                                l2 = wp.tile_load(L, shape=(BS, BS), offset=(k, j))
+                                l2t = wp.tile_transpose(l2)
+                                wp.tile_matmul(lt, l2t, a_ik, alpha=-1.0)
+                        # transpose → solve-inplace → transpose (fused rewrite
+                        # + alias refresh for the downstream read)
+                        t = wp.tile_transpose(a_ik)
+                        wp.tile_lower_solve_inplace(l_kk, t)
+                        sol = wp.tile_transpose(t)
+                        wp.tile_store(L, sol, offset=(i, k))
+
+            @wp.kernel
+            def k_solve(Lm: wp.array2d(dtype=float), b: wp.array2d(dtype=float),
+                        x: wp.array2d(dtype=float), y: wp.array2d(dtype=float),
+                        nact: wp.array(dtype=int)):
+                nn = ((nact[0] + BS - 1) // BS) * BS
+                for i in range(0, nn, BS):
+                    r = wp.tile_load(b, shape=(BS, 1), offset=(i, 0))
+                    if i > 0:
+                        for j in range(0, i, BS):
+                            lb = wp.tile_load(Lm, shape=(BS, BS), offset=(i, j))
+                            yb = wp.tile_load(y, shape=(BS, 1), offset=(j, 0))
+                            wp.tile_matmul(lb, yb, r, alpha=-1.0)
+                    ld = wp.tile_load(Lm, shape=(BS, BS), offset=(i, i))
+                    wp.tile_lower_solve_inplace(ld, r)
+                    wp.tile_store(y, r, offset=(i, 0))
+                for i in range(nn - BS, -1, -BS):
+                    r = wp.tile_load(y, shape=(BS, 1), offset=(i, 0))
+                    if i + BS < nn:
+                        for j in range(i + BS, nn, BS):
+                            l2 = wp.tile_load(Lm, shape=(BS, BS), offset=(j, i))
+                            l2t = wp.tile_transpose(l2)
+                            xt = wp.tile_load(x, shape=(BS, 1), offset=(j, 0))
+                            wp.tile_matmul(l2t, xt, r, alpha=-1.0)
+                    ld = wp.tile_load(Lm, shape=(BS, BS), offset=(i, i))
+                    wp.tile_upper_solve_inplace(wp.tile_transpose(ld), r)
+                    wp.tile_store(x, r, offset=(i, 0))
+
+            rng = np.random.default_rng(5)
+            n_active = 50  # exercises the identity-padding branch
+            M = rng.normal(size=(N, N)).astype(np.float32)
+            SPD = (M @ M.T + N * np.eye(N)).astype(np.float32)
+            bnp = rng.normal(size=(N, 1)).astype(np.float32)
+            xref = np.linalg.solve(SPD[:n_active, :n_active].astype(np.float64),
+                                   bnp[:n_active].astype(np.float64))
+
+            res = {}
+            for dev in ('cpu', 'metal:0'):
+                with wp.ScopedDevice(dev):
+                    A = wp.array(SPD, dtype=float)
+                    L = wp.zeros((N, N), dtype=float)
+                    na = wp.array(np.array([n_active], np.int32), dtype=int)
+                    bd = 64 if dev != 'cpu' else 1
+                    wp.launch_tiled(k_factor, dim=(1,), inputs=[A], outputs=[L, na], block_dim=bd)
+                    b = wp.array(bnp, dtype=float)
+                    x = wp.zeros((N, 1), dtype=float)
+                    y = wp.zeros((N, 1), dtype=float)
+                    wp.launch_tiled(k_solve, dim=(1,), inputs=[L, b, x, y, na], block_dim=bd)
+                    wp.synchronize_device()
+                    res[dev] = (L.numpy().copy(), x.numpy().copy())
+            np.testing.assert_allclose(res['cpu'][0], res['metal:0'][0], rtol=1e-4, atol=1e-5)
+            np.testing.assert_allclose(res['cpu'][1], res['metal:0'][1], rtol=1e-4, atol=1e-5)
+            assert np.abs(res['metal:0'][1][:n_active] - xref).max() < 1e-3
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=300)
+
+
+@unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
+@unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
 class TestMetalCoopTiles(unittest.TestCase):
     """Distributed cooperative register tiles: eligible launch-tiled
     kernels build their IR at the honest block_dim and dispatch one

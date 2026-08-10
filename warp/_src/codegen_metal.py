@@ -3896,7 +3896,7 @@ def _emit_tile_cholesky(n: int, msl_scalar: str) -> str:
     """
     name = f"wp_tile_{n}x{n}_{msl_scalar}"
     parts: list[str] = []
-    parts.append(f"inline {name} {name}_cholesky({name} A) {{")
+    parts.append(f"__attribute__((noinline)) {name} {name}_cholesky(const thread {name}& A) {{")
     parts.append(f"    {name} L = A;")
     # Disable unrolling on the outer ``j`` loop. With N>=8 and the natural
     # full unroll of the triple-nested loops, Apple's MSL compiler
@@ -4165,7 +4165,7 @@ def _emit_tile_lower_solve_inplace(n: int, k: int, msl_scalar: str) -> str:
     # ``noinline`` for the same reason as ``cholesky_inplace``: 3+
     # inlined copies in one kernel produce silently-zero writes on
     # Metal at N=16. Out-of-lining restores correctness.
-    parts: list[str] = [f"__attribute__((noinline)) void {name}({L_name} L, thread {B_name}& B) {{"]
+    parts: list[str] = [f"__attribute__((noinline)) void {name}(const thread {L_name}& L, thread {B_name}& B) {{"]
     parts.append("    #pragma clang loop unroll(disable)")
     parts.append(f"    for (int i = 0; i < {n}; ++i) {{")
     parts.append(f"        for (int col = 0; col < {k}; ++col) {{")
@@ -4190,7 +4190,7 @@ def _emit_tile_upper_solve_inplace(n: int, k: int, msl_scalar: str) -> str:
     name = f"wp_tile_upper_solve_{n}x{k}_{msl_scalar}_inplace"
     # ``noinline`` matches ``lower_solve_inplace`` — same Metal compiler
     # inline-bug at 3+ invocations.
-    parts: list[str] = [f"__attribute__((noinline)) void {name}({L_name} U, thread {B_name}& B) {{"]
+    parts: list[str] = [f"__attribute__((noinline)) void {name}(const thread {L_name}& U, thread {B_name}& B) {{"]
     parts.append("    #pragma clang loop unroll(disable)")
     parts.append(f"    for (int i = {n} - 1; i >= 0; --i) {{")
     parts.append(f"        for (int col = 0; col < {k}; ++col) {{")
@@ -4223,7 +4223,7 @@ def _emit_tile_lower_solve_inplace_transposed(n: int, k: int, msl_scalar: str) -
     L_name = f"wp_tile_{n}x{n}_{msl_scalar}"
     A_name = f"wp_tile_{k}x{n}_{msl_scalar}"
     name = f"wp_tile_lower_solve_{n}x{k}_{msl_scalar}_inplace_transposed"
-    parts: list[str] = [f"__attribute__((noinline)) void {name}({L_name} L, thread {A_name}& A) {{"]
+    parts: list[str] = [f"__attribute__((noinline)) void {name}(const thread {L_name}& L, thread {A_name}& A) {{"]
     parts.append("    #pragma clang loop unroll(disable)")
     parts.append(f"    for (int row = 0; row < {k}; ++row) {{")
     parts.append(f"        for (int i = 0; i < {n}; ++i) {{")
@@ -4245,7 +4245,7 @@ def _emit_tile_upper_solve_inplace_transposed(n: int, k: int, msl_scalar: str) -
     L_name = f"wp_tile_{n}x{n}_{msl_scalar}"
     A_name = f"wp_tile_{k}x{n}_{msl_scalar}"
     name = f"wp_tile_upper_solve_{n}x{k}_{msl_scalar}_inplace_transposed"
-    parts: list[str] = [f"__attribute__((noinline)) void {name}({L_name} U, thread {A_name}& A) {{"]
+    parts: list[str] = [f"__attribute__((noinline)) void {name}(const thread {L_name}& U, thread {A_name}& A) {{"]
     parts.append("    #pragma clang loop unroll(disable)")
     parts.append(f"    for (int row = 0; row < {k}; ++row) {{")
     parts.append(f"        for (int i = {n} - 1; i >= 0; --i) {{")
@@ -4278,7 +4278,7 @@ def _emit_tile_matmul(r: int, k: int, n: int, msl_scalar: str) -> str:
     # to the C accumulator (same family of bug as the
     # ``cholesky_inplace`` / ``*_solve_inplace`` regressions).
     parts: list[str] = [
-        f"__attribute__((noinline)) void {name}({A} A, {B} B, thread {C}& C, {msl_scalar} alpha, {msl_scalar} beta) {{"
+        f"__attribute__((noinline)) void {name}(const thread {A}& A, const thread {B}& B, thread {C}& C, {msl_scalar} alpha, {msl_scalar} beta) {{"
     ]
     parts.append(f"    for (int i = 0; i < {r}; ++i) {{")
     parts.append(f"        for (int j = 0; j < {n}; ++j) {{")
@@ -4306,7 +4306,12 @@ def _emit_tile_transpose(rows: int, cols: int, msl_scalar: str) -> str:
     """
     in_name = f"wp_tile_{rows}x{cols}_{msl_scalar}"
     out_name = f"wp_tile_{cols}x{rows}_{msl_scalar}"
-    parts: list[str] = [f"inline {out_name} {in_name}_transpose({in_name} A) {{"]
+    # ``noinline`` for the same reason as the solve/cholesky/matmul
+    # helpers: inlining several large struct-by-value helpers into one
+    # kernel triggers a Metal compiler miscompile (observed: the
+    # backward-substitution loop of a combined forward+backward solve
+    # kernel silently produced zeros while the same loop alone was fine).
+    parts: list[str] = [f"__attribute__((noinline)) {out_name} {in_name}_transpose(const thread {in_name}& A) {{"]
     parts.append(f"    {out_name} R;")
     parts.append(f"    for (int i = 0; i < {rows}; ++i) {{")
     parts.append(f"        for (int j = 0; j < {cols}; ++j) {{")
@@ -4329,7 +4334,9 @@ def _emit_tile_cholesky_solve(n: int, k: int, msl_scalar: str) -> str:
     if k == 1:
         B_name = f"wp_tile_{n}x1_{msl_scalar}"
         parts: list[str] = []
-        parts.append(f"inline {B_name} {L_name}_cholesky_solve_1({L_name} L, {B_name} b) {{")
+        parts.append(
+            f"__attribute__((noinline)) {B_name} {L_name}_cholesky_solve_1(const thread {L_name}& L, const thread {B_name}& b) {{"
+        )
         parts.append(f"    {B_name} x = b;")
         # Forward: L y = b. Same Apple-MSL unroll bug as ``_cholesky``: at
         # N>=8 a fully unrolled triangular solve drops the writes to
@@ -5497,9 +5504,13 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"wp::length_sq\s*\(\s*([^()]+?)\s*\)"), r"wp_dot(\1, \1)"),
     # ``wp::assign(target, value)`` — used by Warp to model in-place mutation
     # of a local (e.g. accumulator updates inside a loop). Translate to a
-    # plain assignment statement.
+    # plain assignment statement. The value group must NOT permit commas:
+    # the 3-/4-arg element forms ``wp::assign(tile, i[, j], value)`` would
+    # otherwise be swallowed into ``tile = i, j, value;`` (comma
+    # expression). Those survive to ``_translate_tile_intrinsics``, whose
+    # ``_repl_tile_assign`` lowers tile targets to flat ``c[]`` stores.
     (
-        re.compile(r"wp::assign\s*\(\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)\s*;"),
+        re.compile(r"wp::assign\s*\(\s*([^,()]+?)\s*,\s*([^,()]+?)\s*\)\s*;"),
         r"\1 = \2;",
     ),
     # ``wp::copy(value)`` is an explicit value copy used by Warp to bind a
@@ -6036,6 +6047,9 @@ _TILE_DIAG_ADD_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_diag_add\s*\(([^)]*
 # ``n_elem`` consecutive scalar components, mirroring the tile_map
 # accessors).
 _TILE_EXTRACT_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_extract\s*\(\s*var_(\w+)\s*,\s*([^)]+?)\s*\)")
+# ``wp::assign(var_t, i[, j], value);`` — per-element tile store. Args are
+# plain ``var_X`` locals in the IR, so a naive comma split is safe.
+_TILE_ELEM_ASSIGN_PAT = re.compile(r"\bwp::assign\s*\(\s*var_(\w+)\s*,\s*([^()]+?)\s*\)\s*;")
 # ``wp::tile_assign(dst, src, offset_tuple)`` — copy ``src`` into ``dst``
 # at ``offset``. With single-element tiles ``offset=(0,0)`` and the call
 # is just ``dst = src``.
@@ -6980,7 +6994,17 @@ def _translate_tile_intrinsics(
             if src_dims is not None:
                 src_rows, src_cols, _src_scalar = src_dims
                 helper_t = f"wp_tile_{kind}_solve_{n}x{k_cols}_{scalar}_inplace_transposed"
-                return f"{helper_t}({L_arg}, var_{src_label})"
+                # The fused call updates the SOURCE tile; the transpose
+                # local ``B`` is a stale copy (on CUDA it's a layout view,
+                # so reads of it after the solve see the update). Refresh
+                # it so downstream reads — ``tile_store(B)``, a second
+                # ``tile_transpose(B)`` (the blocked-Cholesky
+                # ``sol = transpose(solve(transpose(A)))`` idiom) — see
+                # the solved values. This is the alias-refresh direction
+                # (``B = transpose(src)``), NOT the writeback direction
+                # (``src = transpose(B)``) that miscompiled (see above).
+                refresh = f"var_{B_label} = wp_tile_{src_rows}x{src_cols}_{scalar}_transpose(var_{src_label})"
+                return f"{helper_t}({L_arg}, var_{src_label});\n{refresh}"
         return call
 
     line = _TILE_LOWER_SOLVE_INPLACE_PAT.sub(lambda m: _repl_solve_inplace("lower", m), line)
@@ -7060,6 +7084,39 @@ def _translate_tile_intrinsics(
         return f"var_{lhs} = var_{t_label}.c[{elem}]"
 
     line = _TILE_EXTRACT_PAT.sub(_repl_tile_extract, line)
+
+    def _repl_tile_assign(m: re.Match[str]) -> str:
+        # ``wp::assign(var_t, i[, j], value);`` — per-element tile store
+        # (``t[i, j] = value`` in user code). Mirrors ``_repl_tile_extract``'s
+        # flat ``c[]`` indexing. Non-tile targets fall through to the
+        # generic 2-arg ``wp::assign`` rewrite; without this handler the
+        # generic pattern also swallowed the 3-/4-arg tile form (its value
+        # group permits commas) and emitted ``t = i, j, value;``.
+        t_label = m.group(1)
+        dims = tile_var_dims.get(t_label)
+        if dims is None:
+            return m.group(0)
+        rows, cols, scalar = dims
+        args = [a.strip() for a in m.group(2).split(",") if a.strip()]
+        if len(args) < 2:
+            return m.group(0)
+        value = args[-1]
+        idxs = args[:-1]
+        if rows * cols == 1:
+            return f"var_{t_label} = {value};"
+        if len(idxs) == 2:
+            elem = f"(({idxs[0]}) * {cols} + ({idxs[1]}))"
+        elif len(idxs) == 1:
+            elem = f"({idxs[0]})"
+        else:
+            raise MetalCodegenError(f"tile element assign with {len(idxs)} indices is not supported: {m.group(0)!r}")
+        vec_n = tile_var_vec_n.get(t_label, 0)
+        if vec_n > 0:
+            stmts = [f"var_{t_label}.c[{elem} * {vec_n} + {k}] = ({value})[{k}];" for k in range(vec_n)]
+            return " ".join(stmts)
+        return f"var_{t_label}.c[{elem}] = {value};"
+
+    line = _TILE_ELEM_ASSIGN_PAT.sub(_repl_tile_assign, line)
 
     def repl_view(m: re.Match[str]) -> str:
         # ``var_X = wp::tile_view<wp::tile_shared_t<dtype, layout<shape<R,C>, ...>>, ...>>(parent, row_off, col_off)``
@@ -7443,26 +7500,35 @@ _FOR_LOOP_LINE_PAT = re.compile(
 _CONST_INT_DECL_PAT = re.compile(r"^\s*const int var_(\w+) = (-?\d+);\s*$")
 
 
-def _fix_negative_step_for_loops(lines: list[str]) -> list[str]:
+def _fix_negative_step_for_loops(
+    lines: list[str], adj=None, extra_const_ints: dict[str, int] | None = None
+) -> list[str]:
     """Rewrite ``for (i = a; i < b; i += step) {`` to use ``>`` when
     ``step`` resolves to a negative literal.
 
     Python's ``range(start, stop, step)`` iterates ``i > stop`` for
     negative steps; the AST emitter writes ``<`` unconditionally, which
-    silently makes the loop run zero iterations when ``start > stop``.
-    This is the codegen bug behind mujoco_warp's blocked-Cholesky
-    failure: the backward-substitution loop ``range(matrix_size -
-    block_size, -1, -block_size)`` was compiled to an empty C-style
-    ``for`` and the upper-triangular solve never ran, leaving the
-    forward-substituted ``y`` as the "answer" instead of computing
-    ``x``.
+    silently makes the loop run zero iterations when ``start > stop``
+    (observed in the blocked-Cholesky backward-substitution loop
+    ``range(matrix_size - block_size, -1, -block_size)``: the
+    upper-triangular solve never ran, leaving the forward-substituted
+    ``y`` as the "answer" instead of computing ``x``).
 
-    Step expressions are resolved via the kernel's ``const int var_X
-    = N;`` declarations (Warp emits one per constant int operand at the
-    top of the body). Non-integer or non-constant steps stay positive
-    by convention — covers ``range(0, n, BLOCK_DIM)`` etc.
+    Constant steps are resolved from ``adj.variables`` (constant locals
+    carry their value on the Var) plus the inliner's surfaced constants
+    for loops spliced in from ``@wp.func`` helpers; a ``const int var_X
+    = N;`` line scan remains as a fallback for pre-declared lines.
+    Non-integer or non-constant steps stay positive by convention —
+    covers ``range(0, n, BLOCK_DIM)`` etc.
     """
     const_ints: dict[str, int] = {}
+    if adj is not None:
+        for v in adj.variables:
+            val = getattr(v, "constant", None)
+            if isinstance(val, int) and not isinstance(val, bool):
+                const_ints[str(v.label)] = val
+    if extra_const_ints:
+        const_ints.update(extra_const_ints)
     for raw in lines:
         m = _CONST_INT_DECL_PAT.match(raw)
         if m is not None:
@@ -7661,13 +7727,13 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
         forward_lines = [ln.replace("builtin_block_dim()", str(coop_block_n)) for ln in forward_lines]
 
     # Negative-step Python ``range`` (e.g. ``range(start, -1, -16)`` in
-    # mujoco_warp's blocked-Cholesky backward sub) emits as
+    # blocked-Cholesky backward substitution) emits as
     # ``for (i = start; i < stop; i += -step)`` from the AST, which
     # never enters its body when ``start > stop``. Python's intent is to
     # iterate *down* while ``i > stop``. Fix the comparison direction
-    # here, after we have the flat IR with all ``const int var_X = N;``
-    # declarations visible.
-    forward_lines = _fix_negative_step_for_loops(forward_lines)
+    # here; constant steps resolve from ``adj.variables`` and the
+    # inliner's surfaced constants.
+    forward_lines = _fix_negative_step_for_loops(forward_lines, adj=adj, extra_const_ints=_inlined_const_ints)
 
     vars_to_skip_decl: set[str] = _struct_skip | _drop_skip | _view_skip | _indexref_skip
 
