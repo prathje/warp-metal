@@ -2060,13 +2060,29 @@ def fold_const_branches(nodes: list[Node], adj, extra_const_ints: dict[str, int]
     return _rewrite(nodes)
 
 
-def fold_views(nodes: list[Node], adj, extra_const_ints: dict[str, int] | None = None) -> tuple[list[Node], set[str]]:
+def fold_views(
+    nodes: list[Node],
+    adj,
+    extra_const_ints: dict[str, int] | None = None,
+    struct_locals: dict[str, Any] | None = None,
+    struct_arg_arrays_out: dict[str, tuple[str, tuple[str, ...]]] | None = None,
+) -> tuple[list[Node], set[str]]:
     """Fold view aliases through the tree.
 
     ``extra_const_ints`` lets the caller supply additional const-int locals
     that aren't in ``adj.variables`` — used by the inliner to surface
     inlined constants so slice/view recognition works inside inlined
     bodies.
+
+    ``struct_locals`` carries the inliner's mangled-label -> ``Struct``
+    map so constructor calls on inlined struct locals participate in the
+    array-field backing pass.
+
+    ``struct_arg_arrays_out``, when provided, is filled with
+    ``synthetic_label -> (arg_label, field_path)`` for every ``wp.array``
+    field of a struct-typed KERNEL ARG the body touches. The fold rewrites
+    those accesses against the synthetic array name (e.g.
+    ``qp_arg__points``); the caller must bind a matching array input.
 
     Returns ``(rewritten_nodes, skip_decls)`` — local labels whose top-
     level declarations should be suppressed (the slice_t and view
@@ -2095,14 +2111,33 @@ def fold_views(nodes: list[Node], adj, extra_const_ints: dict[str, int] | None =
     # of the backing array, and the ptr/store/load plumbing lines drop.
     # mujoco_warp's GJK/EPA kernels build their ``Geom``/``Polytope``
     # scratch entirely this way.
+    from warp._src.codegen import Struct  # noqa: PLC0415
     from warp._src.types import is_array  # noqa: PLC0415  (lazy — annotation args are ``_ArrayAnnotation``)
 
     array_arg_labels = {a.label for a in adj.args if is_array(a.type)}
-    field_ptr_backing, field_load_aliases = _collect_field_array_aliases(nodes, view_aliases, array_arg_labels)
+    # Struct-typed kernel ARGS seed the backing pass: their array fields
+    # have no in-kernel store (the data comes from the host), so accesses
+    # resolve to synthetic ``<arg>__<path>`` array inputs instead. Only
+    # active when the caller supplied ``struct_arg_arrays_out`` — the
+    # rewrites are useless unless the caller binds the synthetic inputs.
+    struct_arg_types = (
+        {a.label: a.type for a in adj.args if isinstance(a.type, Struct)} if struct_arg_arrays_out is not None else {}
+    )
+    struct_local_types: dict[str, Any] = {v.label: v.type for v in adj.variables if isinstance(v.type, Struct)}
+    if struct_locals:
+        struct_local_types.update(struct_locals)
+    field_ptr_backing, field_load_aliases = _collect_field_array_aliases(
+        nodes,
+        view_aliases,
+        array_arg_labels,
+        struct_arg_types=struct_arg_types,
+        struct_local_types=struct_local_types,
+        synthetic_out=struct_arg_arrays_out,
+    )
     backed_field_ptrs = set(field_ptr_backing)
 
     skip_decls: set[str] = set(slice_aliases) | set(view_aliases) | backed_field_ptrs
-    if not view_aliases:
+    if not view_aliases and not field_ptr_backing:
         return nodes, skip_decls
 
     # ``view.shape[k]`` lowers to ``&(var_V.shape)`` + load + extract.
@@ -2188,6 +2223,9 @@ def _collect_field_array_aliases(
     nodes: tuple[Node, ...] | list[Node],
     view_aliases: dict[str, tuple[str, list[str]]],
     array_arg_labels: set[str],
+    struct_arg_types: dict[str, Any] | None = None,
+    struct_local_types: dict[str, Any] | None = None,
+    synthetic_out: dict[str, tuple[str, tuple[str, ...]]] | None = None,
 ) -> tuple[set[str], set[str]]:
     """Resolve struct-local array fields to their backing arrays.
 
@@ -2208,6 +2246,13 @@ def _collect_field_array_aliases(
     runs to fixpoint because a load alias can itself back another field
     (``pt2.vert = pt.vert``).
 
+    ``struct_arg_types`` seeds a second backing source: array fields of
+    struct-typed KERNEL ARGS (and of structs derived from them via
+    nested-field pointers, whole-struct loads/copies, and constructor
+    calls — resolved with ``struct_local_types``). Those fields have no
+    in-kernel store; their backing is a synthetic ``<arg>__<path>`` array
+    name recorded in ``synthetic_out`` for the caller to bind at launch.
+
     Returns ``(backed_field_ptr_labels, load_alias_labels)`` — the ptr
     labels whose ``&(...)`` / ``store`` lines drop, and the load targets
     whose ``wp::load`` lines drop (their declarations are suppressed via
@@ -2216,7 +2261,13 @@ def _collect_field_array_aliases(
     conflicted: set[tuple[str, str]] = set()
     while True:
         field_ptrs, backing, load_aliases, new_conflicts = _collect_field_aliases_round(
-            nodes, view_aliases, array_arg_labels, conflicted
+            nodes,
+            view_aliases,
+            array_arg_labels,
+            conflicted,
+            struct_arg_types=struct_arg_types,
+            struct_local_types=struct_local_types,
+            synthetic_out=synthetic_out,
         )
         if not new_conflicts:
             ptr_backing = {p: backing[key] for p, key in field_ptrs.items() if key in backing and key not in conflicted}
@@ -2233,6 +2284,9 @@ def _collect_field_aliases_round(
     view_aliases: dict[str, tuple[str, list[str]]],
     array_arg_labels: set[str],
     conflicted: set[tuple[str, str]],
+    struct_arg_types: dict[str, Any] | None = None,
+    struct_local_types: dict[str, Any] | None = None,
+    synthetic_out: dict[str, tuple[str, tuple[str, ...]]] | None = None,
 ) -> tuple[
     dict[str, tuple[str, str]],
     dict[tuple[str, str], tuple[str, list[str]]],
@@ -2242,6 +2296,9 @@ def _collect_field_aliases_round(
     """One collection round of ``_collect_field_array_aliases`` with the
     given conflict blacklist; returns (field_ptrs, backing, load_aliases,
     new_conflicts)."""
+    from warp._src.codegen import Struct  # noqa: PLC0415
+    from warp._src.codegen_metal import _is_array_arg_type  # noqa: PLC0415
+
     field_ptrs: dict[str, tuple[str, str]] = {}
     backing: dict[tuple[str, str], tuple[str, list[str]]] = {}
     load_aliases: dict[str, tuple[str, list[str]]] = {}
@@ -2256,6 +2313,29 @@ def _collect_field_aliases_round(
     where_edges: dict[str, tuple[str, str]] = {}
     new_conflicts: set[tuple[str, str]] = set()
 
+    # ---- Struct-ARG rooting state (see the caller's docstring) ---------
+    # Value labels holding a struct rooted at a struct-typed kernel arg:
+    # label -> (root_arg_label, field_path, Struct type at that path).
+    struct_paths: dict[str, tuple[str, tuple[str, ...], Any]] = {
+        label: (label, (), stype) for label, stype in (struct_arg_types or {}).items()
+    }
+    # Pointer labels pointing at an arg-rooted struct (``&(var_S.f)`` /
+    # ``&(var_P->f)`` chains through STRUCT-kind fields).
+    ptr_paths: dict[str, tuple[str, tuple[str, ...], Any]] = {}
+    # Constructor propagation: (struct_label, field) of a ctor result whose
+    # positional arg was an arg-rooted struct value.
+    field_value_paths: dict[tuple[str, str], tuple[str, tuple[str, ...], Any]] = {}
+    # Same, but the ctor arg was a plain struct local with its own array
+    # backings: loading ``&(var_D.f)`` adds a copy edge from the source.
+    field_struct_sources: dict[tuple[str, str], str] = {}
+    # Pointers to ctor fields with a plain-struct-local source.
+    ptr_sources: dict[str, str] = {}
+    struct_locals = struct_local_types or {}
+
+    def _field_type(stype, fname: str):
+        v = getattr(stype, "vars", {}).get(fname)
+        return None if v is None else v.type
+
     def _bind(key: tuple[str, str], b: tuple[str, list[str]]) -> bool:
         prev = backing.get(key)
         if prev is None:
@@ -2268,6 +2348,28 @@ def _collect_field_aliases_round(
             return True
         return False
 
+    def _seed_arg_field(key: tuple[str, str], owner: tuple[str, tuple[str, ...], Any], ptr_label: str) -> bool:
+        """Handle a field addr on an arg-rooted struct: seed array-field
+        backings with a synthetic ``<arg>__<path>`` name; extend the path
+        for STRUCT-kind fields."""
+        changed = False
+        root, path, stype = owner
+        ftype = _field_type(stype, key[1])
+        if ftype is None:
+            return False
+        if _is_array_arg_type(ftype):
+            if key not in conflicted:
+                syn = "__".join((root, *path, key[1]))
+                if synthetic_out is not None:
+                    synthetic_out[syn] = (root, (*path, key[1]))
+                changed |= _bind(key, (syn, []))
+        elif isinstance(ftype, Struct):
+            new_owner = (root, (*path, key[1]), ftype)
+            if ptr_paths.get(ptr_label) != new_owner:
+                ptr_paths[ptr_label] = new_owner
+                changed = True
+        return changed
+
     def walk(ns: tuple[Node, ...] | list[Node]) -> bool:
         changed = False
         for n in ns:
@@ -2276,6 +2378,32 @@ def _collect_field_aliases_round(
                 if field_ptrs.get(n.lhs) != key:
                     field_ptrs[n.lhs] = key
                     changed = True
+                owner = struct_paths.get(key[0])
+                if owner is not None:
+                    changed |= _seed_arg_field(key, owner, n.lhs)
+                else:
+                    fvp = field_value_paths.get(key)
+                    if fvp is not None and ptr_paths.get(n.lhs) != fvp:
+                        ptr_paths[n.lhs] = fvp
+                        changed = True
+                    src = field_struct_sources.get(key)
+                    if src is not None and ptr_sources.get(n.lhs) != src:
+                        ptr_sources[n.lhs] = src
+                        changed = True
+            elif (
+                isinstance(n, Assign)
+                and isinstance(n.expr, AddrOf)
+                and n.expr.inner_kind == "field_arrow"
+                and n.expr.inner_target in ptr_paths
+                and n.expr.inner_field != "shape"
+            ):
+                # Nested chain through an arg-rooted struct pointer:
+                # ``var_P = &(var_s.inner); var_Q = &(var_P->vals);``.
+                key = (n.expr.inner_target, n.expr.inner_field or "")
+                if field_ptrs.get(n.lhs) != key:
+                    field_ptrs[n.lhs] = key
+                    changed = True
+                changed |= _seed_arg_field(key, ptr_paths[key[0]], n.lhs)
             elif isinstance(n, VoidCall) and n.op == "store" and len(n.args) == 2:
                 p = _strip_var_prefix(n.args[0].strip())
                 s = _strip_var_prefix(n.args[1].strip())
@@ -2301,6 +2429,64 @@ def _collect_field_aliases_round(
                     if key in backing and key not in conflicted and n.lhs not in load_aliases:
                         load_aliases[n.lhs] = backing[key]
                         changed = True
+                if p is not None:
+                    # Whole-struct load of an arg-rooted STRUCT-kind field:
+                    # the loaded value is itself arg-rooted.
+                    if p in ptr_paths and n.lhs not in struct_paths:
+                        struct_paths[n.lhs] = ptr_paths[p]
+                        changed = True
+                    src = ptr_sources.get(p)
+                    if src is not None and n.lhs not in copy_edges.setdefault(src, set()):
+                        copy_edges[src].add(n.lhs)
+                        changed = True
+            elif (
+                isinstance(n, Assign)
+                and isinstance(n.expr, Builtin)
+                and n.expr.name == "copy"
+                and len(n.expr.args) == 1
+            ):
+                # ``var_X = wp::copy(var_Y);`` — Warp emits this for
+                # whole-struct assignments (``inner = s.inner``). Treat it
+                # as a copy edge so arg-rooted paths and array-field
+                # backings propagate.
+                src = _strip_var_prefix(n.expr.args[0].strip())
+                if src is not None and n.lhs not in copy_edges.setdefault(src, set()):
+                    copy_edges[src].add(n.lhs)
+                    changed = True
+            elif isinstance(n, Assign) and isinstance(n.expr, UserCall) and n.lhs in struct_locals:
+                # Struct constructor call ``var_D = Name_<hash>(a, b, ...)``
+                # — positional args map to fields in declaration order.
+                # Array- and struct-typed ctor args propagate backings /
+                # arg-rooted paths into the result's fields (the flat-side
+                # per-field ctor expansion skips array fields).
+                stype = struct_locals[n.lhs]
+                if n.expr.name in (getattr(stype, "native_name", ""), getattr(stype, "key", "")):
+                    svars = getattr(stype, "vars", {})
+                    if len(n.expr.args) == len(svars):
+                        for (fname, fvar), a in zip(svars.items(), n.expr.args, strict=True):
+                            al = _strip_var_prefix(a.strip())
+                            if al is None:
+                                continue
+                            keyf = (n.lhs, fname)
+                            ftype = fvar.type
+                            if _is_array_arg_type(ftype):
+                                if keyf in conflicted:
+                                    continue
+                                if al in array_arg_labels:
+                                    fb: tuple[str, list[str]] | None = (al, [])
+                                else:
+                                    fb = view_aliases.get(al) or load_aliases.get(al)
+                                if fb is not None:
+                                    changed |= _bind(keyf, fb)
+                            elif isinstance(ftype, Struct):
+                                sp = struct_paths.get(al)
+                                if sp is not None:
+                                    if field_value_paths.get(keyf) != sp:
+                                        field_value_paths[keyf] = sp
+                                        changed = True
+                                elif field_struct_sources.get(keyf) != al:
+                                    field_struct_sources[keyf] = al
+                                    changed = True
             elif (
                 isinstance(n, Assign)
                 and isinstance(n.expr, Builtin)
@@ -2335,6 +2521,24 @@ def _collect_field_aliases_round(
                 key2 = (dst, f)
                 if key2 not in conflicted and key2 not in new_conflicts and backing.get(key2) != (b[0], list(b[1])):
                     prop_changed |= _bind(key2, b)
+        # Propagate arg-rooted struct paths (and ctor field sources) along
+        # copy edges so ``inner = s.inner`` / struct-returning helpers keep
+        # their rooting; non-struct edges are inert.
+        for label, sp in list(struct_paths.items()):
+            for dst in copy_edges.get(label, ()):
+                if dst not in struct_paths:
+                    struct_paths[dst] = sp
+                    prop_changed = True
+        for (s, f), sp in list(field_value_paths.items()):
+            for dst in copy_edges.get(s, ()):
+                if (dst, f) not in field_value_paths:
+                    field_value_paths[(dst, f)] = sp
+                    prop_changed = True
+        for (s, f), src in list(field_struct_sources.items()):
+            for dst in copy_edges.get(s, ()):
+                if (dst, f) not in field_struct_sources:
+                    field_struct_sources[(dst, f)] = src
+                    prop_changed = True
         # Where edges: bind fields whose branches agree. A branch with
         # NO recorded backing is a default-constructed struct (native's
         # null ``array_t`` — dereferencing it when selected is UB there

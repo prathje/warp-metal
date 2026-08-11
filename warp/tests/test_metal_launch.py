@@ -3046,6 +3046,138 @@ class TestMetalLaunch(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet)
 
+    def test_struct_arg_scalar_array_field_matches_cpu(self):
+        # ``wp.array`` fields of struct-typed kernel args: the AST fold
+        # resolves ``s.vals[i]`` to a synthetic ``s__vals`` array input
+        # whose buffer the launcher binds by walking the struct instance.
+        # warp.fem's quadrature/field EvalArg structs are the main user.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.struct
+            class Params:
+                scale: wp.float32
+                vals: wp.array(dtype=wp.float32)
+
+            @wp.kernel
+            def k(p: Params, out: wp.array(dtype=wp.float32)):
+                tid = wp.tid()
+                n = p.vals.shape[0]
+                out[tid] = p.scale * p.vals[tid] + float(n)
+
+            N = 64
+            rng = np.random.default_rng(11)
+            vals_np = rng.standard_normal(N).astype(np.float32)
+
+            for dev in ('cpu', 'metal:0'):
+                p = Params()
+                p.scale = 3.0
+                p.vals = wp.array(vals_np, dtype=wp.float32, device=dev)
+                out = wp.zeros(N, dtype=wp.float32, device=dev)
+                wp.launch(k, dim=N, inputs=[p], outputs=[out], device=dev)
+                if dev == 'cpu':
+                    cpu_out = out.numpy()
+                else:
+                    np.testing.assert_array_equal(out.numpy(), cpu_out)
+            np.testing.assert_allclose(cpu_out, 3.0 * vals_np + float(N), rtol=1e-6)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_struct_arg_vec3_array_field_matches_cpu(self):
+        # Vec-typed array field of a struct arg — the synthetic input uses
+        # the same flat-scalar binding convention as top-level vec arrays.
+        # Mirrors warp.fem's RegularQuadrature ``qp_arg.points[qp_index]``.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.struct
+            class QP:
+                points: wp.array(dtype=wp.vec3)
+                weights: wp.array(dtype=wp.float32)
+
+            @wp.kernel
+            def k(qp: QP, out: wp.array(dtype=wp.float32)):
+                tid = wp.tid()
+                pt = qp.points[tid]
+                out[tid] = qp.weights[tid] * (pt[0] + 2.0 * pt[1] + 3.0 * pt[2])
+
+            N = 48
+            rng = np.random.default_rng(5)
+            pts_np = rng.standard_normal((N, 3)).astype(np.float32)
+            w_np = rng.standard_normal(N).astype(np.float32)
+
+            for dev in ('cpu', 'metal:0'):
+                qp = QP()
+                qp.points = wp.array(pts_np, dtype=wp.vec3, device=dev)
+                qp.weights = wp.array(w_np, dtype=wp.float32, device=dev)
+                out = wp.zeros(N, dtype=wp.float32, device=dev)
+                wp.launch(k, dim=N, inputs=[qp], outputs=[out], device=dev)
+                if dev == 'cpu':
+                    cpu_out = out.numpy()
+                else:
+                    np.testing.assert_array_equal(out.numpy(), cpu_out)
+            expected = w_np * (pts_np[:, 0] + 2.0 * pts_np[:, 1] + 3.0 * pts_np[:, 2])
+            np.testing.assert_allclose(cpu_out, expected, rtol=1e-5, atol=1e-6)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_struct_arg_nested_struct_array_field_matches_cpu(self):
+        # Array field of a NESTED struct inside a struct arg (synthetic
+        # path ``s__inner__vals``), read both through the direct pointer
+        # chain and through a whole-struct load (``inner = s.inner``), and
+        # through an inlined ``@wp.func`` helper.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.struct
+            class Inner:
+                scale: wp.float32
+                vals: wp.array(dtype=wp.float32)
+
+            @wp.struct
+            class Outer:
+                offset: wp.float32
+                inner: Inner
+
+            @wp.func
+            def helper(s: Outer, i: int) -> float:
+                return s.inner.vals[i]
+
+            @wp.kernel
+            def k(s: Outer, out: wp.array(dtype=wp.float32)):
+                tid = wp.tid()
+                inner = s.inner  # whole-struct load
+                direct = s.inner.vals[tid]
+                out[tid] = inner.scale * direct + helper(s, tid) + s.offset
+
+            N = 32
+            rng = np.random.default_rng(7)
+            vals_np = rng.standard_normal(N).astype(np.float32)
+
+            for dev in ('cpu', 'metal:0'):
+                s = Outer()
+                s.offset = 5.0
+                s.inner.scale = 2.0
+                s.inner.vals = wp.array(vals_np, dtype=wp.float32, device=dev)
+                out = wp.zeros(N, dtype=wp.float32, device=dev)
+                wp.launch(k, dim=N, inputs=[s], outputs=[out], device=dev)
+                if dev == 'cpu':
+                    cpu_out = out.numpy()
+                else:
+                    np.testing.assert_array_equal(out.numpy(), cpu_out)
+            np.testing.assert_allclose(cpu_out, 2.0 * vals_np + vals_np + 5.0, rtol=1e-6)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
     def test_unot_floordiv_bit_and_length_sq_match_cpu(self):
         # Trivial intrinsics that surfaced as gaps in the mujoco_warp recon.
         # Each is a one-line regex add; this test bundles them.

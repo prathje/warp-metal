@@ -7629,6 +7629,12 @@ class MetalKernelArtifact:
     # binds a 1-int ``__tid4_dim3`` input (= ``dim[3]``) that the kernel
     # uses to decompose ``z`` back into the k/l indices.
     tid4: bool = False
+    # Synthetic read-only array inputs backing ``wp.array`` fields of
+    # struct-typed kernel args: ``(input_name, arg_label, field_path)``
+    # per entry (e.g. ``("qp_arg__points", "qp_arg", ("points",))``).
+    # The launcher resolves each one by walking the struct instance and
+    # binds the field's array buffer like a regular array input.
+    struct_array_args: tuple[tuple[str, str, tuple[str, ...]], ...] = ()
 
 
 # Match the AST-emitted ``for`` lines so we can flip ``<`` to ``>`` when
@@ -7860,7 +7866,20 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
     # geom types.
     _ast_nodes = _ast_fold_const_branches(_ast_nodes, adj, _inlined_const_ints)
     _ast_nodes, _drop_skip = _ast_fold_drop(_ast_nodes, adj, _inlined_var_ctypes)
-    _ast_nodes, _view_skip = _ast_fold_views(_ast_nodes, adj, extra_const_ints=_inlined_const_ints)
+    # ``_struct_arg_array_fields``: synthetic label -> (arg label, field
+    # path) for every ``wp.array`` field of a struct-typed kernel arg the
+    # body reads. The fold rewrites those accesses against the synthetic
+    # array name (``qp_arg__points``); below we add a matching read-only
+    # array input to the signature and the launcher binds the field's
+    # buffer by walking the struct instance.
+    _struct_arg_array_fields: dict[str, tuple[str, tuple[str, ...]]] = {}
+    _ast_nodes, _view_skip = _ast_fold_views(
+        _ast_nodes,
+        adj,
+        extra_const_ints=_inlined_const_ints,
+        struct_locals=_inlined_struct_locals,
+        struct_arg_arrays_out=_struct_arg_array_fields,
+    )
     _ast_nodes, _indexref_skip = _ast_fold_indexref(_ast_nodes, adj, _early_vec_arr_info)
     # Flatten multi-dim ``wp::atomic_<op>(arr, i, j, ..., val)`` into the
     # 3-arg form the intrinsic regex handles, expanding to per-component
@@ -7980,6 +7999,35 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
         else:
             input_args.append(arg)
 
+    # Synthetic read-only array inputs for ``wp.array`` fields of struct-
+    # typed kernel args (resolved by the AST view fold). Each becomes a
+    # regular array input named ``<arg>__<path>``; the launcher walks the
+    # struct instance to bind the field's buffer. Writes through struct-
+    # held arrays are not supported — fail loudly instead of corrupting.
+    struct_field_array_vars: list = []
+    if _struct_arg_array_fields:
+        from warp._src.codegen import Var as _WpVar  # noqa: PLC0415
+        from warp._src.types import indexedarray as _wp_indexedarray  # noqa: PLC0415
+
+        for syn_label, (root_label, fpath) in _struct_arg_array_fields.items():
+            field_desc = f"struct arg {root_label!r} array field {'.'.join(fpath)!r}"
+            if syn_label in written_arg_names:
+                raise MetalCodegenError(
+                    f"Kernel {adj.fun_name!r}: writing through {field_desc} is not supported on "
+                    f"the Metal backend; pass the array as a top-level kernel argument instead"
+                )
+            ftype = next(a.type for a in adj.args if a.label == root_label)
+            for comp in fpath:
+                ftype = ftype.vars[comp].type
+            if isinstance(ftype, _wp_indexedarray) or getattr(ftype, "_wp_generic_type_str_", None) == "indexedarray_t":
+                raise MetalCodegenError(
+                    f"Kernel {adj.fun_name!r}: {field_desc} is a wp.indexedarray, which is not "
+                    f"supported on the Metal backend"
+                )
+            syn_var = _WpVar(syn_label, ftype)
+            struct_field_array_vars.append(syn_var)
+            input_args.append(syn_var)
+
     if not output_args:
         raise MetalCodegenError(
             f"Kernel {adj.fun_name!r} has no output array; MSL kernels must write through at least one output buffer"
@@ -8005,14 +8053,14 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
     # native vec dtype and ``packed_floatN`` pointer casts hit address-space
     # mismatches in MLX-generated wrappers. So we emit per-component reads
     # ``floatN(arr[i*N+0], arr[i*N+1], ...)`` instead of any cast trick.
-    arg_label_set = {a.label for a in adj.args}
+    arg_label_set = {a.label for a in adj.args} | {v.label for v in struct_field_array_vars}
     # Map argname -> (vec_size, msl_scalar) for each vec-typed array arg,
     # argname -> (rows, cols, msl_scalar) for each mat-typed array arg, and
     # argname -> _StructLayout for each struct-typed array arg.
     vec_arr_info: dict[str, tuple[int, str]] = {}
     mat_arr_info: dict[str, tuple[int, int, str]] = {}
     struct_arr_info: dict[str, _StructLayout] = {}
-    for arg in adj.args:
+    for arg in (*adj.args, *struct_field_array_vars):
         v_info = _vec_dtype_info(arg)
         if v_info is not None:
             vec_arr_info[arg.label] = v_info
@@ -8812,9 +8860,21 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
         m_decl = inlined_decl_pat.match(raw)
         if m_decl and m_decl.group(1) in subscript_map:
             continue
-        # Address lines have been folded into ``subscript_map``.
-        if _ADDRESS_MULTI_PAT.match(raw):
-            continue
+        # Address lines have been folded into ``subscript_map`` (or, for
+        # struct-element pointers, ``struct_refs``). An address whose base
+        # is NOT a bound array name was never registered — dropping it
+        # silently used to emit broken MSL (undeclared ``var_X`` loads),
+        # so fail loudly instead: the base is an array-valued local no
+        # fold could resolve (e.g. an unsupported struct-field chain).
+        m_addr = _ADDRESS_MULTI_PAT.match(raw)
+        if m_addr:
+            if m_addr.group("local") in subscript_map or m_addr.group("local") in struct_refs:
+                continue
+            raise MetalCodegenError(
+                f"Kernel {adj.fun_name!r}: cannot resolve wp::address on array "
+                f"'var_{m_addr.group('arr')}' — it is not a kernel argument or a resolvable "
+                f"struct-held array (line: {raw.strip()})"
+            )
         # ``var_X = &(var_arg.shape);`` and the load that follows are also
         # collapsed via ``subscript_map``/``shape_aliases``; skip the raw lines.
         if shape_address_pat.match(raw):
@@ -9751,7 +9811,7 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
     _SHAPE_SLOT = 4  # max ndim per array — Warp arrays cap at 4D
     _shape_idx_pat = re.compile(r"\b(\w+)_shape\[([^\]]+)\]")
     _shape_arrs_seen: list[str] = []
-    arg_label_set_local = {a.label for a in adj.args}
+    arg_label_set_local = {a.label for a in adj.args} | {v.label for v in struct_field_array_vars}
     for line in body_lines:
         for _m in _shape_idx_pat.finditer(line):
             _arr = _m.group(1)
@@ -9827,7 +9887,11 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
     shapes_buf_count = 1 if _shape_arrs_seen else 0
     total_slots = len(input_args) + len(output_args) + len(init_input_names) + shapes_buf_count
     if total_slots > 30:
-        packable_arrs = [a for a in input_args if _is_int32_1d_array_arg(a)]
+        # Struct-arg array-field inputs are excluded from packing: the
+        # packers resolve launch values via ``arg_by_name`` (kernel.adj
+        # args), which synthetic inputs are not part of.
+        _sfa_labels = set(_struct_arg_array_fields)
+        packable_arrs = [a for a in input_args if _is_int32_1d_array_arg(a) and a.label not in _sfa_labels]
         packable_scalars = [a for a in input_args if _is_int_or_bool_scalar_arg(a)]
         # Pack int32-1D arrays + int/bool scalars into ``__ints_packed``
         # only when there's a net win: K + S >= 2 saves slots.
@@ -9839,7 +9903,7 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
         # arrays we pack. Activate if packing recovers any slot — F >= 2
         # is the floor, but also needed when do_int_pack already pays
         # the slot for ``__ints_packed`` (any F >= 1 then is free).
-        packable_floats = [a for a in input_args if _is_float_packable_array_arg(a)]
+        packable_floats = [a for a in input_args if _is_float_packable_array_arg(a) and a.label not in _sfa_labels]
         do_float_pack = len(packable_floats) >= (1 if do_int_pack else 2)
 
         if do_int_pack or do_float_pack:
@@ -9937,6 +10001,19 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
 
     header = _build_kernel_header(source)
 
+    # Struct-arg array-field inputs that survived the unused-arg prune —
+    # recorded on the artifact so launch paths (and cache reload) can
+    # resolve each synthetic input back to its struct field. A field whose
+    # only use is ``.shape`` gets pruned from the inputs (the shape pack
+    # rewrite removes its last data reference) but still needs launch-time
+    # resolution for ``__shapes_packed``.
+    _final_input_labels = {a.label for a in input_args} | set(_shape_arrs_seen)
+    struct_array_args_final = tuple(
+        (syn, root, tuple(fpath))
+        for syn, (root, fpath) in _struct_arg_array_fields.items()
+        if syn in _final_input_labels
+    )
+
     inplace_set = set(mlx_inplace_arrays)
     final_output_names = [a.label for a in output_args if a.label not in inplace_set]
     if not final_output_names and mlx_inplace_arrays:
@@ -9982,6 +10059,7 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
         ),
         header=header,
         tid4=uses_tid4,
+        struct_array_args=struct_array_args_final,
     )
 
 
@@ -10154,7 +10232,24 @@ def _load_cached_artifact(key: str, adj) -> MetalKernelArtifact | None:
             payload = pickle.load(f)
         fields = payload["fields"]
         by_label = {a.label: a for a in adj.args}
-        input_args = [by_label[label] for label in payload["input_arg_labels"]]
+        # Synthetic struct-arg array-field inputs aren't in ``adj.args`` —
+        # rebuild their Vars by walking the struct type along the recorded
+        # field path (any mismatch degrades to a regenerate via KeyError).
+        sfa_paths = {syn: (root, tuple(fpath)) for syn, root, fpath in fields.get("struct_array_args", ())}
+
+        def _arg_for(label):
+            arg = by_label.get(label)
+            if arg is not None:
+                return arg
+            from warp._src.codegen import Var as _WpVar  # noqa: PLC0415
+
+            root, fpath = sfa_paths[label]
+            ftype = by_label[root].type
+            for comp in fpath:
+                ftype = ftype.vars[comp].type
+            return _WpVar(label, ftype)
+
+        input_args = [_arg_for(label) for label in payload["input_arg_labels"]]
         output_args = [by_label[label] for label in payload["output_arg_labels"]]
         artifact = MetalKernelArtifact(**fields)
         artifact.input_args = input_args
@@ -10837,6 +10932,48 @@ def _array_view_dtype_and_shape(value):
     return _wp_dtype_to_mx_dtype(dtype), value.shape
 
 
+def _struct_field_launch_value(fwd_args, arg_by_name, root_label: str, fpath: tuple[str, ...]):
+    """Resolve a synthetic struct-arg array-field input to its wp.array.
+
+    Walks the launched struct instance along ``fpath``. Returns ``None``
+    when the field (or an intermediate struct) was never assigned — the
+    caller binds a placeholder buffer in that case, matching how empty
+    top-level arrays are handled.
+    """
+    idx, _ = arg_by_name[root_label]
+    value = fwd_args[idx]
+    for comp in fpath:
+        if value is None:
+            return None
+        value = getattr(value, comp, None)
+    return value
+
+
+def _placeholder_view_for_array_type(arr_type):
+    """``(mx_dtype, zero-element view shape)`` for an unset (None) array value.
+
+    Mirrors ``_array_view_dtype_and_shape`` but derives everything from the
+    declared array TYPE — used when a struct arg's array field is ``None``
+    and the MLX path still needs a typed zero-element buffer to bind.
+    """
+    import mlx.core as mx  # noqa: PLC0415
+
+    from warp._src.codegen import Struct  # noqa: PLC0415
+
+    dtype = arr_type.dtype
+    ndim = int(getattr(arr_type, "ndim", 1) or 1)
+    kind = getattr(dtype, "_wp_generic_type_str_", None)
+    if kind in ("vec_t", "quat_t", "transform_t"):
+        return _wp_dtype_to_mx_dtype(dtype._wp_scalar_type_), (0,) * ndim + (int(dtype._length_),)
+    if kind == "mat_t":
+        rows, cols = dtype._shape_
+        return _wp_dtype_to_mx_dtype(dtype._wp_scalar_type_), (0,) * ndim + (int(rows) * int(cols),)
+    if isinstance(dtype, Struct):
+        layout = _struct_layout_for(dtype)
+        return mx.float32, (0,) * ndim + (layout.scalars_per_elem,)
+    return _wp_dtype_to_mx_dtype(dtype), (0,) * ndim
+
+
 _NATIVE_BUILTIN_PARAMS = (
     "uint3 thread_position_in_grid [[thread_position_in_grid]]",
     "uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]]",
@@ -11347,9 +11484,13 @@ def launch_metal_kernel_native(kernel, dim, inputs, outputs, device, block_dim: 
         kernel._metal_native_arg_var_by_name = {a.label: a for a in artifact.input_args}
         kernel._metal_native_out_var_by_name = {a.label: a for a in artifact.output_args}
         kernel._metal_native_init_shadow_names = frozenset(n for n in artifact.input_names if n.endswith("__init"))
+        kernel._metal_native_struct_field_args = {
+            syn: (root, tuple(fpath)) for syn, root, fpath in getattr(artifact, "struct_array_args", ())
+        }
     arg_var_by_name = kernel._metal_native_arg_var_by_name
     out_var_by_name = kernel._metal_native_out_var_by_name
     init_shadow_names = kernel._metal_native_init_shadow_names
+    struct_field_args = kernel._metal_native_struct_field_args
 
     dispatcher = get_dispatcher()
     bindings: list = []
@@ -11430,6 +11571,26 @@ def launch_metal_kernel_native(kernel, dim, inputs, outputs, device, block_dim: 
     for name in artifact.input_names:
         if name in arg_var_by_name:
             arg_var = arg_var_by_name[name]
+            sfa = struct_field_args.get(name)
+            if sfa is not None:
+                # Synthetic struct-arg array-field input: walk the struct
+                # instance to fetch the field's wp.array. ``None`` (field
+                # never assigned) binds a placeholder — the kernel only
+                # reads it under conditions the caller guarantees false.
+                value = _struct_field_launch_value(fwd_args, arg_by_name, sfa[0], sfa[1])
+                if value is None or value.ptr is None or value.size == 0:
+                    buf, _ = dispatcher.alloc(4)
+                    transient_refs.append(buf)
+                    bindings.append(buf)
+                elif not getattr(value, "device", None) or not value.device.is_metal:
+                    raise RuntimeError(
+                        f"Kernel '{kernel.key}' struct arg {sfa[0]!r} field {'.'.join(sfa[1])!r} must be "
+                        f"a wp.array on a Metal device; got {getattr(value, 'device', '?')}"
+                    )
+                else:
+                    bindings.append(_resolve_mtl(value, kernel.key, name))
+                binding_modes.append("r")
+                continue
             idx, _ = arg_by_name[name]
             value = fwd_args[idx]
             if _is_array_arg(arg_var):
@@ -11671,8 +11832,15 @@ def launch_metal_kernel_native(kernel, dim, inputs, outputs, device, block_dim: 
         slot = artifact.shape_packed_slot
         shapes_key = []
         for arr_name in artifact.shape_packed_arrs:
-            idx, _ = arg_by_name[arr_name]
-            value = fwd_args[idx]
+            sfa = struct_field_args.get(arr_name)
+            if sfa is not None:
+                value = _struct_field_launch_value(fwd_args, arg_by_name, sfa[0], sfa[1])
+            else:
+                idx, _ = arg_by_name[arr_name]
+                value = fwd_args[idx]
+            if value is None:
+                shapes_key.append(())  # unset struct field: all-zero shape
+                continue
             _, view_shape = _array_view_dtype_and_shape(value)
             shapes_key.append(tuple(view_shape[:slot]))
         shapes_key = tuple(shapes_key)
@@ -11894,6 +12062,7 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim: int = 2
     _normalize_none_array_args(kernel, fwd_args, device)
 
     arg_by_name = {a.label: (i, a) for i, a in enumerate(kernel.adj.args)}
+    struct_field_args = {syn: (root, tuple(fpath)) for syn, root, fpath in getattr(artifact, "struct_array_args", ())}
 
     # ---- Build MLX inputs ----
     # Order must match ``artifact.input_names``: real inputs first (from the
@@ -11902,6 +12071,32 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim: int = 2
     mlx_inputs: list = []
     for arg_var in artifact.input_args:
         input_name = arg_var.label
+        sfa = struct_field_args.get(input_name)
+        if sfa is not None:
+            # Synthetic struct-arg array-field input: walk the struct
+            # instance to fetch the field's wp.array.
+            value = _struct_field_launch_value(fwd_args, arg_by_name, sfa[0], sfa[1])
+            if value is None:
+                mx_dtype, view_shape = _placeholder_view_for_array_type(arg_var.type)
+                mlx_inputs.append(mx.zeros(view_shape, dtype=mx_dtype))
+                continue
+            if not getattr(value, "device", None) or not value.device.is_metal:
+                raise RuntimeError(
+                    f"Kernel '{kernel.key}' struct arg {sfa[0]!r} field {'.'.join(sfa[1])!r} must be "
+                    f"a wp.array on a Metal device; got {getattr(value, 'device', '?')}"
+                )
+            mx_dtype, view_shape = _array_view_dtype_and_shape(value)
+            if value.ptr is None or value.size == 0:
+                mlx_inputs.append(mx.zeros(view_shape, dtype=mx_dtype))
+                continue
+            mx_buf = _metal_get_buffer(value.ptr)
+            if mx_buf is None:
+                raise RuntimeError(
+                    f"Kernel '{kernel.key}' struct arg {sfa[0]!r} field {'.'.join(sfa[1])!r} has no "
+                    f"registered MLX buffer (ptr={value.ptr}). Was it allocated by Warp's Metal allocator?"
+                )
+            mlx_inputs.append(mx_buf.view(mx_dtype).reshape(view_shape))
+            continue
         idx, _ = arg_by_name[input_name]
         value = fwd_args[idx]
         if _is_array_arg(arg_var):
@@ -12182,8 +12377,14 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim: int = 2
         slot = artifact.shape_packed_slot
         packed = np.zeros(len(artifact.shape_packed_arrs) * slot, dtype=np.int32)
         for i, arr_name in enumerate(artifact.shape_packed_arrs):
-            idx, _ = arg_by_name[arr_name]
-            value = fwd_args[idx]
+            sfa = struct_field_args.get(arr_name)
+            if sfa is not None:
+                value = _struct_field_launch_value(fwd_args, arg_by_name, sfa[0], sfa[1])
+                if value is None:
+                    continue  # unset struct field: all-zero shape
+            else:
+                idx, _ = arg_by_name[arr_name]
+                value = fwd_args[idx]
             # Vec/mat/struct dtypes expand the inner dim in the MLX view
             # — match ``_array_view_dtype_and_shape``'s logic.
             _, mlx_view_shape = _array_view_dtype_and_shape(value)
