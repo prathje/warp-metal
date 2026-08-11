@@ -10,6 +10,8 @@
   `tile_cholesky_solve`, and `tile_store` instead of copying them through a per-thread private struct in every
   cooperating lane, up to ~23x faster for a 35x35 factorize-and-solve. Add `warp.config.metal_threadgroup_tiles`
   (environment variable `WARP_METAL_THREADGROUP_TILES`) to disable it.
+- Support `wp.tile_fft()` / `wp.tile_ifft()` on `vec2f` tiles and `wp.tile_transpose()` on vector-element tiles
+  on the Metal backend (`vec2d` remains unsupported — Apple GPUs have no double precision).
 
 ### Removed
 
@@ -24,6 +26,11 @@
   ([GH-1380](https://github.com/NVIDIA/warp/issues/1380)).
 
 ### Fixed
+
+- Fix a crash on interpreter shutdown when a script exits with Metal GPU work still in flight; the Metal
+  dispatcher now drains outstanding command buffers at exit instead of relying on Python-level completion
+  handlers.
+- Fix `wp.diag()` on `vec2f`/`vec4f` inputs and Warp-struct constructor calls with arguments in Metal kernels.
 
 ### Documentation
 
