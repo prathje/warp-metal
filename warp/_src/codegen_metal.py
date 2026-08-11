@@ -841,11 +841,23 @@ def _emit_wp_dot_overloads(source: str) -> str:
     return "\n".join(parts)
 
 
-_DIAG_HELPER_FLOAT3 = (
+# Overload set so ``wp::diag(v)`` resolves by the argument's vector
+# width — the IR line carries no type info (warp.fem's Grid2D path
+# passes float2, mujoco_warp passes float3).
+_DIAG_HELPERS = (
+    "inline float2x2 wp_diag_float3(float2 v) {\n"
+    "    return float2x2(float2(v[0], 0.0f), float2(0.0f, v[1]));\n"
+    "}\n"
     "inline float3x3 wp_diag_float3(float3 v) {\n"
     "    return float3x3(float3(v[0], 0.0f, 0.0f), "
     "float3(0.0f, v[1], 0.0f), "
     "float3(0.0f, 0.0f, v[2]));\n"
+    "}\n"
+    "inline float4x4 wp_diag_float3(float4 v) {\n"
+    "    return float4x4(float4(v[0], 0.0f, 0.0f, 0.0f), "
+    "float4(0.0f, v[1], 0.0f, 0.0f), "
+    "float4(0.0f, 0.0f, v[2], 0.0f), "
+    "float4(0.0f, 0.0f, 0.0f, v[3]));\n"
     "}"
 )
 
@@ -4969,7 +4981,7 @@ def _build_kernel_header(source: str) -> str:
     if extract_helpers:
         parts.append(extract_helpers)
     if "wp_diag_float3" in source:
-        parts.append(_DIAG_HELPER_FLOAT3)
+        parts.append(_DIAG_HELPERS)
     # Always emitted: kernels reference ``wp_normalize``/``wp_quat_normalize``
     # directly, and the quat/noise/BVH helper families below call
     # ``wp_normalize`` internally (mirroring native code's guarded
@@ -8829,6 +8841,72 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
         m_ctor = re.match(r"^\s*var_(\w+)\s*=\s*\w+\s*\(\s*\)\s*;\s*$", raw)
         if m_ctor and m_ctor.group(1) in struct_local_layouts:
             continue
+        # Struct constructor WITH args ``var_X = StructName_<hash>(a, b, ...);``
+        # — Warp's C++ emits one positional arg per field in declaration
+        # order. Expand into per-field assignments on the split locals.
+        # warp.fem's Sample/ElementEvalArg construction is the main user.
+        m_ctor_args = re.match(r"^(?P<indent>\s*)var_(\w+)\s*=\s*(\w+)\s*\(\s*(.+?)\s*\)\s*;\s*$", raw)
+        if (
+            m_ctor_args
+            and m_ctor_args.group(2) in struct_local_layouts
+            and m_ctor_args.group(3)
+            in (
+                struct_local_layouts[m_ctor_args.group(2)].name,
+                struct_local_layouts[m_ctor_args.group(2)].native_name,
+            )
+        ):
+            indent = m_ctor_args.group("indent")
+            dst = m_ctor_args.group(2)
+            dst_layout = struct_local_layouts[dst]
+            ctor_args = [a.strip() for a in m_ctor_args.group(4).split(",")]
+            if len(ctor_args) != len(dst_layout.fields):
+                raise MetalCodegenError(
+                    f"Kernel {adj.fun_name!r}: struct constructor {dst_layout.name!r} called with "
+                    f"{len(ctor_args)} args but the struct has {len(dst_layout.fields)} fields"
+                )
+            for (fname, finfo), arg_expr in zip(dst_layout.fields.items(), ctor_args, strict=True):
+                if finfo.kind == _STRUCT_FIELD_KIND_ARRAY_UNUSED:
+                    continue
+                if finfo.kind == _STRUCT_FIELD_KIND_STRUCT:
+                    # Struct-typed field: source is a split struct local, a
+                    # flat-buffer struct arg, or a pointer alias into one.
+                    src_label = arg_expr[len("var_") :] if arg_expr.startswith("var_") else None
+                    dst_leaves = {p for p, _o, _f in _iter_scalar_leaves(finfo.sub)}
+                    if src_label in struct_local_layouts:
+                        for fpath, _off, _fi in _iter_scalar_leaves(struct_local_layouts[src_label]):
+                            if fpath not in dst_leaves:
+                                continue
+                            body_lines.append(
+                                f"{indent}{_per_field_local(dst, f'{fname}__{fpath}')} = "
+                                f"{_per_field_local(src_label, fpath)};"
+                            )
+                        continue
+                    if src_label in struct_arg_layouts:
+                        src_layout = struct_arg_layouts[src_label]
+                        for fpath, off, fi in _iter_scalar_leaves(src_layout):
+                            if fpath not in dst_leaves:
+                                continue
+                            read = _struct_field_read_expr(src_label, str(off), fi)
+                            body_lines.append(
+                                _finalize(f"{indent}{_per_field_local(dst, f'{fname}__{fpath}')} = {read};")
+                            )
+                        continue
+                    if src_label in struct_ptr_bases:
+                        buf, base_expr, src_layout = struct_ptr_bases[src_label]
+                        for fpath, off, fi in _iter_scalar_leaves(src_layout):
+                            if fpath not in dst_leaves:
+                                continue
+                            read = _struct_field_read_expr(buf, f"{base_expr} + {off}", fi)
+                            body_lines.append(
+                                _finalize(f"{indent}{_per_field_local(dst, f'{fname}__{fpath}')} = {read};")
+                            )
+                        continue
+                    raise MetalCodegenError(
+                        f"Kernel {adj.fun_name!r}: struct constructor {dst_layout.name!r} field "
+                        f"{fname!r} takes a struct arg {arg_expr!r} with no known layout"
+                    )
+                body_lines.append(_finalize(f"{indent}{_per_field_local(dst, fname)} = {arg_expr};"))
+            continue
         # Struct-to-struct local copy ``var_X = var_Y;``. Both X and Y
         # have already been split into per-field locals; expand the
         # whole-struct copy into one per-field assignment per non-array
@@ -10467,6 +10545,9 @@ class _StructLayout:
     name: str  # mangled name from Warp's struct (``Particle_4b7eabdf``)
     fields: dict[str, _StructFieldInfo] = field(default_factory=dict)
     scalars_per_elem: int = 0
+    # The C++ type/constructor name (``Struct.native_name`` — key plus a
+    # content-hash suffix). Constructor calls in the IR use this form.
+    native_name: str = ""
 
 
 # Struct fields must be 4-byte-per-component so the flat float32 view of
@@ -10572,6 +10653,7 @@ def _struct_layout_for(struct_cls) -> _StructLayout:
     import ctypes  # noqa: PLC0415
 
     layout = _StructLayout(name=getattr(struct_cls, "key", "anonymous_struct"))
+    layout.native_name = getattr(struct_cls, "native_name", layout.name)
     ctype = getattr(struct_cls, "ctype", None)
     for fname, fvar in getattr(struct_cls, "vars", {}).items():
         finfo = _classify_struct_field(fname, fvar.type)
