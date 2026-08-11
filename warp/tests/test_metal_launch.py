@@ -3299,6 +3299,79 @@ class TestMetalLaunch(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet)
 
+    def test_tile_fft_ifft_matches_numpy(self):
+        # ``wp.tile_fft`` / ``wp.tile_ifft`` on vec2f tiles lower to the
+        # serial radix-2 helper (``_emit_tile_fft``). Compared against
+        # NumPy rather than warp-CPU because the CPU no-MathDx build
+        # lowers tile_fft to a no-op macro. The round trip also checks
+        # the unnormalized cuFFTDx convention (ifft(fft(x)) == N*x).
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            wp.set_module_options({"enable_backward": False})
+
+            @wp.kernel
+            def fft_k(x: wp.array2d(dtype=wp.vec2f), y: wp.array2d(dtype=wp.vec2f)):
+                a = wp.tile_load(x, shape=(2, 32))
+                wp.tile_fft(a)
+                wp.tile_store(y, a)
+
+            @wp.kernel
+            def roundtrip_k(x: wp.array2d(dtype=wp.vec2f), y: wp.array2d(dtype=wp.vec2f)):
+                a = wp.tile_load(x, shape=(2, 32))
+                wp.tile_fft(a)
+                wp.tile_ifft(a)
+                wp.tile_store(y, a)
+
+            rng = np.random.default_rng(7)
+            x_h = rng.standard_normal((2, 32, 2)).astype(np.float32)
+            x = wp.array2d(x_h, dtype=wp.vec2f, device="metal:0")
+            y = wp.zeros((2, 32), dtype=wp.vec2f, device="metal:0")
+
+            wp.launch_tiled(fft_k, dim=[1, 1], inputs=[x], outputs=[y],
+                            block_dim=8, device="metal:0")
+            got = y.numpy()
+            ref = np.fft.fft(x_h[..., 0] + 1j * x_h[..., 1], axis=-1)
+            np.testing.assert_allclose(got[..., 0], ref.real, atol=2e-4)
+            np.testing.assert_allclose(got[..., 1], ref.imag, atol=2e-4)
+
+            wp.launch_tiled(roundtrip_k, dim=[1, 1], inputs=[x], outputs=[y],
+                            block_dim=8, device="metal:0")
+            np.testing.assert_allclose(y.numpy(), x_h * 32.0, atol=2e-3)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_tile_transpose_vec_element_matches_numpy(self):
+        # ``wp.tile_transpose`` on a vec-element tile used to lower to the
+        # scalar transpose helper (type mismatch at MSL compile). The FFT
+        # Navier-Stokes example transposes 16x16 vec2f tiles.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            wp.set_module_options({"enable_backward": False})
+
+            @wp.kernel
+            def k(x: wp.array2d(dtype=wp.vec2f), y: wp.array2d(dtype=wp.vec2f)):
+                a = wp.tile_load(x, shape=(4, 8))
+                b = wp.tile_transpose(a)
+                wp.tile_store(y, b)
+
+            rng = np.random.default_rng(3)
+            x_h = rng.standard_normal((4, 8, 2)).astype(np.float32)
+            x = wp.array2d(x_h, dtype=wp.vec2f, device="metal:0")
+            y = wp.zeros((8, 4), dtype=wp.vec2f, device="metal:0")
+            wp.launch_tiled(k, dim=[1, 1], inputs=[x], outputs=[y],
+                            block_dim=1, device="metal:0")
+            np.testing.assert_array_equal(y.numpy(), x_h.transpose(1, 0, 2))
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
     def test_tile_extract_multi_element_matches_cpu(self):
         # ``t[idx]`` on a multi-element tile used to lower as an identity
         # assignment (only valid for 1-element tiles), which failed MSL

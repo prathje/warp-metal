@@ -13138,6 +13138,22 @@ def tile_fft_generic_lto_dispatch_func(
     ept = size // num_threads
 
     if arch is None or not warp._src.context.runtime.core.wp_is_mathdx_enabled():
+        if options.get("metal_backend"):
+            # The Metal backend transpiles this call from the generated
+            # source, so emit the FFT geometry (direction, batch, size) and
+            # the tile operand for codegen_metal to rewrite into its MSL
+            # helper. The CPU compiler never sees this form.
+            return (
+                (
+                    Var(str(fwd_dir), str, False, True, False),
+                    Var(str(batch), str, False, True, False),
+                    Var(str(size), str, False, True, False),
+                    inout,
+                ),
+                [],
+                [],
+                0,
+            )
         # CPU/no-MathDx dispatch
         return ([], [], [], 0)
     else:

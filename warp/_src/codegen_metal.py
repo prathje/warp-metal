@@ -3886,6 +3886,59 @@ def _emit_tile_struct_vec(rows: int, cols: int, n_elem: int, msl_scalar: str) ->
     return "\n".join(parts)
 
 
+def _emit_tile_fft(rows: int, cols: int, msl_scalar: str) -> str:
+    """Emit ``wp_tile_RxC_vec2_<scalar>_fft`` — in-place complex FFT.
+
+    Serial iterative radix-2 Cooley-Tukey over each row of a vec2-element
+    tile (interleaved re/im in the flat ``c[]`` storage). Unnormalized in
+    both directions, matching the cuFFTDx convention that
+    ``tile_ifft(tile_fft(x)) == N * x``. ``cols`` (the FFT size) must be a
+    power of two — the translator validates before emitting a call.
+    """
+    name = f"wp_tile_{rows}x{cols}_vec2_{msl_scalar}_fft"
+    two_pi = "6.283185307179586f"
+    parts: list[str] = []
+    parts.append(f"inline void {name}(thread wp_tile_{rows}x{cols}_vec2_{msl_scalar}& t, bool inverse) {{")
+    parts.append(f"    for (int b = 0; b < {rows}; ++b) {{")
+    parts.append(f"        thread {msl_scalar}* d = t.c + b * {cols * 2};")
+    parts.append("        // Bit-reversal permutation.")
+    parts.append(f"        for (int i = 1, j = 0; i < {cols}; ++i) {{")
+    parts.append(f"            int bit = {cols} >> 1;")
+    parts.append("            for (; j & bit; bit >>= 1) j ^= bit;")
+    parts.append("            j ^= bit;")
+    parts.append("            if (i < j) {")
+    parts.append(f"                {msl_scalar} tr = d[2 * i];")
+    parts.append(f"                {msl_scalar} ti = d[2 * i + 1];")
+    parts.append("                d[2 * i] = d[2 * j];")
+    parts.append("                d[2 * i + 1] = d[2 * j + 1];")
+    parts.append("                d[2 * j] = tr;")
+    parts.append("                d[2 * j + 1] = ti;")
+    parts.append("            }")
+    parts.append("        }")
+    parts.append(f"        for (int len = 2; len <= {cols}; len <<= 1) {{")
+    parts.append(f"            {msl_scalar} ang = (inverse ? {two_pi} : -{two_pi}) / {msl_scalar}(len);")
+    # ``half`` is an MSL type name — use ``hlen``.
+    parts.append("            int hlen = len >> 1;")
+    parts.append(f"            for (int i = 0; i < {cols}; i += len) {{")
+    parts.append("                for (int k = 0; k < hlen; ++k) {")
+    parts.append(f"                    {msl_scalar} wr = metal::precise::cos(ang * {msl_scalar}(k));")
+    parts.append(f"                    {msl_scalar} wi = metal::precise::sin(ang * {msl_scalar}(k));")
+    parts.append("                    int a = 2 * (i + k);")
+    parts.append("                    int c = 2 * (i + k + hlen);")
+    parts.append(f"                    {msl_scalar} vr = d[c] * wr - d[c + 1] * wi;")
+    parts.append(f"                    {msl_scalar} vi = d[c] * wi + d[c + 1] * wr;")
+    parts.append("                    d[c] = d[a] - vr;")
+    parts.append("                    d[c + 1] = d[a + 1] - vi;")
+    parts.append("                    d[a] += vr;")
+    parts.append("                    d[a + 1] += vi;")
+    parts.append("                }")
+    parts.append("            }")
+    parts.append("        }")
+    parts.append("    }")
+    parts.append("}")
+    return "\n".join(parts)
+
+
 def _emit_tile_cholesky(n: int, msl_scalar: str) -> str:
     """Emit ``wp_tile_NxN_<scalar>_cholesky`` — in-place lower Cholesky.
 
@@ -4316,6 +4369,28 @@ def _emit_tile_transpose(rows: int, cols: int, msl_scalar: str) -> str:
     parts.append(f"    for (int i = 0; i < {rows}; ++i) {{")
     parts.append(f"        for (int j = 0; j < {cols}; ++j) {{")
     parts.append(f"            R.c[j*{rows} + i] = A.c[i*{cols} + j];")
+    parts.append("        }")
+    parts.append("    }")
+    parts.append("    return R;")
+    parts.append("}")
+    return "\n".join(parts)
+
+
+def _emit_tile_transpose_vec(rows: int, cols: int, n_elem: int, msl_scalar: str) -> str:
+    """Emit ``wp_tile_RxC_vec<N>_<scalar>_transpose`` returning a ``CxR`` tile.
+
+    Vec-element variant of :func:`_emit_tile_transpose` — elements keep
+    their ``n_elem`` components together while (i, j) swap.
+    """
+    in_name = f"wp_tile_{rows}x{cols}_vec{n_elem}_{msl_scalar}"
+    out_name = f"wp_tile_{cols}x{rows}_vec{n_elem}_{msl_scalar}"
+    parts: list[str] = [f"__attribute__((noinline)) {out_name} {in_name}_transpose(const thread {in_name}& A) {{"]
+    parts.append(f"    {out_name} R;")
+    parts.append(f"    for (int i = 0; i < {rows}; ++i) {{")
+    parts.append(f"        for (int j = 0; j < {cols}; ++j) {{")
+    parts.append(f"            for (int k = 0; k < {n_elem}; ++k) {{")
+    parts.append(f"                R.c[(j*{rows} + i)*{n_elem} + k] = A.c[(i*{cols} + j)*{n_elem} + k];")
+    parts.append("            }")
     parts.append("        }")
     parts.append("    }")
     parts.append("    return R;")
@@ -4951,6 +5026,11 @@ def _build_kernel_header(source: str) -> str:
     for m in transpose_pat.finditer(source):
         rows, cols = int(m.group(1)), int(m.group(2))
         scalar = m.group(3)
+        # Greedy ``(\w+)`` also matches vec-element transposes
+        # (``wp_tile_RxC_vec2_float_transpose`` → scalar "vec2_float");
+        # those are handled by the vec scan below.
+        if scalar not in _MSL_PREFIX_TO_SAME:
+            continue
         transpose_seen.add((rows, cols, scalar))
         seen_tile.add((rows, cols, scalar))
         seen_tile.add((cols, rows, scalar))
@@ -4968,8 +5048,30 @@ def _build_kernel_header(source: str) -> str:
         scalar = m.group(4)
         if scalar in _MSL_PREFIX_TO_SAME:
             seen_vec_tile.add((rows, cols, n_elem, scalar))
+    # Vec-element transposes return a ``CxR`` struct — register both
+    # shapes (mirrors the scalar ``transpose_pat`` handling above) and
+    # remember which helpers to define after the structs.
+    vec_transpose_pat = re.compile(r"\bwp_tile_(\d+)x(\d+)_vec(\d+)_(\w+?)_transpose\b")
+    vec_transpose_seen: set[tuple[int, int, int, str]] = set()
+    for m in vec_transpose_pat.finditer(source):
+        rows, cols, n_elem = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        scalar = m.group(4)
+        if scalar in _MSL_PREFIX_TO_SAME:
+            vec_transpose_seen.add((rows, cols, n_elem, scalar))
+            seen_vec_tile.add((rows, cols, n_elem, scalar))
+            seen_vec_tile.add((cols, rows, n_elem, scalar))
     for rows, cols, n_elem, scalar in sorted(seen_vec_tile):
         parts.append(_emit_tile_struct_vec(rows, cols, n_elem, scalar))
+    for rows, cols, n_elem, scalar in sorted(vec_transpose_seen):
+        parts.append(_emit_tile_transpose_vec(rows, cols, n_elem, scalar))
+    # In-place FFT helpers over vec2-element tiles (``tile_fft`` /
+    # ``tile_ifft``). Emitted after the structs they take by reference.
+    fft_pat = re.compile(r"\bwp_tile_(\d+)x(\d+)_vec2_(\w+)_fft\b")
+    seen_fft: set[tuple[int, int, str]] = set()
+    for m in fft_pat.finditer(source):
+        seen_fft.add((int(m.group(1)), int(m.group(2)), m.group(3)))
+    for rows, cols, scalar in sorted(seen_fft):
+        parts.append(_emit_tile_fft(rows, cols, scalar))
     # Cooperative load/store variants — scan for ``..._load_coop`` /
     # ``..._store_coop`` references and emit their definitions
     # alongside the single-thread ones.
@@ -6083,6 +6185,13 @@ _TILE_CHOLESKY_INPLACE_PAT = re.compile(r"\bwp::tile_cholesky_inplace\s*<[^()]*>
 # Match the bare form. Same shape for the upper variant.
 _TILE_LOWER_SOLVE_INPLACE_PAT = re.compile(r"\btile_lower_solve_inplace\s*\(([^)]*)\)")
 _TILE_UPPER_SOLVE_INPLACE_PAT = re.compile(r"\btile_upper_solve_inplace\s*\(([^)]*)\)")
+# ``tile_fft(dir, batch, size, var_X)`` / ``tile_ifft(...)`` — the
+# no-MathDx dispatch emits these bare (namespace="") with the FFT
+# geometry when building for Metal (``metal_backend`` builder option):
+# ``dir`` is 0 for forward / 1 for inverse, ``batch`` the number of
+# independent rows, ``size`` the FFT length (the tile's last dim). The
+# transform is in place and unnormalized, matching cuFFTDx semantics.
+_TILE_FFT_PAT = re.compile(r"\btile_i?fft\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*var_(\w+)\s*\)")
 # ``var_X = wp::tile_view<wp::tile_shared_t<dtype, layout<shape<R,C>,
 # stride<...>>, ...>>(parent, row_off, col_off)``. The template arg
 # carries the view's output shape; the function args are the parent
@@ -6890,7 +6999,11 @@ def _translate_tile_intrinsics(
         # writeback into the source.
         if transpose_aliases is not None:
             transpose_aliases[lhs] = in_label
-        helper = f"wp_tile_{rows}x{cols}_{msl_scalar}_transpose"
+        vec_n = tile_var_vec_n.get(in_label, 0)
+        if vec_n > 0:
+            helper = f"wp_tile_{rows}x{cols}_vec{vec_n}_{msl_scalar}_transpose"
+        else:
+            helper = f"wp_tile_{rows}x{cols}_{msl_scalar}_transpose"
         return f"var_{lhs} = {helper}(var_{in_label})"
 
     line = _TILE_TRANSPOSE_NOTPL_PAT.sub(repl_transpose_notpl, line)
@@ -7009,6 +7122,25 @@ def _translate_tile_intrinsics(
 
     line = _TILE_LOWER_SOLVE_INPLACE_PAT.sub(lambda m: _repl_solve_inplace("lower", m), line)
     line = _TILE_UPPER_SOLVE_INPLACE_PAT.sub(lambda m: _repl_solve_inplace("upper", m), line)
+
+    def _repl_tile_fft(m: re.Match[str]) -> str:
+        # ``tile_fft(dir, batch, size, var_X)`` — see ``_TILE_FFT_PAT``.
+        direction, size, t_label = int(m.group(1)), int(m.group(3)), m.group(4)
+        dims = tile_var_dims.get(t_label)
+        vec_n = tile_var_vec_n.get(t_label, 0)
+        if dims is None or vec_n != 2:
+            raise MetalCodegenError(f"tile_fft on Metal requires a vec2f register tile; got tile local 'var_{t_label}'")
+        rows, cols, scalar = dims
+        if scalar != "float":
+            raise MetalCodegenError(f"tile_fft on Metal supports vec2f only, got vec2 of {scalar!r} (no fp64 on MSL)")
+        if cols != size or cols & (cols - 1) or cols < 2:
+            raise MetalCodegenError(
+                f"tile_fft on Metal requires a power-of-two FFT size matching the tile's last dim, got {cols}"
+            )
+        inv = "true" if direction == 1 else "false"
+        return f"wp_tile_{rows}x{cols}_vec2_{scalar}_fft(var_{t_label}, {inv})"
+
+    line = _TILE_FFT_PAT.sub(_repl_tile_fft, line)
 
     def _repl_tile_broadcast(m: re.Match[str]) -> str:
         # ``var_X = wp::tile_broadcast<...>(var_Y)``. Source ``var_Y``
@@ -7612,6 +7744,11 @@ def _ensure_adj_built(kernel, block_dim: int | None = None):
                 "enable_backward": False,
                 "output_arch": None,
                 "block_dim": 1,
+                # Tells no-MathDx lto_dispatch funcs (e.g. ``tile_fft``) to
+                # emit their operands into the generated source so the MSL
+                # translators can rewrite the call — the plain CPU path
+                # emits a bare no-op macro invocation instead.
+                "metal_backend": True,
             },
         )
     # Distributed-tile upgrade: launched at the coop width, eligible tile
@@ -7627,6 +7764,7 @@ def _ensure_adj_built(kernel, block_dim: int | None = None):
                     "enable_backward": False,
                     "output_arch": None,
                     "block_dim": _COOP_BLOCK_DIM,
+                    "metal_backend": True,
                 },
             )
             adj._metal_coop_block_n = _COOP_BLOCK_DIM
@@ -10947,7 +11085,24 @@ def _get_or_build_metal_kernel_native(kernel, block_dim: int | None = None):
             return artifact, None
         wrapped = _wrap_msl_for_native_dispatch(artifact)
         kernel._metal_native_wrapped_source = wrapped
-        pso = get_dispatcher().compile(wrapped, f"custom_kernel_{artifact.name}")
+        try:
+            pso = get_dispatcher().compile(wrapped, f"custom_kernel_{artifact.name}")
+        except Exception:
+            if os.environ.get("WARP_METAL_DUMP_ON_FAIL"):
+                import tempfile
+
+                dump_dir = tempfile.mkdtemp(prefix=f"warp_metal_fail_{kernel.key}_")
+                with open(os.path.join(dump_dir, "wrapped_source.metal"), "w") as f:
+                    f.write(wrapped)
+                blocks = getattr(kernel.adj, "blocks", None)
+                if blocks:
+                    with open(os.path.join(dump_dir, "forward_ir.cpp"), "w") as f:
+                        f.write("\n".join(blocks[0].body_forward))
+                    with open(os.path.join(dump_dir, "variables.txt"), "w") as f:
+                        for v in kernel.adj.variables:
+                            f.write(f"var_{v.label}: {v.ctype()}\n")
+                print(f"[warp-metal] kernel '{kernel.key}' failed to compile; dumped to {dump_dir}", flush=True)
+            raise
         kernel._metal_native_pso = pso
     elif pso is _METAL_NOOP_PSO:
         return artifact, None
