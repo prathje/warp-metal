@@ -18377,6 +18377,23 @@ def tile_fft_generic_lto_dispatch_func(
     arch = options["output_arch"]
     ept = size // num_threads
 
+    if options.get("metal_backend"):
+        # The Metal backend transpiles this call from the generated
+        # source, so emit the FFT geometry (direction, batch, size) and
+        # the tile operand for codegen_metal to rewrite into its MSL
+        # helper. The CPU/CUDA compilers never see this form.
+        return (
+            (
+                Var(str(fwd_dir), str, False, True, False),
+                Var(str(batch), str, False, True, False),
+                Var(str(size), str, False, True, False),
+                inout,
+            ),
+            [],
+            [],
+            0,
+        )
+
     func_name = "tile_fft" if direction == "forward" else "tile_ifft"
     use_mathdx = (
         arch is not None
