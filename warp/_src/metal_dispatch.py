@@ -285,6 +285,16 @@ class MetalDispatcher:
         # which autoflushes ~3x and leaves the older two cmd buffers
         # in flight at sync time).
         self._pending_commits: list = []
+        # ``(cmd_buf, refs)`` pairs pinning per-launch transient buffers
+        # until their command buffer completes. Pruned opportunistically
+        # on each ``flush``/``sync`` by polling ``status()`` — NOT via
+        # ``addCompletedHandler_``: a Python-level completion handler
+        # fires on a non-Python dispatch queue, and if a buffer completes
+        # while the interpreter is finalizing (a script exiting with GPU
+        # work still in flight), PyObjC's ``PyGILState_Ensure`` kills the
+        # calling thread mid-callout and the process dies with SIGKILL
+        # (observed: example_tile_nbody headless, 1000 un-synced frames).
+        self._inflight_refs_by_buf: list = []
         # Auto-flush threshold. ``launch_metal_kernel_native`` enqueues
         # per-launch transient buffers (packed shapes / ints / floats /
         # struct args) into ``_inflight_refs``; if a workload runs many
@@ -367,6 +377,11 @@ class MetalDispatcher:
             # the main script returns but before Python tears down
             # extension state, so PyObjC bridges are still alive.
             atexit.register(self._serialize_archive_if_dirty)
+        # Drain in-flight GPU work before the interpreter finalizes — a
+        # script that exits right after fire-and-forget launches would
+        # otherwise tear down Python while Metal is still executing.
+        # Registered after the archive handler so LIFO runs it first.
+        atexit.register(self._drain_at_exit)
 
         # ------------------------------------------------------------
         # Indirect-command-buffer recording state.
@@ -1082,17 +1097,12 @@ class MetalDispatcher:
         self._cmd_buf = None
         self._inflight_refs = []
 
-        # ``_release`` does nothing explicit — it just exists to *capture*
-        # ``refs`` in its closure so the bound buffers stay alive until
-        # Metal calls back and releases the handler block. Avoid
-        # ``del refs`` here: PyObjC re-invokes the handler from a non-
-        # Python dispatch queue and a ``del`` of a free var raises
-        # ``UnboundLocalError`` mid-callback (it tries to shadow the
-        # cell as a local).
-        def _release(_cmd_buf):
-            refs  # noqa: B018, keep closure ref alive
-
-        cmd_buf.addCompletedHandler_(_release)
+        # Pin ``refs`` until the command buffer completes. Pruned by
+        # status-polling on the next flush/sync (see the field docstring
+        # in ``__init__`` for why a completion handler is unsafe).
+        # MTLCommandBufferStatus: 4 = Completed, 5 = Error.
+        self._inflight_refs_by_buf = [(cb, r) for cb, r in self._inflight_refs_by_buf if cb.status() < 4]
+        self._inflight_refs_by_buf.append((cmd_buf, refs))
         cmd_buf.commit()
         # Remember every fire-and-forget commit so :meth:`sync` can
         # block until *each* one has finished. See ``_pending_commits``
@@ -1129,6 +1139,19 @@ class MetalDispatcher:
         for cb in self._pending_commits:
             cb.waitUntilCompleted()
         self._pending_commits = []
+        # Everything has completed — release the pinned transient refs.
+        self._inflight_refs_by_buf = []
+
+    def _drain_at_exit(self) -> None:
+        """``atexit`` hook: block until outstanding GPU work finishes.
+
+        Never raises — shutdown must proceed even if the queue is in a
+        bad state (e.g. a command buffer erred out).
+        """
+        try:
+            self.sync()
+        except Exception:
+            pass
 
     def has_pending_work(self) -> bool:
         """Return ``True`` if any recorded-but-unsynced GPU work exists
