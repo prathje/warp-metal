@@ -291,8 +291,8 @@ def _vec_t_to_msl(n: int, scalar_ctype: str) -> str:
     like ``wp_vec6_float`` for which the codegen emits a custom struct
     declaration in the kernel header.
     """
-    if n < 2:
-        raise MetalCodegenError(f"MSL codegen: vec_t<{n}, ...> not supported (need N >= 2)")
+    if n < 1:
+        raise MetalCodegenError(f"MSL codegen: vec_t<{n}, ...> not supported")
     full_ctype = f"wp::{scalar_ctype}"
     if full_ctype not in _MSL_VEC_SCALAR_PREFIX:
         raise MetalCodegenError(f"MSL codegen does not yet support vec_t element type {full_ctype!r}")
@@ -328,8 +328,8 @@ def _mat_t_to_msl(rows: int, cols: int, scalar_ctype: str) -> str:
     codegen emits a custom struct in the kernel header (alongside the
     big-vec structs).
     """
-    if rows < 2 or cols < 2:
-        raise MetalCodegenError(f"MSL codegen: mat_t<{rows}, {cols}, ...> not supported (need >= 2 per dim)")
+    if rows < 1 or cols < 1:
+        raise MetalCodegenError(f"MSL codegen: mat_t<{rows}, {cols}, ...> not supported")
     full_ctype = f"wp::{scalar_ctype}"
     if full_ctype not in _MSL_VEC_SCALAR_PREFIX:
         raise MetalCodegenError(f"MSL codegen does not yet support mat_t element type {full_ctype!r}")
@@ -421,13 +421,18 @@ def _emit_big_vec_struct(name: str, n: int, msl_scalar: str) -> str:
     body_lines.append("}")
     # Single-scalar broadcast overload: Warp's IR emits
     # ``wp_vecN_<scalar>_make(scalar)`` for ``vec_t<N>(s)`` patterns
-    # (e.g. ``wp.vec8(0.0)`` to zero-init or fill).
-    body_lines.append(f"inline {name} {name}_make({msl_scalar} v) {{")
-    body_lines.append(f"    {name} r;")
-    for i in range(n):
-        body_lines.append(f"    r.c[{i}] = v;")
-    body_lines.append("    return r;")
-    body_lines.append("}")
+    # (e.g. ``wp.vec8(0.0)`` to zero-init or fill). For n == 1 this is
+    # the same signature as the per-component factory above — skip it.
+    if n > 1:
+        body_lines.append(f"inline {name} {name}_make({msl_scalar} v) {{")
+        body_lines.append(f"    {name} r;")
+        for i in range(n):
+            body_lines.append(f"    r.c[{i}] = v;")
+        body_lines.append("    return r;")
+        body_lines.append("}")
+    # Copy overload: ``vec_t<N>(v)`` with a same-type operand (Warp's
+    # explicit copy-construction, e.g. warp.fem's vec1 accumulators).
+    body_lines.append(f"inline {name} {name}_make({name} v) {{ return v; }}")
     # Operator overloads. Component-wise unrolled for clarity and so MSL's
     # auto-vectoriser sees independent statements.
     for op in ("+", "-", "*", "/"):
@@ -576,13 +581,18 @@ def _emit_big_mat_struct(name: str, rows: int, cols: int, msl_scalar: str) -> st
         body.append(f"    r.c[{i}] = v{i};")
     body.append("    return r;")
     body.append("}")
-    # Single-scalar broadcast: ``mat23(0.0)`` zero-fills.
-    body.append(f"inline {name} {name}_make({msl_scalar} v) {{")
-    body.append(f"    {name} r;")
-    for i in range(n):
-        body.append(f"    r.c[{i}] = v;")
-    body.append("    return r;")
-    body.append("}")
+    # Single-scalar broadcast: ``mat23(0.0)`` zero-fills. At 1x1 this has
+    # the same signature as the flat per-element factory above — skip it
+    # (mirrors the big-vec n == 1 case).
+    if n > 1:
+        body.append(f"inline {name} {name}_make({msl_scalar} v) {{")
+        body.append(f"    {name} r;")
+        for i in range(n):
+            body.append(f"    r.c[{i}] = v;")
+        body.append("    return r;")
+        body.append("}")
+    # Copy overload: ``mat_t<R, C>(m)`` with a same-type operand.
+    body.append(f"inline {name} {name}_make({name} m) {{ return m; }}")
     body.append(f"inline {msl_scalar} wp_mat_extract({name} m, int row, int col) {{ return m.c[row * {cols} + col]; }}")
     body.append(
         f"inline void wp_mat_elem_store(thread {name}& m, int row, int col, {msl_scalar} v) "
@@ -860,6 +870,29 @@ _DIAG_HELPERS = (
     "float4(0.0f, 0.0f, 0.0f, v[3]));\n"
     "}"
 )
+
+
+# Software demotion of IEEE-754 double bits to fp32 — Apple GPUs have no
+# fp64, so float64 struct fields (warp.fem's ``wp.float64`` integrand
+# parameters ride in the ValueStruct) are read as their raw 64 bits and
+# converted here. Truncating (round-toward-zero) mantissa conversion;
+# handles inf/NaN, overflow to inf, and flushes underflow/denormals to 0.
+_F64_HELPERS = """\
+inline float wp_f64_to_f32(ulong b) {
+    uint sign = uint(b >> 63) << 31;
+    int exp = int((b >> 52) & 0x7ffull);
+    ulong man = b & 0xfffffffffffffull;
+    if (exp == 0x7ff) {  // inf / NaN
+        uint m = man ? 0x400000u : 0u;
+        return as_type<float>(sign | 0x7f800000u | m);
+    }
+    if (exp == 0) return as_type<float>(sign);  // double denormal < 1e-308: flush to 0
+    int e32 = exp - 1023 + 127;
+    if (e32 >= 255) return as_type<float>(sign | 0x7f800000u);  // overflow -> inf
+    if (e32 <= 0) return as_type<float>(sign);                  // underflow -> 0
+    return as_type<float>(sign | (uint(e32) << 23) | uint(man >> 29));
+}
+"""
 
 
 # ``wp.normalize`` must match ``warp/native/vec.h``/``quat.h`` exactly:
@@ -3832,6 +3865,28 @@ def _emit_tile_struct(rows: int, cols: int, msl_scalar: str) -> str:
     parts.append("    }")
     parts.append("    return t;")
     parts.append("}")
+    # Bounds-checked overload: elements outside the source array's extents
+    # read as zero, matching ``wp.tile_load``'s CPU/CUDA behaviour. A tile
+    # is a fixed compile-time shape, so a partial trailing block (array
+    # length not a multiple of the tile size) is the common case; without
+    # the guard the load runs past the end of the row and silently mixes in
+    # neighbouring data.
+    parts.append("template <typename T>")
+    parts.append(
+        f"inline {name} {name}_load(T arr, int base, int row_stride, int row_off, int col_off, "
+        "int n_rows, int n_cols) {"
+    )
+    parts.append(f"    {name} t;")
+    parts.append(f"    for (int i = 0; i < {rows}; ++i) {{")
+    parts.append("        int r = row_off + i;")
+    parts.append(f"        for (int j = 0; j < {cols}; ++j) {{")
+    parts.append("            int c = col_off + j;")
+    parts.append("            bool in_range = r >= 0 && r < n_rows && c >= 0 && c < n_cols;")
+    parts.append(f"            t.c[i * {cols} + j] = in_range ? arr[base + r * row_stride + c] : ({msl_scalar})0;")
+    parts.append("        }")
+    parts.append("    }")
+    parts.append("    return t;")
+    parts.append("}")
     # Store target is always writable, so it stays ``device``.
     parts.append(
         f"inline void {name}_store(device {msl_scalar}* arr, "
@@ -4945,6 +5000,15 @@ def _build_kernel_header(source: str) -> str:
     # ``wp.transform_identity()``), so force the struct in.
     if "wp_transform_" in source:
         seen_vec.add((7, "float"))
+    # 1-component vec/mat algebra (warp.fem's scalar-space local dof
+    # values are ``vec_t<1>`` / ``mat_t<1, 1>``): the misc-math helper
+    # families only cover native sizes, so ``wp_mat1x1_float`` kernels
+    # get a dedicated overload block (trace / get_diag / outer /
+    # determinant / transpose). Force both structs in so the block —
+    # and expression-only uses that never declare a local — compile.
+    need_mat1x1 = "wp_mat1x1_float" in source or ("wp_outer" in source and "wp_vec1_float" in source)
+    if need_mat1x1:
+        seen_vec.add((1, "float"))
     seen_mat: set[tuple[int, int, str]] = set()
     for m in _BIG_MAT_NAME_PAT.finditer(source):
         rows = int(m.group(1))
@@ -4957,6 +5021,8 @@ def _build_kernel_header(source: str) -> str:
         if rows == cols and rows in _MSL_VEC_NATIVE_N:
             continue
         seen_mat.add((rows, cols, scalar))
+    if need_mat1x1:
+        seen_mat.add((1, 1, "float"))
     # Big-mat arithmetic (mat * vec / vec * mat) is typed on the big-vec
     # structs for any non-native row/col count, so those structs must be
     # emitted even when the kernel body never names them directly.
@@ -4982,6 +5048,8 @@ def _build_kernel_header(source: str) -> str:
         parts.append(extract_helpers)
     if "wp_diag_float3" in source:
         parts.append(_DIAG_HELPERS)
+    if "wp_f64_to_f32" in source:
+        parts.append(_F64_HELPERS)
     # Always emitted: kernels reference ``wp_normalize``/``wp_quat_normalize``
     # directly, and the quat/noise/BVH helper families below call
     # ``wp_normalize`` internally (mirroring native code's guarded
@@ -5017,6 +5085,19 @@ def _build_kernel_header(source: str) -> str:
     misc_math = _emit_misc_math_helpers(source)
     if misc_math:
         parts.append(misc_math)
+    if need_mat1x1:
+        parts.append(
+            "inline float wp_trace(wp_mat1x1_float m) { return m.c[0]; }\n"
+            "inline wp_vec1_float wp_get_diag(wp_mat1x1_float m) "
+            "{ wp_vec1_float r; r.c[0] = m.c[0]; return r; }\n"
+            "inline wp_mat1x1_float wp_outer(wp_vec1_float a, wp_vec1_float b) "
+            "{ wp_mat1x1_float r; r.c[0] = a.c[0] * b.c[0]; return r; }\n"
+            "inline float wp_determinant(wp_mat1x1_float m) { return m.c[0]; }\n"
+            # ``wp.transpose`` renames to ``metal::transpose``; a 1x1
+            # transpose is the identity. Extending the metal namespace is
+            # legal MSL (it is an ordinary C++ namespace).
+            "namespace metal { inline wp_mat1x1_float transpose(wp_mat1x1_float m) { return m; } }"
+        )
     if "wp_dot" in source:
         dot_overloads = _emit_wp_dot_overloads(source)
         if dot_overloads:
@@ -5226,7 +5307,7 @@ def _rewrite_vec_t_brace_constructor(text: str) -> str:
         if args_str.startswith("{") and args_str.endswith("}"):
             args_str = args_str[1:-1].strip()
         full_ctype = f"wp::{scalar_ctype}"
-        if full_ctype not in _MSL_VEC_SCALAR_PREFIX or n < 2:
+        if full_ctype not in _MSL_VEC_SCALAR_PREFIX or n < 1:
             return m.group(0)
         msl_scalar = _MSL_VEC_SCALAR_PREFIX[full_ctype]
         if n in _MSL_VEC_NATIVE_N:
@@ -5265,7 +5346,7 @@ def _rewrite_mat_t_constructor(text: str) -> str:
             args_str = args_str[1:-1].strip()
         args = [a.strip() for a in args_str.split(",") if a.strip()]
         full_ctype = f"wp::{scalar}"
-        if full_ctype not in _MSL_VEC_SCALAR_PREFIX or rows < 2 or cols < 2:
+        if full_ctype not in _MSL_VEC_SCALAR_PREFIX or rows < 1 or cols < 1:
             return m.group(0)
         msl_scalar = _MSL_VEC_SCALAR_PREFIX[full_ctype]
         # Native MSL matrix only for *square* sizes (``_msl_mat_name``).
@@ -5401,6 +5482,14 @@ def _msl_var_type(ctype: str) -> str:
     """Translate a local variable's ctype to MSL."""
     if ctype.endswith("*"):
         return _msl_pointer_type(ctype)
+    # Scalar float64 VALUES demote to fp32 — Apple GPUs have no fp64, and
+    # warp.fem integrands routinely take ``wp.float64`` parameters that are
+    # immediately cast down to the space's scalar type. Only bare value
+    # locals demote: float64 POINTERS (i.e. float64 wp.array storage, whose
+    # 8-byte element stride is user-visible memory layout) still raise via
+    # ``_msl_pointer_type`` above.
+    if ctype == "wp::float64":
+        return "float"
     # Tile types translate two ways depending on element shape:
     #   * shape == (1,) or (1, 1) — a single-thread tile of one element.
     #     With ``block_dim=1`` (the Metal default) every register-tile
@@ -5722,13 +5811,25 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     ),
     # ``wp::identity<N, wp::T>()`` builds an NxN identity matrix. MSL's
     # native floatNxN single-scalar constructor fills the diagonal, so
-    # ``floatNxN(1.0f)`` is the identity. (Same for int/uint.)
+    # ``floatNxN(1.0f)`` is the identity. (Same for int/uint.) Non-native
+    # sizes (1x1, 5x5, ...) route through the custom big-mat struct's flat
+    # row-major ``_make`` factory with explicit diagonal ones.
     (
         re.compile(r"wp::identity\s*<\s*(\d+)\s*,\s*wp::(\w+)\s*>\s*\(\s*\)"),
         lambda m: (
-            f"{_MSL_VEC_SCALAR_PREFIX[f'wp::{m.group(2)}']}{m.group(1)}x{m.group(1)}(1.0f)"
-            if f"wp::{m.group(2)}" in _MSL_VEC_SCALAR_PREFIX
-            else m.group(0)
+            m.group(0)
+            if f"wp::{m.group(2)}" not in _MSL_VEC_SCALAR_PREFIX
+            else (
+                f"{_MSL_VEC_SCALAR_PREFIX[f'wp::{m.group(2)}']}{m.group(1)}x{m.group(1)}(1.0f)"
+                if int(m.group(1)) in _MSL_VEC_NATIVE_N
+                else (
+                    f"wp_mat{m.group(1)}x{m.group(1)}_{_MSL_VEC_SCALAR_PREFIX[f'wp::{m.group(2)}']}_make("
+                    + ", ".join(
+                        "1.0f" if i == j else "0.0f" for i in range(int(m.group(1))) for j in range(int(m.group(1)))
+                    )
+                    + ")"
+                )
+            )
         ),
     ),
     # Quaternion builtins — dispatched by name to the ``wp_quat_*`` helpers
@@ -5904,7 +6005,7 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     # ``float(x)`` / ``int(x)`` constructor calls in user code.
     (
         re.compile(
-            r"wp::(float|float16|float32|int|int8|int16|int32|int64|"
+            r"wp::(float|float16|float32|float64|int|int8|int16|int32|int64|"
             r"uint|uint8|uint16|uint32|uint64|bool)\s*\(\s*([^()]+?)\s*\)"
         ),
         r"\2",
@@ -6112,6 +6213,9 @@ _TILE_ARGMIN_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_(argmin|argmax)\s*\(\
 # ``wp::tile_min(t)`` / ``wp::tile_max(t)`` — value-reduction forms
 # (distinct from ``tile_reduce(wp::min, t)`` handled above).
 _TILE_MINMAX_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_(min|max)\s*\(\s*var_(\w+)\s*\)")
+# ``wp::tile_sum(t)`` — sum-reduce every element to a 1-element tile (a
+# plain scalar here). ``wp.optim.linear``'s tiled dot product uses it.
+_TILE_SUM_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_sum\s*\(\s*var_(\w+)\s*\)")
 # ``wp::tile_zeros<dtype, ...>()`` / ``wp::tile_ones<dtype, ...>()`` —
 # constant-fill register tile. With block_dim=1 it's the corresponding
 # scalar 0 / 1 (or vec ``T(0)`` / ``T(1)``).
@@ -6325,7 +6429,10 @@ def _translate_tile_intrinsics(
     atomic_output_names: set[str] | None = None,
     smem_tiles: dict[str, tuple[int, int, int, str]] | None = None,
     distributed_tiles: dict[str, str] | None = None,
+    shaped_array_names: set[str] | None = None,
 ) -> str:
+    if shaped_array_names is None:
+        shaped_array_names = set()
     if tile_var_vec_n is None:
         tile_var_vec_n = {}
     if atomic_output_names is None:
@@ -6347,6 +6454,11 @@ def _translate_tile_intrinsics(
         dtype_token = m.group(2)
         rows = int(m.group(3))
         cols = int(m.group(4)) if m.group(4) else 1
+        # Whether the tile was declared 1-D (``shape=N``) as opposed to 2-D
+        # with a single column (``shape=(N, 1)``). Both give ``cols == 1``
+        # but they consume a different number of trailing offsets, which
+        # shifts how many array dims the leading args cover.
+        tile_is_1d = m.group(4) is None
         # Resolve the element type. Three cases:
         #  - scalar: ``wp::float32`` -> msl_scalar=``float``
         #  - vec_t (Warp form): ``wp::vec_t<N, wp::SCALAR>``
@@ -6424,7 +6536,37 @@ def _translate_tile_intrinsics(
         # single-thread emit remains for non-resident tiles, where the 32
         # redundant device reads land in L1 (16 KB at N=64 fits).
         helper = f"wp_tile_{rows}x{cols}_{msl_scalar}_load"
-        return f"var_{lhs} = {helper}({arr}, {base_expr}, {row_stride}, {row_off}, {col_off})"
+        # Pass the source extents so a partial trailing block zero-fills
+        # instead of reading past the row (``wp.tile_load`` semantics).
+        # ``<arr>_shape`` is only available for real array args; tiles read
+        # out of anything else keep the unchecked overload.
+        n_rows_expr = None
+        n_cols_expr = None
+        if arr_name in shaped_array_names:
+            n_lead = len(lead_idx_args)
+            if cols > 1:
+                # Both tile offsets were consumed as such, so the tile spans
+                # array dims ``n_lead`` and ``n_lead + 1``.
+                n_rows_expr = f"(int){arr_name}_shape[{n_lead}]"
+                n_cols_expr = f"(int){arr_name}_shape[{n_lead + 1}]"
+            elif tile_is_1d:
+                # True 1-D tile: it walks the array's innermost dim, and any
+                # leading array indices were parsed as slice indices.
+                n_rows_expr = f"(int){arr_name}_shape[{n_lead}]"
+                n_cols_expr = "1"
+            elif n_lead >= 1:
+                # 2-D tile declared with a single column (``shape=(R, 1)``).
+                # Only one trailing offset is consumed above, so the row
+                # offset landed in ``lead_idx_args`` and the dim the tile
+                # actually walks is one further out.
+                n_rows_expr = f"(int){arr_name}_shape[{n_lead - 1}]"
+                n_cols_expr = f"(int){arr_name}_shape[{n_lead}]"
+        if n_rows_expr is None:
+            return f"var_{lhs} = {helper}({arr}, {base_expr}, {row_stride}, {row_off}, {col_off})"
+        return (
+            f"var_{lhs} = {helper}({arr}, {base_expr}, {row_stride}, {row_off}, {col_off}, "
+            f"{n_rows_expr}, {n_cols_expr})"
+        )
 
     def repl_store(m: re.Match[str]) -> str:
         # Group 1 is the full dtype string after the regex update —
@@ -6709,6 +6851,25 @@ def _translate_tile_intrinsics(
         )
 
     line = _TILE_MINMAX_PAT.sub(repl_tile_minmax, line)
+
+    def repl_tile_sum(m: re.Match[str]) -> str:
+        lhs = m.group(1)
+        in_label = m.group(2)
+        dims = tile_var_dims.get(in_label)
+        n = dims[0] * dims[1] if dims is not None else 1
+        if n == 1:
+            return f"var_{lhs} = var_{in_label}"
+        vec_n = tile_var_vec_n.get(in_label, 0)
+        if vec_n > 0:
+            raise MetalCodegenError(f"MSL codegen: tile_sum on a vec-element tile 'var_{in_label}' is not supported")
+        return (
+            f"var_{lhs} = ({{ auto _ts_acc = var_{in_label}.c[0]; "
+            f"for (int _ts_i = 1; _ts_i < {n}; ++_ts_i) "
+            f"_ts_acc += var_{in_label}.c[_ts_i]; "
+            f"_ts_acc; }})"
+        )
+
+    line = _TILE_SUM_PAT.sub(repl_tile_sum, line)
 
     def repl_zeros(m: re.Match[str]) -> str:
         return _emit_tile_const_fill(m.group(1), m.group(2), "0")
@@ -7988,6 +8149,18 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
             # Scalar arg — always an input.
             input_args.append(arg)
             continue
+        # float64 ARRAYS stay rejected: their 8-byte element stride is
+        # user-visible memory layout that cannot be demoted the way scalar
+        # float64 locals / struct fields are. (This raise used to come
+        # implicitly from the f64 locals the loads produce — those now
+        # demote to fp32, so the array check must be explicit.)
+        _dtype = getattr(arg.type, "dtype", None)
+        _scalar = getattr(_dtype, "_wp_scalar_type_", _dtype)
+        if getattr(_scalar, "__name__", None) == "float64":
+            raise MetalCodegenError(
+                f"Kernel {adj.fun_name!r}: array argument {arg.label!r} has float64 elements — "
+                f"MSL has no fp64; use float32 arrays on Metal"
+            )
         # Args whose names end in ``_out`` are conventionally outputs in
         # mujoco_warp (and most Warp kernels). Treat them as outputs even
         # when the body has no detected writes — this happens for kernels
@@ -8024,6 +8197,10 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
                     f"Kernel {adj.fun_name!r}: {field_desc} is a wp.indexedarray, which is not "
                     f"supported on the Metal backend"
                 )
+            _fdtype = getattr(ftype, "dtype", None)
+            _fscalar = getattr(_fdtype, "_wp_scalar_type_", _fdtype)
+            if getattr(_fscalar, "__name__", None) == "float64":
+                raise MetalCodegenError(f"Kernel {adj.fun_name!r}: {field_desc} has float64 elements — MSL has no fp64")
             syn_var = _WpVar(syn_label, ftype)
             struct_field_array_vars.append(syn_var)
             input_args.append(syn_var)
@@ -8710,7 +8887,12 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
     # was O(lines x args) and dominated codegen on arg-heavy GJK kernels.
     # The trailing ``\b`` keeps alternation order irrelevant: a shorter
     # label that prefixes a longer one fails the boundary and backtracks.
-    _arg_label_alt = "|".join(re.escape(arg.label) for arg in adj.args)
+    # Includes the synthetic struct-field array inputs: rewrites that keep
+    # the array name inline (e.g. ``wp::lower_bound(var_<syn>, ...)``)
+    # need the same ``var_`` strip as real args.
+    _arg_label_alt = "|".join(
+        re.escape(lbl) for lbl in [*(arg.label for arg in adj.args), *(v.label for v in struct_field_array_vars)]
+    )
     _arg_rename_pat = re.compile(rf"\bvar_({_arg_label_alt})\b") if _arg_label_alt else None
 
     # --- Forward statements --------------------------------------------
@@ -8735,6 +8917,7 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
             atomic_output_names,
             smem_tiles,
             distributed_tiles,
+            arg_label_set,
         )
         # Inline subscripts that the address-collapse produced.
         translated = _substitute_subscripts(translated)
@@ -8990,6 +9173,19 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
                 r"^(?P<indent>\s*)var_(\w+)\s*=\s*wp::(?:copy|load)\s*\(\s*var_(\w+)\s*\)\s*;\s*$",
                 raw,
             )
+        if m_struct_copy is None:
+            # And the ``wp::assign(dst, src)`` statement form — Warp uses
+            # it for in-place mutation, notably the loop-carried rebinds
+            # of struct locals at the bottom of ``while``/``for`` bodies
+            # (warp.fem's ``dispatch_*_kernel_fn`` iteration state). The
+            # generic pattern-table rewrite (``dst = src;``) runs AFTER
+            # this loop, so without this match the whole-struct assign
+            # slipped through unexpanded and referenced never-declared
+            # whole-struct locals.
+            m_struct_copy = re.match(
+                r"^(?P<indent>\s*)wp::assign\s*\(\s*var_(\w+)\s*,\s*var_(\w+)\s*\)\s*;\s*$",
+                raw,
+            )
         if (
             m_struct_copy
             and m_struct_copy.group(2) in struct_local_layouts
@@ -9189,6 +9385,11 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
                     slot = f"{buf}[{base_expr}]"
                     writes.append(f"{indent}{slot} = {_slot_rhs(slot, value)};")
                 elif finfo.kind == _STRUCT_FIELD_KIND_SCALAR64:
+                    if finfo.scalar_msl == "double":
+                        raise MetalCodegenError(
+                            f"Kernel {adj.fun_name!r}: cannot write to float64 struct field "
+                            f"{finfo.name!r} — fp64 fields are read-only (demoted to fp32) on Metal"
+                        )
                     # Split the 64-bit value across two 4-byte slots
                     # (little-endian: low word first). The temp is required:
                     # compound ops read-modify-write through the field's
@@ -10327,14 +10528,21 @@ def _is_array_arg_type(t) -> bool:
     return getattr(t, "_wp_generic_type_str_", None) in ("array_t", "indexedarray_t")
 
 
-def _reject_unsupported_launch_args(kernel) -> None:
+def _reject_unsupported_launch_args(kernel, args=None) -> None:
     """Raise for argument types the MSL codegen would translate incorrectly.
 
     ``wp.indexedarray`` matches the array-arg predicates, but the generated
     body would index the base storage flat — silently skipping the index
     indirection — so it must be rejected before codegen or a cached-artifact
     launch can run.
+
+    ``args`` is the launch's actual argument values, when available. Every
+    multi-dimensional array must be row-major contiguous: MSL index
+    expressions are built from the array's *shape*
+    (see ``_flat_index_expr``), so a strided or broadcast view would be
+    read at the wrong offsets and silently return wrong results.
     """
+    from warp._src.types import array as wp_array  # noqa: PLC0415
     from warp._src.types import indexedarray  # noqa: PLC0415
 
     for arg in kernel.adj.args:
@@ -10344,6 +10552,21 @@ def _reject_unsupported_launch_args(kernel) -> None:
                 f"Kernel '{kernel.key}': wp.indexedarray arguments are not supported on the "
                 "Metal backend. Gather the indexed elements into a contiguous wp.array first."
             )
+
+    if not args:
+        return
+    # ``strict=False``: a launch may legitimately omit trailing outputs.
+    for arg, value in zip(kernel.adj.args, args, strict=False):
+        if value is None or not isinstance(value, wp_array):
+            continue
+        if value.is_contiguous:
+            continue
+        raise MetalCodegenError(
+            f"Kernel '{kernel.key}': argument {arg.label!r} is a non-contiguous array "
+            f"(shape {tuple(value.shape)}, strides {tuple(value.strides)}). The Metal backend "
+            "computes flat indices from the array's shape, so strided or broadcast views would "
+            "be read at the wrong offsets. Pass a contiguous copy (``arr.contiguous()``)."
+        )
 
 
 def _is_array_arg(var) -> bool:
@@ -10552,8 +10775,8 @@ def _vec_dtype_info(arg) -> tuple[int, str] | None:
     scalar_cls = getattr(dtype, "_wp_scalar_type_", None)
     if n is None or scalar_cls is None:
         return None
-    if n < 2:
-        raise MetalCodegenError(f"MSL codegen does not support vec{n} (need N >= 2)")
+    if n < 1:
+        raise MetalCodegenError(f"MSL codegen does not support vec{n}")
     scalar_ctype = f"wp::{scalar_cls.__name__}"
     if scalar_ctype not in _MSL_VEC_SCALAR_PREFIX:
         raise MetalCodegenError(f"MSL codegen does not yet support arrays of vec_t with element type {scalar_ctype!r}")
@@ -10576,8 +10799,8 @@ def _mat_dtype_info(arg) -> tuple[int, int, str] | None:
     if shape is None or len(shape) != 2 or scalar_cls is None:
         return None
     rows, cols = int(shape[0]), int(shape[1])
-    if rows < 2 or cols < 2:
-        raise MetalCodegenError(f"MSL codegen does not yet support arrays of mat{rows}x{cols} (need dims >= 2)")
+    if rows < 1 or cols < 1:
+        raise MetalCodegenError(f"MSL codegen does not yet support arrays of mat{rows}x{cols}")
     scalar_ctype = f"wp::{scalar_cls.__name__}"
     if scalar_ctype not in _MSL_VEC_SCALAR_PREFIX:
         raise MetalCodegenError(f"MSL codegen does not yet support arrays of mat_t with element type {scalar_ctype!r}")
@@ -10661,7 +10884,7 @@ def _classify_struct_field(fname: str, ftype) -> _StructFieldInfo:
         scalar_cls = ftype._wp_scalar_type_
         scalar_ctype = f"wp::{scalar_cls.__name__}"
         msl_scalar = _MSL_VEC_SCALAR_PREFIX.get(scalar_ctype)
-        if n < 2 or msl_scalar not in _STRUCT_SCALAR_MSL_4BYTE:
+        if n < 1 or msl_scalar not in _STRUCT_SCALAR_MSL_4BYTE:
             raise MetalCodegenError(f"MSL codegen does not support vec field {fname!r} of {ftype!r} in a struct")
         return _StructFieldInfo(
             name=fname,
@@ -10715,7 +10938,15 @@ def _classify_struct_field(fname: str, ftype) -> _StructFieldInfo:
         raise MetalCodegenError(f"MSL codegen: struct field {fname!r} has unsupported type {ftype!r}")
     scalar_ctype = f"wp::{name}"
     if scalar_ctype == "wp::float64":
-        raise MetalCodegenError(f"MSL codegen: struct field {fname!r} is float64 — MSL has no fp64")
+        # fp64 field: occupies two 4-byte slots in the flat float32 view;
+        # reads reassemble the IEEE-754 double bits and demote to fp32 via
+        # the ``wp_f64_to_f32`` helper (Apple GPUs have no fp64). Writes
+        # are rejected in the store branch. ``scalar_msl="double"`` is the
+        # demotion marker — MSL has no such type; it never appears in
+        # emitted code.
+        return _StructFieldInfo(
+            name=fname, offset=0, size=2, kind=_STRUCT_FIELD_KIND_SCALAR64, msl_type="float", scalar_msl="double"
+        )
     msl = _SCALAR_CTYPE_TO_MSL.get(scalar_ctype)
     if msl is None:
         raise MetalCodegenError(
@@ -10753,21 +10984,27 @@ def _struct_layout_for(struct_cls) -> _StructLayout:
     for fname, fvar in getattr(struct_cls, "vars", {}).items():
         finfo = _classify_struct_field(fname, fvar.type)
         byte_off = getattr(ctype, fname).offset if ctype is not None else None
-        if byte_off is None or byte_off % 4 != 0:
+        if byte_off is None or (byte_off % 4 != 0 and finfo.size > 0):
+            # Size-0 fields (empty nested structs, array fields) may land at
+            # odd byte offsets — ctypes gives empty structs 1 byte and
+            # alignment 1. Nothing is ever read from them, so only fields
+            # with readable content need the 4-byte alignment (which ctypes
+            # guarantees: every supported leaf type has alignment >= 4).
             raise MetalCodegenError(
                 f"MSL codegen: struct field {fname!r} of {layout.name!r} has byte offset "
                 f"{byte_off} — flat float32 struct storage needs 4-byte-aligned fields"
             )
-        finfo.offset = byte_off // 4
+        finfo.offset = (byte_off // 4) if finfo.size > 0 else 0
         layout.fields[fname] = finfo
     total = ctypes.sizeof(ctype) if ctype is not None else 0
-    if total == 1 and all(f.size == 0 for f in layout.fields.values()):
-        # ctypes pads empty structures to 1 byte; there is nothing to pack.
-        # Covers no fields at all AND fields that are themselves empty
-        # structs (recursively size 0). wp.fem instantiates plenty of both
-        # (e.g. WholeGeometryPartition's CellArg, single-field Fields
-        # wrappers around it), so they must round-trip as zero-size
-        # payloads.
+    if all(f.size == 0 for f in layout.fields.values()) and (total % 4 != 0 or total == 1):
+        # ctypes pads empty structures to 1 byte (and a struct of K empty
+        # struct fields to K bytes); there is nothing to pack. Covers no
+        # fields at all AND fields that are themselves empty structs
+        # (recursively size 0). wp.fem instantiates plenty of both (e.g.
+        # WholeGeometryPartition's CellArg, ``Fields`` wrappers holding
+        # only empty test/trial EvalArgs), so they must round-trip as
+        # zero-size payloads.
         total = 0
     if total % 4 != 0:
         raise MetalCodegenError(f"MSL codegen: struct {layout.name!r} has size {total}, not a multiple of 4")
@@ -10814,6 +11051,9 @@ def _struct_field_read_expr(buf: str, base_expr: str, finfo: _StructFieldInfo) -
         lo = f"as_type<uint>({buf}[{base_expr}])"
         hi = f"as_type<uint>({buf}[({base_expr}) + 1])"
         bits = f"((ulong({hi}) << 32) | ulong({lo}))"
+        if finfo.scalar_msl == "double":
+            # fp64 field — demote the double bits to fp32 (no fp64 on Metal).
+            return f"wp_f64_to_f32({bits})"
         return bits if finfo.scalar_msl == "ulong" else f"as_type<{finfo.scalar_msl}>({bits})"
     if finfo.kind == _STRUCT_FIELD_KIND_VEC:
         comps = [_struct_bitcast_read(f"{buf}[({base_expr}) + {k}]", finfo.scalar_msl) for k in range(finfo.size)]
@@ -11461,7 +11701,7 @@ def launch_metal_kernel_native(kernel, dim, inputs, outputs, device, block_dim: 
     if any(d <= 0 for d in dims_check):
         return
 
-    _reject_unsupported_launch_args(kernel)
+    _reject_unsupported_launch_args(kernel, [*inputs, *outputs])
 
     artifact, pso = _get_or_build_metal_kernel_native(kernel, block_dim=block_dim)
     if pso is None:
@@ -11514,6 +11754,15 @@ def launch_metal_kernel_native(kernel, dim, inputs, outputs, device, block_dim: 
             return buf
         mtl_buf = _metal_get_buffer(value.ptr)
         if mtl_buf is None:
+            # Interior pointer: the array is a view into the middle of a
+            # larger allocation (``scratch[1]``, ``a[2:]``, ...). Bind the
+            # containing buffer at the view's byte offset.
+            from warp._src.context import _metal_find_buffer  # noqa: PLC0415
+            from warp._src.metal_dispatch import BufferSlice  # noqa: PLC0415
+
+            base_buf, byte_off = _metal_find_buffer(value.ptr)
+            if base_buf is not None:
+                return BufferSlice(base_buf, byte_off)
             raise RuntimeError(
                 f"Kernel '{kernel_name}' argument {input_name!r} has no registered Metal buffer "
                 f"(ptr={value.ptr}). Was the array allocated with metal_native_dispatch enabled?"
@@ -11678,10 +11927,12 @@ def launch_metal_kernel_native(kernel, dim, inputs, outputs, device, block_dim: 
                 idx, _ = arg_by_name[arr_name]
                 value = fwd_args[idx]
                 mtl = _resolve_mtl(value, kernel.key, arr_name)
-                # ``_resolve_mtl`` maps ``value.ptr`` (the array's start)
-                # to its MTLBuffer, so the buffer's gpuAddress IS the
-                # array's device address — no view-offset arithmetic.
-                table[k] = int(mtl.gpuAddress())
+                # ``_resolve_mtl`` maps ``value.ptr`` to its MTLBuffer, so
+                # the buffer's gpuAddress is the array's device address —
+                # unless the array is an interior view, in which case the
+                # slice's byte offset has to be added on.
+                mtl, view_off = _split_buffer_slice(mtl)
+                table[k] = int(mtl.gpuAddress()) + view_off
                 extra_resources.append((mtl, "r"))
             data = table.tobytes()
             bindings.append((data, len(data)))
@@ -11783,8 +12034,8 @@ def launch_metal_kernel_native(kernel, dim, inputs, outputs, device, block_dim: 
             # value-packed into a wide constraint kernel), and skipping
             # "probably static" parts measurably drifts G1 replay.
             for src_value, dst_elems, n_elems in parts:
-                src_buf = _resolve_mtl(src_value, kernel.key, "__packed_refresh_src")
-                dispatcher.device_copy(slab_buf, src_buf, n_elems * 4, dst_off=dst_elems * 4, src_off=0)
+                src_buf, src_view_off = _split_buffer_slice(_resolve_mtl(src_value, kernel.key, "__packed_refresh_src"))
+                dispatcher.device_copy(slab_buf, src_buf, n_elems * 4, dst_off=dst_elems * 4, src_off=src_view_off)
 
         # Build __ints_packed buffer (header + int-array data).
         if int_data_parts:
@@ -12000,6 +12251,65 @@ def launch_metal_kernel_native(kernel, dim, inputs, outputs, device, block_dim: 
     # ``.numpy()``, etc.).
 
 
+def _split_buffer_slice(mtl):
+    """Return ``(mtl_buffer, byte_offset)`` for a binding value.
+
+    ``_resolve_mtl`` yields a bare ``MTLBuffer`` for an allocation-base
+    pointer and a ``BufferSlice`` for an interior view. Callers that need
+    the raw buffer (``gpuAddress`` arithmetic, device copies) use this to
+    normalise both forms.
+    """
+    from warp._src.metal_dispatch import BufferSlice  # noqa: PLC0415
+
+    if isinstance(mtl, BufferSlice):
+        return mtl.buffer, mtl.offset
+    return mtl, 0
+
+
+class MetalLaunch:
+    """Minimal ``wp.launch(..., record_cmd=True)`` stand-in for Metal.
+
+    The CUDA ``Launch`` object pre-packs ctypes params so replays skip
+    marshalling; on Metal we simply store the launch spec and re-dispatch
+    through :func:`launch_metal_kernel` on every :meth:`launch` — correct,
+    without the repacking speedup. Covers the mutation surface
+    ``wp.optim.linear`` uses (``set_dim``, ``set_param_at_index``,
+    ``set_param_by_name``, ``set_params``).
+    """
+
+    def __init__(self, kernel, dim, inputs, outputs, device, block_dim: int = 256):
+        self.kernel = kernel
+        self.device = device
+        self.block_dim = block_dim
+        self.dim = dim
+        self._inputs = list(inputs)
+        self._outputs = list(outputs)
+
+    def set_dim(self, dim) -> None:
+        self.dim = dim
+
+    def set_param_at_index(self, index: int, value, adjoint: bool = False) -> None:
+        if adjoint:
+            raise RuntimeError("Metal backend does not yet support adjoint launches")
+        n = len(self._inputs)
+        if index < n:
+            self._inputs[index] = value
+        else:
+            self._outputs[index - n] = value
+
+    def set_param_by_name(self, name: str, value, adjoint: bool = False) -> None:
+        labels = [a.label for a in self.kernel.adj.args]
+        self.set_param_at_index(labels.index(name), value, adjoint=adjoint)
+
+    def set_params(self, values) -> None:
+        n = len(self._inputs)
+        self._inputs = list(values[:n])
+        self._outputs = list(values[n:])
+
+    def launch(self, stream=None) -> None:
+        launch_metal_kernel(self.kernel, self.dim, self._inputs, self._outputs, self.device, block_dim=self.block_dim)
+
+
 def launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim: int = 256):
     """Dispatch a Warp kernel on a Metal device via MLX.
 
@@ -12045,7 +12355,7 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim: int = 2
     if any(d <= 0 for d in _dims_check):
         return
 
-    _reject_unsupported_launch_args(kernel)
+    _reject_unsupported_launch_args(kernel, [*inputs, *outputs])
 
     artifact, mlx_kernel = _get_or_build_metal_kernel(kernel, block_dim=block_dim)
     # No-op kernel (the prune step found every declared output is
