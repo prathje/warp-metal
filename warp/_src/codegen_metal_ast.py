@@ -2717,6 +2717,26 @@ def _apply_view_rewrites(
                         )
                     )
                     continue
+        # ``wp::lower_bound(arr, ...)`` on a resolved alias (struct-arg
+        # array field / backed field load) — substitute the backing array
+        # name; the flat-side translator appends the shape bounds. Only
+        # zero-lead backings apply (a sliced view would need an offset the
+        # helper signature can't express).
+        if isinstance(n, Assign) and isinstance(n.expr, Builtin) and n.expr.name == "lower_bound" and n.expr.args:
+            lb_arr_l = _strip_var_prefix(n.expr.args[0])
+            if lb_arr_l is not None and lb_arr_l in view_aliases and not view_aliases[lb_arr_l][1]:
+                lb_arr_name = view_aliases[lb_arr_l][0]
+                lb_args = (f"var_{lb_arr_name}", *n.expr.args[1:])
+                indent = _leading_indent(n.raw)
+                new_expr_raw = f"wp::lower_bound({', '.join(lb_args)})"
+                out.append(
+                    Assign(
+                        raw=f"{indent}var_{n.lhs} = {new_expr_raw};",
+                        lhs=n.lhs,
+                        expr=Builtin(raw=new_expr_raw, name="lower_bound", args=lb_args),
+                    )
+                )
+                continue
         if isinstance(n, Assign) and isinstance(n.expr, Builtin) and n.expr.name == "address":
             view_arr_l = _strip_var_prefix(n.expr.args[0]) if n.expr.args else None
             if view_arr_l is not None and view_arr_l in view_aliases:
