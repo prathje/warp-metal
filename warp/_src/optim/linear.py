@@ -189,6 +189,20 @@ def preconditioner(A: _Matrix, ptype: str = "diag") -> LinearOperator:
     raise ValueError(f"Unsupported preconditioner type '{ptype}'")
 
 
+def _as_contiguous_input(x: wp.array):
+    """Materialise ``x`` if the device's kernels can't index a strided view.
+
+    The Metal backend derives flat indices from an array's shape, so a
+    multi-dimensional strided or broadcast view would be read at the
+    wrong offsets (it raises rather than doing so silently). Only read-only
+    kernel inputs may be passed through this — the copy does not alias the
+    original storage.
+    """
+    if x.ndim > 1 and not x.is_contiguous and getattr(x.device, "is_metal", False):
+        return x.contiguous()
+    return x
+
+
 def _as_scalar_array(x: wp.array):
     scalar_type = type_scalar_type(x.dtype)
     if scalar_type == x.dtype:
@@ -268,6 +282,14 @@ class TiledDot:
         data_out = self.partial_sums_a[col_offset : col_offset + column_count]
         data_in = self.partial_sums_b[col_offset : col_offset + column_count]
 
+        # Some backends (Metal) index multi-dimensional arrays from their
+        # shape rather than their strides, so strided or broadcast input
+        # views — e.g. the repeated-row view the preconditioned solvers
+        # use to get two dot products from one pass — have to be
+        # materialised.
+        a = _as_contiguous_input(a)
+        b = _as_contiguous_input(b)
+
         self.dot_launch.set_param_at_index(0, a)
         self.dot_launch.set_param_at_index(1, b)
         self.dot_launch.set_param_at_index(2, data_out)
@@ -279,7 +301,7 @@ class TiledDot:
             num_blocks = (array_length + self.tile_size - 1) // self.tile_size
             data_in, data_out = data_out, data_in
 
-            self.sum_launch.set_param_at_index(0, data_in[:, :array_length])
+            self.sum_launch.set_param_at_index(0, _as_contiguous_input(data_in[:, :array_length]))
             self.sum_launch.set_param_at_index(1, data_out)
             self.sum_launch.set_dim((column_count, num_blocks, self.tile_size))
             self.sum_launch.launch()

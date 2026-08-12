@@ -27,6 +27,7 @@ from warp._src.types import (
     type_to_warp,
     types_equal,
 )
+from warp._src.utils import _use_host_native_op
 
 _wp_module_name_ = "warp.sparse"
 
@@ -564,7 +565,7 @@ def bsr_set_from_triplets(
 
     from warp._src.context import runtime  # noqa: PLC0415
 
-    if device.is_cpu:
+    if _use_host_native_op(device):
         native_func = runtime.core.wp_bsr_matrix_from_triplets_host
     else:
         native_func = runtime.core.wp_bsr_matrix_from_triplets_device
@@ -987,7 +988,7 @@ def bsr_assign(
             # Compute destination offsets from triplets
             from warp._src.context import runtime  # noqa: PLC0415
 
-            if dest.device.is_cpu:
+            if _use_host_native_op(dest.device):
                 native_func = runtime.core.wp_bsr_matrix_from_triplets_host
             else:
                 native_func = runtime.core.wp_bsr_matrix_from_triplets_device
@@ -1153,7 +1154,7 @@ def bsr_set_transpose(
 
         from warp._src.context import runtime  # noqa: PLC0415
 
-        if dest.values.device.is_cpu:
+        if _use_host_native_op(dest.values.device):
             native_func = runtime.core.wp_bsr_transpose_host
         else:
             native_func = runtime.core.wp_bsr_transpose_device
@@ -1652,7 +1653,7 @@ def bsr_axpy(
 
         from warp._src.context import runtime  # noqa: PLC0415
 
-        if device.is_cpu:
+        if _use_host_native_op(device):
             native_func = runtime.core.wp_bsr_matrix_from_triplets_host
         else:
             native_func = runtime.core.wp_bsr_matrix_from_triplets_device
@@ -1868,7 +1869,12 @@ def _bsr_mm_compute_values(
     y_values: wp.array(dtype=Any),
     mm_row_min: wp.array(dtype=int),
     summed_triplet_offsets: wp.array(dtype=int),
-    summed_triplet_src_blocks: wp.indexedarray(dtype=int),
+    # Source-block gather, as two plain arrays rather than the equivalent
+    # ``mm_src_blocks[summed_triplet_indices]`` indexed array — indexed
+    # arrays are not supported by every backend (notably Metal), and the
+    # memory accesses are identical either way.
+    mm_src_blocks: wp.array(dtype=int),
+    summed_triplet_indices: wp.array(dtype=int),
     mm_row_count: int,
     mm_offsets: wp.array(dtype=int),
     mm_cols: wp.array(dtype=int),
@@ -1888,7 +1894,7 @@ def _bsr_mm_compute_values(
     col = mm_cols[mm_block]
     if use_triplets:
         for tpl_idx in range(block_beg, block_end):
-            x_block = summed_triplet_src_blocks[tpl_idx]
+            x_block = mm_src_blocks[summed_triplet_indices[tpl_idx]]
             x_col = x_columns[x_block]
             if x_block != -1:
                 y_block = bsr_block_index(x_col, col, y_offsets, y_columns)
@@ -2276,7 +2282,7 @@ def bsr_mm(
 
         from warp._src.context import runtime  # noqa: PLC0415
 
-        if device.is_cpu:
+        if _use_host_native_op(device):
             native_func = runtime.core.wp_bsr_matrix_from_triplets_host
         else:
             native_func = runtime.core.wp_bsr_matrix_from_triplets_device
@@ -2404,7 +2410,8 @@ def bsr_mm(
             work_arrays._old_z_values if y == z else y.values,
             None if masked else work_arrays._mm_row_min,
             None if masked else summed_triplet_offsets,
-            None if masked else work_arrays._mm_src_blocks[summed_triplet_indices],
+            None if masked else work_arrays._mm_src_blocks,
+            None if masked else summed_triplet_indices,
             z.nrow,
             z.offsets,
             z.columns,

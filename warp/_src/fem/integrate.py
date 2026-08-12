@@ -1756,6 +1756,18 @@ def integrate(
     if device is None:
         device = wp.get_device()
 
+    # Apple GPUs have no double precision; fall back to single-precision
+    # accumulation on Metal devices rather than failing at codegen time.
+    if accumulate_dtype is wp.float64 and getattr(wp.get_device(device), "is_metal", False):
+        from warp._src.utils import warn  # noqa: PLC0415
+
+        warn(
+            "wp.fem.integrate: accumulate_dtype=wp.float64 is not supported on Metal devices; "
+            "falling back to wp.float32 accumulation.",
+            stacklevel=2,
+        )
+        accumulate_dtype = wp.float32
+
     if not isinstance(integrand, Integrand):
         raise ValueError("integrand must be tagged with @warp.fem.integrand decorator")
 

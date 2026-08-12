@@ -8581,8 +8581,6 @@ def launch(
     if device.is_metal:
         if adjoint:
             raise RuntimeError("Metal backend does not yet support adjoint launches")
-        if record_cmd:
-            raise RuntimeError("Metal backend does not yet support record_cmd launches")
         # Generic kernels (``dtype=Any``) need their concrete overload
         # resolved before MSL codegen — the type-inference + ``add_overload``
         # flow normally runs further down the launch path, after the
@@ -8592,7 +8590,12 @@ def launch(
             fwd_args = list(inputs) + list(outputs)
             fwd_types = kernel.infer_argument_types(fwd_args)
             kernel = kernel.add_overload(fwd_types)
-        from warp._src.codegen_metal import launch_metal_kernel  # noqa: PLC0415
+        from warp._src.codegen_metal import MetalLaunch, launch_metal_kernel  # noqa: PLC0415
+
+        if record_cmd:
+            # Store the spec and re-dispatch on each ``.launch()`` — see
+            # ``MetalLaunch`` for the (lack of) replay optimisation.
+            return MetalLaunch(kernel, dim, inputs, outputs, device, block_dim=block_dim)
 
         launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim=block_dim)
         # Record on an active tape so a later ``tape.backward()`` raises the
@@ -10793,6 +10796,24 @@ def copy(
                 )
                 stream.wait_stream(dest.device.stream)
         else:
+            # ``wp_array_copy_host`` is a host-side strided copy. On Metal
+            # the arrays live in unified memory, so pending GPU work must be
+            # drained first or the copy reads a stale source / is overwritten
+            # by a queued kernel (same reasoning as the contiguous branch
+            # above).
+            if (
+                getattr(src.device, "is_metal", False) or getattr(dest.device, "is_metal", False)
+            ) and warp.config.metal_native_dispatch:
+                from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
+
+                dispatcher = get_dispatcher()
+                if dispatcher._record_state is not None:
+                    raise RuntimeError(
+                        "wp.copy of a non-contiguous Metal array is not supported inside a "
+                        "Metal graph capture — the strided transfer runs on the host and would "
+                        "not be replayed. Move it outside the capture region."
+                    )
+                dispatcher.sync()
             result = runtime.core.wp_array_copy_host(dst_ptr, src_ptr, dst_type, src_type, src_elem_size)
 
         if not result:
