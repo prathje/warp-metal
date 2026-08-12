@@ -224,6 +224,35 @@ class MetalDispatchError(RuntimeError):
     """Raised on Metal API failure (compile, dispatch, allocate)."""
 
 
+class BufferSlice:
+    """An ``MTLBuffer`` plus a byte offset, for use as a ``dispatch`` binding.
+
+    A Warp array can be a view into the middle of another array's
+    allocation (``scratch[1]``, ``a[2:]``), so its data pointer is an
+    interior address rather than an allocation base. Binding such an
+    argument needs the containing buffer *and* the offset within it,
+    which Metal supports natively via ``setBuffer:offset:atIndex:``.
+    """
+
+    __slots__ = ("buffer", "offset")
+
+    def __init__(self, buffer, offset: int):
+        self.buffer = buffer
+        self.offset = int(offset)
+
+
+def _binding_buffer(entry):
+    """Return the ``MTLBuffer`` a binding entry references, or ``None`` for
+    ``setBytes`` payloads. Offsets are irrelevant to identity-based
+    bookkeeping (residency, dependency chunking, canary lookups), so
+    callers that only need the buffer use this."""
+    if isinstance(entry, tuple):
+        return None
+    if isinstance(entry, BufferSlice):
+        return entry.buffer
+    return entry
+
+
 class MetalDispatcher:
     """Encapsulates the Apple Metal API state Warp needs for direct dispatch.
 
@@ -862,11 +891,13 @@ class MetalDispatcher:
         self.sync()
         offenders: list[tuple] = []
         for idx, entry in enumerate(bindings):
-            if isinstance(entry, tuple):
+            buf = _binding_buffer(entry)
+            if buf is None:
                 continue  # ``setBytes`` payloads carry no guard region.
-            info = self._canaries.get(entry)
+            info = self._canaries.get(buf)
             if info is None:
                 continue
+            entry = buf
             data_nbytes, guard_nbytes = info
             mv = entry.contents().as_buffer(data_nbytes + guard_nbytes)
             arr = np.frombuffer(mv, dtype=np.uint8)
@@ -899,6 +930,9 @@ class MetalDispatcher:
         ``i`` in the kernel. Each entry is either:
 
         * An ``MTLBuffer`` — bound via ``setBuffer:offset:atIndex:``.
+        * A :class:`BufferSlice` — an ``MTLBuffer`` plus a byte offset,
+          for an interior pointer into a larger allocation (a Warp array
+          that is a view of another array's storage).
         * A ``(bytes-like, length)`` tuple — bound via
           ``setBytes:length:atIndex:`` (cheaper for small const args
           ≤4KB; avoids a buffer allocation).
@@ -1010,6 +1044,9 @@ class MetalDispatcher:
                 _flush_run(idx)
                 data, length = entry
                 encoder.setBytes_length_atIndex_(data, length, idx)
+            elif isinstance(entry, BufferSlice):
+                run_buffers.append(entry.buffer)
+                run_offsets.append(entry.offset)
             else:
                 run_buffers.append(entry)
                 run_offsets.append(0)
@@ -1657,9 +1694,10 @@ class MetalDispatcher:
                     "conflicts on the unpaired buffers."
                 )
             for entry, mode in zip(bindings, binding_modes):
-                if mode is None or isinstance(entry, tuple):
+                buf = _binding_buffer(entry)
+                if mode is None or buf is None:
                     continue
-                ptr = id(entry)
+                ptr = id(buf)
                 if mode in ("r", "rw"):
                     cmd_reads.add(ptr)
                 if mode in ("w", "rw"):
@@ -1720,11 +1758,15 @@ class MetalDispatcher:
                     res_set.add(bid)
                     resources.append(buf)
             else:
-                cmd.setKernelBuffer_offset_atIndex_(entry, 0, idx)
-                bid = id(entry)
+                if isinstance(entry, BufferSlice):
+                    buf, off = entry.buffer, entry.offset
+                else:
+                    buf, off = entry, 0
+                cmd.setKernelBuffer_offset_atIndex_(buf, off, idx)
+                bid = id(buf)
                 if bid not in res_set:
                     res_set.add(bid)
-                    resources.append(entry)
+                    resources.append(buf)
         gx, gy, gz = grid
         tx, ty, tz = threadgroup
         cmd.concurrentDispatchThreads_threadsPerThreadgroup_(

@@ -3178,6 +3178,92 @@ class TestMetalLaunch(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet)
 
+    def test_struct_copy_inside_loop_matches_cpu(self):
+        # Whole-struct copies INSIDE a loop body lower to the statement
+        # form ``wp::assign(dst, src);`` (loop-carried rebinds), not the
+        # ``dst = src;`` / ``wp::copy`` forms — warp.fem's dispatch
+        # kernels iterate quadrature state this way. The body-emission
+        # loop must expand the assign per field before the generic
+        # pattern-table rewrite turns it into an (undeclared) whole-
+        # struct assignment.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.struct
+            class State:
+                a: wp.float32
+                b: wp.vec3
+
+            @wp.kernel
+            def k(x: wp.array(dtype=wp.float32), n: int, out: wp.array(dtype=wp.float32)):
+                tid = wp.tid()
+                cur = State()
+                cur.a = x[tid]
+                cur.b = wp.vec3(x[tid], 2.0 * x[tid], -1.0)
+                best = State()
+                best.a = -1.0e9
+                i = int(0)
+                while i < n:
+                    nxt = State()
+                    nxt.a = cur.a + float(i)
+                    nxt.b = cur.b * 0.5
+                    if nxt.a > best.a:
+                        best = nxt  # struct copy inside the loop body
+                    cur = nxt  # loop-carried struct rebind
+                    i += 1
+                out[tid] = best.a + best.b[0] + best.b[1] + best.b[2]
+
+            N = 64
+            rng = np.random.default_rng(2)
+            xn = rng.standard_normal(N).astype(np.float32)
+
+            for dev in ('cpu', 'metal:0'):
+                x = wp.array(xn, dtype=wp.float32, device=dev)
+                out = wp.zeros(N, dtype=wp.float32, device=dev)
+                wp.launch(k, dim=N, inputs=[x, 4], outputs=[out], device=dev)
+                if dev == 'cpu':
+                    cpu_out = out.numpy()
+                else:
+                    np.testing.assert_array_equal(out.numpy(), cpu_out)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_struct_arg_float64_field_demotes_to_fp32(self):
+        # ``wp.float64`` struct-arg fields (warp.fem integrand parameters
+        # ride in the ValueStruct) demote to fp32 on read via the
+        # ``wp_f64_to_f32`` bit-conversion helper — Apple GPUs have no
+        # fp64. Values representable in fp32 must round-trip exactly.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.struct
+            class Params:
+                nu: wp.float64
+                gain: wp.float32
+
+            @wp.kernel
+            def k(p: Params, out: wp.array(dtype=wp.float32)):
+                tid = wp.tid()
+                out[tid] = wp.float32(p.nu) * p.gain + float(tid)
+
+            N = 8
+            p = Params()
+            p.nu = wp.float64(2.5)
+            p.gain = 3.0
+
+            out = wp.zeros(N, dtype=wp.float32, device='metal:0')
+            wp.launch(k, dim=N, inputs=[p], outputs=[out], device='metal:0')
+            expected = np.array([2.5 * 3.0 + i for i in range(N)], dtype=np.float32)
+            np.testing.assert_array_equal(out.numpy(), expected)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
     def test_unot_floordiv_bit_and_length_sq_match_cpu(self):
         # Trivial intrinsics that surfaced as gaps in the mujoco_warp recon.
         # Each is a one-line regex add; this test bundles them.
@@ -3427,6 +3513,100 @@ class TestMetalLaunch(unittest.TestCase):
                 wp.launch_tiled(k, dim=[1], inputs=[A], outputs=[out],
                                 block_dim=1, device=dev)
                 np.testing.assert_array_equal(out.numpy(), ref)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_tile_load_out_of_bounds_zero_fills(self):
+        # ``wp.tile_load`` zero-fills elements past the end of the source
+        # array. Metal used to read straight past the row instead, so a
+        # partial trailing block silently mixed in the *next* row's data —
+        # this made warp.optim.linear's tiled dot product return the wrong
+        # value for every row but the last (a 512-wide tile over a 32-long
+        # row read 480 elements of neighbouring memory).
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            TILE = 8
+
+            @wp.kernel
+            def row_sums(a: wp.array2d(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
+                row, _lane = wp.tid()
+                t = wp.tile_load(a[row], shape=TILE, offset=0)
+                s = wp.tile_sum(t)
+                out[row] = wp.tile_extract(s, 0)
+
+            # 3 rows of 5 elements each: TILE=8 overruns every row by 3.
+            a_h = np.arange(15, dtype=np.float32).reshape(3, 5)
+            ref = a_h.sum(axis=1)
+            for dev in ("cpu", "metal:0"):
+                a = wp.array(a_h, dtype=wp.float32, device=dev)
+                out = wp.zeros(3, dtype=wp.float32, device=dev)
+                wp.launch(row_sums, dim=(3, 1), inputs=[a], outputs=[out], device=dev)
+                np.testing.assert_allclose(out.numpy(), ref, rtol=1e-6)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_noncontiguous_array_arg_is_rejected(self):
+        # Metal builds flat indices from an array's shape, so a strided or
+        # broadcast view would be read at the wrong offsets. That must be an
+        # error rather than a silently wrong result.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+            from warp._src.codegen_metal import MetalCodegenError
+
+            @wp.kernel
+            def k(a: wp.array2d(dtype=wp.float32), out: wp.array2d(dtype=wp.float32)):
+                i, j = wp.tid()
+                out[i, j] = a[i, j]
+
+            base = wp.array(np.arange(16, dtype=np.float32).reshape(2, 8), device="metal:0")
+            out = wp.zeros((2, 8), dtype=wp.float32, device="metal:0")
+            # Zero-stride broadcast of row 0 (what warp.optim.linear's
+            # preconditioned solvers build to pair r with (r, z)).
+            rep = wp.array(ptr=base.ptr, shape=base.shape, dtype=base.dtype,
+                           strides=(0, *base.strides[1:]), device=base.device)
+            rep._ref = base
+            try:
+                wp.launch(k, dim=(2, 8), inputs=[rep], outputs=[out], device="metal:0")
+            except MetalCodegenError as exc:
+                assert "non-contiguous" in str(exc), str(exc)
+            else:
+                raise AssertionError("expected a non-contiguous array argument to be rejected")
+
+            # Materialising the view is the documented workaround.
+            wp.launch(k, dim=(2, 8), inputs=[rep.contiguous()], outputs=[out], device="metal:0")
+            np.testing.assert_array_equal(out.numpy(), np.broadcast_to(base.numpy()[0], (2, 8)))
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_strided_copy_drains_pending_gpu_work(self):
+        # ``wp.copy`` of a non-contiguous array runs as a host-side strided
+        # copy; on Metal's unified memory it must drain queued GPU work first
+        # or it snapshots stale data written by an earlier launch.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def fill(val: float, out: wp.array2d(dtype=wp.float32)):
+                i, j = wp.tid()
+                out[i, j] = val + wp.float32(i * 8 + j)
+
+            a = wp.zeros((2, 8), dtype=wp.float32, device="metal:0")
+            wp.launch(fill, dim=(2, 8), inputs=[100.0], outputs=[a], device="metal:0")
+            # No explicit sync: the strided copy must observe the launch.
+            sliced = a[:, :4]
+            got = sliced.contiguous().numpy()
+            want = (100.0 + np.arange(16, dtype=np.float32).reshape(2, 8))[:, :4]
+            np.testing.assert_array_equal(got, want)
             """
         )
         _run_with_metal_enabled(self, snippet)
