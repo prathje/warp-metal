@@ -12,6 +12,9 @@
   (environment variable `WARP_METAL_THREADGROUP_TILES`) to disable it.
 - Support `wp.tile_fft()` / `wp.tile_ifft()` on `vec2f` tiles and `wp.tile_transpose()` on vector-element tiles
   on the Metal backend (`vec2d` remains unsupported — Apple GPUs have no double precision).
+- Support `warp.sparse`, `warp.optim.linear`, and `warp.fem` on Metal devices, including `wp.tile_sum()`,
+  `wp.launch(..., record_cmd=True)`, arrays that are interior views of a larger allocation, and `wp.array`
+  fields of struct kernel arguments. `wp.fem.integrate()` falls back to `wp.float32` accumulation on Metal.
 
 ### Fixed
 
@@ -19,6 +22,10 @@
   dispatcher now drains outstanding command buffers at exit instead of relying on Python-level completion
   handlers.
 - Fix `wp.diag()` on `vec2f`/`vec4f` inputs and Warp-struct constructor calls with arguments in Metal kernels.
+- Fix `wp.tile_load()` on Metal reading past the end of the source array instead of zero-filling elements
+  outside its extents. Non-contiguous array arguments are now rejected on Metal (the backend derives flat
+  indices from an array's shape, so a strided or broadcast view would be read at the wrong offsets), and
+  `wp.copy()` of a non-contiguous Metal array no longer reads stale data.
 
 ## [1.18.0] - 2026-10-05
 
