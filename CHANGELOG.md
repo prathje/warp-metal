@@ -15,6 +15,10 @@
 - Support `warp.sparse`, `warp.optim.linear`, and `warp.fem` on Metal devices, including `wp.tile_sum()`,
   `wp.launch(..., record_cmd=True)`, arrays that are interior views of a larger allocation, and `wp.array`
   fields of struct kernel arguments. `wp.fem.integrate()` falls back to `wp.float32` accumulation on Metal.
+- Support writing through `wp.array` fields of struct kernel arguments on Metal (previously read-only), the
+  single-argument `wp.min()` / `wp.max()` component reductions, `wp.length()` on vectors of unsupported-by-MSL
+  widths, and non-square matrices (`wp.transpose()`, `wp.matrix_from_cols()`, `wp.matrix_from_rows()`, and
+  products mixing square and non-square operands).
 
 ### Fixed
 
@@ -22,6 +26,10 @@
   dispatcher now drains outstanding command buffers at exit instead of relying on Python-level completion
   handlers.
 - Fix `wp.diag()` on `vec2f`/`vec4f` inputs and Warp-struct constructor calls with arguments in Metal kernels.
+- Fix Metal kernels using integer matrices failing to compile: MSL has no `int2x2`, so integer matrices of every
+  shape now use Warp's own row-major matrix type.
+- Fix Metal codegen dropping the declaration of a Warp struct local that a control-flow join leaves unset, and
+  raise the `@wp.func` inlining depth limit so deeply nested helper chains (`warp.fem` geometry lookups) resolve.
 - Fix `wp.tile_load()` on Metal reading past the end of the source array instead of zero-filling elements
   outside its extents. Non-contiguous array arguments are now rejected on Metal (the backend derives flat
   indices from an array's shape, so a strided or broadcast view would be read at the wrong offsets), and

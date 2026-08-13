@@ -239,6 +239,10 @@ def _normalize_quat_t(text: str) -> str:
 
 _MSL_VEC_NATIVE_N = (2, 3, 4)
 
+# MSL declares matrix types for floating-point element types only — there is
+# no ``int2x2``. Integer matrices of every shape use our ``wp_mat*`` struct.
+_MSL_NATIVE_MAT_SCALARS = ("float", "half")
+
 # ``var_P = wp::indexref(var_V, idx);`` — component pointer into a vec
 # lvalue (optionally through ``&``). Array-element forms are folded in the
 # AST phase; this pattern feeds the vec-local alias pass in
@@ -314,8 +318,17 @@ def _msl_mat_name(rows: int, cols: int, msl_scalar: str) -> str:
     returns a Warp-row-shaped vector. Cartpole's ``mat_t<2, 3>``
     surfaced this — we now emit ``wp_mat2x3_float`` instead of MSL
     native ``float2x3``.
+
+    Also floating-point only: MSL declares matrix types for ``float`` and
+    ``half`` and nothing else, so an integer matrix of any shape uses the
+    struct. (``int2x2`` is not a type — naming one is an ``unknown type
+    name`` at MSL compile time.)
+
+    This is THE rule for whether a matrix shape is native; callers that
+    need the predicate should ask ``_is_native_mat_shape`` rather than
+    re-deriving it.
     """
-    if rows == cols and rows in _MSL_VEC_NATIVE_N:
+    if rows == cols and rows in _MSL_VEC_NATIVE_N and msl_scalar in _MSL_NATIVE_MAT_SCALARS:
         return f"{msl_scalar}{rows}x{cols}"
     return f"wp_mat{rows}x{cols}_{msl_scalar}"
 
@@ -478,6 +491,21 @@ def _emit_big_vec_struct(name: str, n: int, msl_scalar: str) -> str:
     body_lines.append("}")
     body_lines.append(f"inline bool operator!=({name} a, {name} b) {{")
     body_lines.append("    return !(a == b);")
+    body_lines.append("}")
+    # ``wp.length`` / ``wp.normalize`` — ``metal::length`` only knows the
+    # native vector widths. warp.fem's scalar function spaces make ``vec1``
+    # dof values, so even n == 1 reaches these.
+    sum_sq = " + ".join(f"v.c[{i}] * v.c[{i}]" for i in range(n))
+    body_lines.append(f"inline {msl_scalar} wp_length({name} v) {{")
+    body_lines.append(f"    return ({msl_scalar})metal::precise::sqrt(float({sum_sq}));")
+    body_lines.append("}")
+    body_lines.append(f"inline {name} wp_normalize({name} v) {{")
+    body_lines.append(f"    {msl_scalar} l = wp_length(v);")
+    body_lines.append(f"    {name} r;")
+    body_lines.append(
+        f"    for (int i = 0; i < {n}; ++i) r.c[i] = (l > ({msl_scalar})0) ? (v.c[i] / l) : ({msl_scalar})0;"
+    )
+    body_lines.append("    return r;")
     body_lines.append("}")
     return "\n".join(body_lines)
 
@@ -684,6 +712,132 @@ def _emit_big_mat_struct(name: str, rows: int, cols: int, msl_scalar: str) -> st
 
 
 _NATIVE_MAT_NAME_PAT = re.compile(r"\b(float|int|uint)([234])x([234])\b")
+
+
+def _mat_shape_msl_name(shape: tuple[int, int, str]) -> str:
+    """``(rows, cols, scalar)`` -> its MSL type name."""
+    rows, cols, scalar = shape
+    return _msl_mat_name(rows, cols, scalar)
+
+
+def _is_native_mat_shape(shape: tuple[int, int, str]) -> bool:
+    """True when ``shape`` is an MSL-native matrix rather than our struct.
+
+    Derived from ``_msl_mat_name`` rather than restating its rule — the two
+    diverging is exactly what produced ``int2x2`` (a type MSL doesn't have)
+    for the ``mat2x6 * mat6x2`` integer product.
+    """
+    return not _mat_shape_msl_name(shape).startswith("wp_mat")
+
+
+def _mat_product_pairs(
+    big_shapes: set[tuple[int, int, str]], source: str
+) -> list[tuple[tuple[int, int, str], tuple[int, int, str], tuple[int, int, str]]]:
+    """Return ``(lhs, rhs, result)`` shapes for every emittable mat product.
+
+    MSL resolves native-square by native-square itself, so only pairs with
+    at least one big-mat operand are listed. The candidate set is the big
+    shapes plus whichever native square matrices the kernel names — a
+    ``mat_t<3, 2>`` times a ``mat33`` is exactly warp.fem's deformation-
+    gradient shape.
+    """
+    natives: set[tuple[int, int, str]] = set()
+    for m in _NATIVE_MAT_NAME_PAT.finditer(source):
+        shape = (int(m.group(2)), int(m.group(3)), m.group(1))
+        if _is_native_mat_shape(shape):
+            natives.add(shape)
+    out = []
+    candidates = sorted(big_shapes | natives)
+    for lhs in candidates:
+        for rhs in candidates:
+            if lhs[2] != rhs[2] or lhs[1] != rhs[0]:
+                continue
+            if _is_native_mat_shape(lhs) and _is_native_mat_shape(rhs):
+                continue  # MSL's own operator*
+            result = (lhs[0], rhs[1], lhs[2])
+            if lhs == rhs and result == lhs:
+                continue  # square same-type product: emitted with the struct
+            out.append((lhs, rhs, result))
+    return out
+
+
+def _emit_big_mat_cross_overloads(
+    shapes: list[tuple[int, int, str]],
+    pairs: list[tuple[tuple[int, int, str], tuple[int, int, str], tuple[int, int, str]]],
+) -> str:
+    """Emit big-mat overloads that span two matrix types.
+
+    Covers ``wp_transpose``, ``wp_matrix_from_cols`` / ``wp_matrix_from_rows``,
+    and ``operator*`` for the shape pairs in ``pairs``. These can't live in
+    ``_emit_big_mat_struct`` because each one names a second matrix type
+    that must already be declared.
+    """
+    body: list[str] = []
+
+    def _vec_name(n: int, scalar: str) -> str:
+        return f"{scalar}{n}" if n in _MSL_VEC_NATIVE_N else f"wp_vec{n}_{scalar}"
+
+    for rows, cols, scalar in shapes:
+        name = f"wp_mat{rows}x{cols}_{scalar}"
+        # transpose: (rows x cols) -> (cols x rows), row-major on both sides.
+        t_name = _mat_shape_msl_name((cols, rows, scalar))
+        body.append(f"inline {t_name} wp_transpose({name} m) {{")
+        if _is_native_mat_shape((cols, rows, scalar)):
+            # Native MSL matrices are column-major: element (r, c) of the
+            # result is ``t[c][r]``, and the result's (r, c) is m's (c, r).
+            body.append(f"    {t_name} t;")
+            body.append(f"    for (int r = 0; r < {cols}; ++r)")
+            body.append(f"    for (int c = 0; c < {rows}; ++c) t[c][r] = m.c[c * {cols} + r];")
+        else:
+            body.append(f"    {t_name} t;")
+            body.append(f"    for (int r = 0; r < {cols}; ++r)")
+            body.append(f"    for (int c = 0; c < {rows}; ++c) t.c[r * {rows} + c] = m.c[c * {cols} + r];")
+        body.append("    return t;")
+        body.append("}")
+        # matrix_from_cols / matrix_from_rows for the non-square shapes
+        # (the square native sizes are covered by ``_MISC_MATH_HELPERS``).
+        col_vec = _vec_name(rows, scalar)
+        col_at = "[{k}]" if rows in _MSL_VEC_NATIVE_N else ".c[{k}]"
+        params = ", ".join(f"{col_vec} c{j}" for j in range(cols))
+        body.append(f"inline {name} wp_matrix_from_cols({params}) {{")
+        body.append(f"    {name} m;")
+        for j in range(cols):
+            for r in range(rows):
+                body.append(f"    m.c[{r * cols + j}] = c{j}{col_at.format(k=r)};")
+        body.append("    return m;")
+        body.append("}")
+        row_vec = _vec_name(cols, scalar)
+        row_at = "[{k}]" if cols in _MSL_VEC_NATIVE_N else ".c[{k}]"
+        params = ", ".join(f"{row_vec} r{i}" for i in range(rows))
+        body.append(f"inline {name} wp_matrix_from_rows({params}) {{")
+        body.append(f"    {name} m;")
+        for i in range(rows):
+            for c in range(cols):
+                body.append(f"    m.c[{i * cols + c}] = r{i}{row_at.format(k=c)};")
+        body.append("    return m;")
+        body.append("}")
+
+    for lhs, rhs, result in pairs:
+        l_name, r_name, o_name = (_mat_shape_msl_name(s) for s in (lhs, rhs, result))
+        m_rows, inner, n_cols = lhs[0], lhs[1], rhs[1]
+        # Element access differs by storage order: our structs are
+        # row-major ``c[r * cols + c]``, native MSL matrices are
+        # column-major ``m[col][row]``.
+        l_native, r_native, o_native = (_is_native_mat_shape(s) for s in (lhs, rhs, result))
+        body.append(f"inline {o_name} operator*({l_name} a, {r_name} b) {{")
+        body.append(f"    {o_name} r;")
+        for i in range(m_rows):
+            for j in range(n_cols):
+                terms = " + ".join(
+                    f"{f'a[{k}][{i}]' if l_native else f'a.c[{i * inner + k}]'} * "
+                    f"{f'b[{j}][{k}]' if r_native else f'b.c[{k * n_cols + j}]'}"
+                    for k in range(inner)
+                )
+                dst = f"r[{j}][{i}]" if o_native else f"r.c[{i * n_cols + j}]"
+                body.append(f"    {dst} = {terms};")
+        body.append("    return r;")
+        body.append("}")
+    return "\n".join(body)
 
 
 def _emit_slice_t_struct(source: str) -> str:
@@ -3228,6 +3382,29 @@ _MISC_MATH_HELPERS: dict[str, str] = {
         "inline bool wp_isfinite(float4x4 m) "
         "{ return wp_isfinite(m[0]) && wp_isfinite(m[1]) && wp_isfinite(m[2]) && wp_isfinite(m[3]); }"
     ),
+    # Unary ``wp.min(v)`` / ``wp.max(v)`` reduce a vector's components to a
+    # scalar (see warp/native/vec.h). MSL's ``metal::min``/``max`` are
+    # binary only, so the unary form routes here. Reductions are pairwise
+    # (not sequential) to match how Warp folds them; for min/max the two
+    # agree exactly, NaNs aside.
+    "wp_vmin": (
+        "template <typename T>\n"
+        "inline T wp_vmin(metal::vec<T, 2> v) { return metal::min(v.x, v.y); }\n"
+        "template <typename T>\n"
+        "inline T wp_vmin(metal::vec<T, 3> v) { return metal::min(metal::min(v.x, v.y), v.z); }\n"
+        "template <typename T>\n"
+        "inline T wp_vmin(metal::vec<T, 4> v) "
+        "{ return metal::min(metal::min(v.x, v.y), metal::min(v.z, v.w)); }"
+    ),
+    "wp_vmax": (
+        "template <typename T>\n"
+        "inline T wp_vmax(metal::vec<T, 2> v) { return metal::max(v.x, v.y); }\n"
+        "template <typename T>\n"
+        "inline T wp_vmax(metal::vec<T, 3> v) { return metal::max(metal::max(v.x, v.y), v.z); }\n"
+        "template <typename T>\n"
+        "inline T wp_vmax(metal::vec<T, 4> v) "
+        "{ return metal::max(metal::max(v.x, v.y), metal::max(v.z, v.w)); }"
+    ),
     "wp_isnan": (
         "template <typename T>\n"
         "inline bool wp_isnan(T x) { return metal::isnan(x); }\n"
@@ -3252,6 +3429,19 @@ _MISC_MATH_HELPERS: dict[str, str] = {
     ),
     # MSL's native matNxN constructors take column vectors, so from_cols
     # is a direct constructor call and from_rows is its transpose.
+    # ``metal::transpose`` handles the native square matrices; the big-mat
+    # (non-square) overloads are emitted per shape alongside their structs.
+    "wp_transpose": ("template <typename T>\ninline T wp_transpose(T m) { return metal::transpose(m); }"),
+    # ``metal::length`` handles the native vector widths; big-vec struct
+    # overloads are emitted with their structs.
+    "wp_length": (
+        "inline float wp_length(float2 v) { return metal::length(v); }\n"
+        "inline float wp_length(float3 v) { return metal::length(v); }\n"
+        "inline float wp_length(float4 v) { return metal::length(v); }\n"
+        "inline half wp_length(half2 v) { return metal::length(v); }\n"
+        "inline half wp_length(half3 v) { return metal::length(v); }\n"
+        "inline half wp_length(half4 v) { return metal::length(v); }"
+    ),
     "wp_matrix_from_cols": (
         "inline float2x2 wp_matrix_from_cols(float2 c0, float2 c1) { return float2x2(c0, c1); }\n"
         "inline float3x3 wp_matrix_from_cols(float3 c0, float3 c1, float3 c2) { return float3x3(c0, c1, c2); }\n"
@@ -5016,13 +5206,23 @@ def _build_kernel_header(source: str) -> str:
         scalar = m.group(3)
         if scalar not in _MSL_PREFIX_TO_SAME:
             continue
-        # Skip only *square* native sizes — non-square small mats use
-        # our custom struct (see ``_msl_mat_name``).
-        if rows == cols and rows in _MSL_VEC_NATIVE_N:
+        # Skip the MSL-native shapes; everything else (non-square, and any
+        # integer matrix) needs our struct emitted (see ``_msl_mat_name``).
+        if _is_native_mat_shape((rows, cols, scalar)):
             continue
         seen_mat.add((rows, cols, scalar))
     if need_mat1x1:
         seen_mat.add((1, 1, "float"))
+    # ``wp.transpose`` on a non-square big-mat yields the mirrored shape,
+    # and a product of two big-mats yields a third. Neither result type is
+    # necessarily named in the body (it can be a temporary), so close the
+    # shape set under transposition and multiplication before emitting the
+    # structs — the cross-type overloads below are typed on them.
+    # warp.fem's reference-element gradients hit this: a ``mat_t<3, 2>``
+    # Jacobian is transposed and multiplied by a ``mat33``.
+    seen_mat |= {(cols, rows, scalar) for rows, cols, scalar in seen_mat if rows != cols}
+    _mat_pairs = _mat_product_pairs(seen_mat, source)
+    seen_mat |= {shape for _a, _b, shape in _mat_pairs if not _is_native_mat_shape(shape)}
     # Big-mat arithmetic (mat * vec / vec * mat) is typed on the big-vec
     # structs for any non-native row/col count, so those structs must be
     # emitted even when the kernel body never names them directly.
@@ -5037,6 +5237,10 @@ def _build_kernel_header(source: str) -> str:
         parts.append(_emit_spatial_helpers())
     for rows, cols, scalar in sorted(seen_mat):
         parts.append(_emit_big_mat_struct(f"wp_mat{rows}x{cols}_{scalar}", rows, cols, scalar))
+    # Cross-type big-mat overloads. Emitted after every struct above so
+    # each one can name both its operand and its result type.
+    if seen_mat:
+        parts.append(_emit_big_mat_cross_overloads(sorted(seen_mat), _mat_pairs))
     slice_struct = _emit_slice_t_struct(source)
     if slice_struct:
         parts.append(slice_struct)
@@ -5853,12 +6057,28 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bwp::isfinite\b"), "wp_isfinite"),
     (re.compile(r"\bwp::isnan\b"), "wp_isnan"),
     (re.compile(r"\bwp::isinf\b"), "wp_isinf"),
+    # UNARY ``wp.min(v)`` / ``wp.max(v)`` — the component reduction, not
+    # the binary form. MSL has no 1-arg ``metal::min``/``max``, so these
+    # must be caught before the blanket ``wp::min`` -> ``metal::min``
+    # rename appended from ``_MATH_BUILTIN_NAMES``. Warp IR always passes
+    # builtins a bare local, so a comma-free single ``var_X`` operand is
+    # an unambiguous match for the unary overload.
+    (re.compile(r"\bwp::min\s*\(\s*(var_\w+)\s*\)"), r"wp_vmin(\1)"),
+    (re.compile(r"\bwp::max\s*\(\s*(var_\w+)\s*\)"), r"wp_vmax(\1)"),
     # ``wp.invert`` is bitwise NOT (integer types only).
     (re.compile(r"wp::invert\s*\(\s*([^()]+?)\s*\)"), r"(~(\1))"),
     # ``matrix_from_cols``/``matrix_from_rows`` may carry explicit template
     # args (``<wp::float32>``); strip them — helper overloads are per-size.
     (re.compile(r"\bwp::matrix_from_cols\s*(?:<[^<>]*>)?"), "wp_matrix_from_cols"),
     (re.compile(r"\bwp::matrix_from_rows\s*(?:<[^<>]*>)?"), "wp_matrix_from_rows"),
+    # Warp hands the column/row list to these as a braced initialiser
+    # (``wp_matrix_from_cols({a, b})``), which MSL reads as a single
+    # init-list argument and fails to match against the per-column
+    # overloads. Unwrap it to a plain argument list.
+    (
+        re.compile(r"\b(wp_matrix_from_(?:cols|rows))\s*\(\s*\{\s*([^{}()]*?)\s*\}\s*\)"),
+        r"\1(\2)",
+    ),
     # Spatial algebra on ``spatial_vector`` (vec6). ``spatial_dot`` is just
     # a vec6 dot product, so reuse the wp_dot machinery (which emits big-vec
     # overloads); cross/cross_dual get helpers next to wp_spatial_top.
@@ -6028,6 +6248,17 @@ for _name in _MATH_BUILTIN_NAMES:
         # Quat-typed operands are intercepted earlier by the type-aware
         # rewrite in ``generate_msl_kernel`` (``wp_quat_normalize``).
         _INTRINSIC_PATTERNS.append((re.compile(rf"\bwp::{_name}\b"), "wp_normalize"))
+    elif _name == "length":
+        # ``metal::length`` covers the native widths only; the big-vec
+        # structs get their own overload next to each struct definition.
+        _INTRINSIC_PATTERNS.append((re.compile(rf"\bwp::{_name}\b"), "wp_length"))
+    elif _name == "transpose":
+        # ``metal::transpose`` only knows native ``floatRxC``; non-square
+        # Warp matrices are our row-major structs (see ``_msl_mat_name``),
+        # whose transposes are emitted per shape by
+        # ``_emit_big_mat_cross_overloads``. The template in
+        # ``_MISC_MATH_HELPERS`` forwards native operands unchanged.
+        _INTRINSIC_PATTERNS.append((re.compile(rf"\bwp::{_name}\b"), "wp_transpose"))
     else:
         _INTRINSIC_PATTERNS.append((re.compile(rf"\bwp::{_name}\b"), f"metal::{_name}"))
 del _name
@@ -8172,11 +8403,13 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
         else:
             input_args.append(arg)
 
-    # Synthetic read-only array inputs for ``wp.array`` fields of struct-
-    # typed kernel args (resolved by the AST view fold). Each becomes a
-    # regular array input named ``<arg>__<path>``; the launcher walks the
-    # struct instance to bind the field's buffer. Writes through struct-
-    # held arrays are not supported — fail loudly instead of corrupting.
+    # Synthetic array args for ``wp.array`` fields of struct-typed kernel
+    # args (resolved by the AST view fold). Each becomes a regular array
+    # arg named ``<arg>__<path>``; the launcher walks the struct instance
+    # to bind the field's buffer. Fields the body writes through are
+    # classified as OUTPUTS so the MSL signature gives them a writable
+    # ``device`` pointer (an input's ``const constant`` qualifier can't be
+    # cast away — the address space differs, not just the constness).
     struct_field_array_vars: list = []
     if _struct_arg_array_fields:
         from warp._src.codegen import Var as _WpVar  # noqa: PLC0415
@@ -8184,11 +8417,6 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
 
         for syn_label, (root_label, fpath) in _struct_arg_array_fields.items():
             field_desc = f"struct arg {root_label!r} array field {'.'.join(fpath)!r}"
-            if syn_label in written_arg_names:
-                raise MetalCodegenError(
-                    f"Kernel {adj.fun_name!r}: writing through {field_desc} is not supported on "
-                    f"the Metal backend; pass the array as a top-level kernel argument instead"
-                )
             ftype = next(a.type for a in adj.args if a.label == root_label)
             for comp in fpath:
                 ftype = ftype.vars[comp].type
@@ -8203,7 +8431,10 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
                 raise MetalCodegenError(f"Kernel {adj.fun_name!r}: {field_desc} has float64 elements — MSL has no fp64")
             syn_var = _WpVar(syn_label, ftype)
             struct_field_array_vars.append(syn_var)
-            input_args.append(syn_var)
+            if syn_label in written_arg_names:
+                output_args.append(syn_var)
+            else:
+                input_args.append(syn_var)
 
     if not output_args:
         raise MetalCodegenError(
@@ -9149,6 +9380,24 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
                         f"{fname!r} takes a struct arg {arg_expr!r} with no known layout"
                     )
                 body_lines.append(_finalize(f"{indent}{_per_field_local(dst, fname)} = {arg_expr};"))
+            continue
+        # Whole-struct zero-init ``var_X = {};``. Warp emits this for a
+        # struct local that a control-flow join leaves unset — notably the
+        # fall-through slot of an inlined struct-returning ``@wp.func``
+        # whose every ``return`` already wrote the destination (warp.fem's
+        # quadrature iteration state). ``var_X`` itself doesn't exist on
+        # Metal (it is split into per-field locals), so expand to one zero
+        # per scalar leaf. Array fields are skipped: their backings resolve
+        # statically in the AST fold and have no per-field local to clear.
+        m_struct_zero = re.match(r"^(?P<indent>\s*)var_(\w+)\s*=\s*\{\s*\}\s*;\s*$", raw)
+        if m_struct_zero and m_struct_zero.group(2) in struct_local_layouts:
+            indent = m_struct_zero.group("indent")
+            dst = m_struct_zero.group(2)
+            for fpath, _off, finfo in _iter_scalar_leaves(struct_local_layouts[dst]):
+                zero = (
+                    f"{finfo.msl_type}()" if finfo.msl_type.startswith(("wp_mat", "wp_vec")) else f"{finfo.msl_type}(0)"
+                )
+                body_lines.append(f"{indent}{_per_field_local(dst, fpath)} = {zero};")
             continue
         # Struct-to-struct local copy ``var_X = var_Y;``. Both X and Y
         # have already been split into per-field locals; expand the
@@ -10202,17 +10451,16 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
 
     header = _build_kernel_header(source)
 
-    # Struct-arg array-field inputs that survived the unused-arg prune —
+    # Struct-arg array-field args that survived the unused-arg prune —
     # recorded on the artifact so launch paths (and cache reload) can
-    # resolve each synthetic input back to its struct field. A field whose
-    # only use is ``.shape`` gets pruned from the inputs (the shape pack
-    # rewrite removes its last data reference) but still needs launch-time
+    # resolve each synthetic back to its struct field. Written fields land
+    # in ``output_args``, so both lists are consulted. A field whose only
+    # use is ``.shape`` gets pruned from the args (the shape pack rewrite
+    # removes its last data reference) but still needs launch-time
     # resolution for ``__shapes_packed``.
-    _final_input_labels = {a.label for a in input_args} | set(_shape_arrs_seen)
+    _final_arg_labels = {a.label for a in input_args} | {a.label for a in output_args} | set(_shape_arrs_seen)
     struct_array_args_final = tuple(
-        (syn, root, tuple(fpath))
-        for syn, (root, fpath) in _struct_arg_array_fields.items()
-        if syn in _final_input_labels
+        (syn, root, tuple(fpath)) for syn, (root, fpath) in _struct_arg_array_fields.items() if syn in _final_arg_labels
     )
 
     inplace_set = set(mlx_inplace_arrays)
@@ -10433,7 +10681,7 @@ def _load_cached_artifact(key: str, adj) -> MetalKernelArtifact | None:
             payload = pickle.load(f)
         fields = payload["fields"]
         by_label = {a.label: a for a in adj.args}
-        # Synthetic struct-arg array-field inputs aren't in ``adj.args`` —
+        # Synthetic struct-arg array-field args aren't in ``adj.args`` —
         # rebuild their Vars by walking the struct type along the recorded
         # field path (any mismatch degrades to a regenerate via KeyError).
         sfa_paths = {syn: (root, tuple(fpath)) for syn, root, fpath in fields.get("struct_array_args", ())}
@@ -10451,7 +10699,7 @@ def _load_cached_artifact(key: str, adj) -> MetalKernelArtifact | None:
             return _WpVar(label, ftype)
 
         input_args = [_arg_for(label) for label in payload["input_arg_labels"]]
-        output_args = [by_label[label] for label in payload["output_arg_labels"]]
+        output_args = [_arg_for(label) for label in payload["output_arg_labels"]]
         artifact = MetalKernelArtifact(**fields)
         artifact.input_args = input_args
         artifact.output_args = output_args
@@ -12131,8 +12379,22 @@ def launch_metal_kernel_native(kernel, dim, inputs, outputs, device, block_dim: 
     # by Warp convention.
     # output_init_shadow_set already cached on kernel above.
     for name in artifact.output_names:
-        idx, arg_var = arg_by_name[name]
-        value = fwd_args[idx]
+        sfa = struct_field_args.get(name)
+        if sfa is not None:
+            # Written struct-arg array field: bind the field's buffer
+            # read-write. An unset field can't take a placeholder the way
+            # a read-only one can — a write through a 4-byte stand-in
+            # would run off the end of it.
+            value = _struct_field_launch_value(fwd_args, arg_by_name, sfa[0], sfa[1])
+            if value is None:
+                raise RuntimeError(
+                    f"Kernel '{kernel.key}' writes through struct arg {sfa[0]!r} field "
+                    f"{'.'.join(sfa[1])!r}, which is unset; assign a wp.array to it before launching"
+                )
+            arg_var = out_var_by_name[name]
+        else:
+            idx, arg_var = arg_by_name[name]
+            value = fwd_args[idx]
         if not _is_array_arg(arg_var):
             raise RuntimeError(f"Kernel '{kernel.key}' output {name!r} is not a wp.array")
         if not getattr(value, "device", None) or not value.device.is_metal:
@@ -12477,8 +12739,17 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim: int = 2
     # copied back after the launch completes.
     inplace_staged: list[tuple] = []  # (staging mx.array, dest wp.array, n_scalars)
     for arr_name in getattr(artifact, "inplace_arrays", ()):
-        idx, _ = arg_by_name[arr_name]
-        value = fwd_args[idx]
+        sfa = struct_field_args.get(arr_name)
+        if sfa is not None:
+            value = _struct_field_launch_value(fwd_args, arg_by_name, sfa[0], sfa[1])
+            if value is None:
+                raise RuntimeError(
+                    f"Kernel '{kernel.key}' writes through struct arg {sfa[0]!r} field "
+                    f"{'.'.join(sfa[1])!r}, which is unset; assign a wp.array to it before launching"
+                )
+        else:
+            idx, _ = arg_by_name[arr_name]
+            value = fwd_args[idx]
         if not getattr(value, "device", None) or not value.device.is_metal:
             raise RuntimeError(
                 f"Kernel '{kernel.key}' in-place output '{arr_name}' must be a wp.array on a "
@@ -12517,12 +12788,21 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim: int = 2
     init_shadow_names = [n for n in artifact.input_names if n.endswith("__init")]
     for init_name in init_shadow_names:
         out_name = init_name[: -len("__init")]
-        if out_name not in arg_by_name:
-            raise RuntimeError(
-                f"Kernel '{kernel.key}' atomic init shadow '{init_name}' references unknown output '{out_name}'"
-            )
-        idx, _ = arg_by_name[out_name]
-        value = fwd_args[idx]
+        sfa = struct_field_args.get(out_name)
+        if sfa is not None:
+            value = _struct_field_launch_value(fwd_args, arg_by_name, sfa[0], sfa[1])
+            if value is None:
+                raise RuntimeError(
+                    f"Kernel '{kernel.key}' writes through struct arg {sfa[0]!r} field "
+                    f"{'.'.join(sfa[1])!r}, which is unset; assign a wp.array to it before launching"
+                )
+        else:
+            if out_name not in arg_by_name:
+                raise RuntimeError(
+                    f"Kernel '{kernel.key}' atomic init shadow '{init_name}' references unknown output '{out_name}'"
+                )
+            idx, _ = arg_by_name[out_name]
+            value = fwd_args[idx]
         if not getattr(value, "device", None) or not value.device.is_metal:
             raise RuntimeError(
                 f"Kernel '{kernel.key}' atomic init shadow '{init_name}' must back a "
@@ -12724,8 +13004,18 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim: int = 2
             output_dtypes.append(mx.float32)
             output_dest_arrays.append(None)
             continue
-        idx, arg_var = arg_by_name[output_name]
-        value = fwd_args[idx]
+        sfa = struct_field_args.get(output_name)
+        if sfa is not None:
+            value = _struct_field_launch_value(fwd_args, arg_by_name, sfa[0], sfa[1])
+            if value is None:
+                raise RuntimeError(
+                    f"Kernel '{kernel.key}' writes through struct arg {sfa[0]!r} field "
+                    f"{'.'.join(sfa[1])!r}, which is unset; assign a wp.array to it before launching"
+                )
+            arg_var = next(a for a in artifact.output_args if a.label == output_name)
+        else:
+            idx, arg_var = arg_by_name[output_name]
+            value = fwd_args[idx]
         if not _is_array_arg(arg_var):
             raise RuntimeError(
                 f"Kernel '{kernel.key}' output '{output_name}' is not a wp.array; "
