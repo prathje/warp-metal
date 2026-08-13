@@ -542,6 +542,99 @@ class MetalDispatcher:
                 h.update(f.read())
         return h.hexdigest()[:16]
 
+    @staticmethod
+    def _reap_gpu_archiver_cache() -> None:
+        """Bound Apple's ``com.apple.gpuarchiver`` cache.
+
+        Every distinct ``MTLBinaryArchive`` identity leaves a directory
+        behind in the per-user Darwin cache, sized by the PSOs it holds
+        (~2 GB for a mujoco_warp G1 module set). macOS never reaps it, and
+        :meth:`_archive_salt` is a content hash of the Metal codegen — so
+        each edit-and-run cycle during development strands another
+        multi-GB entry. One working tree reached 254 GB across 3911
+        entries this way, filling the volume.
+
+        Deletes entries by age, then count, then total size, using the
+        first cap that bites. Entries touched within the last hour are
+        always kept so a concurrently running process keeps its own.
+        Every limit is configurable; ``WARP_METAL_GPU_ARCHIVER_MAX_MB=0``
+        disables reaping entirely.
+        """
+        import shutil  # noqa: PLC0415
+        import time  # noqa: PLC0415
+
+        max_mb = int(os.environ.get("WARP_METAL_GPU_ARCHIVER_MAX_MB", "8192") or "0")
+        if max_mb <= 0:
+            return
+        max_age_days = float(os.environ.get("WARP_METAL_GPU_ARCHIVER_MAX_AGE_DAYS", "3") or "0")
+        max_entries = int(os.environ.get("WARP_METAL_GPU_ARCHIVER_MAX_ENTRIES", "16") or "0")
+
+        cache_root = os.environ.get("DARWIN_USER_CACHE_DIR")
+        if not cache_root:
+            # ``tempfile.gettempdir()`` is DARWIN_USER_TEMP_DIR (``.../T``);
+            # the cache dir is its sibling ``.../C``.
+            import tempfile  # noqa: PLC0415
+
+            tmp = tempfile.gettempdir().rstrip(os.sep)
+            if os.path.basename(tmp) != "T":
+                return
+            cache_root = os.path.join(os.path.dirname(tmp), "C")
+        arch_dir = os.path.join(cache_root, "com.apple.gpuarchiver")
+        if not os.path.isdir(arch_dir):
+            return
+
+        now = time.time()
+        entries = []
+        with os.scandir(arch_dir) as it:
+            for e in it:
+                if not e.name.startswith("gpuarchiver-"):
+                    continue
+                try:
+                    mtime = e.stat().st_mtime
+                except OSError:
+                    continue
+                if now - mtime < 3600:
+                    continue  # possibly live in another process
+                entries.append((mtime, e.path))
+        entries.sort()  # oldest first
+
+        def _drop(path: str) -> None:
+            shutil.rmtree(path, ignore_errors=True)
+
+        # 1) Age cap.
+        if max_age_days > 0:
+            cutoff = now - max_age_days * 86400
+            fresh = []
+            for mtime, path in entries:
+                if mtime < cutoff:
+                    _drop(path)
+                else:
+                    fresh.append((mtime, path))
+            entries = fresh
+        # 2) Count cap (cheap, and bounds the size walk below).
+        if max_entries > 0 and len(entries) > max_entries:
+            for _mtime, path in entries[: len(entries) - max_entries]:
+                _drop(path)
+            entries = entries[len(entries) - max_entries :]
+        # 3) Size cap over whatever survived.
+        budget = max_mb * 1024 * 1024
+        sized = []
+        for mtime, path in entries:
+            total = 0
+            for root, _dirs, files in os.walk(path):
+                for fn in files:
+                    try:
+                        total += os.stat(os.path.join(root, fn)).st_size
+                    except OSError:
+                        pass
+            sized.append((mtime, path, total))
+        running = sum(sz for _m, _p, sz in sized)
+        for _mtime, path, sz in sized:  # oldest first
+            if running <= budget:
+                break
+            _drop(path)
+            running -= sz
+
     def _init_binary_archive(self) -> None:
         """Open the on-disk PSO archive, creating one if it doesn't exist.
 
@@ -550,8 +643,17 @@ class MetalDispatcher:
         upgrade naturally invalidates the archive; the salt (see
         :meth:`_archive_salt`) does the same for codegen changes. Stale
         archives from other salts are deleted here to bound disk usage.
+
+        Set ``WARP_METAL_PSO_ARCHIVE=0`` to skip archiving altogether.
+        That is worth doing while iterating on the Metal codegen: the salt
+        changes on every edit, so each run writes an archive it will never
+        read again, and each one also strands a multi-GB entry in Apple's
+        own archiver cache (see :meth:`_reap_gpu_archiver_cache`).
         """
         import warp.config as _wp_cfg  # noqa: PLC0415
+
+        if os.environ.get("WARP_METAL_PSO_ARCHIVE", "").strip().lower() in ("0", "false", "off"):
+            return
 
         cache_dir = getattr(_wp_cfg, "kernel_cache_dir", None)
         if not cache_dir:
@@ -559,6 +661,13 @@ class MetalDispatcher:
             return
         archive_path = os.path.join(cache_dir, f"metal_pso_archive_{self._archive_salt()}")
         os.makedirs(cache_dir, exist_ok=True)
+
+        # Apple's side of the cache grows without bound; trim it before we
+        # add another entry of our own.
+        try:
+            self._reap_gpu_archiver_cache()
+        except Exception:
+            pass  # best-effort housekeeping, never fatal
 
         # Drop archives from previous codegen versions (including the
         # legacy unsalted ``metal_pso_archive`` and any orphaned

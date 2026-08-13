@@ -22,6 +22,12 @@
 
 ### Fixed
 
+- Fix the Metal PSO archive growing macOS's `com.apple.gpuarchiver` cache without bound: every distinct binary
+  archive strands a multi-GB directory there that macOS never reclaims, so repeated runs could consume hundreds of
+  gigabytes. The dispatcher now trims that cache by age, entry count, and total size
+  (`WARP_METAL_GPU_ARCHIVER_MAX_AGE_DAYS`, `WARP_METAL_GPU_ARCHIVER_MAX_ENTRIES`,
+  `WARP_METAL_GPU_ARCHIVER_MAX_MB`; set the last to `0` to disable trimming). Set `WARP_METAL_PSO_ARCHIVE=0` to skip
+  PSO archiving entirely, which is worth doing while iterating on the Metal codegen.
 - Fix a crash on interpreter shutdown when a script exits with Metal GPU work still in flight; the Metal
   dispatcher now drains outstanding command buffers at exit instead of relying on Python-level completion
   handlers.
