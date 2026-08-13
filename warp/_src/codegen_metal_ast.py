@@ -1774,7 +1774,7 @@ def _inline_walk(
 
 
 def inline_user_calls(
-    nodes: list[Node], kernel_adj, max_depth: int = 8
+    nodes: list[Node], kernel_adj, max_depth: int = 24
 ) -> tuple[list[Node], dict[str, int], dict[str, Any], dict[str, str]]:
     """Splice every user-``@wp.func`` call into the AST tree.
 
