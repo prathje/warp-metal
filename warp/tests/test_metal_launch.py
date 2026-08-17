@@ -9047,6 +9047,143 @@ class TestMetalReplayTimed(unittest.TestCase):
 
 @unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
 @unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
+class TestMetalDemoteFp64(unittest.TestCase):
+    """Opt-in ``warp.config.metal_demote_fp64``: float64 arrays keep their
+    8-byte storage (so host round-trips are unchanged) but are computed on in
+    float32."""
+
+    def test_float64_arrays_round_trip_at_fp32_precision(self):
+        # Covers the read path, a plain store, a compound read-modify-write
+        # (which binds in place and so must type its ``__rw`` alias as
+        # ``ulong`` — getting that wrong reinterprets double bits as floats
+        # and was off by ~1e146), a 2-D store, and vec2d / mat22d elements.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+            wp.config.metal_demote_fp64 = True
+
+            N = 64
+
+            @wp.kernel
+            def rw(x: wp.array(dtype=wp.float64), out: wp.array(dtype=wp.float64)):
+                i = wp.tid()
+                out[i] = x[i] * wp.float64(2.0) + wp.float64(1.0)
+
+            @wp.kernel
+            def compound(acc: wp.array(dtype=wp.float64)):
+                i = wp.tid()
+                acc[i] = acc[i] + wp.float64(3.0)
+
+            @wp.kernel
+            def two_d(x: wp.array(dtype=wp.float64), out: wp.array2d(dtype=wp.float64)):
+                i = wp.tid()
+                out[i, 0] = x[i]
+                out[i, 1] = x[i] * x[i]
+
+            @wp.kernel
+            def vecs(v: wp.array(dtype=wp.vec2d), out: wp.array(dtype=wp.vec2d)):
+                i = wp.tid()
+                a = v[i]
+                out[i] = wp.vec2d(a[1], a[0])
+
+            @wp.kernel
+            def mats(m: wp.array(dtype=wp.mat22d), out: wp.array(dtype=wp.float64)):
+                i = wp.tid()
+                a = m[i]
+                out[i] = a[0, 0] + a[1, 1]
+
+            rng = np.random.default_rng(4)
+            x_np = rng.standard_normal(N)
+            acc_np = rng.standard_normal(N)
+            v_np = rng.standard_normal((N, 2))
+            m_np = rng.standard_normal((N, 2, 2))
+
+            dev = 'metal:0'
+            x = wp.array(x_np, dtype=wp.float64, device=dev)
+            out = wp.zeros(N, dtype=wp.float64, device=dev)
+            wp.launch(rw, dim=N, inputs=[x], outputs=[out], device=dev)
+            acc = wp.array(acc_np, dtype=wp.float64, device=dev)
+            wp.launch(compound, dim=N, inputs=[acc], device=dev)
+            out2 = wp.zeros((N, 2), dtype=wp.float64, device=dev)
+            wp.launch(two_d, dim=N, inputs=[x], outputs=[out2], device=dev)
+            v = wp.array(v_np, dtype=wp.vec2d, device=dev)
+            outv = wp.zeros(N, dtype=wp.vec2d, device=dev)
+            wp.launch(vecs, dim=N, inputs=[v], outputs=[outv], device=dev)
+            m = wp.array(m_np, dtype=wp.mat22d, device=dev)
+            outm = wp.zeros(N, dtype=wp.float64, device=dev)
+            wp.launch(mats, dim=N, inputs=[m], outputs=[outm], device=dev)
+            wp.synchronize_device(dev)
+
+            # Storage must still be real float64 on the host side.
+            for arr in (out, acc, out2, outv, outm):
+                assert arr.numpy().dtype == np.float64, arr.numpy().dtype
+
+            # fp32 arithmetic: a few float epsilons, not double precision.
+            tol = {"rtol": 1e-5, "atol": 1e-6}
+            np.testing.assert_allclose(out.numpy(), x_np * 2.0 + 1.0, **tol)
+            np.testing.assert_allclose(acc.numpy(), acc_np + 3.0, **tol)
+            np.testing.assert_allclose(out2.numpy(), np.stack([x_np, x_np * x_np], 1), **tol)
+            np.testing.assert_allclose(outv.numpy(), v_np[:, ::-1], **tol)
+            np.testing.assert_allclose(outm.numpy(), m_np[:, 0, 0] + m_np[:, 1, 1], **tol)
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=180)
+
+    def test_float64_array_rejected_without_the_flag(self):
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+            from warp._src.codegen_metal import MetalCodegenError
+
+            @wp.kernel
+            def k(x: wp.array(dtype=wp.float64), out: wp.array(dtype=wp.float64)):
+                i = wp.tid()
+                out[i] = x[i]
+
+            dev = 'metal:0'
+            x = wp.zeros(4, dtype=wp.float64, device=dev)
+            out = wp.zeros(4, dtype=wp.float64, device=dev)
+            try:
+                wp.launch(k, dim=4, inputs=[x], outputs=[out], device=dev)
+            except (MetalCodegenError, RuntimeError) as e:
+                assert 'metal_demote_fp64' in str(e), str(e)
+            else:
+                raise AssertionError('expected float64 arrays to be rejected by default')
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
+    def test_atomic_add_into_float64_array_raises(self):
+        # Metal has no 64-bit atomics, so an 8-byte element cannot be updated
+        # atomically even under demotion. Must be a clear error, not a
+        # miscompile or a silent race.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+            from warp._src.codegen_metal import MetalCodegenError
+            wp.config.metal_demote_fp64 = True
+
+            @wp.kernel
+            def k(x: wp.array(dtype=wp.float64), acc: wp.array(dtype=wp.float64)):
+                i = wp.tid()
+                wp.atomic_add(acc, 0, x[i])
+
+            dev = 'metal:0'
+            x = wp.zeros(8, dtype=wp.float64, device=dev)
+            acc = wp.zeros(1, dtype=wp.float64, device=dev)
+            try:
+                wp.launch(k, dim=8, inputs=[x], outputs=[acc], device=dev)
+            except (MetalCodegenError, RuntimeError) as e:
+                assert '64-bit atomics' in str(e), str(e)
+            else:
+                raise AssertionError('expected wp.atomic_add into a float64 array to raise')
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
+
+@unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
+@unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
 class TestMetalTileFullAndScan(unittest.TestCase):
     """``wp.tile_full()`` and the tile prefix scans, lowered to the serial
     tile model."""

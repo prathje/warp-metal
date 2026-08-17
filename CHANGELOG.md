@@ -19,6 +19,13 @@
   single-argument `wp.min()` / `wp.max()` component reductions, `wp.length()` on vectors of unsupported-by-MSL
   widths, and non-square matrices (`wp.transpose()`, `wp.matrix_from_cols()`, `wp.matrix_from_rows()`, and
   products mixing square and non-square operands).
+- Add `warp.config.metal_demote_fp64` (`WARP_METAL_DEMOTE_FP64`), an opt-in mode that allows `float64` arrays on
+  Metal devices by computing on them at single precision. Elements keep their 8-byte IEEE-754 storage, so host-side
+  `numpy()` round-trips are unchanged, but every value is converted to `float32` on read and back on write. Warp
+  warns once per process, since this changes results relative to a CUDA or CPU run. `wp.atomic_add()` and the other
+  atomic operations on `float64` arrays still raise: Metal has no 64-bit atomics, so an 8-byte element cannot be
+  updated atomically.
+- Support `wp.tile_full()`, `wp.tile_scan_inclusive()`, and `wp.tile_scan_exclusive()` on Metal devices.
 - Support `wp.atomic_cas()` and `wp.atomic_exch()` on Metal devices, including through `wp.array` fields of
   struct kernel arguments. Note that mutual-exclusion spin locks built on these deadlock on Apple GPUs, which
   do not guarantee independent forward progress within a SIMD group; lock-free retry loops work correctly.
