@@ -25,6 +25,13 @@
   warns once per process, since this changes results relative to a CUDA or CPU run. `wp.atomic_add()` and the other
   atomic operations on `float64` arrays still raise: Metal has no 64-bit atomics, so an 8-byte element cannot be
   updated atomically.
+- Support reverse-mode differentiation (`wp.Tape().backward()`) on Metal devices for kernels built from scalar and
+  vector arithmetic, array reads and writes, and `wp.atomic_add()` accumulation. Gradients are accumulated
+  atomically, so kernels whose threads read the same array element are handled correctly. Requires
+  `warp.config.metal_native_dispatch` (`WARP_METAL_NATIVE_DISPATCH=1`); the MLX dispatch path raises, since it
+  allocates output buffers from a pool and cannot accumulate into caller-owned gradient arrays. Kernels using
+  builtins whose adjoint is not yet implemented, or calling a `@wp.func` from a differentiated statement, raise a
+  `MetalCodegenError` naming the missing piece.
 - Support `wp.tile_full()`, `wp.tile_scan_inclusive()`, and `wp.tile_scan_exclusive()` on Metal devices.
 - Support `wp.atomic_cas()` and `wp.atomic_exch()` on Metal devices, including through `wp.array` fields of
   struct kernel arguments. Note that mutual-exclusion spin locks built on these deadlock on Apple GPUs, which
