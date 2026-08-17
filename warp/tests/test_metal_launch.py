@@ -72,6 +72,37 @@ def _run_with_metal_enabled(test_case, snippet: str, timeout: int = 30):
     )
 
 
+def _run_with_metal_native(test_case, snippet: str, timeout: int = 60):
+    """Run a snippet with native dispatch forced on.
+
+    Reverse-mode (adjoint) kernels only exist on the native path — the MLX
+    path allocates output buffers from a pool and cannot accumulate into
+    caller-owned gradient arrays — so these tests must not depend on
+    whether ``WARP_METAL_NATIVE_DISPATCH`` happens to be set.
+    """
+    code = (
+        "import warp as wp\n"
+        "wp.config.enable_metal = True\n"
+        "wp.config.metal_native_dispatch = True\n"
+        "wp.init()\n" + snippet
+    )
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, prefix="warp_metal_adj_") as f:
+        f.write(code)
+        path = f.name
+    try:
+        result = subprocess.run([sys.executable, path], check=False, capture_output=True, text=True, timeout=timeout)
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    test_case.assertEqual(
+        result.returncode,
+        0,
+        f"subprocess exited with {result.returncode}\n--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}",
+    )
+
+
 @unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
 @unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
 class TestMetalLaunch(unittest.TestCase):
@@ -4386,7 +4417,9 @@ class TestMetalLaunch(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet, timeout=60)
 
-    def test_rejects_adjoint_launch(self):
+    def test_adjoint_launch_matches_cpu_gradients(self):
+        # Reverse mode is native-dispatch only; the MLX path must say so
+        # rather than silently leaving gradients at zero.
         snippet = textwrap.dedent(
             """
             import warp as wp
@@ -4396,20 +4429,30 @@ class TestMetalLaunch(unittest.TestCase):
             def k(a: wp.array(dtype=wp.float32), b: wp.array(dtype=wp.float32),
                   c: wp.array(dtype=wp.float32)):
                 tid = wp.tid()
-                c[tid] = a[tid] + b[tid]
+                c[tid] = a[tid] * b[tid] + a[tid]
 
-            a = wp.zeros(8, dtype=wp.float32, device='metal:0')
-            b = wp.zeros(8, dtype=wp.float32, device='metal:0')
-            c = wp.zeros(8, dtype=wp.float32, device='metal:0')
-            try:
-                wp.launch(k, dim=8, inputs=[a, b], outputs=[c], device='metal:0', adjoint=True)
-            except RuntimeError as e:
-                assert 'adjoint' in str(e).lower(), str(e)
-            else:
-                raise AssertionError('expected RuntimeError for adjoint=True on Metal')
+            a_np = np.array([1.0, 2.0, 3.0, 4.0], np.float32)
+            b_np = np.array([5.0, 6.0, 7.0, 8.0], np.float32)
+            got = {}
+            for dev in ('cpu', 'metal:0'):
+                a = wp.array(a_np, device=dev, requires_grad=True)
+                b = wp.array(b_np, device=dev, requires_grad=True)
+                c = wp.zeros(4, dtype=wp.float32, device=dev, requires_grad=True)
+                tape = wp.Tape()
+                with tape:
+                    wp.launch(k, dim=4, inputs=[a, b], outputs=[c], device=dev)
+                c.grad = wp.array(np.ones(4, np.float32), device=dev)
+                tape.backward()
+                wp.synchronize_device(dev)
+                got[dev] = (a.grad.numpy().copy(), b.grad.numpy().copy())
+            # d/da = b + 1, d/db = a
+            np.testing.assert_allclose(got['metal:0'][0], b_np + 1.0, rtol=1e-6)
+            np.testing.assert_allclose(got['metal:0'][1], a_np, rtol=1e-6)
+            np.testing.assert_allclose(got['metal:0'][0], got['cpu'][0], rtol=1e-6)
+            np.testing.assert_allclose(got['metal:0'][1], got['cpu'][1], rtol=1e-6)
             """
         )
-        _run_with_metal_enabled(self, snippet)
+        _run_with_metal_native(self, snippet)
 
 
 @unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
@@ -6646,35 +6689,37 @@ class TestMetalUnsupportedFeaturesRaise(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet)
 
-    def test_tape_backward_raises(self):
+    def test_tape_backward_accumulates_across_threads(self):
         snippet = textwrap.dedent(
             """
             import numpy as np
             import warp as wp
 
+            # Every lane reads x[0], so x[0]'s gradient is summed across all
+            # 64 threads — this is the case that needs atomic accumulation
+            # into the gradient buffer, not a plain read-modify-write.
             @wp.kernel
-            def k_sq(x: wp.array(dtype=wp.float32), y: wp.array(dtype=wp.float32)):
+            def k_shared(x: wp.array(dtype=wp.float32), y: wp.array(dtype=wp.float32)):
                 i = wp.tid()
-                y[i] = x[i] * x[i]
+                y[i] = x[0] * wp.float32(i + 1)
 
             dev = 'metal:0'
-            x = wp.array(np.ones(4, np.float32), device=dev, requires_grad=True)
-            y = wp.zeros(4, dtype=wp.float32, device=dev, requires_grad=True)
+            n = 64
+            x = wp.array(np.array([3.0], np.float32), device=dev, requires_grad=True)
+            y = wp.zeros(n, dtype=wp.float32, device=dev, requires_grad=True)
             tape = wp.Tape()
             with tape:
-                wp.launch(k_sq, dim=4, inputs=[x], outputs=[y], device=dev)
+                wp.launch(k_shared, dim=n, inputs=[x], outputs=[y], device=dev)
             # The forward launch must be recorded — a silently empty tape
             # would "succeed" and leave every gradient at zero.
             assert len(tape.launches) == 1, len(tape.launches)
-            try:
-                tape.backward(grads={y: wp.array(np.ones(4, np.float32), device=dev)})
-            except RuntimeError as e:
-                assert 'adjoint' in str(e), str(e)
-            else:
-                raise AssertionError('tape.backward should have raised')
+            tape.backward(grads={y: wp.array(np.ones(n, np.float32), device=dev)})
+            wp.synchronize_device(dev)
+            # sum_{i=0}^{n-1} (i + 1)
+            np.testing.assert_allclose(x.grad.numpy(), [n * (n + 1) / 2], rtol=1e-6)
             """
         )
-        _run_with_metal_enabled(self, snippet)
+        _run_with_metal_native(self, snippet)
 
     def test_hashgrid_and_volume_creation_raise(self):
         # Volume construction used to fall through to the CUDA native
@@ -9371,6 +9416,191 @@ class TestMetalScalarArgAndSubviewBinding(unittest.TestCase):
             """
         )
         _run_with_metal_enabled(self, snippet, timeout=120)
+
+
+@unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
+@unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
+class TestMetalAdjoint(unittest.TestCase):
+    """Reverse-mode kernels on Metal, checked against Warp's own autodiff.
+
+    Each case compares Metal gradients to the CPU gradients for the same
+    kernel rather than to a hand-derived formula — the property under test
+    is that the Metal backward pass agrees with the reference backend.
+    """
+
+    def test_scalar_chain_matches_cpu(self):
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            @wp.kernel
+            def k(x: wp.array(dtype=wp.float32), y: wp.array(dtype=wp.float32),
+                  out: wp.array(dtype=wp.float32)):
+                i = wp.tid()
+                a = x[i] + y[i]
+                b = x[i] - y[i]
+                out[i] = a * b / wp.sqrt(y[i] * y[i] + 1.0)
+
+            n = 32
+            rng = np.random.default_rng(7)
+            x_np = rng.standard_normal(n).astype(np.float32) + 2.0
+            y_np = rng.standard_normal(n).astype(np.float32) + 3.0
+            got = {}
+            for dev in ('cpu', 'metal:0'):
+                x = wp.array(x_np, device=dev, requires_grad=True)
+                y = wp.array(y_np, device=dev, requires_grad=True)
+                out = wp.zeros(n, dtype=wp.float32, device=dev, requires_grad=True)
+                tape = wp.Tape()
+                with tape:
+                    wp.launch(k, dim=n, inputs=[x, y], outputs=[out], device=dev)
+                out.grad = wp.array(np.ones(n, np.float32), device=dev)
+                tape.backward()
+                wp.synchronize_device(dev)
+                got[dev] = (x.grad.numpy().copy(), y.grad.numpy().copy())
+            np.testing.assert_allclose(got['metal:0'][0], got['cpu'][0], rtol=1e-5, atol=1e-6)
+            np.testing.assert_allclose(got['metal:0'][1], got['cpu'][1], rtol=1e-5, atol=1e-6)
+            """
+        )
+        _run_with_metal_native(self, snippet)
+
+    def test_scalar_loss_through_atomic_add_matches_cpu(self):
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            @wp.kernel
+            def k(x: wp.array(dtype=wp.float32), loss: wp.array(dtype=wp.float32)):
+                i = wp.tid()
+                wp.atomic_add(loss, 0, x[i] * x[i])
+
+            n = 32
+            x_np = (np.arange(n, dtype=np.float32) - 8.0) * 0.25
+            got = {}
+            for dev in ('cpu', 'metal:0'):
+                x = wp.array(x_np, device=dev, requires_grad=True)
+                loss = wp.zeros(1, dtype=wp.float32, device=dev, requires_grad=True)
+                tape = wp.Tape()
+                with tape:
+                    wp.launch(k, dim=n, inputs=[x], outputs=[loss], device=dev)
+                tape.backward(loss=loss)
+                wp.synchronize_device(dev)
+                got[dev] = x.grad.numpy().copy()
+            np.testing.assert_allclose(got['metal:0'], got['cpu'], rtol=1e-5, atol=1e-6)
+            np.testing.assert_allclose(got['metal:0'], 2.0 * x_np, rtol=1e-5, atol=1e-6)
+            """
+        )
+        _run_with_metal_native(self, snippet)
+
+    def test_vec3_dot_and_length_matches_cpu(self):
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            @wp.kernel
+            def k(v: wp.array(dtype=wp.vec3), out: wp.array(dtype=wp.float32)):
+                i = wp.tid()
+                a = v[i]
+                out[i] = wp.dot(a, a) + wp.length(a)
+
+            n = 32
+            rng = np.random.default_rng(11)
+            v_np = rng.standard_normal((n, 3)).astype(np.float32) + 1.5
+            got = {}
+            for dev in ('cpu', 'metal:0'):
+                v = wp.array(v_np, dtype=wp.vec3, device=dev, requires_grad=True)
+                out = wp.zeros(n, dtype=wp.float32, device=dev, requires_grad=True)
+                tape = wp.Tape()
+                with tape:
+                    wp.launch(k, dim=n, inputs=[v], outputs=[out], device=dev)
+                out.grad = wp.array(np.ones(n, np.float32), device=dev)
+                tape.backward()
+                wp.synchronize_device(dev)
+                got[dev] = v.grad.numpy().copy()
+            np.testing.assert_allclose(got['metal:0'], got['cpu'], rtol=1e-5, atol=1e-6)
+            """
+        )
+        _run_with_metal_native(self, snippet)
+
+    def test_array_without_grad_is_not_a_gradient_sink(self):
+        # ``requires_grad=False`` inputs have no ``.grad``; their adjoint
+        # statements are compiled out entirely, so the launch must still
+        # succeed and the differentiable input must still get its gradient.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            @wp.kernel
+            def k(w: wp.array(dtype=wp.float32), x: wp.array(dtype=wp.float32),
+                  out: wp.array(dtype=wp.float32)):
+                i = wp.tid()
+                out[i] = w[i] * x[i]
+
+            n = 16
+            w_np = np.linspace(1.0, 2.0, n, dtype=np.float32)
+            x_np = np.linspace(3.0, 4.0, n, dtype=np.float32)
+            dev = 'metal:0'
+            w = wp.array(w_np, device=dev)  # no gradient
+            x = wp.array(x_np, device=dev, requires_grad=True)
+            out = wp.zeros(n, dtype=wp.float32, device=dev, requires_grad=True)
+            tape = wp.Tape()
+            with tape:
+                wp.launch(k, dim=n, inputs=[w, x], outputs=[out], device=dev)
+            out.grad = wp.array(np.ones(n, np.float32), device=dev)
+            tape.backward()
+            wp.synchronize_device(dev)
+            assert w.grad is None or w.grad.ptr is None, 'non-differentiable input grew a gradient'
+            np.testing.assert_allclose(x.grad.numpy(), w_np, rtol=1e-6)
+            """
+        )
+        _run_with_metal_native(self, snippet)
+
+    def test_mlx_dispatch_rejects_adjoint_launch(self):
+        # The default (MLX) path must say why rather than silently leaving
+        # every gradient at zero.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+            import warp as wp
+
+            wp.config.enable_metal = True
+            wp.config.metal_native_dispatch = False
+            wp.init()
+
+            @wp.kernel
+            def k(x: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
+                i = wp.tid()
+                out[i] = x[i] * x[i]
+
+            dev = 'metal:0'
+            x = wp.array(np.ones(4, np.float32), device=dev, requires_grad=True)
+            out = wp.zeros(4, dtype=wp.float32, device=dev, requires_grad=True)
+            tape = wp.Tape()
+            with tape:
+                wp.launch(k, dim=4, inputs=[x], outputs=[out], device=dev)
+            try:
+                tape.backward(grads={out: wp.array(np.ones(4, np.float32), device=dev)})
+            except RuntimeError as e:
+                assert 'native dispatch' in str(e), str(e)
+            else:
+                raise AssertionError('MLX-path backward should have raised')
+            """
+        )
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, prefix="warp_metal_adj_mlx_") as f:
+            f.write(snippet)
+            path = f.name
+        try:
+            result = subprocess.run([sys.executable, path], check=False, capture_output=True, text=True, timeout=60)
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"subprocess exited with {result.returncode}\n--- stdout ---\n{result.stdout}"
+            f"\n--- stderr ---\n{result.stderr}",
+        )
 
 
 if __name__ == "__main__":

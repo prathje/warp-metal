@@ -1098,6 +1098,235 @@ inline ulong wp_f32_to_f64(float f) {
 """
 
 
+# ---------------------------------------------------------------------------
+# Reverse-mode (adjoint) helpers
+#
+# Warp's reverse IR calls ``wp::adj_<builtin>(fwd args..., [fwd ret,]
+# adj args..., adj ret)`` with the adjoint arguments taken by mutable
+# reference. The arities below mirror ``warp/native/*.h`` exactly — an
+# arity mismatch would silently bind the wrong operand, so each helper
+# is written against the signature grepped from the native header rather
+# than inferred.
+#
+# Adjoint locals live in ``thread`` address space (they are plain kernel
+# locals), so ``thread T&`` out-params are the MSL spelling of the
+# native ``T&``. Explicit non-template overloads for mixed-type cases
+# (vec * scalar) beat the generic template in overload resolution, which
+# is why no ``enable_if`` gymnastics are needed.
+# ---------------------------------------------------------------------------
+_ADJ_HELPERS = """\
+template <typename T> inline void wp_adj_add(T a, T b, thread T& aa, thread T& ab, T r) { aa += r; ab += r; }
+template <typename T> inline void wp_adj_sub(T a, T b, thread T& aa, thread T& ab, T r) { aa += r; ab -= r; }
+template <typename T> inline void wp_adj_mul(T a, T b, thread T& aa, thread T& ab, T r) { aa += b * r; ab += a * r; }
+template <typename T> inline void wp_adj_div(T a, T b, T ret, thread T& aa, thread T& ab, T r) {
+    aa += r / b;
+    ab -= r * ret / b;
+}
+template <typename T> inline void wp_adj_neg(T x, thread T& ax, T r) { ax -= r; }
+template <typename T> inline void wp_adj_copy(T src, thread T& adj_src, thread T& adj_dest) {
+    adj_src += adj_dest;
+    adj_dest = T(0);
+}
+// Matches ``warp/native/builtin.h``: assign is non-differentiable except
+// through read-modify-write, where the adjoint MOVES (``=``, not ``+=``).
+template <typename T> inline void wp_adj_assign(T dest, T src, thread T& adj_dest, thread T& adj_src) {
+    adj_src = adj_dest;
+    adj_dest = T(0);
+}
+template <typename C, typename T>
+inline void wp_adj_where(C c, T a, T b, thread C& ac, thread T& aa, thread T& ab, T r) {
+    if (!!c) aa += r; else ab += r;
+}
+template <typename T> inline void wp_adj_sqrt(T x, T ret, thread T& ax, T r) {
+    ax += T(0.5) * (T(1) / ret) * r;
+}
+template <typename T> inline void wp_adj_sin(T x, thread T& ax, T r) { ax += metal::cos(x) * r; }
+template <typename T> inline void wp_adj_cos(T x, thread T& ax, T r) { ax -= metal::sin(x) * r; }
+template <typename T> inline void wp_adj_exp(T x, T ret, thread T& ax, T r) { ax += ret * r; }
+template <typename T> inline void wp_adj_log(T x, thread T& ax, T r) { ax += r / x; }
+template <typename T> inline void wp_adj_tanh(T x, T ret, thread T& ax, T r) { ax += r * (T(1) - ret * ret); }
+template <typename T> inline void wp_adj_abs(T x, thread T& ax, T r) { ax += x < T(0) ? -r : r; }
+template <typename T> inline void wp_adj_min(T a, T b, thread T& aa, thread T& ab, T r) {
+    if (a < b) aa += r; else ab += r;
+}
+template <typename T> inline void wp_adj_max(T a, T b, thread T& aa, thread T& ab, T r) {
+    if (a > b) aa += r; else ab += r;
+}
+// ``wp.float32(x)`` / ``wp.int32(x)`` style casts. Warp emits
+// ``adj_<type>(x, adj_x, adj_ret)``; integer results carry no gradient.
+template <typename T, typename U> inline void wp_adj_cast(T x, thread T& ax, U r) { ax += T(r); }
+template <typename T, typename U> inline void wp_adj_cast_nodiff(T x, thread T& ax, U r) { }
+// Gradient accumulation into a ``device`` buffer. Several threads can hold
+// the adjoint of the same array element (any kernel where more than one
+// lane reads ``arr[i]``), so this must be atomic. The pointer cast is
+// legal MSL and verified to give the right total under contention.
+inline void wp_adj_accum(device float* p, float v) {
+    atomic_fetch_add_explicit((device atomic_float*)p, v, memory_order_relaxed);
+}
+"""
+
+# Per-vector-length adjoint helpers: component constructors, dot/length/
+# normalize, and the mixed vec*scalar products. Emitted only for the
+# lengths a kernel actually uses so the generated source stays readable.
+_ADJ_VEC_HELPER_LENGTHS = (2, 3, 4)
+
+
+def _adj_vec_helpers(n: int) -> str:
+    """MSL adjoint helpers for the native ``floatN`` vector type."""
+    v = f"float{n}"
+    comps = "".join(f"    a{i} += r[{i}];\n" for i in range(n))
+    args = ", ".join(f"float c{i}" for i in range(n))
+    refs = ", ".join(f"thread float& a{i}" for i in range(n))
+    return (
+        f"inline void wp_adj_vec_t({args}, {refs}, {v} r) {{\n{comps}}}\n"
+        f"inline void wp_adj_mul({v} a, float b, thread {v}& aa, thread float& ab, {v} r) {{\n"
+        f"    aa += b * r;\n    ab += metal::dot(a, r);\n}}\n"
+        f"inline void wp_adj_mul(float a, {v} b, thread float& aa, thread {v}& ab, {v} r) {{\n"
+        f"    aa += metal::dot(b, r);\n    ab += a * r;\n}}\n"
+        f"inline void wp_adj_div({v} a, float b, {v} ret, thread {v}& aa, thread float& ab, {v} r) {{\n"
+        f"    aa += r / b;\n    ab -= metal::dot(r, ret) / b;\n}}\n"
+        f"inline void wp_adj_dot({v} a, {v} b, thread {v}& aa, thread {v}& ab, float r) {{\n"
+        f"    aa += b * r;\n    ab += a * r;\n}}\n"
+        f"inline void wp_adj_length({v} a, float ret, thread {v}& aa, float r) {{\n"
+        f"    if (ret > 0.0f) aa += a * (r / ret);\n}}\n"
+        f"inline void wp_adj_length_sq({v} a, thread {v}& aa, float r) {{ aa += a * (2.0f * r); }}\n"
+        f"inline void wp_adj_normalize({v} a, {v} ret, thread {v}& aa, {v} r) {{\n"
+        f"    float d = metal::length(a);\n"
+        f"    if (d > 0.0f) aa += (r - ret * metal::dot(ret, r)) / d;\n}}\n"
+        # ``wp.extract(v, i)`` on a vector: scatter the scalar adjoint back
+        # into the indexed component. The index itself is non-differentiable.
+        f"inline void wp_adj_extract({v} a, int i, thread {v}& aa, thread int& ai, float r) {{\n"
+        f"    aa[i] += r;\n}}\n"
+    )
+
+
+_ADJ_VEC3_EXTRA = """\
+inline void wp_adj_cross(float3 a, float3 b, thread float3& aa, thread float3& ab, float3 r) {
+    aa += metal::cross(b, r);
+    ab += metal::cross(r, a);
+}
+"""
+
+# ``wp::adj_<name>`` -> ``wp_adj_<name>`` for everything the helper block
+# above defines. Anything absent stays as ``wp::adj_*`` and trips
+# ``_check_no_unsupported_intrinsics``, which is the intended failure mode:
+# a named, actionable gap instead of a wrong gradient.
+_ADJ_SUPPORTED = frozenset(
+    {
+        "add",
+        "sub",
+        "mul",
+        "div",
+        "neg",
+        "copy",
+        "assign",
+        "where",
+        "sqrt",
+        "sin",
+        "cos",
+        "exp",
+        "log",
+        "tanh",
+        "abs",
+        "min",
+        "max",
+        "vec_t",
+        "dot",
+        "length",
+        "length_sq",
+        "normalize",
+        "cross",
+        "extract",
+    }
+)
+
+# Scalar-cast adjoints (``adj_float``, ``adj_int32``, ...). Float targets
+# propagate; integer targets are gradient sinks.
+_ADJ_FLOAT_CASTS = frozenset({"float", "float32", "float16", "float64"})
+_ADJ_INT_CASTS = frozenset({"int", "int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64", "bool"})
+
+
+def _msl_zero_init(msl_type: str) -> str:
+    """Zero-initialiser expression for an MSL value type.
+
+    Native types (``float``, ``float3``, ``float3x3``, ``int``) take the
+    broadcasting one-arg form; the generated ``wp_vecN`` / ``wp_matRxC``
+    structs have no such constructor and need aggregate value-init.
+    """
+    return f"{msl_type}()" if msl_type.startswith(("wp_mat", "wp_vec")) else f"{msl_type}(0)"
+
+
+_ADJ_CALL_PAT = re.compile(r"\bwp::adj_([A-Za-z_]\w*)\s*\(")
+
+# The three array-indexed adjoints, lowered inside the generator (they need
+# the array's shape to build a flat index).
+_ADJ_ARRAY_PAT = re.compile(
+    r"^(?P<indent>\s*)wp::adj_(?P<op>address|array_store|atomic_add)\s*\((?P<args>.*)\)\s*;\s*$"
+)
+
+
+_ADJ_AGGREGATE_INIT_PAT = re.compile(r"^(?P<indent>\s*)adj_(?P<label>\w+)\s*=\s*\{\s*\}\s*;\s*$")
+
+
+def _rewrite_adj_aggregate_init(line: str, zero_by_label: dict[str, str]) -> str:
+    """Turn ``adj_X = {};`` into a typed MSL zero assignment.
+
+    Warp emits C++ aggregate initialisation to reset a dual variable (loop-
+    carried adjoints, and the reset after an ``assign``). MSL has no ``= {}``
+    form, and the IR parser rejects the statement outright, so translate it
+    here using the same zero-init the declaration used.
+    """
+    m = _ADJ_AGGREGATE_INIT_PAT.match(line)
+    if m is None:
+        return line
+    zero = zero_by_label.get(m.group("label"))
+    if zero is None:
+        return line
+    return f"{m.group('indent')}adj_{m.group('label')} = {zero};"
+
+
+def _split_top_level_args(s: str) -> list[str]:
+    """Split a comma-separated argument list, ignoring nested brackets."""
+    out: list[str] = []
+    depth = 0
+    cur: list[str] = []
+    for ch in s:
+        if ch in "([{<":
+            depth += 1
+        elif ch in ")]}>":
+            depth -= 1
+        if ch == "," and depth == 0:
+            out.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    if cur:
+        out.append("".join(cur))
+    return out
+
+
+def _translate_adjoint_intrinsics(line: str) -> str:
+    """Rewrite ``wp::adj_<builtin>(...)`` calls to their MSL helpers.
+
+    Array-indexed adjoints (``adj_address``, ``adj_array_store``,
+    ``adj_atomic_add``) are *not* handled here — they need the flat-index
+    machinery that only the generator has, so they are lowered before
+    this pass runs.
+    """
+
+    def repl(m: re.Match[str]) -> str:
+        name = m.group(1)
+        if name in _ADJ_SUPPORTED:
+            return f"wp_adj_{name}("
+        if name in _ADJ_FLOAT_CASTS:
+            return "wp_adj_cast("
+        if name in _ADJ_INT_CASTS:
+            return "wp_adj_cast_nodiff("
+        return m.group(0)
+
+    return _ADJ_CALL_PAT.sub(repl, line)
+
+
 def _reject_f64_atomics(text: str, arr_names: set[str], kernel_name: str) -> None:
     """Raise if a kernel atomically accumulates into an fp32-demoted float64 array.
 
@@ -5394,6 +5623,13 @@ def _build_kernel_header(source: str) -> str:
         parts.append(_DIAG_HELPERS)
     if "wp_f64_to_f32" in source or "wp_f32_to_f64" in source:
         parts.append(_F64_HELPERS)
+    if "wp_adj_" in source:
+        parts.append(_ADJ_HELPERS)
+        for _n in _ADJ_VEC_HELPER_LENGTHS:
+            if f"float{_n}" in source:
+                parts.append(_adj_vec_helpers(_n))
+        if "wp_adj_cross" in source:
+            parts.append(_ADJ_VEC3_EXTRA)
     # Always emitted: kernels reference ``wp_normalize``/``wp_quat_normalize``
     # directly, and the quat/noise/BVH helper families below call
     # ``wp_normalize`` internally (mirroring native code's guarded
@@ -8165,6 +8401,9 @@ class MetalKernelArtifact:
     # ``device atomic<T>*`` in the generated function signature, and the
     # ``init_value=0.0`` fallback is applied at call time.
     atomic_outputs: bool = False
+    # Output names that must NOT be typed ``device atomic<T>*`` even when
+    # ``atomic_outputs`` is set — the reverse pass's gradient buffers.
+    nonatomic_outputs: tuple[str, ...] = ()
     # Legacy: names of outputs whose shape we used to pass as a synthetic
     # per-output ``<name>_shape`` input. Now superseded by the packed
     # shape buffer (see ``shape_packed_arrs``); kept on the artifact for
@@ -8390,7 +8629,7 @@ def _strip_comments_and_directives(line: str) -> str | None:
     return line
 
 
-def _ensure_adj_built(kernel, block_dim: int | None = None):
+def _ensure_adj_built(kernel, block_dim: int | None = None, enable_backward: bool = False):
     """Build the kernel's forward IR if it hasn't been already; return the adj.
 
     Split out of ``generate_msl_kernel`` so the artifact-cache wrapper can
@@ -8405,6 +8644,23 @@ def _ensure_adj_built(kernel, block_dim: int | None = None):
     codegen and launcher geometry key off that marker.
     """
     adj = kernel.adj
+
+    # Reverse-mode codegen needs ``body_replay`` / ``body_reverse``, which
+    # only a backward-enabled build populates. A forward-only build may
+    # already be cached on the kernel, so force a rebuild in that case —
+    # ``Adjoint.build`` fully resets IR state, so this is safe (the forward
+    # artifact is cached separately and keyed off the same ``body_forward``,
+    # which a backward-enabled build produces identically).
+    if enable_backward and not getattr(adj.blocks[0] if getattr(adj, "blocks", None) else None, "body_reverse", None):
+        adj.build(
+            builder=None,
+            default_builder_options={
+                "enable_backward": True,
+                "output_arch": None,
+                "block_dim": 1,
+                "metal_backend": True,
+            },
+        )
 
     # Build the IR if not already built. Pass enable_backward=False because
     # we only consume the forward pass — the Metal backend does not yet
@@ -8490,15 +8746,25 @@ def _artifact_display_name(kernel, adj) -> str:
     return name
 
 
-def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
+def _generate_msl_kernel_uncached(
+    kernel, adjoint: bool = False, grad_args: tuple[str, ...] = ()
+) -> MetalKernelArtifact:
     """Build an MSL artifact for a Warp ``Kernel`` object.
 
     The kernel must already have been added to a module so that
     ``kernel.adj.build()`` can resolve overloads. We invoke ``build()``
     here defensively in case it hasn't run yet.
+
+    With ``adjoint=True`` the artifact is the kernel's *backward* pass:
+    the statement source becomes Warp's replay body (the forward
+    recompute, with stores commented out) followed by the reverse body,
+    and one extra writable array arg named ``adj_<name>`` is appended per
+    differentiable array arg to receive the gradients.
     """
-    adj = _ensure_adj_built(kernel)
+    adj = _ensure_adj_built(kernel, enable_backward=adjoint)
     artifact_name = _artifact_display_name(kernel, adj)
+    if adjoint:
+        artifact_name = f"{artifact_name}__adj"
 
     # Preprocess via the AST pipeline (see ``warp._src.codegen_metal_ast``):
     #   parse → structural fold (for/while/if) → drop unsupported locals
@@ -8520,7 +8786,27 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
         if m_info is not None:
             _early_mat_arr_info[arg.label] = m_info
 
-    _ast_nodes = _ast_parse(adj.blocks[0].body_forward)
+    # Reverse mode consumes replay (forward recompute) followed by the
+    # reverse statements. ``body_reverse`` is accumulated in FORWARD order
+    # and consumed reversed (``codegen.codegen_func_reverse`` does
+    # ``for l in reversed(...)``); nested blocks are pre-reversed when they
+    # are spliced in, so one flat reverse here is correct and matches what
+    # the CPU/CUDA backends emit.
+    if adjoint:
+        _ir_lines = list(adj.blocks[0].body_replay) + list(reversed(adj.blocks[0].body_reverse))
+        # Warp resets a dual var with C++ aggregate init (``adj_15 = {};``),
+        # which MSL has no equivalent for. Rewrite to the typed zero the
+        # declaration used; the type comes from the variable's value type.
+        _adj_zero_types: dict[str, str] = {}
+        for _v in adj.variables:
+            try:
+                _adj_zero_types[str(_v.label)] = _msl_zero_init(_msl_var_type(_v.ctype(value_type=True)))
+            except MetalCodegenError:
+                pass
+        _ir_lines = [_rewrite_adj_aggregate_init(ln, _adj_zero_types) for ln in _ir_lines]
+    else:
+        _ir_lines = adj.blocks[0].body_forward
+    _ast_nodes = _ast_parse(_ir_lines)
     _ast_nodes, _struct_skip = _ast_fold(_ast_nodes, query_iter_vars=_ast_query_iterator_vars(adj))
     # Inline ``@wp.func`` user-function calls into the kernel body before
     # the view / indexref / drop folds run, so those folds see the spliced-
@@ -8735,6 +9021,25 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
             else:
                 input_args.append(syn_var)
 
+    # Synthetic gradient array args (reverse mode). One writable array per
+    # differentiable array arg whose launch-time value carried a ``.grad``
+    # — which arrays those are is baked into the artifact (it is part of
+    # the cache key), so adjoint statements touching a gradient-less array
+    # lower to nothing at all rather than branching at runtime.
+    grad_array_vars: list = []
+    grad_arg_of: dict[str, str] = {}
+    if adjoint:
+        from warp._src.codegen import Var as _WpVar  # noqa: PLC0415
+
+        for arg in adj.args:
+            if arg.label not in grad_args or not _is_array_arg(arg):
+                continue
+            gname = f"adj_{arg.label}"
+            gvar = _WpVar(gname, arg.type)
+            grad_array_vars.append(gvar)
+            grad_arg_of[arg.label] = gname
+            output_args.append(gvar)
+
     if not output_args:
         raise MetalCodegenError(
             f"Kernel {adj.fun_name!r} has no output array; MSL kernels must write through at least one output buffer"
@@ -8760,7 +9065,9 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
     # native vec dtype and ``packed_floatN`` pointer casts hit address-space
     # mismatches in MLX-generated wrappers. So we emit per-component reads
     # ``floatN(arr[i*N+0], arr[i*N+1], ...)`` instead of any cast trick.
-    arg_label_set = {a.label for a in adj.args} | {v.label for v in struct_field_array_vars}
+    arg_label_set = (
+        {a.label for a in adj.args} | {v.label for v in struct_field_array_vars} | {v.label for v in grad_array_vars}
+    )
     # Map argname -> (vec_size, msl_scalar) for each vec-typed array arg,
     # argname -> (rows, cols, msl_scalar) for each mat-typed array arg, and
     # argname -> _StructLayout for each struct-typed array arg.
@@ -8772,7 +9079,7 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
     # every read must go through ``wp_f64_to_f32`` and every write through
     # ``wp_f32_to_f64``. Index arithmetic is unchanged.
     f64_arr_names: set[str] = set()
-    for arg in (*adj.args, *struct_field_array_vars):
+    for arg in (*adj.args, *struct_field_array_vars, *grad_array_vars):
         if _is_array_arg(arg) and _is_demoted_f64_array(arg):
             f64_arr_names.add(arg.label)
     if f64_arr_names:
@@ -8782,7 +9089,7 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
         """Wrap a raw element access in the fp64->fp32 conversion if needed."""
         return f"wp_f64_to_f32({slot})" if arr_name in f64_arr_names else slot
 
-    for arg in (*adj.args, *struct_field_array_vars):
+    for arg in (*adj.args, *struct_field_array_vars, *grad_array_vars):
         v_info = _vec_dtype_info(arg)
         if v_info is not None:
             vec_arr_info[arg.label] = v_info
@@ -9213,6 +9520,34 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
         else:
             body_lines.append(f"    const {msl_type} var_{var.label} = {_msl_constant_str(var.constant)};")
 
+    # --- Adjoint (dual) locals -----------------------------------------
+    # Mirrors ``codegen.codegen_func_reverse``'s "dual vars" section: one
+    # zero-initialised ``adj_<label>`` per IR variable, typed as the
+    # variable's *value* type (a pointer local's adjoint is the pointee —
+    # ``wp::address`` produces ``T*`` but its adjoint accumulates a ``T``).
+    # Non-array kernel args get one too; their adjoints are write-only
+    # sinks the backward pass discards, but the reverse statements name
+    # them, so they must exist.
+    if adjoint:
+        for var in adj.variables:
+            ctype = var.ctype(value_type=True)
+            try:
+                msl_type = _msl_var_type(ctype)
+            except MetalCodegenError:
+                # A type we can't represent can still be harmless if no
+                # reverse statement touches its adjoint; leave it
+                # undeclared and let MSL name the symbol if it is used.
+                continue
+            body_lines.append(f"    {msl_type} adj_{var.label} = {_msl_zero_init(msl_type)};")
+        for arg in adj.args:
+            if _is_array_arg(arg) or arg.label in grad_arg_of:
+                continue
+            try:
+                msl_type = _msl_var_type(arg.ctype(value_type=True))
+            except MetalCodegenError:
+                continue
+            body_lines.append(f"    {msl_type} adj_{arg.label} = {_msl_zero_init(msl_type)};")
+
     # Emit per-field local declarations for inlined struct locals (their
     # mangled labels are not in ``adj.variables`` so the loop above
     # didn't catch them).
@@ -9276,7 +9611,14 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
     # *every* output buffer comes through as ``device atomic<T>*``. Reads
     # via plain subscripting won't compile, so we'll wrap them in
     # ``atomic_load_explicit`` inside ``_finalize``.
-    atomic_output_names: set[str] = {a.label for a in output_args} if has_atomic else set()
+    # Gradient buffers stay plain ``device T*`` even in an atomic kernel:
+    # the reverse pass both accumulates into them (through an explicit
+    # atomic pointer cast) and reads/zeroes them non-atomically, which
+    # ``device atomic<T>*`` would not allow.
+    grad_label_set = {v.label for v in grad_array_vars}
+    atomic_output_names: set[str] = (
+        {a.label for a in output_args if a.label not in grad_label_set} if has_atomic else set()
+    )
 
     # ``tile_view`` materialisation registry: view local label →
     # (parent_label, parent_rows, parent_cols, view_rows, view_cols,
@@ -9459,7 +9801,12 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
     # the array name inline (e.g. ``wp::lower_bound(var_<syn>, ...)``)
     # need the same ``var_`` strip as real args.
     _arg_label_alt = "|".join(
-        re.escape(lbl) for lbl in [*(arg.label for arg in adj.args), *(v.label for v in struct_field_array_vars)]
+        re.escape(lbl)
+        for lbl in [
+            *(arg.label for arg in adj.args),
+            *(v.label for v in struct_field_array_vars),
+            *(v.label for v in grad_array_vars),
+        ]
     )
     _arg_rename_pat = re.compile(rf"\bvar_({_arg_label_alt})\b") if _arg_label_alt else None
 
@@ -9470,6 +9817,11 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
         # subscript inlining rewrites the ``var_X`` operand names the
         # type lookup keys on.
         translated = _rewrite_quat_mul(translated)
+        # Reverse-mode builtin calls (``wp::adj_mul`` -> ``wp_adj_mul``).
+        # Only the operand names still need substituting after this, and
+        # the adjoint operands are plain locals, so order is free.
+        if adjoint:
+            translated = _translate_adjoint_intrinsics(translated)
         # Lower tile intrinsics *before* the subscript-substitute pass —
         # the tile pattern matches on the raw ``wp::tile_*<...>`` shape,
         # which contains ``var_X`` operands that the substitute would
@@ -9615,6 +9967,53 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
         m_decl = inlined_decl_pat.match(raw)
         if m_decl and m_decl.group(1) in subscript_map:
             continue
+        # --- Array-indexed adjoints (reverse mode) ----------------------
+        # These three need the flat-index machinery, so they are lowered
+        # here rather than in the generic ``wp::adj_*`` translator. An
+        # array with no launch-time ``.grad`` has no gradient sink, so its
+        # statements lower to nothing at all.
+        if adjoint:
+            m_adj_arr = _ADJ_ARRAY_PAT.match(raw)
+            if m_adj_arr:
+                op = m_adj_arr.group("op")
+                indent = m_adj_arr.group("indent")
+                args = [a.strip() for a in _split_top_level_args(m_adj_arr.group("args"))]
+                arr = args[0][len("var_") :] if args[0].startswith("var_") else args[0]
+                # Arity per ``warp/native/array.h``:
+                #   address:     arr, i..,        adj_arr, adj_i.., adj_ret
+                #   array_store: arr, i.., value, adj_arr, adj_i.., adj_value
+                #   atomic_add:  arr, i.., value, adj_arr, adj_i.., adj_value, adj_ret
+                fixed = {"address": 3, "array_store": 4, "atomic_add": 5}[op]
+                if (len(args) - fixed) % 2 != 0:
+                    raise MetalCodegenError(f"Kernel {adj.fun_name!r}: unexpected wp::adj_{op} arity in: {raw.strip()}")
+                ndim = (len(args) - fixed) // 2
+                indices = args[1 : 1 + ndim]
+                grad_name = grad_arg_of.get(arr)
+                if grad_name is None:
+                    continue
+                # ``adj_value`` for atomic_add sits before the trailing
+                # ``adj_ret``; for the other two it is last.
+                adj_val = args[-2] if op == "atomic_add" else args[-1]
+                flat = _flat_index_expr(arr, indices)
+                vec_n = vec_arr_info.get(arr, (None,))[0]
+                if arr in mat_arr_info or arr in struct_arr_info:
+                    raise MetalCodegenError(
+                        f"Kernel {adj.fun_name!r}: reverse mode through a mat- or struct-element "
+                        f"array ({arr!r}) is not supported on Metal yet"
+                    )
+                slots = (
+                    [(f"({flat}) * {vec_n} + {k}", f"[{k}]") for k in range(vec_n)] if vec_n else [(f"({flat})", "")]
+                )
+                for idx_expr, comp in slots:
+                    tgt = f"{grad_name}[{idx_expr}]"
+                    if op == "address":
+                        body_lines.append(_finalize(f"{indent}wp_adj_accum(&{tgt}, {adj_val}{comp});"))
+                    elif op == "atomic_add":
+                        body_lines.append(_finalize(f"{indent}{adj_val}{comp} += {tgt};"))
+                    else:  # array_store consumes the incoming gradient
+                        body_lines.append(_finalize(f"{indent}{adj_val}{comp} += {tgt};"))
+                        body_lines.append(_finalize(f"{indent}{tgt} = 0.0f;"))
+                continue
         # Address lines have been folded into ``subscript_map`` (or, for
         # struct-element pointers, ``struct_refs``). An address whose base
         # is NOT a bound array name was never registered — dropping it
@@ -10655,7 +11054,9 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
     _SHAPE_SLOT = 4  # max ndim per array — Warp arrays cap at 4D
     _shape_idx_pat = re.compile(r"\b(\w+)_shape\[([^\]]+)\]")
     _shape_arrs_seen: list[str] = []
-    arg_label_set_local = {a.label for a in adj.args} | {v.label for v in struct_field_array_vars}
+    arg_label_set_local = (
+        {a.label for a in adj.args} | {v.label for v in struct_field_array_vars} | {v.label for v in grad_array_vars}
+    )
     for line in body_lines:
         for _m in _shape_idx_pat.finditer(line):
             _arr = _m.group(1)
@@ -10873,6 +11274,7 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
         input_args=input_args,
         output_args=output_args,
         atomic_outputs=has_atomic,
+        nonatomic_outputs=tuple(sorted(grad_label_set)),
         output_shape_inputs=[],
         shape_packed_arrs=tuple(_shape_arrs_seen),
         shape_packed_slot=_SHAPE_SLOT,
@@ -11137,23 +11539,33 @@ def _store_cached_artifact(key: str, artifact: MetalKernelArtifact) -> None:
         pass
 
 
-def generate_msl_kernel(kernel, block_dim: int | None = None) -> MetalKernelArtifact:
+def generate_msl_kernel(
+    kernel, block_dim: int | None = None, adjoint: bool = False, grad_args: tuple[str, ...] = ()
+) -> MetalKernelArtifact:
     """Return the MSL artifact for a Warp ``Kernel``, using the on-disk
     cache when possible.
 
     ``block_dim`` is the launch's block width — it decides whether the IR
     is rebuilt for the distributed-tile path (see ``_ensure_adj_built``).
 
+    ``adjoint`` selects the backward pass; ``grad_args`` names the array
+    args that carry a ``.grad`` at launch time. Both change the generated
+    source, so both join the cache key.
+
     See ``_generate_msl_kernel_uncached`` for the actual translation
     pipeline and ``_artifact_cache_key`` for what invalidates entries.
     """
-    adj = _ensure_adj_built(kernel, block_dim=block_dim)
-    key = _artifact_cache_key(kernel, adj)
+    adj = _ensure_adj_built(kernel, block_dim=block_dim, enable_backward=adjoint)
+    # The on-disk cache reconstructs arg Vars by looking their labels up in
+    # ``adj.args``, which cannot resolve the synthetic ``adj_<name>`` grad
+    # vars — so backward artifacts are memory-cached only (see
+    # ``_get_or_build_metal_kernel_native``).
+    key = None if adjoint else _artifact_cache_key(kernel, adj)
     if key is not None:
         cached = _load_cached_artifact(key, adj)
         if cached is not None:
             return cached
-    artifact = _generate_msl_kernel_uncached(kernel)
+    artifact = _generate_msl_kernel_uncached(kernel, adjoint=adjoint, grad_args=grad_args)
     if key is not None:
         _store_cached_artifact(key, artifact)
     return artifact
@@ -12215,7 +12627,8 @@ def _wrap_msl_for_native_dispatch(artifact) -> str:
         if arg_var is None:
             raise MetalCodegenError(f"Native dispatch: output {name!r} has no matching Var in artifact.output_args")
         inner = _native_array_inner_msl(arg_var)
-        qual = f"device atomic<{inner}>*" if artifact.atomic_outputs else f"device {inner}*"
+        atomic_ok = artifact.atomic_outputs and name not in artifact.nonatomic_outputs
+        qual = f"device atomic<{inner}>*" if atomic_ok else f"device {inner}*"
         add_buffer(f"{qual} {name}")
 
     # Builtins — always include the full set so the body's references
@@ -12299,14 +12712,33 @@ def _coop_upgrade_pending(kernel, artifact, block_dim: int | None) -> bool:
     )
 
 
-def _get_or_build_metal_kernel_native(kernel, block_dim: int | None = None):
+def _get_or_build_metal_kernel_native(
+    kernel, block_dim: int | None = None, adjoint: bool = False, grad_args: tuple[str, ...] = ()
+):
     """Return ``(artifact, pso)`` for a Warp kernel under native dispatch.
 
     Caches the PSO on the kernel object so subsequent launches skip
     compilation entirely. Falls back to ``(artifact, None)`` for no-op
     kernels (all args pruned), matching the MLX path's behaviour.
+
+    Backward passes cache under a separate key per ``grad_args`` set,
+    since which arrays have gradients changes the generated source.
     """
     from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
+
+    if adjoint:
+        cache = getattr(kernel, "_metal_adj_cache", None)
+        if cache is None:
+            cache = {}
+            kernel._metal_adj_cache = cache
+        hit = cache.get(grad_args)
+        if hit is not None:
+            return hit
+        artifact = generate_msl_kernel(kernel, block_dim=block_dim, adjoint=True, grad_args=grad_args)
+        wrapped = _wrap_msl_for_native_dispatch(artifact)
+        pso = get_dispatcher().compile(wrapped, f"custom_kernel_{artifact.name}")
+        cache[grad_args] = (artifact, pso)
+        return artifact, pso
 
     artifact = getattr(kernel, "_metal_artifact", None)
     pso = getattr(kernel, "_metal_native_pso", None)
@@ -12445,7 +12877,17 @@ def _normalize_none_array_args(kernel, fwd_args: list, device) -> None:
         fwd_args[i] = placeholder
 
 
-def launch_metal_kernel_native(kernel, dim, inputs, outputs, device, block_dim: int = 256):
+def launch_metal_kernel_native(
+    kernel,
+    dim,
+    inputs,
+    outputs,
+    device,
+    block_dim: int = 256,
+    adjoint: bool = False,
+    adj_inputs=(),
+    adj_outputs=(),
+):
     """CUDA-style native Metal dispatch.
 
     Bypasses ``mx.fast.metal_kernel`` and dispatches directly through
@@ -12482,7 +12924,32 @@ def launch_metal_kernel_native(kernel, dim, inputs, outputs, device, block_dim: 
 
     _reject_unsupported_launch_args(kernel, [*inputs, *outputs])
 
-    artifact, pso = _get_or_build_metal_kernel_native(kernel, block_dim=block_dim)
+    # Reverse mode: pair each array arg with the gradient array the tape
+    # supplied for it. ``adj_<label>`` names the synthetic grad arg the
+    # codegen appends; args with no gradient are absent from ``grad_args``
+    # and their adjoint statements were compiled out entirely.
+    grad_value_of: dict[str, Any] = {}
+    grad_args: tuple[str, ...] = ()
+    if adjoint:
+        adj_values = list(adj_inputs) + list(adj_outputs)
+        names = []
+        # Not strict: a caller may pass fewer adjoint arrays than the kernel
+        # has arguments (or none at all), in which case the missing ones
+        # simply have no gradient sink — same tolerance as the CPU/CUDA
+        # ``pack_args`` path.
+        for arg, gval in zip(kernel.adj.args, adj_values, strict=False):
+            if gval is None or not _is_array_arg(arg):
+                continue
+            if getattr(gval, "device", None) is None or not gval.device.is_metal:
+                raise RuntimeError(
+                    f"Kernel '{kernel.key}': gradient array for {arg.label!r} must live on a "
+                    f"Metal device; got {getattr(gval, 'device', '?')}"
+                )
+            names.append(arg.label)
+            grad_value_of[f"adj_{arg.label}"] = gval
+        grad_args = tuple(names)
+
+    artifact, pso = _get_or_build_metal_kernel_native(kernel, block_dim=block_dim, adjoint=adjoint, grad_args=grad_args)
     if pso is None:
         return
 
@@ -12506,10 +12973,20 @@ def launch_metal_kernel_native(kernel, dim, inputs, outputs, device, block_dim: 
         kernel._metal_native_struct_field_args = {
             syn: (root, tuple(fpath)) for syn, root, fpath in getattr(artifact, "struct_array_args", ())
         }
-    arg_var_by_name = kernel._metal_native_arg_var_by_name
-    out_var_by_name = kernel._metal_native_out_var_by_name
-    init_shadow_names = kernel._metal_native_init_shadow_names
-    struct_field_args = kernel._metal_native_struct_field_args
+    if adjoint:
+        # The backward artifact has a different arg set (grad buffers
+        # appended), so the per-kernel forward metadata does not apply.
+        arg_var_by_name = {a.label: a for a in artifact.input_args}
+        out_var_by_name = {a.label: a for a in artifact.output_args}
+        init_shadow_names = frozenset(n for n in artifact.input_names if n.endswith("__init"))
+        struct_field_args = {
+            syn: (root, tuple(fpath)) for syn, root, fpath in getattr(artifact, "struct_array_args", ())
+        }
+    else:
+        arg_var_by_name = kernel._metal_native_arg_var_by_name
+        out_var_by_name = kernel._metal_native_out_var_by_name
+        init_shadow_names = kernel._metal_native_init_shadow_names
+        struct_field_args = kernel._metal_native_struct_field_args
 
     dispatcher = get_dispatcher()
     bindings: list = []
@@ -12910,6 +13387,14 @@ def launch_metal_kernel_native(kernel, dim, inputs, outputs, device, block_dim: 
     # by Warp convention.
     # output_init_shadow_set already cached on kernel above.
     for name in artifact.output_names:
+        gval = grad_value_of.get(name)
+        if gval is not None:
+            # Synthetic gradient buffer (reverse mode) — bind the tape's
+            # grad array read-write: adj_address accumulates into it and
+            # adj_array_store consumes and zeroes elements.
+            bindings.append(_resolve_mtl(gval, kernel.key, name))
+            binding_modes.append("rw")
+            continue
         sfa = struct_field_args.get(name)
         if sfa is not None:
             # Written struct-arg array field: bind the field's buffer
@@ -13103,7 +13588,17 @@ class MetalLaunch:
         launch_metal_kernel(self.kernel, self.dim, self._inputs, self._outputs, self.device, block_dim=self.block_dim)
 
 
-def launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim: int = 256):
+def launch_metal_kernel(
+    kernel,
+    dim,
+    inputs,
+    outputs,
+    device,
+    block_dim: int = 256,
+    adjoint: bool = False,
+    adj_inputs=(),
+    adj_outputs=(),
+):
     """Dispatch a Warp kernel on a Metal device via MLX.
 
     This is the Metal-specific equivalent of the CUDA/CPU launch path in
@@ -13127,7 +13622,24 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim: int = 2
     import warp.config as _wp_cfg  # noqa: PLC0415
 
     if _wp_cfg.metal_native_dispatch:
-        return launch_metal_kernel_native(kernel, dim, inputs, outputs, device, block_dim=block_dim)
+        return launch_metal_kernel_native(
+            kernel,
+            dim,
+            inputs,
+            outputs,
+            device,
+            block_dim=block_dim,
+            adjoint=adjoint,
+            adj_inputs=adj_inputs,
+            adj_outputs=adj_outputs,
+        )
+    if adjoint:
+        raise RuntimeError(
+            "Metal adjoint (backward) launches require native dispatch; set "
+            "warp.config.metal_native_dispatch (WARP_METAL_NATIVE_DISPATCH=1). The MLX "
+            "dispatch path allocates fresh output buffers from a pool, which cannot "
+            "accumulate into caller-owned gradient arrays."
+        )
 
     import ctypes  # noqa: PLC0415
 

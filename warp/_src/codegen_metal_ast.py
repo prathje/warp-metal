@@ -387,7 +387,12 @@ _RE_WHILE_COND = re.compile(
     r"goto\s+(?P<end>end_while_\d+)\s*;\s*$"
 )
 _RE_TID = re.compile(r"^\s*builtin_tid(?P<arity>\d)d?\s*\((?P<args>[^()]*)\)\s*;\s*$")
-_RE_ASSIGN = re.compile(r"^(?P<indent>\s*)var_(?P<lhs>\w+)\s*=\s*(?P<rhs>.+?)\s*;\s*$")
+# Reverse-mode dual-variable resets (``adj_15 = int(0);``) assign to an
+# ``adj_``-prefixed local rather than a ``var_`` one. They are parsed as
+# ordinary assignments so they keep their position in the statement stream;
+# the ``lhs`` keeps its ``adj_`` prefix so no downstream fold can mistake it
+# for the same-numbered primal variable.
+_RE_ASSIGN = re.compile(r"^(?P<indent>\s*)(?P<pfx>var_|adj_)(?P<lhs>\w+)\s*=\s*(?P<rhs>.+?)\s*;\s*$")
 _RE_VOID_CALL = re.compile(r"^(?P<indent>\s*)(?P<func>[\w:]+)\s*(?P<tpl><[^()]*>)?\s*\((?P<args>.*)\)\s*;\s*$")
 
 # RHS shape recognizers used inside Assign parsing. Each captures just enough
@@ -562,7 +567,8 @@ def parse_line(line: str) -> Node:
     m = _RE_ASSIGN.match(line)
     if m:
         rhs = m.group("rhs")
-        return Assign(raw=line, lhs=m.group("lhs"), expr=_parse_rhs(rhs))
+        lhs = m.group("lhs") if m.group("pfx") == "var_" else f"adj_{m.group('lhs')}"
+        return Assign(raw=line, lhs=lhs, expr=_parse_rhs(rhs))
 
     m = _RE_VOID_CALL.match(line)
     if m:

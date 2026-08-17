@@ -11996,8 +11996,6 @@ def launch(
     # backend, bypassing Warp's CUDA/CPU compilation pipeline (which would
     # try to emit CUDA/C++ for a kernel we want to lower to MSL instead).
     if device.is_metal:
-        if adjoint:
-            raise RuntimeError("Metal backend does not yet support adjoint launches")
         # Generic kernels (``dtype=Any``) need their concrete overload
         # resolved before MSL codegen — the type-inference + ``add_overload``
         # flow normally runs further down the launch path, after the
@@ -12014,7 +12012,17 @@ def launch(
             # ``MetalLaunch`` for the (lack of) replay optimisation.
             return MetalLaunch(kernel, dim, inputs, outputs, device, block_dim=block_dim)
 
-        launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim=block_dim)
+        launch_metal_kernel(
+            kernel,
+            dim,
+            inputs,
+            outputs,
+            device,
+            block_dim=block_dim,
+            adjoint=adjoint,
+            adj_inputs=adj_inputs,
+            adj_outputs=adj_outputs,
+        )
         # Record on an active tape so a later ``tape.backward()`` raises the
         # adjoint-launch error above instead of silently replaying an empty
         # tape (which would leave all gradients at zero).
