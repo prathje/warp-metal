@@ -19,6 +19,7 @@ import numpy as np
 import warp as wp
 from warp._src.codegen_metal import (
     MetalCodegenError,
+    _msl_constant_str,
     generate_msl_kernel,
 )
 
@@ -69,6 +70,22 @@ def _scale_then_subtract(
 ):
     tid = wp.tid()
     c[tid] = a[tid] * 3.0 - b[tid]
+
+
+# ``wp.constant`` wrapping a Warp-typed FLOAT scalar (not a Python float).
+# warp.fem builds its reference-cell measure this way.
+_HALF = wp.constant(wp.float32(0.5))
+_QUARTER = wp.constant(wp.float32(0.25))
+
+
+@wp.kernel
+def _typed_float_constants(
+    a: wp.array(dtype=wp.float32),
+    b: wp.array(dtype=wp.float32),
+    c: wp.array(dtype=wp.float32),
+):
+    tid = wp.tid()
+    c[tid] = a[tid] * _HALF + b[tid] * _QUARTER
 
 
 @wp.kernel
@@ -127,6 +144,23 @@ class TestMetalCodegenStructure(unittest.TestCase):
     def test_no_output_array_raises(self):
         with self.assertRaises(MetalCodegenError):
             generate_msl_kernel(_all_inputs_no_output)
+
+    def test_typed_float_constants_are_not_truncated(self):
+        # ``wp.float32(0.5)`` is neither a Python ``float`` nor a Python
+        # ``int``, so it used to fall through to an ``int(value)`` fallback
+        # and emit ``0`` — silently zeroing warp.fem's integration weights
+        # with no diagnostic. Both the literal and the result must survive.
+        src = generate_msl_kernel(_typed_float_constants).source
+        self.assertIn("0.5f", src)
+        self.assertIn("0.25f", src)
+
+    def test_msl_constant_str_typed_scalars(self):
+        for scalar_type in (wp.float16, wp.float32, wp.float64):
+            with self.subTest(scalar_type=scalar_type.__name__):
+                self.assertEqual(_msl_constant_str(scalar_type(0.5)), "0.5f")
+        # Typed ints must keep taking the integer path.
+        self.assertEqual(_msl_constant_str(wp.uint32(2)), "2")
+        self.assertEqual(_msl_constant_str(wp.int32(-7)), "-7")
 
     def test_float64_raises(self):
         # MSL has no native float64; this should be rejected at codegen time
@@ -200,6 +234,17 @@ class TestMetalCodegenCompiles(unittest.TestCase):
             np.array([1.0, 2.0], dtype=np.float32),
             np.array([0.5, 1.5], dtype=np.float32),
             np.array([2.5, 4.5], dtype=np.float32),  # a*3 - b
+            mx.float32,
+        )
+
+    def test_typed_float_constants_compile_and_run(self):
+        import mlx.core as mx  # noqa: PLC0415
+
+        self._run_one_element(
+            _typed_float_constants,
+            np.array([2.0, 4.0], dtype=np.float32),
+            np.array([8.0, 16.0], dtype=np.float32),
+            np.array([3.0, 6.0], dtype=np.float32),  # a*0.5 + b*0.25
             mx.float32,
         )
 

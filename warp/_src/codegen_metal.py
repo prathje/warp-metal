@@ -68,13 +68,26 @@ pointer to the offending statement):
 - ``wp::assign(dst, src)`` (in-place mutation, used by the loop body for
   accumulator updates).
 - Atomic ops on output arrays — ``wp.atomic_add``, ``wp.atomic_sub``,
-  ``wp.atomic_min``, ``wp.atomic_max`` — translated to MSL's
+  ``wp.atomic_min``, ``wp.atomic_max``, ``wp.atomic_cas``,
+  ``wp.atomic_exch`` — translated to MSL's
   ``atomic_fetch_*_explicit`` with relaxed ordering. The launcher sets
   ``mx.fast.metal_kernel(atomic_outputs=True)`` for kernels that use any
   atomic op, which makes *all* outputs of that kernel ``device atomic<T>*``.
   Kernels that mix ``wp.atomic_*`` with plain ``arr[i] = val`` writes on
   *different* outputs are supported by translating each regular scalar
   store to ``atomic_store_explicit`` when the kernel is in atomic mode.
+
+  CAVEAT — mutual-exclusion spin locks DEADLOCK on Apple GPUs. Threads in
+  a SIMD group execute in lockstep and Metal guarantees no independent
+  forward progress between them, so the classic
+  ``while wp.atomic_cas(lock, 0, 0, 1) == 1: pass`` acquire loop hangs as
+  soon as two threads contend: the waiting lanes can never retire to let
+  the holder reach its release. (Verified: ``dim=1`` completes, ``dim=2``
+  hangs indefinitely.) CUDA's independent thread scheduling makes the
+  same code work on NVIDIA hardware from Volta on. Lock-free patterns are
+  fine — a CAS retry loop where *every* thread makes progress on failure
+  (ticket counters, Treiber-style queues) works correctly, because no
+  lane's progress depends on another lane retiring first.
 - Vec types ``wp.vec2``/``wp.vec3``/``wp.vec4`` (and the corresponding
   int/uint variants) — native ``floatN`` / ``intN`` etc. in MSL.
   Constructor maps to ``floatN(...)``, ``[i]`` indexing maps to MSL
@@ -696,6 +709,15 @@ def _emit_big_mat_struct(name: str, rows: int, cols: int, msl_scalar: str) -> st
     body.append("    return true;")
     body.append("}")
     body.append(f"inline bool operator!=({name} a, {name} b) {{ return !(a == b); }}")
+    # Double-dot (Frobenius inner) product. The native-shape overloads in
+    # ``_MISC_MATH_HELPERS`` only cover square ``floatNxN``, so a big-mat
+    # operand (warp.fem's ``mat_t<2, 3>`` reference gradients) has no
+    # viable candidate without this one.
+    body.append(f"inline {msl_scalar} wp_ddot({name} a, {name} b) {{")
+    body.append(f"    {msl_scalar} s = ({msl_scalar})0;")
+    body.append(f"    for (int i = 0; i < {n}; ++i) s += a.c[i] * b.c[i];")
+    body.append("    return s;")
+    body.append("}")
     if rows == cols:
         # mat * mat (square — same struct type on both sides).
         body.append(f"inline {name} operator*({name} a, {name} b) {{")
@@ -3169,7 +3191,12 @@ _MISC_MATH_HELPERS: dict[str, str] = {
     "wp_degrees": ("template <typename T>\ninline T wp_degrees(T x) { return x * T(57.29577951308232087679); }"),
     "wp_radians": ("template <typename T>\ninline T wp_radians(T x) { return x * T(0.01745329251994329577); }"),
     # Outer product: element [i][j] = a[i] * b[j]. MSL matrices are
-    # column-major, so column j is ``a * b[j]``.
+    # column-major, so column j is ``a * b[j]``. Only the square shapes
+    # live here — ``outer(vecM, vecN)`` with M != N yields a non-square
+    # matrix, which the backend represents as a ``wp_matMxN_<scalar>``
+    # struct rather than an MSL native type. Those overloads are generated
+    # per-kernel by ``_emit_nonsquare_outer_overloads`` so they only ever
+    # name structs that kernel actually emits.
     "wp_outer": (
         "inline float2x2 wp_outer(float2 a, float2 b) {\n"
         "    return float2x2(a * b.x, a * b.y);\n"
@@ -3502,6 +3529,35 @@ _MISC_MATH_HELPERS: dict[str, str] = {
         "        if (atomic_compare_exchange_weak_explicit(u, &cur, newu, "
         "metal::memory_order_relaxed, metal::memory_order_relaxed)) { return curf; }\n"
         "    }\n"
+        "}"
+    ),
+    # Compare-and-swap. Warp returns the value that was in memory before
+    # the call, whether or not the swap happened; MSL's
+    # ``atomic_compare_exchange_weak_explicit`` instead returns a bool and
+    # writes the observed value back through ``expected``. The retry loop
+    # is not optional: the ``_weak`` form may fail *spuriously* with
+    # ``expected`` still equal to ``compare``, and returning that would
+    # tell the caller "the swap succeeded" when it did not — silently
+    # breaking every lock built on CAS. Only a mismatch is a real failure.
+    "wp_atomic_cas": (
+        "template <typename T>\n"
+        "inline T wp_atomic_cas(device metal::atomic<T>* p, T compare, T value, "
+        "metal::memory_order o = metal::memory_order_relaxed) {\n"
+        "    T expected = compare;\n"
+        "    while (!atomic_compare_exchange_weak_explicit(p, &expected, value, "
+        "metal::memory_order_relaxed, metal::memory_order_relaxed)) {\n"
+        "        if (expected != compare) { return expected; }\n"
+        "        expected = compare;\n"
+        "    }\n"
+        "    return compare;\n"
+        "}"
+    ),
+    # Unconditional swap; returns the previous value, like Warp's.
+    "wp_atomic_exch": (
+        "template <typename T>\n"
+        "inline T wp_atomic_exch(device metal::atomic<T>* p, T v, "
+        "metal::memory_order o = metal::memory_order_relaxed) {\n"
+        "    return atomic_exchange_explicit(p, v, metal::memory_order_relaxed);\n"
         "}"
     ),
     # Matrix inverse — port of warp/native/mat.h ``inverse_impl`` with
@@ -5171,6 +5227,34 @@ def _plan_smem_tiles(
     return plan, offset
 
 
+def _msl_vec_name(n: int, msl_scalar: str) -> str:
+    """MSL type name for ``vec_t<N, T>`` — native ``floatN`` or our struct."""
+    return f"{msl_scalar}{n}" if n in _MSL_VEC_NATIVE_N else f"wp_vec{n}_{msl_scalar}"
+
+
+def _emit_nonsquare_outer_overloads(shapes: set[tuple[int, int, str]]) -> str:
+    """Emit ``wp_outer`` overloads whose result is a non-square big-mat.
+
+    ``wp.outer(vecM, vecN)`` with M != N produces a ``mat_t<M, N>``, which
+    the backend represents as the row-major ``wp_matMxN_<scalar>`` struct
+    (MSL's native ``floatNxM`` has the wrong access semantics — see
+    ``_msl_mat_name``). Generated per kernel from the shapes whose structs
+    are actually emitted, so an overload can never reference a struct that
+    is not declared. Both native ``floatN`` and our big-vec structs expose
+    ``operator[]``, so the element reads below are uniform.
+    """
+    parts: list[str] = []
+    for rows, cols, scalar in sorted(shapes):
+        if rows == cols:
+            continue
+        mat = _msl_mat_name(rows, cols, scalar)
+        a_ty = _msl_vec_name(rows, scalar)
+        b_ty = _msl_vec_name(cols, scalar)
+        assigns = " ".join(f"r.c[{i * cols + j}] = a[{i}] * b[{j}];" for i in range(rows) for j in range(cols))
+        parts.append(f"inline {mat} wp_outer({a_ty} a, {b_ty} b) {{ {mat} r; {assigns} return r; }}")
+    return "\n".join(parts)
+
+
 def _build_kernel_header(source: str) -> str:
     """Scan ``source`` for helpers we need to emit (big-vec structs,
     big-mat structs, spatial helpers, diag helper, ``wp_mat_extract``
@@ -5302,6 +5386,10 @@ def _build_kernel_header(source: str) -> str:
             # legal MSL (it is an ordinary C++ namespace).
             "namespace metal { inline wp_mat1x1_float transpose(wp_mat1x1_float m) { return m; } }"
         )
+    if "wp_outer" in source:
+        nonsquare_outer = _emit_nonsquare_outer_overloads(seen_mat)
+        if nonsquare_outer:
+            parts.append(nonsquare_outer)
     if "wp_dot" in source:
         dot_overloads = _emit_wp_dot_overloads(source)
         if dot_overloads:
@@ -5777,6 +5865,15 @@ def _msl_constant_str(value) -> str:
         # Non-square / big matrix: custom row-major struct + ``_make`` factory
         # taking Warp's row-major argument order.
         return f"wp_mat{rows}x{cols}_{msl_scalar}_make({', '.join(elems)})"
+    # Warp's typed FLOAT scalars (``wp.constant(wp.float32(0.5))``) must be
+    # routed through the float branch above: they are not Python floats, so
+    # the ``int(...)`` fallback below would silently TRUNCATE them — that
+    # turned warp.fem's reference-cell measure ``wp.float32(0.5)`` into
+    # ``0``, zeroing every integration weight without any diagnostic.
+    from warp._src.types import float_types  # noqa: PLC0415
+
+    if isinstance(value, float_types):
+        return _msl_constant_str(float(value.value))
     # Warp's ``uint32`` / ``int32`` etc. wrap into typed-int classes
     # whose ``int(...)`` works. mujoco_warp's solver passes these as
     # bitmask constants (``DisableBit.WARMSTART`` = ``uint32(2)``).
@@ -6004,6 +6101,23 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (
         re.compile(r"wp::atomic_max\s*\(\s*([^,()]+?)\s*,\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)"),
         r"wp_atomic_max(&\1[\2], \3)",
+    ),
+    # ``wp::atomic_cas(arr, idx, compare, value)`` takes one more operand
+    # than the other atomics, so it needs its own pattern — the 3-operand
+    # ones above would not match it. Every operand group here is
+    # comma-free (unlike the value slot of add/sub/min/max, which has to
+    # absorb the multi-dim fold's output): there is no multi-dim fold for
+    # cas/exch, so a ``(arr, i, j, cmp, val)`` call must NOT match and
+    # silently produce a wrong-arity helper call. Failing to match leaves
+    # the ``wp::`` prefix in place, which the unsupported-intrinsic guard
+    # reports by name.
+    (
+        re.compile(r"wp::atomic_cas\s*\(\s*([^,()]+?)\s*,\s*([^,()]+?)\s*,\s*([^,()]+?)\s*,\s*([^,()]+?)\s*\)"),
+        r"wp_atomic_cas(&\1[\2], \3, \4)",
+    ),
+    (
+        re.compile(r"wp::atomic_exch\s*\(\s*([^,()]+?)\s*,\s*([^,()]+?)\s*,\s*([^,()]+?)\s*\)"),
+        r"wp_atomic_exch(&\1[\2], \3)",
     ),
     # ``wp::diag(vec3)`` builds a 3x3 diagonal matrix. MSL has no native
     # diag-from-vector helper, so we route it through ``wp_diag_float3``
@@ -6447,11 +6561,17 @@ _TILE_MINMAX_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_(min|max)\s*\(\s*var_
 # ``wp::tile_sum(t)`` — sum-reduce every element to a 1-element tile (a
 # plain scalar here). ``wp.optim.linear``'s tiled dot product uses it.
 _TILE_SUM_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_sum\s*\(\s*var_(\w+)\s*\)")
+# ``wp::tile_scan_inclusive(tile)`` / ``wp::tile_scan_exclusive(tile)`` —
+# prefix sums over a register tile. Serial per-thread, like ``tile_sum``.
+_TILE_SCAN_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_scan_(inclusive|exclusive)\s*\(\s*var_(\w+)\s*\)")
 # ``wp::tile_zeros<dtype, ...>()`` / ``wp::tile_ones<dtype, ...>()`` —
 # constant-fill register tile. With block_dim=1 it's the corresponding
 # scalar 0 / 1 (or vec ``T(0)`` / ``T(1)``).
 _TILE_ZEROS_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_zeros\s*<\s*(?:wp::)?(\w+)\s*[^>]*>\s*\(\s*\)")
 _TILE_ONES_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_ones\s*<\s*(?:wp::)?(\w+)\s*[^>]*>\s*\(\s*\)")
+# ``wp::tile_full<dtype, ...>(value)`` — the same constant fill with a
+# runtime value instead of a literal 0 / 1.
+_TILE_FULL_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_full\s*<\s*(?:wp::)?(\w+)\s*[^>]*>\s*\(([^)]*)\)")
 # ``wp::tile_arange<int>(N)`` with N=1 → ``var_X = 0``.
 _TILE_ARANGE_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_arange\s*<[^>]*>\s*\(\s*\d+\s*\)")
 # ``wp::tile_arange<dtype, N>(start, stop, step)`` — multi-element form
@@ -6583,6 +6703,16 @@ _TILE_STORE_PAT = re.compile(
     r"\bwp::tile_store\s*<\s*"
     r"(wp::vec_t<\d+,\s*wp::\w+>|wp::\w+|wp_vec\d+_\w+|wp_mat\d+x\d+_\w+)"
     r"\s*,\s*\w+\s*,\s*\w+\s*>\s*\(([^)]*)\)"
+)
+# ``var_X = wp::tile_atomic_add<dtype, bounds_check>(arr, off_0[, off_1], tile)``
+# — same ``(a, *offset, t)`` operand layout as ``tile_store``, but two
+# template args instead of three, and it yields a tile holding the
+# destination's *previous* values. ``wp.fem``'s scalar-integrate path
+# accumulates into its result array through this.
+_TILE_ATOMIC_ADD_PAT = re.compile(
+    r"\bvar_(\w+)\s*=\s*wp::tile_atomic_add\s*<\s*"
+    r"(wp::vec_t<\d+,\s*wp::\w+>|wp::\w+|wp_vec\d+_\w+|wp_mat\d+x\d+_\w+)"
+    r"\s*,\s*\w+\s*>\s*\(([^)]*)\)"
 )
 _TILE_CHOLESKY_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_cholesky\s*<[^()]*>\s*\(([^)]*)\)")
 _TILE_CHOLESKY_SOLVE_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_cholesky_solve\s*<[^()]*>\s*\(([^)]*)\)")
@@ -6898,6 +7028,61 @@ def _translate_tile_intrinsics(
         helper = f"wp_tile_{rows}x{cols}_{msl_scalar}_store"
         return f"{helper}({arr}, {base_expr}, {row_stride}, {row_off}, {col_off}, {tile_var})"
 
+    def repl_tile_atomic_add(m: re.Match[str]) -> str:
+        # ``var_X = wp::tile_atomic_add<dtype, bounds>(arr, off..., tile)``.
+        # Index arithmetic is identical to ``repl_store``; only the write
+        # differs (atomic fetch-add per element) plus the previous-value
+        # tile that comes back. The destination is registered as an atomic
+        # output by the write detector, so it is always ``device
+        # atomic<T>*`` here and the plain-store fast paths do not apply.
+        lhs = m.group(1)
+        dtype_token = m.group(2)
+        if dtype_token.startswith("wp::vec_t") or dtype_token.startswith("wp_vec") or dtype_token.startswith("wp_mat"):
+            raise MetalCodegenError(
+                f"MSL codegen: tile_atomic_add on a non-scalar element type {dtype_token!r} is not supported"
+            )
+        msl_scalar = _SCALAR_CTYPE_TO_MSL.get(dtype_token)
+        if msl_scalar is None:
+            return m.group(0)
+        args = [a.strip() for a in m.group(3).split(",")]
+        arr = args[0]
+        tile_var = args[-1]
+        tile_label = tile_var[len("var_") :] if tile_var.startswith("var_") else tile_var
+        dims = tile_var_dims.get(tile_label)
+        if dims is None:
+            return m.group(0)
+        rows, cols, _ = dims
+        n_off = 2 if cols > 1 else 1
+        middle = args[1:-1]
+        lead_idx_args = middle[:-n_off] if len(middle) > n_off else []
+        offsets = middle[-n_off:]
+        arr_name = arr[len("var_") :] if arr.startswith("var_") else arr
+        base_expr = _build_flat_base_expr(arr_name, lead_idx_args, inner_dims=(2 if cols > 1 else 1))
+        if cols > 1:
+            row_stride = f"{arr_name}_shape[{len(lead_idx_args) + 1}]"
+            row_off, col_off = offsets
+        else:
+            row_stride = "1"
+            row_off, col_off = offsets[0], "0"
+
+        def _elem(i: str, j: str) -> str:
+            return f"{arr}[{base_expr} + (({row_off}) + {i}) * ({row_stride}) + (({col_off}) + {j})]"
+
+        # Single-element tile is a plain scalar local on both sides.
+        if rows == 1 and cols == 1:
+            return f"var_{lhs} = atomic_fetch_add_explicit(&{_elem('0', '0')}, {tile_var}, memory_order_relaxed)"
+        # Multi-element: the result tile local is already declared by the
+        # generic local-decl pass, so only fill it — one pre-add value per
+        # element. (Re-declaring here is a redefinition error in MSL.)
+        return (
+            "do { "
+            f"for (int _ta_i = 0; _ta_i < {rows}; ++_ta_i) "
+            f"for (int _ta_j = 0; _ta_j < {cols}; ++_ta_j) "
+            f"var_{lhs}.c[_ta_i * {cols} + _ta_j] = atomic_fetch_add_explicit("
+            f"&{_elem('_ta_i', '_ta_j')}, {tile_var}.c[_ta_i * {cols} + _ta_j], memory_order_relaxed); "
+            "} while (0)"
+        )
+
     def repl_cholesky(m: re.Match[str]) -> str:
         lhs = m.group(1)
         args = [a.strip() for a in m.group(2).split(",")]
@@ -7102,6 +7287,31 @@ def _translate_tile_intrinsics(
 
     line = _TILE_SUM_PAT.sub(repl_tile_sum, line)
 
+    def repl_tile_scan(m: re.Match[str]) -> str:
+        lhs, kind, in_label = m.group(1), m.group(2), m.group(3)
+        dims = tile_var_dims.get(in_label)
+        n = dims[0] * dims[1] if dims is not None else 1
+        if tile_var_vec_n.get(in_label, 0) > 0:
+            raise MetalCodegenError(
+                f"MSL codegen: tile_scan_{kind} on a vec-element tile 'var_{in_label}' is not supported"
+            )
+        if n == 1:
+            # A single-element inclusive scan is the element itself; an
+            # exclusive one is the additive identity before it.
+            return f"var_{lhs} = var_{in_label}" if kind == "inclusive" else f"var_{lhs} = {{}}"
+        # Serial prefix sum. Written to tolerate ``lhs`` aliasing the input:
+        # the running accumulator is read before the slot is overwritten.
+        if kind == "inclusive":
+            body = f"_sc_acc += var_{in_label}.c[_sc_i]; var_{lhs}.c[_sc_i] = _sc_acc;"
+        else:
+            body = f"auto _sc_cur = var_{in_label}.c[_sc_i]; var_{lhs}.c[_sc_i] = _sc_acc; _sc_acc += _sc_cur;"
+        return (
+            f"{{ auto _sc_acc = var_{in_label}.c[0]; _sc_acc = _sc_acc - _sc_acc; "
+            f"for (int _sc_i = 0; _sc_i < {n}; ++_sc_i) {{ {body} }} }}"
+        )
+
+    line = _TILE_SCAN_PAT.sub(repl_tile_scan, line)
+
     def repl_zeros(m: re.Match[str]) -> str:
         return _emit_tile_const_fill(m.group(1), m.group(2), "0")
 
@@ -7123,8 +7333,15 @@ def _translate_tile_intrinsics(
             return f"var_{lhs} = ({msl}){value}"
         return f"{{ for (int _tc_i = 0; _tc_i < {n}; ++_tc_i) var_{lhs}.c[_tc_i] = ({msl}){value}; }}"
 
+    def repl_full(m: re.Match[str]) -> str:
+        value = m.group(3).strip()
+        if not value:
+            return m.group(0)
+        return _emit_tile_const_fill(m.group(1), m.group(2), f"({value})")
+
     line = _TILE_ZEROS_PAT.sub(repl_zeros, line)
     line = _TILE_ONES_PAT.sub(repl_ones, line)
+    line = _TILE_FULL_PAT.sub(repl_full, line)
     line = _TILE_ARANGE_PAT.sub(r"var_\1 = 0", line)
 
     def repl_tile_arange_3(m: re.Match[str]) -> str:
@@ -7701,6 +7918,7 @@ def _translate_tile_intrinsics(
 
     line = _TILE_LOAD_PAT.sub(repl_load, line)
     line = _TILE_STORE_PAT.sub(repl_store, line)
+    line = _TILE_ATOMIC_ADD_PAT.sub(repl_tile_atomic_add, line)
     line = _TILE_CHOLESKY_PAT.sub(repl_cholesky, line)
     line = _TILE_CHOLESKY_SOLVE_PAT.sub(repl_cholesky_solve, line)
 
@@ -8237,10 +8455,14 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
     # we still emit a flat string list and the existing regex sweep takes
     # over from there.
     _early_vec_arr_info: dict[str, tuple[int, str]] = {}
+    _early_mat_arr_info: dict[str, tuple[int, int, str]] = {}
     for arg in adj.args:
         v_info = _vec_dtype_info(arg)
         if v_info is not None:
             _early_vec_arr_info[arg.label] = v_info
+        m_info = _mat_dtype_info(arg)
+        if m_info is not None:
+            _early_mat_arr_info[arg.label] = m_info
 
     _ast_nodes = _ast_parse(adj.blocks[0].body_forward)
     _ast_nodes, _struct_skip = _ast_fold(_ast_nodes, query_iter_vars=_ast_query_iterator_vars(adj))
@@ -8276,7 +8498,7 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
     # Flatten multi-dim ``wp::atomic_<op>(arr, i, j, ..., val)`` into the
     # 3-arg form the intrinsic regex handles, expanding to per-component
     # atomics for vec-typed arrays.
-    _ast_nodes = _ast_fold_multidim_atomics(_ast_nodes, adj, _early_vec_arr_info)
+    _ast_nodes = _ast_fold_multidim_atomics(_ast_nodes, adj, _early_vec_arr_info, _early_mat_arr_info)
     forward_lines = _ast_emit(_ast_nodes)
 
     # Distributed-tile mode: the IR was rebuilt at the honest block width
@@ -8314,11 +8536,17 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
     atomic_op_kinds: dict[str, set[str]] = {}
     plain_store_arg_names: set[str] = set()
     array_store_pat = re.compile(r"\s*wp::array_store\s*\(\s*var_([A-Za-z_]\w*)")
-    atomic_pat = re.compile(r"wp::atomic_(add|sub|min|max)\s*\(\s*var_([A-Za-z_]\w*)")
+    atomic_pat = re.compile(r"wp::atomic_(add|sub|min|max|cas|exch)\s*\(\s*var_([A-Za-z_]\w*)")
     scalar_store_pat = re.compile(r"\s*wp::__metal_scalar_store__\s*\(\s*var_([A-Za-z_]\w*)")
     # ``wp::tile_store<...>(arr, tile, off...)`` — the blocked-Cholesky
     # path writes through tile_store directly (no array_store wrapper).
     tile_store_pat = re.compile(r"wp::tile_store\s*<[^()]*>\s*\(\s*var_([A-Za-z_]\w*)")
+    # ``wp::tile_atomic_add<...>(arr, off..., tile)`` accumulates a tile
+    # into ``arr``. It is both a write (so ``arr`` is an output) and an
+    # atomic op (so ``arr`` must be typed ``device atomic<T>*``); without
+    # this, kernels whose only write is a tile atomic-add — wp.fem's
+    # scalar integrate path — were rejected as having no output array.
+    tile_atomic_add_pat = re.compile(r"wp::tile_atomic_add\s*<[^()]*>\s*\(\s*var_([A-Za-z_]\w*)")
     # ``wp::view(arr, slice)`` — slicing an array. The slice can be the
     # target of a downstream tile_store, but the IR loses the connection
     # back to the underlying array after the slice is taken. Treat any
@@ -8332,7 +8560,9 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
     # too so the output classification picks up the write.
     # min/max raw lines dispatch through the wp_atomic_* helpers (float
     # emulation — see ``_MISC_MATH_HELPERS``), so match both spellings.
-    raw_atomic_pat = re.compile(r"(?:atomic_fetch_(add|sub|min|max)_explicit|wp_atomic_(min|max))\s*\(\s*&\s*(\w+)\[")
+    raw_atomic_pat = re.compile(
+        r"(?:atomic_fetch_(add|sub|min|max)_explicit|wp_atomic_(min|max|cas|exch))\s*\(\s*&\s*(\w+)\["
+    )
     for raw in forward_lines:
         m = array_store_pat.match(raw)
         if m:
@@ -8350,6 +8580,11 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
         m = tile_store_pat.search(raw)
         if m:
             written_arg_names.add(m.group(1))
+        m = tile_atomic_add_pat.search(raw)
+        if m:
+            written_arg_names.add(m.group(1))
+            atomic_arg_names.add(m.group(1))
+            atomic_op_kinds.setdefault(m.group(1), set()).add("add")
         m = view_pat.search(raw)
         if m:
             written_arg_names.add(m.group(1))
@@ -10015,8 +10250,23 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
         elif stripped == "return;" and depth == 0:
             has_early_return = True
             break
+    # Only atomic kernels take this blanket seed. Non-atomic ones fall to
+    # the in-place binding below, which solves the same problem without a
+    # race: seeding is race-free only when a thread seeds exactly the rows
+    # it goes on to write — i.e. when the output row IS the x tid — and
+    # warp.fem's bilinear triplet dispatch breaks that outright. It writes
+    # ``triplet_rows[x * max_nodes_per_element + y]``, so threadgroup x
+    # seeds rows {x, x + gridx, ...} while writing rows {4x .. 4x+3}, and
+    # the post-prologue ``threadgroup_barrier`` is threadgroup-scoped: it
+    # cannot order one threadgroup's seed against another's body write.
+    # Every fem mass / stiffness matrix therefore came out with a
+    # nondeterministic fraction of its triplets replaced by pool garbage
+    # (a 4x4 Grid2D degree-1 mass matrix landed at nnz 83..101 instead of
+    # 169, total mass 0.4 instead of 1.0, varying run to run). Atomic
+    # kernels can't use the in-place path — MLX zero-inits their outputs
+    # and the atomics accumulate onto that — so they keep the seed.
     if not non_standard_launch:
-        if has_early_return:
+        if has_early_return and has_atomic:
             # Tentatively add every output not already seeded.
             tentative = list(init_outputs)
             for a in output_args:
@@ -10064,9 +10314,25 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
     # alias the registered buffer; write-through verified), so unwritten
     # elements keep their previous values, exactly like CUDA. Non-atomic
     # kernels only; atomic kernels keep the zero-init + seed machinery.
+    #
+    # This also takes over from the seeding prologue for every non-atomic
+    # kernel that *would* have been seeded (``init_outputs`` non-empty:
+    # read-modify-write outputs and partial tile stores). Seeding is only
+    # race-free when a thread seeds exactly the elements it goes on to
+    # write, and the prologue's threadgroup-scoped barrier cannot order
+    # one threadgroup's seed against another's body write. ``bsr_mv`` is
+    # the clean demonstration: it reads and writes ``y[row * block_rows +
+    # subrow]``, so with 1x1 blocks the seed row is the x tid and the
+    # result is right, while with 2x2 blocks threadgroup x seeds rows
+    # {x, x + nrow*2, ...} but writes rows {2x, 2x+1} — and every
+    # 2x2-block matrix-vector product came out wrong (a 289-block
+    # tridiagonal system: relative error 1.0, and CG on it diverged).
+    # Binding in place has the same effect the seed was reaching for and
+    # needs no ordering at all.
     mlx_inplace_arrays: list[str] = []
-    if not _wp_cfg.metal_native_dispatch and has_early_return and not has_atomic:
-        mlx_inplace_arrays = [a.label for a in output_args if a.label not in init_outputs]
+    if not _wp_cfg.metal_native_dispatch and not has_atomic and (has_early_return or init_outputs):
+        mlx_inplace_arrays = [a.label for a in output_args]
+        init_outputs = []
     if mlx_inplace_arrays:
         inplace_set = set(mlx_inplace_arrays)
         alias_lines = []
@@ -11380,6 +11646,64 @@ def _wp_dtype_to_mx_dtype(wp_dtype):
     return mapping[wp_dtype]
 
 
+def _unwrap_scalar_value(value):
+    """Return the Python value behind a scalar kernel argument.
+
+    Warp's scalar types (``wp.float32(0.5)`` and friends) are ctypes-backed
+    wrappers, not Python numbers, so they have to be unwrapped before MLX
+    will accept them. Plain Python numbers pass through untouched.
+    """
+    import warp._src.types as wpt  # noqa: PLC0415
+
+    if isinstance(value, wpt.scalar_base):
+        return value.value
+    return value
+
+
+def _mx_bind_view(value, mx_dtype, view_shape):
+    """Return the ``mx.array`` aliasing ``value``'s bytes, or ``None`` when
+    no registered allocation covers it.
+
+    The Metal allocator registers one flat ``uint8`` ``mx.array`` per
+    allocation, so a ``wp.array`` that is a *sub-view* of a larger one —
+    ``partial_sums[c : c + n]`` in ``warp.optim.linear``'s tiled dot, say —
+    needs the buffer narrowed to its own window before the reshape, both
+    because the element counts otherwise disagree and because an interior
+    view starts at a non-zero byte offset.
+
+    Contiguous MLX slices are metadata-only: they alias the parent buffer
+    and ``mx.fast.metal_kernel`` binds them at the right offset, so this
+    stays zero-copy and remains valid for the in-place (``__rw``) bindings
+    whose writes must land in the caller's array.
+    """
+    from warp._src.context import _metal_find_buffer, _metal_get_buffer  # noqa: PLC0415
+
+    mx_buf = _metal_get_buffer(value.ptr)
+    byte_off = 0
+    if mx_buf is None:
+        mx_buf, byte_off = _metal_find_buffer(value.ptr)
+        if mx_buf is None:
+            return None
+    typed = mx_buf.view(mx_dtype)
+    n = 1
+    for d in view_shape:
+        n *= int(d)
+    itemsize = mx_dtype.size
+    if byte_off % itemsize:
+        raise MetalCodegenError(
+            f"Metal array view starts {byte_off} bytes into its allocation, which is not a "
+            f"multiple of its {itemsize}-byte element size; unsupported on Metal"
+        )
+    start = byte_off // itemsize
+    if start or typed.size != n:
+        if start + n > typed.size:
+            raise MetalCodegenError(
+                f"Metal array view wants {n} elements at offset {start} but its allocation only holds {typed.size}"
+            )
+        typed = typed[start : start + n]
+    return typed.reshape(view_shape)
+
+
 def _array_view_dtype_and_shape(value):
     """Return ``(mx_dtype, mlx_shape)`` for a Metal-resident wp.array.
 
@@ -12604,7 +12928,7 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim: int = 2
     import numpy as np  # noqa: PLC0415
 
     from warp._src.codegen import Struct  # noqa: PLC0415
-    from warp._src.context import _metal_get_buffer, runtime  # noqa: PLC0415
+    from warp._src.context import runtime  # noqa: PLC0415
 
     # Empty launches (any dim component is 0) produce no work, so skip
     # codegen entirely — that lets us tolerate kernels we can't yet
@@ -12661,13 +12985,13 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim: int = 2
             if value.ptr is None or value.size == 0:
                 mlx_inputs.append(mx.zeros(view_shape, dtype=mx_dtype))
                 continue
-            mx_buf = _metal_get_buffer(value.ptr)
-            if mx_buf is None:
+            bound = _mx_bind_view(value, mx_dtype, view_shape)
+            if bound is None:
                 raise RuntimeError(
                     f"Kernel '{kernel.key}' struct arg {sfa[0]!r} field {'.'.join(sfa[1])!r} has no "
                     f"registered MLX buffer (ptr={value.ptr}). Was it allocated by Warp's Metal allocator?"
                 )
-            mlx_inputs.append(mx_buf.view(mx_dtype).reshape(view_shape))
+            mlx_inputs.append(bound)
             continue
         idx, _ = arg_by_name[input_name]
         value = fwd_args[idx]
@@ -12689,14 +13013,13 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim: int = 2
 
                 mlx_inputs.append(mx.zeros(view_shape, dtype=mx_dtype))
                 continue
-            mx_buf = _metal_get_buffer(value.ptr)
-            if mx_buf is None:
+            # ``view`` reinterprets bytes (no copy); ``reshape`` flattens / shapes for MLX.
+            typed = _mx_bind_view(value, mx_dtype, view_shape)
+            if typed is None:
                 raise RuntimeError(
                     f"Kernel '{kernel.key}' argument '{input_name}' has no registered MLX buffer "
                     f"(ptr={value.ptr}). Was it allocated by Warp's Metal allocator?"
                 )
-            # ``view`` reinterprets bytes (no copy); ``reshape`` flattens / shapes for MLX.
-            typed = mx_buf.view(mx_dtype).reshape(view_shape)
             mlx_inputs.append(typed)
         elif isinstance(arg_var.type, Struct):
             # Struct-typed arg: serialise the user's ``StructInstance`` into
@@ -12725,9 +13048,13 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim: int = 2
                 )
             mlx_inputs.append(mx.array(np_buf, dtype=mx.float32))
         else:
-            # Scalar input — convert to a 0-D mx.array literal.
+            # Scalar input — convert to a 0-D mx.array literal. Callers may
+            # pass either a plain Python number or a Warp-typed scalar
+            # (``warp.sparse`` wraps ``alpha``/``beta`` in the matrix's
+            # ``scalar_type``); the latter is a ctypes wrapper MLX cannot
+            # ingest, so unwrap it to its Python value first.
             mx_dtype = _wp_dtype_to_mx_dtype(arg_var.type)
-            mlx_inputs.append(mx.array(value, dtype=mx_dtype))
+            mlx_inputs.append(mx.array(_unwrap_scalar_value(value), dtype=mx_dtype))
 
     # In-place outputs: bind the caller's buffer as a ``<name>__rw``
     # input — the kernel writes through a const-cast alias, so unwritten
@@ -12773,13 +13100,13 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim: int = 2
             mlx_inputs.append(staging)
             inplace_staged.append((staging, value, sz))
             continue
-        mx_buf = _metal_get_buffer(value.ptr)
-        if mx_buf is None:
+        bound = _mx_bind_view(value, mx_dtype, view_shape)
+        if bound is None:
             raise RuntimeError(
                 f"Kernel '{kernel.key}' in-place output '{arr_name}' has no registered MLX "
                 f"buffer (ptr={value.ptr}). Was it allocated by Warp's Metal allocator?"
             )
-        mlx_inputs.append(mx_buf.view(mx_dtype).reshape(view_shape))
+        mlx_inputs.append(bound)
 
     # Append init-shadow buffers for atomic outputs. Each ``<name>__init``
     # input carries the user's current array data so the kernel prologue
@@ -12812,12 +13139,11 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim: int = 2
         if value.ptr is None or value.size == 0:
             mlx_inputs.append(mx.zeros(view_shape, dtype=mx_dtype))
             continue
-        mx_buf = _metal_get_buffer(value.ptr)
-        if mx_buf is None:
+        typed = _mx_bind_view(value, mx_dtype, view_shape)
+        if typed is None:
             raise RuntimeError(
                 f"Kernel '{kernel.key}' atomic init shadow '{init_name}' has no registered MLX buffer (ptr={value.ptr})"
             )
-        typed = mx_buf.view(mx_dtype).reshape(view_shape)
         mlx_inputs.append(typed)
 
     # Append the packed int buffer if the kernel exceeded the 31-slot
@@ -12862,13 +13188,13 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim: int = 2
             sz = int(getattr(value, "size", 0) or 0)
             if value.ptr is None or sz == 0:
                 continue
-            mx_buf = _metal_get_buffer(value.ptr)
-            if mx_buf is None:
+            bound = _mx_bind_view(value, mx.int32, (sz,))
+            if bound is None:
                 raise RuntimeError(
                     f"Kernel '{kernel.key}' packed-int array '{arr_name}' has no registered MLX buffer "
                     f"(ptr={value.ptr}). Was it allocated by Warp's Metal allocator?"
                 )
-            data_parts.append(mx_buf.view(mx.int32).reshape((sz,)))
+            data_parts.append(bound)
             running += sz
         for j, scalar_name in enumerate(artifact.ints_packed_scalars):
             idx, _ = arg_by_name[scalar_name]
@@ -12885,13 +13211,13 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim: int = 2
             sz = int(np.prod(view_shape)) if view_shape else 0
             if value.ptr is None or sz == 0:
                 continue
-            mx_buf = _metal_get_buffer(value.ptr)
-            if mx_buf is None:
+            bound = _mx_bind_view(value, mx_dtype, (sz,))
+            if bound is None:
                 raise RuntimeError(
                     f"Kernel '{kernel.key}' packed-float array '{arr_name}' has no registered MLX buffer "
                     f"(ptr={value.ptr}). Was it allocated by Warp's Metal allocator?"
                 )
-            float_data_parts.append(mx_buf.view(mx_dtype).reshape((sz,)))
+            float_data_parts.append(bound)
             float_running += sz
         # Compute per-init-shadow offsets within the appropriate
         # packed buffer (``__init_shadows_floats`` or
@@ -12915,17 +13241,17 @@ def launch_metal_kernel(kernel, dim, inputs, outputs, device, block_dim: int = 2
                     # No data to seed; the offset stays valid (no-op
                     # writes by the prologue's stride loop, since size=0).
                     continue
-                mx_buf = _metal_get_buffer(value.ptr)
-                if mx_buf is None:
+                bound = _mx_bind_view(value, mx_dtype, (sz,))
+                if bound is None:
                     raise RuntimeError(
                         f"Kernel '{kernel.key}' init-shadow output '{out_name}' has no "
                         f"registered MLX buffer (ptr={value.ptr})"
                     )
                 if is_float_pack:
-                    init_floats_parts.append(mx_buf.view(mx_dtype).reshape((sz,)))
+                    init_floats_parts.append(bound)
                     init_floats_running += sz
                 else:
-                    init_ints_parts.append(mx_buf.view(mx_dtype).reshape((sz,)))
+                    init_ints_parts.append(bound)
                     init_ints_running += sz
         header_mx = mx.array(header_np, dtype=mx.int32)
         if data_parts:

@@ -19,9 +19,40 @@
   single-argument `wp.min()` / `wp.max()` component reductions, `wp.length()` on vectors of unsupported-by-MSL
   widths, and non-square matrices (`wp.transpose()`, `wp.matrix_from_cols()`, `wp.matrix_from_rows()`, and
   products mixing square and non-square operands).
+- Support `wp.atomic_cas()` and `wp.atomic_exch()` on Metal devices, including through `wp.array` fields of
+  struct kernel arguments. Note that mutual-exclusion spin locks built on these deadlock on Apple GPUs, which
+  do not guarantee independent forward progress within a SIMD group; lock-free retry loops work correctly.
+- Support `wp.tile_atomic_add()` and `wp.outer()` on vectors of differing lengths on Metal devices.
+- Support `wp.atomic_add()` and the other atomic operations on matrix-valued arrays on Metal devices, which
+  `warp.sparse.bsr_mm()` uses to accumulate block values.
 
 ### Fixed
 
+- Include Metal devices in `wp.get_devices()`, `wp.is_device_available()`, and the `wp.init()` device listing
+  when `warp.config.enable_metal` is set. `wp.get_preferred_device()` now returns `metal:0` on builds without CUDA
+  support when Metal is enabled.
+- Fix an `AttributeError` when generating Metal kernels for modules whose globals reference a Warp built-in
+  function by name, which affected `warp.fem` examples.
+- Fix Metal kernels silently truncating `wp.constant()` values declared with a Warp scalar type
+  (`wp.constant(wp.float32(0.5))` became `0`). Constants with a plain Python `float` were unaffected. This zeroed
+  every integration weight in `warp.fem` on triangle and tetrahedron meshes, whose reference-element measure is
+  declared this way.
+- Support taking a view of a `wp.array` field held by a struct kernel argument on Metal (`args.topo.indices[i]`),
+  including when the struct was built and returned by a `@wp.func` and when the index is a struct field.
+- Fix Metal kernels producing wrong and run-to-run nondeterministic results whenever a kernel only partially writes
+  an output array or reads it back before writing it. Affected `warp.fem` matrix assembly (a 4x4 `Grid2D` degree-1
+  mass matrix came out with roughly half its blocks replaced by garbage, varying between runs) and
+  `warp.sparse.bsr_mv()` for every block size other than 1x1, which in turn made `warp.optim.linear` solvers
+  diverge on those systems. Such outputs now bind the caller's buffer directly instead of being reconstructed.
+- Fix the Metal backend picking the wrong specialization of a generic `@wp.func` when two specializations coexist
+  and the call is distinguished only by a kernel argument. Any process holding both a 2D and a 3D `warp.fem`
+  geometry of the same family (`Quadmesh2D` plus `Quadmesh3D`, say) hit this, producing either an MSL compile error
+  or silently wrong element types.
+- Support `wp.ddot()` on non-square matrices on Metal, which `warp.fem` uses for surface-embedded geometries.
+- Fix Metal launches rejecting a scalar kernel argument passed as a Warp scalar type rather than a Python number
+  (`wp.float32(0.5)`), which `warp.sparse` does for its `alpha` and `beta` factors.
+- Support binding a `wp.array` that is a view into a larger allocation as a Metal kernel argument, which
+  `warp.optim.linear`'s reductions rely on.
 - Fix the Metal PSO archive growing macOS's `com.apple.gpuarchiver` cache without bound: every distinct binary
   archive strands a multi-GB directory there that macOS never reclaims, so repeated runs could consume hundreds of
   gigabytes. The dispatcher now trims that cache by age, entry count, and total size
