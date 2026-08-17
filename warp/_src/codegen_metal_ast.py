@@ -1253,10 +1253,18 @@ def _build_function_overload_table(adj) -> dict[str, list[Any]]:
         seen_overloads.add(oid)
         out.setdefault(native, []).append(overload)
 
+    # ``user_overloads`` is only set on *user-defined* Warp functions
+    # (``Function.__init__`` creates it under ``if func:``). Builtins are
+    # also ``Function`` instances and have no such attribute — reaching one
+    # through a kernel's globals raised AttributeError before this guard
+    # (warp.fem's ``example_stokes_transfer`` imports builtins by name).
+    def _overloads(fn) -> tuple:
+        return tuple(getattr(fn, "user_overloads", {}).values())
+
     refs = adj.get_references()
     fn_table = refs[2]
     for fn in fn_table:
-        for overload in fn.user_overloads.values():
+        for overload in _overloads(fn):
             _add(overload)
 
     func = getattr(adj, "func", None)
@@ -1265,7 +1273,7 @@ def _build_function_overload_table(adj) -> dict[str, list[Any]]:
         for value in globals_dict.values():
             if not isinstance(value, Function):
                 continue
-            for overload in value.user_overloads.values():
+            for overload in _overloads(value):
                 _add(overload)
 
     # Sweep every registered Warp module for user functions. Functions
@@ -1283,7 +1291,7 @@ def _build_function_overload_table(adj) -> dict[str, list[Any]]:
         for fn in mod.functions.values():
             if not isinstance(fn, Function):
                 continue
-            for overload in fn.user_overloads.values():
+            for overload in _overloads(fn):
                 _add(overload)
             # Top-level fn (without overloads, e.g. concrete @wp.func)
             _add(fn)
@@ -1376,7 +1384,16 @@ def _rewrite_returns_to_breaks(
             indent = _leading_indent(n.raw)
             if n.value is not None and return_value_dst is not None:
                 # Synthesize ``var_<dst> = <value>;`` then break out.
-                out.append(_RawLine(raw=f"{indent}var_{return_value_dst} = {n.value};"))
+                stmt = f"{indent}var_{return_value_dst} = {n.value};"
+                if _COPY_RHS_PAT.match(str(n.value).strip()):
+                    # ``return <local>`` — parse it into a real ``Assign``
+                    # rather than an opaque raw line, so the struct-field
+                    # passes see the copy edge. warp.fem's geometry helpers
+                    # return freshly constructed ``CellArg`` structs whose
+                    # array fields are only reachable through this edge.
+                    out.append(parse_line(stmt))
+                else:
+                    out.append(_RawLine(raw=stmt))
             if in_loop and ret_flag is not None:
                 out.append(_RawLine(raw=f"{indent}{ret_flag} = true;"))
             out.append(Break(raw=f"{indent}break;"))
@@ -1807,11 +1824,23 @@ def inline_user_calls(
         return list(nodes), {}, {}, {}
     inlined_const_ints: dict[str, int] = {}
     inlined_struct_locals: dict[str, Any] = {}
-    # Seed var_types with the kernel's own locals so generic-overload
-    # selection at each call site can match parameter types against
-    # caller-argument types.
+    # Seed var_types with the kernel's own arguments *and* locals so
+    # generic-overload selection at each call site can match parameter
+    # types against caller-argument types.
+    #
+    # The arguments matter as much as the locals: warp.fem passes its
+    # geometry ``CellArg`` struct straight through as a kernel parameter,
+    # so ``Quadmesh__cell_deformation_gradient(var_domain_arg, var_13)``
+    # is discriminated entirely by that argument. With only locals seeded
+    # it read as a wildcard, and a process holding both a Quadmesh2D and
+    # a Quadmesh3D (the two share one generic ``@wp.func``, hence two
+    # concrete specializations under one ``native_func``) fell back to
+    # ``overloads[0]`` — splicing the 2D body's vec2/mat22 local
+    # declarations under 3D vec3 array reads. That is an MSL compile
+    # error at best ("assigning to 'float2' from incompatible type
+    # 'float3'") and silently wrong types where it does compile.
     var_types: dict[str, str] = {}
-    for var in kernel_adj.variables:
+    for var in list(getattr(kernel_adj, "args", ())) + list(kernel_adj.variables):
         try:
             var_types[var.label] = var.ctype()
         except Exception:
@@ -2136,6 +2165,14 @@ def fold_views(
     )
     backed_field_ptrs = set(field_ptr_backing)
 
+    # A view can be taken OF an array-typed struct field — warp.fem's
+    # geometry helpers do exactly that
+    # (``args.topology.tri_vertex_indices[s.element_index]``). The field
+    # only becomes a resolvable array during the pass above, so collect
+    # views once more now that it is; this second pass is what composes
+    # ``view(<field load>, slice)`` onto the field's backing array.
+    _collect_view_aliases(nodes, view_aliases, slice_aliases, arg_label_set)
+
     skip_decls: set[str] = set(slice_aliases) | set(view_aliases) | backed_field_ptrs
     if not view_aliases and not field_ptr_backing:
         return nodes, skip_decls
@@ -2173,16 +2210,82 @@ def _strip_var_prefix(s: str) -> str | None:
     return None
 
 
+def _collect_pure_load_equiv(nodes: tuple[Node, ...] | list[Node]) -> dict[str, str]:
+    """Map each label holding a repeatable ``wp::load(ptr)`` to that ptr.
+
+    Warp's IR is SSA, so ``arr[s.field]`` evaluates ``s.field`` twice and
+    binds each result to its own label:
+
+        var_A = wp::load(var_P);
+        var_B = wp::load(var_P);          // same value, different label
+
+    Two such labels denote the same value, which lets the slice
+    recogniser below see ``slice_t(A, B, 0)`` as the integer index it is.
+
+    Anything the body could write between the two loads disqualifies the
+    pointer, because then the labels genuinely differ: a ``wp::store``
+    through the pointer itself, or — for a pointer obtained via
+    ``wp::address(arr, ...)`` — any store or atomic on ``arr``. This is
+    deliberately whole-body and conservative rather than flow-sensitive;
+    a missed fold only costs a clear "unsupported statement" error, while
+    a wrong one would silently misindex.
+    """
+    load_of: dict[str, str] = {}
+    addr_of: dict[str, str] = {}
+    stored_ptrs: set[str] = set()
+    stored_arrays: set[str] = set()
+    multi: set[str] = set()
+
+    def _walk(ns: tuple[Node, ...] | list[Node]) -> None:
+        for n in ns:
+            if isinstance(n, Assign):
+                if n.lhs in load_of or n.lhs in addr_of or n.lhs in multi:
+                    # Reassigned: no longer a single stable definition.
+                    multi.add(n.lhs)
+                    load_of.pop(n.lhs, None)
+                    addr_of.pop(n.lhs, None)
+                elif isinstance(n.expr, Builtin):
+                    if n.expr.name == "load" and len(n.expr.args) == 1:
+                        p = _strip_var_prefix(n.expr.args[0].strip())
+                        if p is not None:
+                            load_of[n.lhs] = p
+                    elif n.expr.name == "address" and n.expr.args:
+                        a = _strip_var_prefix(n.expr.args[0].strip())
+                        if a is not None:
+                            addr_of[n.lhs] = a
+                    elif n.expr.name in _ATOMIC_VIEW_OPS and n.expr.args:
+                        a = _strip_var_prefix(n.expr.args[0].strip())
+                        if a is not None:
+                            stored_arrays.add(a)
+            elif isinstance(n, VoidCall) and n.args:
+                target = _strip_var_prefix(n.args[0].strip())
+                if target is not None:
+                    if n.op == "store":
+                        stored_ptrs.add(target)
+                    elif n.op == "array_store" or n.op in _ATOMIC_VIEW_OPS:
+                        stored_arrays.add(target)
+            if isinstance(n, (If, For, While, _DoWhileZero)):
+                _walk(n.body)
+
+    _walk(nodes)
+    return {label: p for label, p in load_of.items() if p not in stored_ptrs and addr_of.get(p) not in stored_arrays}
+
+
 def _collect_slice_aliases(
     nodes: tuple[Node, ...] | list[Node],
     out: dict[str, str],
     const_int_vars: dict[str, int],
+    load_equiv: dict[str, str] | None = None,
 ) -> None:
     """Walk the tree, recording every supported ``wp::slice_t(i, i, 0)`` def.
 
-    The supported pattern is integer-index only: start==stop AND step is a
-    locally-constant zero.
+    The supported pattern is integer-index only: start and stop are the
+    same value AND step is a locally-constant zero. "Same value" means the
+    same label, or two loads of the same never-written pointer (see
+    :func:`_collect_pure_load_equiv`).
     """
+    if load_equiv is None:
+        load_equiv = _collect_pure_load_equiv(nodes)
     for n in nodes:
         if isinstance(n, Assign) and isinstance(n.expr, Builtin) and n.expr.name == "slice_t":
             args = n.expr.args
@@ -2190,10 +2293,14 @@ def _collect_slice_aliases(
                 start_l = _strip_var_prefix(args[0])
                 stop_l = _strip_var_prefix(args[1])
                 step_l = _strip_var_prefix(args[2])
-                if start_l is not None and start_l == stop_l and step_l is not None and const_int_vars.get(step_l) == 0:
+                same = start_l is not None and (
+                    start_l == stop_l
+                    or (stop_l is not None and start_l in load_equiv and load_equiv[start_l] == load_equiv.get(stop_l))
+                )
+                if same and step_l is not None and const_int_vars.get(step_l) == 0:
                     out[n.lhs] = start_l
         elif isinstance(n, (If, For, While, _DoWhileZero)):
-            _collect_slice_aliases(n.body, out, const_int_vars)
+            _collect_slice_aliases(n.body, out, const_int_vars, load_equiv)
 
 
 def _collect_view_aliases(
@@ -2202,19 +2309,27 @@ def _collect_view_aliases(
     slice_aliases: dict[str, str],
     arg_label_set: set[str],
 ) -> None:
-    """Walk the tree, recording every supported ``wp::view(arr, slice...)``."""
+    """Walk the tree, recording every supported ``wp::view(arr, slice...)``.
+
+    The viewed array is either a kernel arg or an array we have already
+    resolved to one — an earlier view, or an array-typed struct field
+    registered by :func:`_collect_field_array_aliases`. In the latter two
+    cases the index lists compose: the base array's leading indices come
+    first, then this view's.
+    """
     for n in nodes:
         if isinstance(n, Assign) and isinstance(n.expr, Builtin) and n.expr.name == "view":
             args = n.expr.args
             if len(args) >= 2:
                 arr_l = _strip_var_prefix(args[0])
                 slice_labels = [_strip_var_prefix(a) for a in args[1:]]
-                if (
-                    arr_l is not None
-                    and arr_l in arg_label_set
-                    and all(s is not None and s in slice_aliases for s in slice_labels)
-                ):
-                    out[n.lhs] = (arr_l, [slice_aliases[s] for s in slice_labels])
+                if arr_l is not None and all(s is not None and s in slice_aliases for s in slice_labels):
+                    idx = [slice_aliases[s] for s in slice_labels]
+                    if arr_l in arg_label_set:
+                        out[n.lhs] = (arr_l, idx)
+                    elif arr_l in out:
+                        base_arr, base_idx = out[arr_l]
+                        out[n.lhs] = (base_arr, [*base_idx, *idx])
         elif isinstance(n, (If, For, While, _DoWhileZero)):
             _collect_view_aliases(n.body, out, slice_aliases, arg_label_set)
 
@@ -2816,16 +2931,14 @@ def _apply_view_rewrites(
                 out.append(VoidCall(raw=new_raw, op="tile_store", args=new_args, extra=n.extra))
                 continue
 
-        if (
-            isinstance(n, Assign)
-            and isinstance(n.expr, Builtin)
-            and n.expr.name in ("atomic_add", "atomic_sub", "atomic_min", "atomic_max")
-        ):
+        if isinstance(n, Assign) and isinstance(n.expr, Builtin) and n.expr.name in _ATOMIC_VIEW_OPS:
             view_arr_l = _strip_var_prefix(n.expr.args[0]) if n.expr.args else None
             if view_arr_l is not None and view_arr_l in view_aliases:
                 arr_name, lead_idx_labels = view_aliases[view_arr_l]
                 tail_idx = n.expr.args[1].strip()
-                val = n.expr.args[2].strip()
+                # Everything after the index is a value operand: one for
+                # add/sub/min/max/exch, two for cas (compare, value).
+                vals = [a.strip() for a in n.expr.args[2:]]
                 all_idx = [f"var_{l}" for l in lead_idx_labels] + [tail_idx]
                 # Build a flat index without outer parens (the atomic
                 # intrinsic regex in codegen_metal disallows them in the
@@ -2842,16 +2955,13 @@ def _apply_view_rewrites(
                             terms.append(f"{idx} * {stride}")
                     flat_idx = " + ".join(terms)
                 indent = _leading_indent(n.raw)
-                new_raw = f"{indent}var_{n.lhs} = wp::{n.expr.name}(var_{arr_name}, {flat_idx}, {val});"
+                new_args = (f"var_{arr_name}", flat_idx, *vals)
+                new_call = f"wp::{n.expr.name}({', '.join(new_args)})"
                 out.append(
                     Assign(
-                        raw=new_raw,
+                        raw=f"{indent}var_{n.lhs} = {new_call};",
                         lhs=n.lhs,
-                        expr=Builtin(
-                            raw=f"wp::{n.expr.name}(var_{arr_name}, {flat_idx}, {val})",
-                            name=n.expr.name,
-                            args=(f"var_{arr_name}", flat_idx, val),
-                        ),
+                        expr=Builtin(raw=new_call, name=n.expr.name, args=new_args),
                     )
                 )
                 continue
@@ -2958,6 +3068,14 @@ def _apply_view_rewrites(
 
 _STORE_OPS = ("store", "assign_inplace", "add_inplace", "sub_inplace", "mul_inplace", "div_inplace")
 _ATOMIC_OPS = ("atomic_add", "atomic_sub", "atomic_min", "atomic_max")
+# Atomics whose array operand may be a view alias or a struct-arg array
+# field. ``atomic_cas`` carries two value operands (compare, value) rather
+# than one, so the rewrite that substitutes the backing array keeps the
+# whole trailing operand list instead of assuming a single value. The
+# multi-dim fold below deliberately does NOT cover cas/exch: a multi-dim
+# call falls through to the unsupported-intrinsic guard with a clear error
+# rather than silently emitting an MSL call with the wrong arity.
+_ATOMIC_VIEW_OPS = (*_ATOMIC_OPS, "atomic_cas", "atomic_exch")
 _ATOMIC_TO_MSL = {
     "atomic_add": "atomic_fetch_add_explicit",
     "atomic_sub": "atomic_fetch_sub_explicit",
@@ -2975,6 +3093,7 @@ def fold_multidim_atomics(
     nodes: list[Node],
     adj,
     vec_arr_info: dict[str, tuple[int, str]],
+    mat_arr_info: dict[str, tuple[int, int, str]] | None = None,
 ) -> list[Node]:
     """Flatten multi-dim ``wp::atomic_<op>(arr, i, j, ..., val)`` calls.
 
@@ -3005,14 +3124,52 @@ def fold_multidim_atomics(
     intrinsic guard.
     """
     arg_label_set = {a.label for a in adj.args}
-    return _apply_multidim_atomics(nodes, vec_arr_info, arg_label_set)
+    return _apply_multidim_atomics(nodes, vec_arr_info, arg_label_set, mat_arr_info)
+
+
+_MSL_NATIVE_MAT_N = (2, 3, 4)
+
+
+def _mat_atomic_lines(
+    indent: str,
+    msl_name: str,
+    arr_label: str,
+    flat_idx: str,
+    value: str,
+    rows: int,
+    cols: int,
+) -> list[_RawLine]:
+    """Expand one mat-dtype atomic into ``rows * cols`` scalar atomics.
+
+    Array storage is row-major (element ``[r][c]`` of item ``i`` lives at
+    ``i * rows * cols + r * cols + c``), matching the mat ``array_store``
+    scatter in ``codegen_metal``. The *value* side depends on how the mat
+    is represented in MSL: square native sizes are column-major matrices
+    (so logical ``[r][c]`` is ``value[c][r]``), while every other shape is
+    our row-major ``wp_matRxC_<scalar>`` struct (``value.c[r * cols + c]``).
+    """
+    native = rows == cols and rows in _MSL_NATIVE_MAT_N
+    stride = rows * cols
+    base = f"({flat_idx}) * {stride}"
+    lines: list[_RawLine] = []
+    for r in range(rows):
+        for c in range(cols):
+            comp = f"{value}[{c}][{r}]" if native else f"{value}.c[{r * cols + c}]"
+            lines.append(
+                _RawLine(
+                    raw=f"{indent}{msl_name}(&{arr_label}[{base} + {r * cols + c}], {comp}, memory_order_relaxed);"
+                )
+            )
+    return lines
 
 
 def _apply_multidim_atomics(
     nodes: tuple[Node, ...] | list[Node],
     vec_arr_info: dict[str, tuple[int, str]],
     arg_label_set: set[str],
+    mat_arr_info: dict[str, tuple[int, int, str]] | None = None,
 ) -> list[Node]:
+    mat_arr_info = mat_arr_info or {}
     out: list[Node] = []
     for n in nodes:
         # 3-arg atomic on a vec-typed array: ``wp::atomic_<op>(arr, idx, vec_val)``.
@@ -3041,6 +3198,23 @@ def _apply_multidim_atomics(
                             raw=(f"{indent}{msl_name}(&{arr_label}[{base} + {k}], {value}[{k}], memory_order_relaxed);")
                         )
                     )
+                continue
+            # Same treatment for mat-dtype arrays — MSL has no atomic on
+            # matrices either. warp.sparse's ``bsr_mm`` accumulates block
+            # values this way (a wp.fem system matrix product).
+            if arr_label is not None and arr_label in arg_label_set and arr_label in mat_arr_info:
+                rows, cols, _ = mat_arr_info[arr_label]
+                out.extend(
+                    _mat_atomic_lines(
+                        _leading_indent(n.raw),
+                        _ATOMIC_TO_MSL[n.expr.name],
+                        arr_label,
+                        n.expr.args[1],
+                        n.expr.args[2],
+                        rows,
+                        cols,
+                    )
+                )
                 continue
 
         if (
@@ -3091,6 +3265,13 @@ def _apply_multidim_atomics(
                     )
                 continue
 
+            if arr_label in mat_arr_info:
+                rows, cols, _ = mat_arr_info[arr_label]
+                out.extend(
+                    _mat_atomic_lines(indent, _ATOMIC_TO_MSL[n.expr.name], arr_label, flat_idx, value, rows, cols)
+                )
+                continue
+
             # Scalar-dtype arr: collapse to 3-arg form. Downstream regex
             # turns it into the right ``atomic_fetch_*_explicit`` call.
             new_raw = f"{indent}var_{n.lhs} = wp::{n.expr.name}(var_{arr_label}, {flat_idx}, {value});"
@@ -3112,7 +3293,7 @@ def _apply_multidim_atomics(
                 If(
                     raw=n.raw,
                     cond=n.cond,
-                    body=tuple(_apply_multidim_atomics(n.body, vec_arr_info, arg_label_set)),
+                    body=tuple(_apply_multidim_atomics(n.body, vec_arr_info, arg_label_set, mat_arr_info)),
                     raw_open=n.raw_open,
                     raw_close=n.raw_close,
                 )
@@ -3126,7 +3307,7 @@ def _apply_multidim_atomics(
                     range_var=n.range_var,
                     start=n.start,
                     stop=n.stop,
-                    body=tuple(_apply_multidim_atomics(n.body, vec_arr_info, arg_label_set)),
+                    body=tuple(_apply_multidim_atomics(n.body, vec_arr_info, arg_label_set, mat_arr_info)),
                     step=n.step,
                 )
             )
@@ -3136,7 +3317,7 @@ def _apply_multidim_atomics(
                 While(
                     raw=n.raw,
                     label_k=n.label_k,
-                    body=tuple(_apply_multidim_atomics(n.body, vec_arr_info, arg_label_set)),
+                    body=tuple(_apply_multidim_atomics(n.body, vec_arr_info, arg_label_set, mat_arr_info)),
                 )
             )
             continue
@@ -3144,7 +3325,7 @@ def _apply_multidim_atomics(
             out.append(
                 _DoWhileZero(
                     raw=n.raw,
-                    body=tuple(_apply_multidim_atomics(n.body, vec_arr_info, arg_label_set)),
+                    body=tuple(_apply_multidim_atomics(n.body, vec_arr_info, arg_label_set, mat_arr_info)),
                 )
             )
             continue

@@ -6422,6 +6422,70 @@ class TestMetalArrayViews(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet)
 
+    def test_view_of_struct_held_2d_array_field(self):
+        # ``args.topology.tri_vertex_indices[s.element_index]`` — warp.fem's
+        # geometry helpers take a view of a 2-D array field reached through a
+        # nested struct that a ``@wp.func`` CONSTRUCTED AND RETURNED. Three
+        # separate things have to line up: the field must resolve to its
+        # backing array across the inliner's return-value copy, the view must
+        # compose onto that backing, and the ``slice_t`` must be recognised
+        # even though Warp's SSA IR loads ``s.element_index`` twice into two
+        # different labels.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.struct
+            class Topo:
+                tri_vertex_indices: wp.array(dtype=int, ndim=2)
+
+            @wp.struct
+            class CellArg:
+                topology: Topo
+                positions: wp.array(dtype=wp.vec2)
+
+            @wp.struct
+            class Sample:
+                element_index: int
+
+            @wp.func
+            def make_cell_arg(topo: Topo, positions: wp.array(dtype=wp.vec2)):
+                return CellArg(topo, positions)
+
+            @wp.func
+            def cell_position(args: CellArg, s: Sample):
+                tri = args.topology.tri_vertex_indices[s.element_index]
+                return (args.positions[tri[0]] + args.positions[tri[1]] + args.positions[tri[2]]) / 3.0
+
+            @wp.kernel
+            def k(topo: Topo, positions: wp.array(dtype=wp.vec2), out: wp.array(dtype=wp.vec2)):
+                i = wp.tid()
+                s = Sample()
+                s.element_index = i
+                out[i] = cell_position(make_cell_arg(topo, positions), s)
+
+            N = 16
+            rng = np.random.default_rng(7)
+            tris = rng.integers(0, 9, size=(N, 3)).astype(np.int32)
+            pts = rng.standard_normal((9, 2)).astype(np.float32)
+
+            outs = {}
+            for dev in ('cpu', 'metal:0'):
+                topo = Topo()
+                topo.tri_vertex_indices = wp.array(tris, dtype=int, ndim=2, device=dev)
+                positions = wp.array(pts, dtype=wp.vec2, device=dev)
+                out = wp.zeros(N, dtype=wp.vec2, device=dev)
+                wp.launch(k, dim=N, inputs=[topo, positions, out], device=dev)
+                outs[dev] = out.numpy()
+
+            expected = pts[tris].mean(axis=1)
+            np.testing.assert_allclose(outs['cpu'], expected, rtol=1e-5, atol=1e-6)
+            np.testing.assert_allclose(outs['metal:0'], expected, rtol=1e-5, atol=1e-6)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
     def test_non_contiguous_host_to_metal_copy(self):
         # wp.copy's cross-device staging path assumed a CUDA stream exists
         # whenever src/dest live on different devices; on Metal the stream is
@@ -7069,6 +7133,85 @@ class TestMetalInplaceOutputs(unittest.TestCase):
             """
         )
         _run_with_metal_enabled(self, snippet, timeout=120)
+
+    def test_read_modify_write_output_indexed_off_second_tid(self):
+        # A kernel that reads its output back before writing it, at an index
+        # built from BOTH launch dims. The old fix was a prologue that
+        # re-seeded the output from the caller's array, gated on the leading
+        # thread of the threadgroup — which is only race-free when the seeded
+        # element IS the x tid. Here element ``x * 2 + y`` is seeded by
+        # threadgroup ``x`` but written by threadgroups ``x // 2``, so
+        # threadgroups raced and a nondeterministic share of the writes were
+        # overwritten by the seed. This is exactly ``warp.sparse.bsr_mv()``'s
+        # ``y[row * block_rows + subrow]`` shape, which was wrong for every
+        # block size other than 1x1.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            @wp.kernel
+            def scale_add(x: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
+                row, sub = wp.tid()
+                i = row * 2 + sub
+                out[i] = 3.0 * out[i] + x[i]
+
+            n = 512
+            x_np = np.arange(2 * n, dtype=np.float32)
+            out_np = np.full(2 * n, 5.0, np.float32)
+            expected = 3.0 * out_np + x_np
+
+            for dev in ('cpu', 'metal:0'):
+                x = wp.array(x_np, dtype=wp.float32, device=dev)
+                out = wp.array(out_np, dtype=wp.float32, device=dev)
+                wp.launch(scale_add, dim=(n, 2), inputs=[x], outputs=[out], device=dev)
+                wp.synchronize_device(dev)
+                np.testing.assert_allclose(out.numpy(), expected, rtol=1e-6)
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
+    def test_bsr_mv_matches_cpu_for_non_scalar_blocks(self):
+        # End-to-end cover for the same defect through the API that surfaced
+        # it: with 2x2 blocks every ``bsr_mv`` result was wrong on Metal
+        # (relative error ~1), which made warp.optim.linear's solvers
+        # diverge. 1x1 blocks were correct by accident.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+            from warp.sparse import bsr_mv, bsr_set_from_triplets, bsr_zeros
+
+            n = 129
+            rng = np.random.default_rng(3)
+            rows = np.repeat(np.arange(n, dtype=np.int32), 2)
+            cols = np.concatenate([[i, (i + 1) % n] for i in range(n)]).astype(np.int32)
+            vals = rng.standard_normal((2 * n, 2, 2)).astype(np.float32)
+            x_np = rng.standard_normal((n, 2)).astype(np.float32)
+            y_np = rng.standard_normal((n, 2)).astype(np.float32)
+
+            got = {}
+            for dev in ('cpu', 'metal:0'):
+                A = bsr_zeros(n, n, wp.mat22, device=dev)
+                bsr_set_from_triplets(
+                    A,
+                    wp.array(rows, dtype=wp.int32, device=dev),
+                    wp.array(cols, dtype=wp.int32, device=dev),
+                    wp.array(vals, dtype=wp.mat22, device=dev),
+                )
+                x = wp.array(x_np, dtype=wp.vec2, device=dev)
+                y = wp.array(y_np, dtype=wp.vec2, device=dev)
+                bsr_mv(A=A, x=x, y=y, alpha=-1.0, beta=1.0)
+                wp.synchronize_device(dev)
+                got[dev] = y.numpy()
+
+            dense = np.zeros((2 * n, 2 * n), np.float64)
+            for r, c, v in zip(rows, cols, vals):
+                dense[2 * r:2 * r + 2, 2 * c:2 * c + 2] += v
+            expected = y_np.reshape(-1) - dense @ x_np.reshape(-1)
+            np.testing.assert_allclose(got['cpu'].reshape(-1), expected, rtol=1e-4, atol=1e-5)
+            np.testing.assert_allclose(got['metal:0'].reshape(-1), expected, rtol=1e-4, atol=1e-5)
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=180)
 
 
 @unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
@@ -8897,6 +9040,197 @@ class TestMetalReplayTimed(unittest.TestCase):
                 # The math-heavy kernel must dominate the trivial ones by
                 # a wide margin — attribution, not just plumbing.
                 assert durs[0] > 5.0 * max(durs[1], durs[2]), durs
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
+
+@unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
+@unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
+class TestMetalTileFullAndScan(unittest.TestCase):
+    """``wp.tile_full()`` and the tile prefix scans, lowered to the serial
+    tile model."""
+
+    def test_tile_full_and_scan_match_cpu(self):
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            N = 32
+
+            @wp.kernel
+            def k(vals: wp.array(dtype=wp.float32),
+                  filled: wp.array2d(dtype=wp.float32),
+                  inc: wp.array2d(dtype=wp.float32),
+                  exc: wp.array2d(dtype=wp.float32)):
+                b = wp.tid()
+                f = wp.tile_full(shape=(N,), value=vals[b], dtype=float)
+                wp.tile_store(filled[b], f)
+                t = wp.tile_load(inc[b], shape=(N,))
+                wp.tile_store(inc[b], wp.tile_scan_inclusive(t))
+                t2 = wp.tile_load(exc[b], shape=(N,))
+                wp.tile_store(exc[b], wp.tile_scan_exclusive(t2))
+
+            B = 4
+            rng = np.random.default_rng(9)
+            vals_np = rng.standard_normal(B).astype(np.float32)
+            data_np = rng.standard_normal((B, N)).astype(np.float32)
+
+            got = {}
+            for dev in ('cpu', 'metal:0'):
+                vals = wp.array(vals_np, dtype=wp.float32, device=dev)
+                filled = wp.zeros((B, N), dtype=wp.float32, device=dev)
+                inc = wp.array(data_np, dtype=wp.float32, device=dev)
+                exc = wp.array(data_np, dtype=wp.float32, device=dev)
+                wp.launch_tiled(k, dim=B, inputs=[vals], outputs=[filled, inc, exc],
+                                block_dim=1, device=dev)
+                wp.synchronize_device(dev)
+                got[dev] = (filled.numpy(), inc.numpy(), exc.numpy())
+
+            want_full = np.repeat(vals_np[:, None], N, axis=1)
+            want_inc = np.cumsum(data_np, axis=1)
+            want_exc = want_inc - data_np
+            for dev in ('cpu', 'metal:0'):
+                f, i, e = got[dev]
+                np.testing.assert_allclose(f, want_full, rtol=1e-6)
+                np.testing.assert_allclose(i, want_inc, rtol=1e-4, atol=1e-5)
+                np.testing.assert_allclose(e, want_exc, rtol=1e-4, atol=1e-5)
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=180)
+
+
+@unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
+@unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
+class TestMetalGenericOverloadSelection(unittest.TestCase):
+    """The inliner splices one specialization of a generic ``@wp.func`` per
+    call site, chosen by matching parameter types against the caller's
+    argument types. Arguments it cannot type are wildcards, so a call
+    distinguished only by an untypable argument fell back to the first
+    specialization registered."""
+
+    def test_overload_discriminated_by_kernel_argument(self):
+        # The discriminating argument is a *kernel parameter*, which was
+        # absent from the inliner's type map — so this read as a wildcard
+        # and both kernels got whichever specialization was built first.
+        # warp.fem hits it by passing its geometry ``CellArg`` struct
+        # straight through: a process holding both a Quadmesh2D and a
+        # Quadmesh3D spliced the 2D body's vec2/mat22 declarations under
+        # 3D vec3 array reads.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+            from typing import Any
+
+            @wp.struct
+            class Arg2:
+                pts: wp.array(dtype=wp.vec2)
+
+            @wp.struct
+            class Arg3:
+                pts: wp.array(dtype=wp.vec3)
+
+            @wp.func
+            def total(arg: Any, i: int):
+                # Generic over the struct type; the returned vector width
+                # differs per specialization.
+                return arg.pts[i] + arg.pts[i]
+
+            @wp.kernel
+            def k2(arg: Arg2, out: wp.array(dtype=wp.vec2)):
+                i = wp.tid()
+                out[i] = total(arg, i)
+
+            @wp.kernel
+            def k3(arg: Arg3, out: wp.array(dtype=wp.vec3)):
+                i = wp.tid()
+                out[i] = total(arg, i)
+
+            N = 16
+            rng = np.random.default_rng(5)
+            p2 = rng.standard_normal((N, 2)).astype(np.float32)
+            p3 = rng.standard_normal((N, 3)).astype(np.float32)
+
+            for dev in ('cpu', 'metal:0'):
+                a2 = Arg2()
+                a2.pts = wp.array(p2, dtype=wp.vec2, device=dev)
+                o2 = wp.zeros(N, dtype=wp.vec2, device=dev)
+                a3 = Arg3()
+                a3.pts = wp.array(p3, dtype=wp.vec3, device=dev)
+                o3 = wp.zeros(N, dtype=wp.vec3, device=dev)
+                # Build the 2-D specialization first; the 3-D launch must
+                # still pick its own.
+                wp.launch(k2, dim=N, inputs=[a2], outputs=[o2], device=dev)
+                wp.launch(k3, dim=N, inputs=[a3], outputs=[o3], device=dev)
+                wp.synchronize_device(dev)
+                np.testing.assert_allclose(o2.numpy(), 2.0 * p2, rtol=1e-6)
+                np.testing.assert_allclose(o3.numpy(), 2.0 * p3, rtol=1e-6)
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=180)
+
+
+@unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
+@unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
+class TestMetalScalarArgAndSubviewBinding(unittest.TestCase):
+    """Launch-path argument binding: Warp-typed scalars, and arrays that are
+    views into a larger allocation."""
+
+    def test_warp_typed_scalar_argument(self):
+        # ``warp.sparse`` wraps alpha/beta in the matrix's ``scalar_type``,
+        # so the value reaching the launcher is a ctypes wrapper rather
+        # than a Python number.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            @wp.kernel
+            def scale(alpha: float, n: int, x: wp.array(dtype=wp.float32),
+                      out: wp.array(dtype=wp.float32)):
+                i = wp.tid()
+                out[i] = alpha * x[i] + float(n)
+
+            N = 32
+            x_np = np.arange(N, dtype=np.float32)
+            for dev in ('cpu', 'metal:0'):
+                x = wp.array(x_np, dtype=wp.float32, device=dev)
+                out = wp.zeros(N, dtype=wp.float32, device=dev)
+                wp.launch(scale, dim=N, inputs=[wp.float32(-1.5), wp.int32(3), x],
+                          outputs=[out], device=dev)
+                wp.synchronize_device(dev)
+                np.testing.assert_allclose(out.numpy(), -1.5 * x_np + 3.0, rtol=1e-6)
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
+    def test_sub_view_array_argument(self):
+        # A row slice of a 2-D array is a contiguous window into a larger
+        # allocation: fewer elements than the buffer holds, and (for a
+        # non-zero start) a byte offset into it. Both the read and the
+        # in-place write have to land on the right window.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            @wp.kernel
+            def add_into(src: wp.array(dtype=wp.float32, ndim=2),
+                         dst: wp.array(dtype=wp.float32, ndim=2)):
+                i, j = wp.tid()
+                dst[i, j] = dst[i, j] + src[i, j]
+
+            R, C = 6, 32
+            base_np = np.arange(R * C, dtype=np.float32).reshape(R, C)
+            add_np = np.full((2, C), 100.0, np.float32)
+
+            for dev in ('cpu', 'metal:0'):
+                base = wp.array(base_np, dtype=wp.float32, device=dev)
+                add = wp.array(add_np, dtype=wp.float32, device=dev)
+                # Interior window: rows 3 and 4 of a 6-row allocation.
+                wp.launch(add_into, dim=(2, C), inputs=[add], outputs=[base[3:5]], device=dev)
+                wp.synchronize_device(dev)
+                expected = base_np.copy()
+                expected[3:5] += 100.0
+                np.testing.assert_allclose(base.numpy(), expected, rtol=1e-6)
             """
         )
         _run_with_metal_enabled(self, snippet, timeout=120)

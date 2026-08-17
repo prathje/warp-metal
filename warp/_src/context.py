@@ -3537,8 +3537,13 @@ def _metal_find_buffer(ptr: int):
     containing ``ptr``, or ``(None, 0)`` if no allocation covers it.
 
     Exact-base lookups are O(1); interior pointers (contiguous views into a
-    larger array) fall back to a linear scan over the registry. The scan
-    only runs on capture-time host-op recording, never on the launch path.
+    larger array) fall back to a linear scan over the registry. Callers on
+    the launch path (binding a sub-view of a larger allocation) only reach
+    the scan when the exact lookup misses.
+
+    Works in both dispatch modes: native mode registers ``MTLBuffer``
+    (byte length via ``length()``), MLX mode registers a flat ``uint8``
+    ``mx.array`` (``nbytes``).
     """
     with _metal_buffer_lock:
         buf = _metal_buffer_registry.get(ptr)
@@ -3548,9 +3553,10 @@ def _metal_find_buffer(ptr: int):
             if not isinstance(base, int):
                 continue
             length = getattr(b, "length", None)
-            if length is None:  # mx.array in MLX mode — no byte-length probe
+            nbytes = length() if callable(length) else getattr(b, "nbytes", None)
+            if nbytes is None:
                 continue
-            if base < ptr < base + length():
+            if base < ptr < base + nbytes:
                 return b, ptr - base
     return None, 0
 
@@ -6301,6 +6307,10 @@ class Runtime:
                 else:
                     primary_alias_str = f'"{self.cuda_primary_devices[cuda_device.ordinal].alias}"'
                     greeting.append(f"     {alias_str:10s} : Non-primary context on device {primary_alias_str}")
+            for metal_device in self.metal_devices:
+                alias_str = f'"{metal_device.alias}"'
+                name_str = f'"{metal_device.name}"'
+                greeting.append(f"     {alias_str:10s} : {name_str}")
             if cuda_device_count > 1:
                 # check peer access support
                 access_matrix = []
@@ -6770,6 +6780,8 @@ def get_devices() -> list[Device]:
         devices.append(runtime.cpu_device)
     for cuda_device in runtime.cuda_devices:
         devices.append(cuda_device)
+    for metal_device in runtime.metal_devices:
+        devices.append(metal_device)
     return devices
 
 
@@ -6801,12 +6813,18 @@ def get_cuda_devices() -> list[Device]:
 
 
 def get_preferred_device() -> Device:
-    """Return the preferred compute device, ``cuda:0`` if available and ``cpu`` otherwise."""
+    """Return the preferred compute device, ``cuda:0`` if available and ``cpu`` otherwise.
+
+    When Warp is built without CUDA and :data:`warp.config.enable_metal` is set, the
+    Metal device ``metal:0`` is preferred over the CPU.
+    """
 
     init()
 
     if is_cuda_available():
         return runtime.cuda_devices[0]
+    elif runtime.metal_devices:
+        return runtime.metal_devices[0]
     elif is_cpu_available():
         return runtime.cpu_device
     else:
