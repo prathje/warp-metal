@@ -357,6 +357,25 @@ intended for inference-only workloads — autograd, graph capture, and most of
 the kernel-builtin surface are not yet wired up.
 """
 
+metal_demote_fp64: bool = _env_flag("WARP_METAL_DEMOTE_FP64")
+"""Allow ``float64`` arrays on Metal devices by computing on them in ``float32``.
+
+Defaults to the ``WARP_METAL_DEMOTE_FP64`` environment variable (unset →
+``False``), so applications that never touch ``warp.config`` can opt in from
+the shell.
+
+Apple Silicon GPUs have no double-precision hardware, so ``float64`` arrays are
+rejected at code-generation time by default. When ``True``, such arrays are
+still *stored* as 8-byte IEEE-754 doubles — host-side ``numpy()`` round-trips
+are unchanged — but every value is converted to ``float32`` when a kernel reads
+it and back when a kernel writes it, so all arithmetic happens at single
+precision. Warp emits a warning the first time a kernel is generated this way.
+
+Enable this only when reduced precision is acceptable: it silently changes
+results relative to a CUDA or CPU run. Algorithms that chose ``float64`` for
+conditioning reasons may converge differently or not at all.
+"""
+
 metal_native_dispatch: bool = _env_flag("WARP_METAL_NATIVE_DISPATCH")
 """Route Metal launches through Apple's Metal API directly instead of MLX.
 

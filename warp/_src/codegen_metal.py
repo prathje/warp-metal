@@ -311,6 +311,12 @@ def _vec_t_to_msl(n: int, scalar_ctype: str) -> str:
     if n < 1:
         raise MetalCodegenError(f"MSL codegen: vec_t<{n}, ...> not supported")
     full_ctype = f"wp::{scalar_ctype}"
+    # float64 VALUE locals demote to fp32, the same as bare ``wp::float64``
+    # scalars (see ``_msl_var_type``). Only float64 *pointers* — i.e. array
+    # storage, whose 8-byte stride is user-visible layout — are gated on
+    # ``warp.config.metal_demote_fp64``.
+    if full_ctype == "wp::float64":
+        full_ctype = "wp::float32"
     if full_ctype not in _MSL_VEC_SCALAR_PREFIX:
         raise MetalCodegenError(f"MSL codegen does not yet support vec_t element type {full_ctype!r}")
     msl_scalar = _MSL_VEC_SCALAR_PREFIX[full_ctype]
@@ -357,6 +363,8 @@ def _mat_t_to_msl(rows: int, cols: int, scalar_ctype: str) -> str:
     if rows < 1 or cols < 1:
         raise MetalCodegenError(f"MSL codegen: mat_t<{rows}, {cols}, ...> not supported")
     full_ctype = f"wp::{scalar_ctype}"
+    if full_ctype == "wp::float64":
+        full_ctype = "wp::float32"  # value locals demote — see ``_vec_t_to_msl``
     if full_ctype not in _MSL_VEC_SCALAR_PREFIX:
         raise MetalCodegenError(f"MSL codegen does not yet support mat_t element type {full_ctype!r}")
     return _msl_mat_name(rows, cols, _MSL_VEC_SCALAR_PREFIX[full_ctype])
@@ -1068,7 +1076,55 @@ inline float wp_f64_to_f32(ulong b) {
     if (e32 <= 0) return as_type<float>(sign);                  // underflow -> 0
     return as_type<float>(sign | (uint(e32) << 23) | uint(man >> 29));
 }
+inline ulong wp_f32_to_f64(float f) {
+    uint b = as_type<uint>(f);
+    ulong sign = ulong(b >> 31) << 63;
+    uint exp = (b >> 23) & 0xffu;
+    uint man = b & 0x7fffffu;
+    if (exp == 0xffu) {  // inf / NaN -- keep the quiet bit
+        return sign | (0x7ffull << 52) | (man ? (1ull << 51) : 0ull);
+    }
+    if (exp == 0) {
+        if (man == 0) return sign;  // +/- 0
+        // float denormal: renormalise into the double's much wider exponent
+        // range, which represents every one of them exactly.
+        int e = -126;
+        while ((man & 0x800000u) == 0) { man <<= 1; --e; }
+        man &= 0x7fffffu;
+        return sign | (ulong(e - 1 + 1023) << 52) | (ulong(man) << 29);
+    }
+    return sign | (ulong(int(exp) - 127 + 1023) << 52) | (ulong(man) << 29);
+}
 """
+
+
+def _reject_f64_atomics(text: str, arr_names: set[str], kernel_name: str) -> None:
+    """Raise if a kernel atomically accumulates into an fp32-demoted float64 array.
+
+    A demoted array's element is 8 bytes, so a correct atomic accumulate needs
+    a 64-bit compare-exchange. Metal exposes none: ``atomic<ulong>`` /
+    ``atomic_ulong`` have no ``atomic_load_explicit`` or
+    ``atomic_compare_exchange_weak_explicit`` overload on this toolchain (32-bit
+    ``atomic_uint`` does, and 32-bit float fetch-add works, which is why
+    float32 arrays are fine). Compare-exchanging only the high word would drop
+    the mantissa to ~20 bits — worse than the fp32 this feature is meant to
+    provide — so this raises instead of silently degrading further.
+    """
+    if not arr_names:
+        return
+    for op in ("add", "sub", "min", "max"):
+        for pat in (f"atomic_fetch_{op}_explicit(&", f"wp_atomic_{op}(&"):
+            pos = text.find(pat)
+            while pos != -1:
+                name = text[pos + len(pat) :].split("[", 1)[0].strip()
+                if name in arr_names:
+                    raise MetalCodegenError(
+                        f"Kernel {kernel_name!r}: wp.atomic_{op}() into float64 array {name!r} is not "
+                        f"supported on Metal even with warp.config.metal_demote_fp64 — Metal has no "
+                        f"64-bit atomics, so the 8-byte element cannot be updated atomically. Use a "
+                        f"float32 array for atomically accumulated output."
+                    )
+                pos = text.find(pat, pos + 1)
 
 
 # ``wp.normalize`` must match ``warp/native/vec.h``/``quat.h`` exactly:
@@ -5336,7 +5392,7 @@ def _build_kernel_header(source: str) -> str:
         parts.append(extract_helpers)
     if "wp_diag_float3" in source:
         parts.append(_DIAG_HELPERS)
-    if "wp_f64_to_f32" in source:
+    if "wp_f64_to_f32" in source or "wp_f32_to_f64" in source:
         parts.append(_F64_HELPERS)
     # Always emitted: kernels reference ``wp_normalize``/``wp_quat_normalize``
     # directly, and the quat/noise/BVH helper families below call
@@ -8615,17 +8671,21 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
             # Scalar arg — always an input.
             input_args.append(arg)
             continue
-        # float64 ARRAYS stay rejected: their 8-byte element stride is
-        # user-visible memory layout that cannot be demoted the way scalar
-        # float64 locals / struct fields are. (This raise used to come
-        # implicitly from the f64 locals the loads produce — those now
-        # demote to fp32, so the array check must be explicit.)
+        # float64 ARRAYS: rejected by default, since their 8-byte element
+        # stride is user-visible memory layout. Under the opt-in
+        # ``metal_demote_fp64`` they bind as ``ulong`` and every read/write
+        # converts through ``wp_f64_to_f32`` / ``wp_f32_to_f64``, so the
+        # storage stays byte-identical and only the arithmetic is fp32.
+        # (This raise used to come implicitly from the f64 locals the loads
+        # produce — those already demote, so the array check is explicit.)
         _dtype = getattr(arg.type, "dtype", None)
         _scalar = getattr(_dtype, "_wp_scalar_type_", _dtype)
-        if getattr(_scalar, "__name__", None) == "float64":
+        if getattr(_scalar, "__name__", None) == "float64" and not _is_demoted_f64_array(arg):
             raise MetalCodegenError(
                 f"Kernel {adj.fun_name!r}: array argument {arg.label!r} has float64 elements — "
-                f"MSL has no fp64; use float32 arrays on Metal"
+                f"MSL has no fp64; use float32 arrays on Metal, or set "
+                f"warp.config.metal_demote_fp64 (WARP_METAL_DEMOTE_FP64=1) to compute on them "
+                f"at single precision"
             )
         # Args whose names end in ``_out`` are conventionally outputs in
         # mujoco_warp (and most Warp kernels). Treat them as outputs even
@@ -8662,8 +8722,12 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
                 )
             _fdtype = getattr(ftype, "dtype", None)
             _fscalar = getattr(_fdtype, "_wp_scalar_type_", _fdtype)
-            if getattr(_fscalar, "__name__", None) == "float64":
-                raise MetalCodegenError(f"Kernel {adj.fun_name!r}: {field_desc} has float64 elements — MSL has no fp64")
+            if getattr(_fscalar, "__name__", None) == "float64" and not _is_demoted_f64_array(ftype):
+                raise MetalCodegenError(
+                    f"Kernel {adj.fun_name!r}: {field_desc} has float64 elements — MSL has no fp64; "
+                    f"set warp.config.metal_demote_fp64 (WARP_METAL_DEMOTE_FP64=1) to compute on "
+                    f"them at single precision"
+                )
             syn_var = _WpVar(syn_label, ftype)
             struct_field_array_vars.append(syn_var)
             if syn_label in written_arg_names:
@@ -8703,6 +8767,21 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
     vec_arr_info: dict[str, tuple[int, str]] = {}
     mat_arr_info: dict[str, tuple[int, int, str]] = {}
     struct_arr_info: dict[str, _StructLayout] = {}
+    # Arrays whose float64 elements are demoted to fp32 arithmetic. Their
+    # buffers bind as ``ulong`` (IEEE-754 double bits, one per element), so
+    # every read must go through ``wp_f64_to_f32`` and every write through
+    # ``wp_f32_to_f64``. Index arithmetic is unchanged.
+    f64_arr_names: set[str] = set()
+    for arg in (*adj.args, *struct_field_array_vars):
+        if _is_array_arg(arg) and _is_demoted_f64_array(arg):
+            f64_arr_names.add(arg.label)
+    if f64_arr_names:
+        _warn_fp64_demoted(adj.fun_name, sorted(f64_arr_names))
+
+    def _f64_read(slot: str, arr_name: str) -> str:
+        """Wrap a raw element access in the fp64->fp32 conversion if needed."""
+        return f"wp_f64_to_f32({slot})" if arr_name in f64_arr_names else slot
+
     for arg in (*adj.args, *struct_field_array_vars):
         v_info = _vec_dtype_info(arg)
         if v_info is not None:
@@ -8717,6 +8796,12 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
             struct_arr_info[arg.label] = s_info
 
     subscript_map: dict[str, str] = {}  # local label -> "arr[flat_idx]" string
+    # Subset of ``subscript_map`` whose entries are RAW scalar element
+    # accesses into an fp32-demoted float64 array: local label -> array name.
+    # Kept separate because those entries are also used as assignment
+    # targets, so the read-side conversion can only be applied where the
+    # alias appears as a value (see ``_subscript_by_token``).
+    f64_scalar_alias: dict[str, str] = {}
     # Field pointers that point into a struct's array field. Those fields
     # aren't materialised on Metal (the launcher doesn't pack arrays into
     # the struct's flat buffer), so writes through these pointers are
@@ -8794,7 +8879,7 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
                     elem_idx = index_var_names[0]
                 else:
                     elem_idx = f"({_flat_index_expr(arr_arg, index_var_names)})"
-                comps = [f"{arr_arg}[{elem_idx} * {vec_n} + {k}]" for k in range(vec_n)]
+                comps = [_f64_read(f"{arr_arg}[{elem_idx} * {vec_n} + {k}]", arr_arg) for k in range(vec_n)]
                 subscript_map[local_label] = f"{msl_vec_ctor}({', '.join(comps)})"
             elif arr_arg in mat_arr_info:
                 # Mat-typed array: each *element* is ``rows*cols`` consecutive
@@ -8814,14 +8899,24 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
                     msl_mat_type = f"{msl_scalar}{rows}x{cols}"
                     col_strs: list[str] = []
                     for c in range(cols):
-                        col_components = [f"{arr_arg}[{elem_idx} * {stride} + {r * cols + c}]" for r in range(rows)]
+                        col_components = [
+                            _f64_read(f"{arr_arg}[{elem_idx} * {stride} + {r * cols + c}]", arr_arg)
+                            for r in range(rows)
+                        ]
                         col_strs.append(f"{msl_vec_type}({', '.join(col_components)})")
                     subscript_map[local_label] = f"{msl_mat_type}({', '.join(col_strs)})"
                 else:
-                    comps = [f"{arr_arg}[{elem_idx} * {stride} + {i}]" for i in range(stride)]
+                    comps = [_f64_read(f"{arr_arg}[{elem_idx} * {stride} + {i}]", arr_arg) for i in range(stride)]
                     subscript_map[local_label] = f"wp_mat{rows}x{cols}_{msl_scalar}_make({', '.join(comps)})"
             else:
+                # Stays a RAW element access: this entry doubles as the
+                # assignment target in the store branch below, and a
+                # ``wp_f64_to_f32(...)`` wrapper is not an lvalue. Demoted
+                # arrays are recorded instead and the conversion is applied
+                # only where the alias is used as a value.
                 subscript_map[local_label] = f"{arr_arg}[{_flat_index_expr(arr_arg, index_var_names)}]"
+                if arr_arg in f64_arr_names:
+                    f64_scalar_alias[local_label] = arr_arg
 
     # ---- Struct LOCAL variables (``q = SomeStruct(); q.field = ...``) ----
     # We don't materialise the struct; instead, each field becomes its own
@@ -9334,7 +9429,14 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
     # O(len(subscript_map)) regex passes per line, which went quadratic on
     # mujoco_warp's inlined GJK kernels (65k lines x thousands of aliases
     # = tens of minutes per kernel).
-    _subscript_by_token = {f"var_{k}": v for k, v in subscript_map.items()}
+    # Scalar aliases into an fp32-demoted float64 array are stored RAW (they
+    # double as assignment targets), so the fp64->fp32 conversion is applied
+    # here — the value-substitution table — and nowhere else. The store
+    # branch reads ``subscript_map`` directly and therefore still sees a
+    # real lvalue.
+    _subscript_by_token = {
+        f"var_{k}": (f"wp_f64_to_f32({v})" if k in f64_scalar_alias else v) for k, v in subscript_map.items()
+    }
     _subscript_token_pat = re.compile(r"\bvar_\w+\b")
 
     def _substitute_subscripts(text: str) -> str:
@@ -9486,6 +9588,10 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
         if has_atomic:
             for out_name in atomic_output_names:
                 translated = _wrap_atomic_load_reads(translated, out_name)
+        # Atomic accumulate on a demoted float64 element would need a 64-bit
+        # compare-exchange, which Metal does not have. Fail with a precise
+        # message rather than emit code that cannot compile.
+        _reject_f64_atomics(translated, f64_arr_names, adj.fun_name)
         _check_no_unsupported_intrinsics(translated)
         return translated
 
@@ -9908,6 +10014,18 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
                 continue
             if addr in subscript_map:
                 lhs = subscript_map[addr]
+                if addr in f64_scalar_alias:
+                    # Demoted float64 element: the slot holds IEEE-754 double
+                    # bits, so a plain ``=`` would store a float bit pattern
+                    # and a compound op would do integer arithmetic on the
+                    # bits. Convert both directions explicitly.
+                    if op == "=":
+                        body_lines.append(_finalize(f"{indent}{lhs} = wp_f32_to_f64({value});"))
+                    else:
+                        body_lines.append(
+                            _finalize(f"{indent}{lhs} = wp_f32_to_f64(wp_f64_to_f32({lhs}) {op[0]} ({value}));")
+                        )
+                    continue
                 body_lines.append(_finalize(f"{indent}{lhs} {op} {value};"))
                 continue
             # Stray store — pass through; the unsupported-intrinsic
@@ -9976,7 +10094,13 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
                 "mul_inplace": "*=",
                 "div_inplace": "/=",
             }[op_name]
-            if has_atomic and arr in output_arg_names and op_sym == "=":
+            if arr in f64_arr_names:
+                slot = f"{arr}[{idx}]"
+                if op_sym == "=":
+                    line_out = f"{indent}{slot} = wp_f32_to_f64({val});"
+                else:
+                    line_out = f"{indent}{slot} = wp_f32_to_f64(wp_f64_to_f32({slot}) {op_sym[0]} ({val}));"
+            elif has_atomic and arr in output_arg_names and op_sym == "=":
                 line_out = f"{indent}atomic_store_explicit(&{arr}[{idx}], {val}, memory_order_relaxed);"
             else:
                 line_out = f"{indent}{arr}[{idx}] {op_sym} {val};"
@@ -10006,7 +10130,11 @@ def _generate_msl_kernel_uncached(kernel) -> MetalKernelArtifact:
                     indent: str = indent,
                     arr: str = arr,
                     use_atomic_store: bool = use_atomic_store,
+                    is_f64: bool = arr in f64_arr_names,
                 ) -> str:
+                    if is_f64:
+                        # Demoted float64 slot: store the double bit pattern.
+                        return f"{indent}{arr}[{idx_expr}] = wp_f32_to_f64({rhs});"
                     if use_atomic_store:
                         return f"{indent}atomic_store_explicit(&{arr}[{idx_expr}], {rhs}, memory_order_relaxed);"
                     return f"{indent}{arr}[{idx_expr}] = {rhs};"
@@ -11244,8 +11372,16 @@ def _msl_array_inner_msl_type(arg) -> str:
     storage is float32 in our backing layout).
 
     Used to route init-shadow data into the right packed buffer
-    (``__init_shadows_floats`` vs ``__init_shadows_ints``).
+    (``__init_shadows_floats`` vs ``__init_shadows_ints``) and to type the
+    in-place ``__rw`` output aliases.
+
+    An fp32-demoted float64 array reports its STORAGE type (``"ulong"``),
+    not the fp32 value type its elements convert to — the ``__rw`` alias
+    this feeds must match the bound buffer or reads and writes reinterpret
+    double bits as floats.
     """
+    if _is_demoted_f64_array(arg):
+        return "ulong"
     v = _vec_dtype_info(arg)
     if v is not None:
         return v[1]
@@ -11292,6 +11428,10 @@ def _vec_dtype_info(arg) -> tuple[int, str] | None:
     if n < 1:
         raise MetalCodegenError(f"MSL codegen does not support vec{n}")
     scalar_ctype = f"wp::{scalar_cls.__name__}"
+    if scalar_ctype == "wp::float64" and _is_demoted_f64_array(arg):
+        # The *value* type is a float vec — storage is ulong and each
+        # component converts on access (see ``_is_demoted_f64_array``).
+        return n, "float"
     if scalar_ctype not in _MSL_VEC_SCALAR_PREFIX:
         raise MetalCodegenError(f"MSL codegen does not yet support arrays of vec_t with element type {scalar_ctype!r}")
     return n, _MSL_VEC_SCALAR_PREFIX[scalar_ctype]
@@ -11316,6 +11456,8 @@ def _mat_dtype_info(arg) -> tuple[int, int, str] | None:
     if rows < 1 or cols < 1:
         raise MetalCodegenError(f"MSL codegen does not yet support arrays of mat{rows}x{cols}")
     scalar_ctype = f"wp::{scalar_cls.__name__}"
+    if scalar_ctype == "wp::float64" and _is_demoted_f64_array(arg):
+        return rows, cols, "float"
     if scalar_ctype not in _MSL_VEC_SCALAR_PREFIX:
         raise MetalCodegenError(f"MSL codegen does not yet support arrays of mat_t with element type {scalar_ctype!r}")
     return rows, cols, _MSL_VEC_SCALAR_PREFIX[scalar_ctype]
@@ -11640,7 +11782,18 @@ def _wp_dtype_to_mx_dtype(wp_dtype):
         wpt.bool: mx.bool_,
     }
     if wp_dtype is wpt.float64:
-        raise MetalCodegenError("MSL/MLX has no native float64; use float32 for Metal kernels")
+        import warp.config as _wp_cfg  # noqa: PLC0415
+
+        if _wp_cfg.metal_demote_fp64:
+            # Bound as the raw IEEE-754 double bit pattern, one per element;
+            # the kernel converts on access. Storage stays 8 bytes so host
+            # round-trips are unchanged.
+            return mx.uint64
+        raise MetalCodegenError(
+            "MSL/MLX has no native float64; use float32 for Metal kernels, or set "
+            "warp.config.metal_demote_fp64 (WARP_METAL_DEMOTE_FP64=1) to compute on float64 "
+            "arrays at single precision"
+        )
     if wp_dtype not in mapping:
         raise MetalCodegenError(f"No MLX dtype for Warp dtype {wp_dtype!r}")
     return mapping[wp_dtype]
@@ -11803,11 +11956,65 @@ def _native_scalar_msl_type(scalar_ctype: str) -> str:
     return _SCALAR_CTYPE_TO_MSL[scalar_ctype]
 
 
+def _array_scalar_type_name(arg_or_type) -> str | None:
+    """Return the ``__name__`` of an array's innermost scalar dtype.
+
+    Looks through vec / quat / transform / mat element types. Returns
+    ``None`` for struct-dtype arrays and anything unrecognised.
+    """
+    from warp._src.codegen import Struct  # noqa: PLC0415
+
+    arr_type = getattr(arg_or_type, "type", arg_or_type)
+    dtype = getattr(arr_type, "dtype", None)
+    if dtype is None or isinstance(dtype, Struct):
+        return None
+    scalar = getattr(dtype, "_wp_scalar_type_", dtype)
+    return getattr(scalar, "__name__", None)
+
+
+def _is_demoted_f64_array(arg_or_type) -> bool:
+    """True when this array's elements are ``float64`` and the opt-in fp32
+    demotion is enabled.
+
+    Demoted arrays keep their 8-byte IEEE-754 storage — they bind as
+    ``ulong`` (one per element, so every index computation is unchanged) and
+    the codegen converts on each read and write. See
+    :data:`warp.config.metal_demote_fp64`.
+    """
+    import warp.config as _wp_cfg  # noqa: PLC0415
+
+    if not _wp_cfg.metal_demote_fp64:
+        return False
+    return _array_scalar_type_name(arg_or_type) == "float64"
+
+
+_fp64_demote_warned = False
+
+
+def _warn_fp64_demoted(kernel_name: str, arr_names: list[str]) -> None:
+    """Warn once per process that fp64 arrays are being computed on in fp32."""
+    global _fp64_demote_warned
+    if _fp64_demote_warned:
+        return
+    _fp64_demote_warned = True
+    from warp._src.utils import warn  # noqa: PLC0415
+
+    warn(
+        f"warp.config.metal_demote_fp64 is set: float64 arrays on Metal devices are stored as "
+        f"doubles but computed on in float32, so results will differ from a CUDA or CPU run "
+        f"(first seen in kernel {kernel_name!r}, argument(s) {', '.join(arr_names)}). "
+        f"Apple Silicon GPUs have no double-precision hardware.",
+        category=UserWarning,
+    )
+
+
 def _native_array_inner_msl(arg_var) -> str:
     """Return the MSL element type for a Warp array argument's storage."""
 
     from warp._src.codegen import Struct  # noqa: PLC0415
 
+    if _is_demoted_f64_array(arg_var):
+        return "ulong"
     dtype = arg_var.type.dtype
     kind = getattr(dtype, "_wp_generic_type_str_", None)
     if kind in ("vec_t", "quat_t", "transform_t", "mat_t"):
