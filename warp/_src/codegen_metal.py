@@ -1342,10 +1342,11 @@ def _msl_zero_init(msl_type: str) -> str:
     """Zero-initialiser expression for an MSL value type.
 
     Native types (``float``, ``float3``, ``float3x3``, ``int``) take the
-    broadcasting one-arg form; the generated ``wp_vecN`` / ``wp_matRxC``
-    structs have no such constructor and need aggregate value-init.
+    broadcasting one-arg form; the generated ``wp_vecN`` / ``wp_matRxC`` /
+    ``wp_tile_RxC_*`` structs have no such constructor and need aggregate
+    value-init.
     """
-    return f"{msl_type}()" if msl_type.startswith(("wp_mat", "wp_vec")) else f"{msl_type}(0)"
+    return f"{msl_type}()" if msl_type.startswith(("wp_mat", "wp_vec", "wp_tile")) else f"{msl_type}(0)"
 
 
 # Types a local declaration can safely be zeroed with (see ``_msl_local_init``).
@@ -1380,6 +1381,94 @@ _ADJ_CALL_PAT = re.compile(r"\bwp::adj_([A-Za-z_]\w*)\s*\(")
 _ADJ_ARRAY_PAT = re.compile(
     r"^(?P<indent>\s*)wp::adj_(?P<op>address|array_store|atomic_add)\s*\((?P<args>.*)\)\s*;\s*$"
 )
+
+# Tile adjoints that pair a tile against an array, so they need the same
+# flat-index machinery as ``_ADJ_ARRAY_PAT`` (and are lowered next to it
+# rather than in ``_translate_tile_intrinsics``, which has no view of the
+# gradient buffers).
+_ADJ_TILE_ARRAY_PAT = re.compile(
+    r"^(?P<indent>\s*)wp::adj_(?P<op>tile_load|tile_store|tile_atomic_add)\s*(?:<[^()]*>)?\s*\((?P<args>.*)\)\s*;\s*$"
+)
+# Argument count as a function of the array rank, per ``warp/native/tile.h``:
+#   tile_load:       src,  off.., adj_src,  adj_off.., adj_ret
+#   tile_store:      dest, off.., t, adj_dest, adj_off.., adj_t
+#   tile_atomic_add: dest, off.., t, adj_dest, adj_off.., adj_t, adj_ret
+_ADJ_TILE_ARRAY_FIXED = {"tile_load": 3, "tile_store": 4, "tile_atomic_add": 5}
+
+
+# ``adj_p.offset += adj_6;`` / ``adj_p.values = adj_1;`` — the adjoint of a
+# struct field read, emitted by ``Adjoint.emit_Attribute`` (``+=`` for
+# differentiable value types, ``=`` for everything else). See
+# ``_dead_struct_duals`` for what the Metal backend does with it.
+_ADJ_STRUCT_FIELD_STORE_PAT = re.compile(
+    r"^\s*adj_(?P<root>\w+)(?P<path>(?:\.\w+)+)\s*(?:\+=|-=|=)\s*(?P<rhs>.+?)\s*;\s*$"
+)
+
+
+def _dead_struct_duals(lines: list[str], struct_arg_labels: set[str]) -> set[str]:
+    """Labels whose ``adj_<label>.<field>`` stores can be dropped.
+
+    Warp emits one such store for every struct-field *read*
+    (``Adjoint.emit_Attribute``). Where the struct is a kernel argument the
+    store has no reader anywhere: the backward entry point takes the adjoint
+    struct **by value**, so accumulating into ``adj_p.scale`` dies with the
+    thread. Gradients for a struct's ``wp.array`` fields do not travel this
+    way either — they reach the tape through the field array's own ``grad``
+    buffer, which the Metal backend binds as a synthetic
+    ``adj_<arg>__<field>`` argument. The ``adj_p.values = adj_1;`` companion
+    line is likewise a dead store: it runs *after* the ``adj_address`` that
+    would have consumed it, since the reverse block is stored forward-order
+    and executed reversed.
+
+    Struct *locals* are the harder case — a nested field read
+    (``o.inner.gain``) routes through Reference-typed intermediates, and
+    warp.fem stacks half a dozen of them per integrand. So rather than
+    enumerate shapes, this computes a greatest fixpoint: assume every struct
+    dual is dead, then disqualify any whose value is genuinely *read*
+    somewhere. The only reads that keep a dual alive are the ones a fold
+    cannot see through — a call argument, a copy into a live struct — and
+    those make the field store an error rather than a silent gradient drop.
+
+    A line does not disqualify ``adj_R`` when it is R's own zero-init, a
+    store *into* one of R's fields, or a store of R as a whole into another
+    dead dual (that store is dropped too, so R's value goes nowhere).
+    """
+    roots: set[str] = set(struct_arg_labels)
+    for line in lines:
+        m = _ADJ_STRUCT_FIELD_STORE_PAT.match(line)
+        if m:
+            roots.add(m.group("root"))
+
+    # Lines mentioning each candidate, so the fixpoint below rescans only
+    # what is relevant instead of the whole body per iteration.
+    mentions: dict[str, list[str]] = {}
+    for label in roots:
+        tok = re.compile(rf"\badj_{re.escape(label)}\b")
+        mentions[label] = [ln for ln in lines if tok.search(ln)]
+
+    def is_read_by(label: str, line: str, dead: set[str]) -> bool:
+        """True if ``line`` reads ``adj_<label>`` in a way that keeps it live."""
+        if _ADJ_AGGREGATE_INIT_PAT.match(line):
+            return False
+        m = _ADJ_STRUCT_FIELD_STORE_PAT.match(line)
+        if m is None:
+            return True
+        if m.group("root") == label:
+            # Writing one of R's own fields is not a read of R. (The RHS
+            # could in principle name R too; nothing Warp emits does.)
+            return False
+        # ``adj_X.f = adj_R;`` — harmless only if that store is itself dropped.
+        return not (m.group("root") in dead and m.group("rhs").strip() == f"adj_{label}")
+
+    dead = set(roots)
+    changed = True
+    while changed:
+        changed = False
+        for label in sorted(dead):
+            if any(is_read_by(label, ln, dead) for ln in mentions[label]):
+                dead.discard(label)
+                changed = True
+    return dead
 
 
 _ADJ_AGGREGATE_INIT_PAT = re.compile(r"^(?P<indent>\s*)(?P<pfx>adj_|var_)(?P<label>\w+)\s*=\s*\{\s*\}\s*;\s*$")
@@ -6980,6 +7069,16 @@ _TILE_MINMAX_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_(min|max)\s*\(\s*var_
 # ``wp::tile_sum(t)`` — sum-reduce every element to a 1-element tile (a
 # plain scalar here). ``wp.optim.linear``'s tiled dot product uses it.
 _TILE_SUM_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_sum\s*\(\s*var_(\w+)\s*\)")
+# Reverse-mode counterparts of the two purely tile-local builtins above.
+# Both are statements, not assignments, and are rewritten in place (the
+# trailing ``;`` of the original line is kept).
+_ADJ_TILE_CTOR_PAT = re.compile(r"\bwp::adj_tile\s*(?:<[^()]*>)?\s*\(\s*var_(\w+)\s*,\s*(adj_\w+)\s*,\s*(adj_\w+)\s*\)")
+_ADJ_TILE_SUM_PAT = re.compile(r"\bwp::adj_tile_sum\s*\(\s*var_(\w+)\s*,\s*(adj_\w+)\s*,\s*(adj_\w+)\s*\)")
+# ``wp::adj_tile_<op>(a, b, adj_a, adj_b, adj_c)`` — the element-wise
+# arithmetic tile ops. ``tile.h`` routes all of them through
+# ``adj_tile_binary_map``, i.e. the scalar adjoint applied per element,
+# which is exactly what the forward ``_TILE_OP_NOTPL_PAT`` lowering mirrors.
+_ADJ_TILE_OP_PAT = re.compile(r"\bwp::adj_tile_(add|sub|mul|div|mul_elementwise)\s*\(([^)]*)\)")
 # ``wp::tile_scan_inclusive(tile)`` / ``wp::tile_scan_exclusive(tile)`` —
 # prefix sums over a register tile. Serial per-thread, like ``tile_sum``.
 _TILE_SCAN_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_scan_(inclusive|exclusive)\s*\(\s*var_(\w+)\s*\)")
@@ -7013,8 +7112,10 @@ _TILE_MAP_NOTPL_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_map\s*\(([^)]*)\)"
 _TILE_BINARY_MAP_NOTPL_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_binary_map\s*\(([^)]*)\)")
 # ``wp::tile_<op>(args...)`` — explicit-op tile builtins like
 # ``tile_mul`` / ``tile_add`` / ``tile_sub`` / ``tile_div``. Treated
-# the same as ``tile_binary_map(wp::<op>, args...)``.
-_TILE_OP_NOTPL_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_(add|sub|mul|div)\s*\(([^)]*)\)")
+# the same as ``tile_binary_map(wp::<op>, args...)``. ``mul_elementwise``
+# (tile * tile, as opposed to ``mul``'s tile * scalar) must precede ``mul``
+# in the alternation or the regex stops at the shorter name.
+_TILE_OP_NOTPL_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_(add|sub|mul_elementwise|mul|div)\s*\(([^)]*)\)")
 # In-place compound forms ``wp::tile_add_inplace(dst, src)`` etc. —
 # accumulates ``src`` into ``dst`` element-wise.
 _TILE_OP_INPLACE_PAT = re.compile(r"\bwp::tile_(add|sub|mul|div)_inplace\s*\(([^)]*)\)")
@@ -7165,6 +7266,50 @@ def _build_flat_base_expr(arr_name: str, lead_idx_args: list[str], inner_dims: i
             stride = " * ".join(f"{arr_name}_shape[{j}]" for j in stride_dims)
             terms.append(f"{idx} * {stride}")
     return " + ".join(terms)
+
+
+def _tile_grad_slots(
+    arr_name: str,
+    lead_idx_args: list[str],
+    offsets: list[str],
+    rows: int,
+    cols: int,
+    vec_n: int,
+) -> list[tuple[str, str]]:
+    """``[(array_flat_index, tile_element_accessor)]`` for a tile/array pairing.
+
+    Mirrors the index arithmetic of the forward ``tile_store`` /
+    ``tile_atomic_add`` lowering so the reverse pass touches exactly the
+    elements the forward pass did. The accessor is the text appended to a
+    tile local to reach one scalar: ``""`` for a tile that collapsed to a
+    plain scalar, ``.c[k]`` for a register tile, plus ``[e]`` for the
+    component of a vec-element tile.
+    """
+    scalar_inner_dims = (2 if cols > 1 else 1) + (1 if vec_n else 0)
+    base_expr = _build_flat_base_expr(arr_name, lead_idx_args, inner_dims=scalar_inner_dims)
+    if cols > 1:
+        row_stride = f"{arr_name}_shape[{len(lead_idx_args) + 1}]"
+        row_off, col_off = offsets[0], offsets[1]
+    else:
+        row_stride = "1"
+        row_off, col_off = offsets[0], "0"
+    n_elem = rows * cols
+    slots: list[tuple[str, str]] = []
+    for i in range(rows):
+        for j in range(cols):
+            flat = f"{base_expr} + (({row_off}) + {i}) * ({row_stride}) + (({col_off}) + {j})"
+            k = i * cols + j
+            if not vec_n:
+                # A single-element tile collapsed to a plain scalar local.
+                slots.append((f"({flat})", "" if n_elem == 1 else f".c[{k}]"))
+                continue
+            # ``wp_tile_RxC_vec<N>_<scalar>`` stores flat, element-major and
+            # component-minor (``c[(i*cols + j)*N + e]``); a single-element
+            # tile collapsed to a bare vec local, indexed component-wise.
+            for e in range(vec_n):
+                cell = f"[{e}]" if n_elem == 1 else f".c[{k * vec_n + e}]"
+                slots.append((f"({flat}) * {vec_n} + {e}", cell))
+    return slots
 
 
 def _emit_tile_writeback(
@@ -7706,6 +7851,80 @@ def _translate_tile_intrinsics(
 
     line = _TILE_SUM_PAT.sub(repl_tile_sum, line)
 
+    def repl_adj_tile(m: re.Match[str]) -> str:
+        # ``wp::adj_tile(var_X, adj_X, adj_T)`` — reverse of ``wp.tile(x)``,
+        # which lifts this thread's scalar into its lane of a register tile.
+        # Each thread owns one element, so the adjoint is a plain scalar
+        # accumulate (``adj_x += adj_reg.data[0]`` in ``tile.h``).
+        src, adj_src, adj_tile = m.group(1), m.group(2), m.group(3)
+        dims = tile_var_dims.get(adj_tile[len("adj_") :])
+        if dims is not None and dims[0] * dims[1] != 1:
+            raise MetalCodegenError(
+                f"MSL codegen: reverse mode through wp.tile() on a {dims[0]}x{dims[1]} tile "
+                f"is not supported (each thread must own exactly one element)"
+            )
+        del src
+        return f"{adj_src} += {adj_tile}"
+
+    line = _ADJ_TILE_CTOR_PAT.sub(repl_adj_tile, line)
+
+    def repl_adj_tile_sum(m: re.Match[str]) -> str:
+        # ``wp::adj_tile_sum(var_T, adj_T, adj_S)`` — every element of the
+        # summed tile contributed once, so each gets the result's adjoint.
+        in_label = m.group(1)
+        adj_in, adj_ret = m.group(2), m.group(3)
+        dims = tile_var_dims.get(in_label)
+        n = dims[0] * dims[1] if dims is not None else 1
+        if n == 1:
+            return f"{adj_in} += {adj_ret}"
+        if tile_var_vec_n.get(in_label, 0) > 0:
+            raise MetalCodegenError(
+                f"MSL codegen: reverse mode through tile_sum on a vec-element tile 'var_{in_label}' is not supported"
+            )
+        return f"for (int _ats_i = 0; _ats_i < {n}; ++_ats_i) {adj_in}.c[_ats_i] += {adj_ret}"
+
+    line = _ADJ_TILE_SUM_PAT.sub(repl_adj_tile_sum, line)
+
+    def repl_adj_tile_op(m: re.Match[str]) -> str:
+        op = m.group(1)
+        scalar_op = "mul" if op == "mul_elementwise" else op
+        args = [a.strip() for a in m.group(2).split(",")]
+        if len(args) != 5:
+            return m.group(0)
+        a, b, adj_a, adj_b, adj_c = args
+
+        def _dims(x: str) -> tuple[int, int] | None:
+            label = x[len("var_") :] if x.startswith("var_") else x
+            d = tile_var_dims.get(label)
+            return None if d is None else (d[0], d[1])
+
+        shape = _dims(a) or _dims(b)
+        if shape is None:
+            return m.group(0)
+        n = shape[0] * shape[1]
+        for x in (a, b):
+            label = x[len("var_") :] if x.startswith("var_") else x
+            if tile_var_vec_n.get(label, 0) > 0:
+                raise MetalCodegenError(
+                    f"MSL codegen: reverse mode through tile_{op} on a vec-element tile '{x}' is not supported"
+                )
+
+        def _elem(x: str, tiled: bool) -> str:
+            # Scalar operands broadcast; a single-element tile already
+            # collapsed to a plain local, so only real tiles get ``.c[i]``.
+            return f"{x}.c[_at_i]" if tiled and n > 1 else x
+
+        a_tiled, b_tiled = _dims(a) is not None, _dims(b) is not None
+        call = (
+            f"wp_adj_{scalar_op}({_elem(a, a_tiled)}, {_elem(b, b_tiled)}, "
+            f"{_elem(adj_a, a_tiled)}, {_elem(adj_b, b_tiled)}, {_elem(adj_c, True)})"
+        )
+        if n == 1:
+            return call
+        return f"do {{ for (int _at_i = 0; _at_i < {n}; ++_at_i) {{ {call}; }} }} while(0)"
+
+    line = _ADJ_TILE_OP_PAT.sub(repl_adj_tile_op, line)
+
     def repl_tile_scan(m: re.Match[str]) -> str:
         lhs, kind, in_label = m.group(1), m.group(2), m.group(3)
         dims = tile_var_dims.get(in_label)
@@ -7906,7 +8125,8 @@ def _translate_tile_intrinsics(
     def _repl_tile_op(m: re.Match[str]) -> str:
         # Rewrite ``wp::tile_<op>(args)`` to the binary_map form so
         # ``repl_tile_map_notpl`` produces the element loop.
-        synth = f"var_{m.group(1)} = wp::tile_binary_map(wp::{m.group(2)}, {m.group(3)})"
+        op = "mul" if m.group(2) == "mul_elementwise" else m.group(2)
+        synth = f"var_{m.group(1)} = wp::tile_binary_map(wp::{op}, {m.group(3)})"
         return _TILE_BINARY_MAP_NOTPL_PAT.sub(repl_tile_map_notpl, synth)
 
     line = _TILE_OP_NOTPL_PAT.sub(_repl_tile_op, line)
@@ -8425,11 +8645,23 @@ def _emit_referenced_user_funcs(source: str) -> str:
     return "\n".join(_USER_FUNC_MSL_DEFS[n] for n in sorted(seen)) + "\n"
 
 
+# A tile adjoint that survived translation. These lose their ``wp::`` on the
+# way through the tile translator, so the generic check below no longer sees
+# them and they would reach the Metal compiler as undeclared identifiers.
+_UNTRANSLATED_TILE_ADJ_PAT = re.compile(r"\badj_(tile_\w+)\s*\(")
+
+
 def _check_no_unsupported_intrinsics(line: str) -> None:
     """After translation, any remaining ``wp::`` or ``builtin_`` is unsupported."""
     if "wp::" in line or "builtin_" in line:
         raise MetalCodegenError(
             f"MSL codegen does not yet support this statement; remaining Warp intrinsic in: {line!r}"
+        )
+    m = _UNTRANSLATED_TILE_ADJ_PAT.search(line)
+    if m:
+        raise MetalCodegenError(
+            f"MSL codegen: reverse mode through wp.{m.group(1)}() is not supported on Metal yet "
+            f"(statement: {line.strip()!r})"
         )
 
 
@@ -9175,6 +9407,20 @@ def _generate_msl_kernel_uncached(
             gvar = _WpVar(gname, arg.type)
             grad_array_vars.append(gvar)
             grad_arg_of[arg.label] = gname
+            output_args.append(gvar)
+
+        # ``wp.array`` fields of struct args get the same treatment. Their
+        # gradients never travel through the adjoint struct (see
+        # ``_dead_struct_duals``) — the tape hands the field's
+        # own grad array to the launcher, which binds it here under the
+        # synthetic field name the forward pass already uses.
+        for syn_var in struct_field_array_vars:
+            if syn_var.label not in grad_args:
+                continue
+            gname = f"adj_{syn_var.label}"
+            gvar = _WpVar(gname, syn_var.type)
+            grad_array_vars.append(gvar)
+            grad_arg_of[syn_var.label] = gname
             output_args.append(gvar)
 
     if not output_args:
@@ -10097,10 +10343,24 @@ def _generate_msl_kernel_uncached(
     # itself once we know the local is aliased away.
     inlined_decl_pat = re.compile(r"^\s*[\w<>:*\s]+?\s+var_(\w+)\s*;\s*$")
 
+    # Labels whose ``adj_<label>.<field>`` stores are dead (see
+    # ``_dead_struct_duals``).
+    dead_struct_duals = _dead_struct_duals(forward_lines, {a.label for a in adj.args if isinstance(a.type, _Struct)})
+
     for raw in forward_lines:
         line = _strip_comments_and_directives(raw)
         if line is None:
             continue
+        m_adj_field = _ADJ_STRUCT_FIELD_STORE_PAT.match(line)
+        if m_adj_field:
+            if m_adj_field.group("root") in dead_struct_duals:
+                continue
+            raise MetalCodegenError(
+                f"Kernel {adj.fun_name!r}: reverse mode through a field of the struct local "
+                f"'var_{m_adj_field.group('root')}' is not supported yet (line: {line.strip()}). "
+                f"The Metal backend splits struct values into per-field locals and has no dual "
+                f"for the struct itself."
+            )
         # Drop inliner-emitted decls for locals that the address-fold pass
         # aliased into ``subscript_map`` — leaving them in place would let
         # ``_finalize`` substitute the alias expression *into* the decl,
@@ -10129,6 +10389,16 @@ def _generate_msl_kernel_uncached(
                     raise MetalCodegenError(f"Kernel {adj.fun_name!r}: unexpected wp::adj_{op} arity in: {raw.strip()}")
                 ndim = (len(args) - fixed) // 2
                 indices = args[1 : 1 + ndim]
+                if arr not in arg_label_set:
+                    # Not a bound array at all — an alias no fold resolved
+                    # (a sliced view, an unsupported struct-field chain).
+                    # Falling through to "no gradient sink" here would drop
+                    # a real gradient and report success, so stop instead.
+                    raise MetalCodegenError(
+                        f"Kernel {adj.fun_name!r}: cannot resolve wp::adj_{op} on array "
+                        f"'var_{arr}' — it is not a kernel argument or a resolvable "
+                        f"struct-held array (line: {raw.strip()})"
+                    )
                 grad_name = grad_arg_of.get(arr)
                 if grad_name is None:
                     continue
@@ -10154,6 +10424,72 @@ def _generate_msl_kernel_uncached(
                     else:  # array_store consumes the incoming gradient
                         body_lines.append(_finalize(f"{indent}{adj_val}{comp} += {tgt};"))
                         body_lines.append(_finalize(f"{indent}{tgt} = 0.0f;"))
+                continue
+
+            m_adj_tile = _ADJ_TILE_ARRAY_PAT.match(raw)
+            if m_adj_tile:
+                op = m_adj_tile.group("op")
+                indent = m_adj_tile.group("indent")
+                args = [a.strip() for a in _split_top_level_args(m_adj_tile.group("args"))]
+                fixed = _ADJ_TILE_ARRAY_FIXED[op]
+                if (len(args) - fixed) % 2 != 0:
+                    raise MetalCodegenError(f"Kernel {adj.fun_name!r}: unexpected wp::adj_{op} arity in: {raw.strip()}")
+                ndim = (len(args) - fixed) // 2
+                # The tile's dual is last except for ``atomic_add``, whose
+                # trailing argument is the adjoint of the previous-values
+                # tile the forward call returned.
+                adj_tile = args[-2] if op == "tile_atomic_add" else args[-1]
+                tile_label = adj_tile[len("adj_") :] if adj_tile.startswith("adj_") else adj_tile
+                dims = tile_var_dims.get(tile_label)
+                if dims is None:
+                    raise MetalCodegenError(
+                        f"Kernel {adj.fun_name!r}: wp::adj_{op} on '{adj_tile}', whose tile shape "
+                        f"could not be resolved (line: {raw.strip()})"
+                    )
+                rows, cols, _scalar = dims
+                arr = args[0]
+                arr_name = arr[len("var_") :] if arr.startswith("var_") else arr
+                if arr_name not in arg_label_set:
+                    raise MetalCodegenError(
+                        f"Kernel {adj.fun_name!r}: cannot resolve wp::adj_{op} on array "
+                        f"'{arr}' — it is not a kernel argument or a resolvable "
+                        f"struct-held array (line: {raw.strip()})"
+                    )
+                if arr_name in mat_arr_info or arr_name in struct_arr_info:
+                    raise MetalCodegenError(
+                        f"Kernel {adj.fun_name!r}: reverse mode through a mat- or struct-element "
+                        f"array ({arr_name!r}) is not supported on Metal yet"
+                    )
+                grad_name = grad_arg_of.get(arr_name)
+                if grad_name is None:
+                    continue
+                n_off = 2 if cols > 1 else 1
+                index_args = args[1 : 1 + ndim]
+                if len(index_args) < n_off:
+                    raise MetalCodegenError(
+                        f"Kernel {adj.fun_name!r}: wp::adj_{op} has {ndim} index argument(s) but its "
+                        f"{rows}x{cols} tile needs {n_off} (line: {raw.strip()})"
+                    )
+                slots = _tile_grad_slots(
+                    arr_name,
+                    index_args[: ndim - n_off],
+                    index_args[ndim - n_off :],
+                    rows,
+                    cols,
+                    tile_var_vec_n.get(tile_label, 0),
+                )
+                for idx_expr, cell in slots:
+                    tgt = f"{grad_name}[{idx_expr}]"
+                    if op == "tile_load":
+                        # The tile was READ from the array, so its dual
+                        # scatters back into the array's gradient.
+                        body_lines.append(_finalize(f"{indent}wp_adj_accum(&{tgt}, {adj_tile}{cell});"))
+                    else:
+                        body_lines.append(_finalize(f"{indent}{adj_tile}{cell} += {tgt};"))
+                        if op == "tile_store":
+                            # ``grad_zero_global``: a plain store consumes
+                            # the gradient, an atomic accumulate does not.
+                            body_lines.append(_finalize(f"{indent}{tgt} = 0.0f;"))
                 continue
         # Address lines have been folded into ``subscript_map`` (or, for
         # struct-element pointers, ``struct_refs``). An address whose base
@@ -11474,7 +11810,7 @@ def _generate_msl_kernel_uncached(
 # closure-kernel instantiations previously collided (same kernel.key,
 # args, and IR statements; different baked ``const`` declarations).
 # v11: native packed arrays go bindless (``ptr_table`` / ``__arg_ptrs``).
-_ARTIFACT_CACHE_VERSION = 13
+_ARTIFACT_CACHE_VERSION = 14
 _codegen_source_hash_cached: str | None = None
 
 
@@ -12467,6 +12803,31 @@ def _struct_field_launch_value(fwd_args, arg_by_name, root_label: str, fpath: tu
     return value
 
 
+def _iter_struct_array_grads(struct_type, adj_instance, _path: tuple[str, ...] = ()):
+    """Yield ``(field_path, grad_array)`` for a tape-built adjoint struct.
+
+    :meth:`warp.Tape.get_adjoint` mirrors a struct argument into a fresh
+    instance of the same class whose ``wp.array`` fields hold the *gradient*
+    arrays (nested structs recursively, everything else copied verbatim).
+    Fields whose array had no gradient are left ``None`` and are skipped —
+    the codegen then compiles their adjoint statements out entirely.
+    """
+    import warp  # noqa: PLC0415
+    from warp._src.codegen import Struct  # noqa: PLC0415
+    from warp._src.types import matches_array_class  # noqa: PLC0415
+
+    if adj_instance is None:
+        return
+    for name, var in struct_type.vars.items():
+        value = getattr(adj_instance, name, None)
+        if value is None:
+            continue
+        if isinstance(var.type, Struct):
+            yield from _iter_struct_array_grads(var.type, value, (*_path, name))
+        elif matches_array_class(var.type, warp.array):
+            yield (*_path, name), value
+
+
 def _placeholder_view_for_array_type(arr_type):
     """``(mx_dtype, zero-element view shape)`` for an unset (None) array value.
 
@@ -13079,7 +13440,25 @@ def launch_metal_kernel_native(
         # simply have no gradient sink — same tolerance as the CPU/CUDA
         # ``pack_args`` path.
         for arg, gval in zip(kernel.adj.args, adj_values, strict=False):
-            if gval is None or not _is_array_arg(arg):
+            if gval is None:
+                continue
+            if isinstance(arg.type, Struct):
+                # ``Tape.get_adjoint`` mirrors a struct arg into an instance
+                # whose ``wp.array`` fields hold the grad arrays. Register
+                # each under the same synthetic name the forward pass gives
+                # the field, so codegen can bind it as a grad buffer.
+                for fpath, garr in _iter_struct_array_grads(arg.type, gval):
+                    syn = "__".join((arg.label, *fpath))
+                    if getattr(garr, "device", None) is None or not garr.device.is_metal:
+                        raise RuntimeError(
+                            f"Kernel '{kernel.key}': gradient array for struct arg {arg.label!r} "
+                            f"field {'.'.join(fpath)!r} must live on a Metal device; "
+                            f"got {getattr(garr, 'device', '?')}"
+                        )
+                    names.append(syn)
+                    grad_value_of[f"adj_{syn}"] = garr
+                continue
+            if not _is_array_arg(arg):
                 continue
             if getattr(gval, "device", None) is None or not gval.device.is_metal:
                 raise RuntimeError(

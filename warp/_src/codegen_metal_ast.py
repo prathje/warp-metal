@@ -398,9 +398,10 @@ _RE_ASSIGN = re.compile(r"^(?P<indent>\s*)(?P<pfx>var_|adj_)(?P<lhs>\w+)\s*=\s*(
 # only ever shows up inside an inlined function's reverse body. There is nothing
 # for a fold to do with it — it passes through to MSL verbatim.
 _RE_ADJ_ACCUM = re.compile(r"^\s*adj_\w+\s*(?:\+=|-=)\s*.+?;\s*$")
-# ``adj_lights.intensities = adj_208;`` — the adjoint of a struct field.
-# Recognised only so the failure names the gap instead of reading as a
-# malformed line.
+# ``adj_lights.intensities = adj_208;`` — the adjoint of a struct field,
+# emitted by ``Adjoint.emit_Attribute`` for every ``s.field`` read. Passed
+# through verbatim; the flat emitter decides what it means, since only there
+# is the kernel's argument list known (see ``_ADJ_STRUCT_FIELD_STORE_PAT``).
 _RE_ADJ_STRUCT_FIELD = re.compile(r"^\s*adj_\w+(?:\.\w+)+\s*(?:=|\+=|-=)")
 _RE_VOID_CALL = re.compile(r"^(?P<indent>\s*)(?P<func>[\w:]+)\s*(?P<tpl><[^()]*>)?\s*\((?P<args>.*)\)\s*;\s*$")
 
@@ -583,11 +584,7 @@ def parse_line(line: str) -> Node:
         return _RawLine(raw=line)
 
     if _RE_ADJ_STRUCT_FIELD.match(line):
-        raise MetalASTParseError(
-            f"reverse mode through a struct field is not supported yet: {line.strip()!r}. "
-            f"The Metal backend splits struct values into per-field locals and has no dual "
-            f"for the struct itself."
-        )
+        return _RawLine(raw=line)
 
     m = _RE_VOID_CALL.match(line)
     if m:
@@ -3400,6 +3397,23 @@ def _apply_view_rewrites(
                 )
                 continue
 
+        # ``wp::adj_address`` / ``wp::adj_array_store`` / ``wp::adj_atomic_add``
+        # on a resolved alias. Only zero-lead backings are rewritten — that
+        # covers the case this exists for, a ``wp.array`` field of a struct
+        # kernel arg, where the synthetic array *is* the field. A sliced view
+        # would need the leading indices threaded into both the primal and
+        # the adjoint index list; leaving it alone makes the flat emitter
+        # raise on the unresolved name rather than quietly dropping the
+        # gradient.
+        if isinstance(n, VoidCall) and n.op in _ADJ_ARRAY_VIEW_OPS:
+            adj_arr_l = _strip_var_prefix(n.args[0]) if n.args else None
+            if adj_arr_l is not None and adj_arr_l in view_aliases and not view_aliases[adj_arr_l][1]:
+                new_args = (f"var_{view_aliases[adj_arr_l][0]}", *n.args[1:])
+                indent = _leading_indent(n.raw)
+                new_raw = f"{indent}wp::{n.op}({', '.join(new_args)});"
+                out.append(VoidCall(raw=new_raw, op=n.op, args=new_args, extra=n.extra))
+                continue
+
         if isinstance(n, VoidCall) and n.op == "array_store":
             view_arr_l = _strip_var_prefix(n.args[0]) if n.args else None
             if view_arr_l is not None and view_arr_l in view_aliases:
@@ -3603,6 +3617,16 @@ _ATOMIC_OPS = ("atomic_add", "atomic_sub", "atomic_min", "atomic_max")
 # call falls through to the unsupported-intrinsic guard with a clear error
 # rather than silently emitting an MSL call with the wrong arity.
 _ATOMIC_VIEW_OPS = (*_ATOMIC_OPS, "atomic_cas", "atomic_exch")
+# Reverse-mode counterparts that carry an array as their first argument, so
+# they participate in the view/struct-field alias rewrite.
+_ADJ_ARRAY_VIEW_OPS = (
+    "adj_address",
+    "adj_array_store",
+    "adj_atomic_add",
+    "adj_tile_load",
+    "adj_tile_store",
+    "adj_tile_atomic_add",
+)
 _ATOMIC_TO_MSL = {
     "atomic_add": "atomic_fetch_add_explicit",
     "atomic_sub": "atomic_fetch_sub_explicit",
