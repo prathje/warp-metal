@@ -393,6 +393,15 @@ _RE_TID = re.compile(r"^\s*builtin_tid(?P<arity>\d)d?\s*\((?P<args>[^()]*)\)\s*;
 # the ``lhs`` keeps its ``adj_`` prefix so no downstream fold can mistake it
 # for the same-numbered primal variable.
 _RE_ASSIGN = re.compile(r"^(?P<indent>\s*)(?P<pfx>var_|adj_)(?P<lhs>\w+)\s*=\s*(?P<rhs>.+?)\s*;\s*$")
+# Reverse-mode gradient accumulation onto a dual variable (``adj_0 += adj_ret;``).
+# Emitted by ``Adjoint.add_return`` for every value-returning ``@wp.func``, so it
+# only ever shows up inside an inlined function's reverse body. There is nothing
+# for a fold to do with it — it passes through to MSL verbatim.
+_RE_ADJ_ACCUM = re.compile(r"^\s*adj_\w+\s*(?:\+=|-=)\s*.+?;\s*$")
+# ``adj_lights.intensities = adj_208;`` — the adjoint of a struct field.
+# Recognised only so the failure names the gap instead of reading as a
+# malformed line.
+_RE_ADJ_STRUCT_FIELD = re.compile(r"^\s*adj_\w+(?:\.\w+)+\s*(?:=|\+=|-=)")
 _RE_VOID_CALL = re.compile(r"^(?P<indent>\s*)(?P<func>[\w:]+)\s*(?P<tpl><[^()]*>)?\s*\((?P<args>.*)\)\s*;\s*$")
 
 # RHS shape recognizers used inside Assign parsing. Each captures just enough
@@ -570,6 +579,16 @@ def parse_line(line: str) -> Node:
         lhs = m.group("lhs") if m.group("pfx") == "var_" else f"adj_{m.group('lhs')}"
         return Assign(raw=line, lhs=lhs, expr=_parse_rhs(rhs))
 
+    if _RE_ADJ_ACCUM.match(line):
+        return _RawLine(raw=line)
+
+    if _RE_ADJ_STRUCT_FIELD.match(line):
+        raise MetalASTParseError(
+            f"reverse mode through a struct field is not supported yet: {line.strip()!r}. "
+            f"The Metal backend splits struct values into per-field locals and has no dual "
+            f"for the struct itself."
+        )
+
     m = _RE_VOID_CALL.match(line)
     if m:
         func_full = m.group("func")
@@ -673,13 +692,10 @@ def _emit_into(nodes, out: list[str]) -> None:
 # just structure it.
 
 
-_RANGE_LINE = re.compile(
-    r"^\s*var_(\w+)\s*=\s*wp::range\s*\("
-    r"\s*var_(\w+)\s*"
-    r"(?:,\s*var_(\w+)\s*)?"
-    r"(?:,\s*var_(\w+)\s*)?"
-    r"\)\s*;\s*$"
-)
+# The arguments are ordinary ``var_X`` locals in the forward IR, but
+# ``lower_reverse_ranges`` synthesises range lines whose bounds are computed
+# expressions, so this accepts anything without a top-level comma.
+_RANGE_LINE = re.compile(r"^\s*var_(?P<dst>\w+)\s*=\s*wp::range\s*\((?P<args>.*)\)\s*;\s*$")
 _INDENT_OF = re.compile(r"^(\s*)")
 
 
@@ -687,6 +703,127 @@ def _leading_indent(s: str) -> str:
     """Return the leading whitespace of ``s``."""
     m = _INDENT_OF.match(s)
     return m.group(1) if m else ""
+
+
+def _range_bounds(args_text: str) -> tuple[str, str, str] | None:
+    """``(start, stop, step)`` expressions for a ``wp::range(...)`` arg list."""
+    args = [a.strip() for a in _split_top_level_args(args_text) if a.strip()]
+    if len(args) == 1:
+        return "0", args[0], "1"
+    if len(args) == 2:
+        return args[0], args[1], "1"
+    if len(args) == 3:
+        return args[0], args[1], args[2]
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Reverse-mode range loops
+# ---------------------------------------------------------------------------
+# A ``for`` loop's reverse pass does not appear in ``body_replay`` at all —
+# Warp keeps only the ``wp::range(...)`` construction there and puts the whole
+# loop, forward recompute included, in ``body_reverse``, opened by
+# ``var_R = wp::iter_reverse(var_R);``. There is no ``range_t`` value in MSL
+# (the fold turns every loop into a native ``for``), so the reversed iterator
+# has to be resolved statically: look up the original bounds and emit the
+# reversed range that ``warp/native/range.h``'s ``iter_reverse`` computes.
+
+_ITER_REVERSE_LINE = re.compile(
+    r"^(?P<indent>\s*)var_(?P<dst>\w+)\s*=\s*wp::iter_reverse\s*\(\s*var_(?P<src>\w+)\s*\)\s*;\s*$"
+)
+_ADJ_RANGE_LINE = re.compile(r"^\s*wp::adj_range\s*\(.*\)\s*;\s*$")
+_START_FOR_LABEL = re.compile(r"^\s*start_for_\d+\s*:\s*;\s*$")
+
+
+def _static_int(expr: str, const_ints: dict[str, int]) -> int | None:
+    """Value of ``expr`` if it is an integer literal or a known const local."""
+    s = expr.strip()
+    if s.startswith("var_"):
+        return const_ints.get(s[len("var_") :])
+    try:
+        return int(s)
+    except ValueError:
+        return None
+
+
+def lower_reverse_ranges(sections: list[list[str]], const_ints: dict[str, int], what: str) -> list[list[str]]:
+    """Replace ``iter_reverse`` openers with the equivalent reversed range.
+
+    Also drops the now-unused forward ``wp::range(...)`` construction (its only
+    consumer is the ``iter_reverse``) and the no-op ``wp::adj_range(...)``.
+
+    ``sections`` (replay, then reverse) is processed as one stream — the range
+    a reverse loop reopens is constructed in the replay — and returned with the
+    same split.
+    """
+    from warp._src.codegen_metal import MetalCodegenError  # noqa: PLC0415
+
+    lines = [line for section in sections for line in section]
+    bounds_at = []
+    total = 0
+    for section in sections:
+        total += len(section)
+        bounds_at.append(total)
+
+    defs: dict[str, tuple[str, str, str]] = {}
+    out: list[str] = []
+    out_bounds: list[int] = []
+    for i, line in enumerate(lines):
+        while len(out_bounds) < len(bounds_at) and bounds_at[len(out_bounds)] == i:
+            out_bounds.append(len(out))
+        m = _RANGE_LINE.match(line)
+        if m is not None:
+            bounds = _range_bounds(m.group("args"))
+            if bounds is not None:
+                defs[m.group("dst")] = bounds
+                # Keep it only when it opens a real forward loop; standing
+                # alone it is just the record the reverse pass reads.
+                nxt = next((line_ for line_ in lines[i + 1 :] if not _is_inert_line(line_)), "")
+                if not _START_FOR_LABEL.match(nxt):
+                    continue
+            out.append(line)
+            continue
+
+        if _ADJ_RANGE_LINE.match(line):
+            continue
+
+        m = _ITER_REVERSE_LINE.match(line)
+        if m is None:
+            out.append(line)
+            continue
+
+        bounds = defs.get(m.group("src"))
+        if bounds is None:
+            raise MetalCodegenError(
+                f"reverse-mode loop in {what}: cannot resolve the range behind `wp::iter_reverse(var_{m.group('src')})`"
+            )
+        start, stop, step = bounds
+        k = _static_int(step, const_ints)
+        if k is None:
+            raise MetalCodegenError(
+                f"reverse-mode loop in {what}: the loop step ({step}) is not a compile-time "
+                f"constant, so the reversed iteration bounds cannot be computed"
+            )
+        # Mirrors ``wp::iter_reverse`` in warp/native/range.h. Integer division
+        # truncates toward zero in both C++ and MSL, so the expression carries
+        # over unchanged.
+        if k == 0:
+            rev_start, rev_stop, rev_step = "0", "0", "1"  # degenerate: empty
+        else:
+            adjust = -1 if k > 0 else 1
+            rev_start = f"(({start}) + (({stop}) - ({start}) {'-' if adjust < 0 else '+'} 1) / {k} * {k})"
+            rev_stop = f"(({start}) - ({k}))"
+            rev_step = str(-k)
+        out.append(f"{m.group('indent')}var_{m.group('dst')} = wp::range({rev_start}, {rev_stop}, {rev_step});")
+
+    while len(out_bounds) < len(bounds_at):
+        out_bounds.append(len(out))
+    result: list[list[str]] = []
+    lo = 0
+    for hi in out_bounds:
+        result.append(out[lo:hi])
+        lo = hi
+    return result
 
 
 def fold(nodes: list[Node], query_iter_vars: dict[str, str] | None = None) -> tuple[list[Node], set[str]]:
@@ -826,19 +963,11 @@ def _match_for_opener(nodes: list[Node], i: int) -> tuple[Node, str, str, str, s
     m = _RANGE_LINE.match(n0.raw)
     if not m:
         return None
-    range_var = m.group(1)
-    if m.group(3) is None:
-        start_expr = "0"
-        stop_expr = f"var_{m.group(2)}"
-        step_expr = "1"
-    elif m.group(4) is None:
-        start_expr = f"var_{m.group(2)}"
-        stop_expr = f"var_{m.group(3)}"
-        step_expr = "1"
-    else:
-        start_expr = f"var_{m.group(2)}"
-        stop_expr = f"var_{m.group(3)}"
-        step_expr = f"var_{m.group(4)}"
+    range_var = m.group("dst")
+    bounds = _range_bounds(m.group("args"))
+    if bounds is None:
+        return None
+    start_expr, stop_expr, step_expr = bounds
 
     n1 = nodes[i + 1]
     if not isinstance(n1, Label) or not n1.name.startswith("start_for_"):
@@ -1205,10 +1334,17 @@ def _find_mutated_locals(fn_lines: list[str]) -> set[str]:
 
 
 def _substitute_var_refs(line: str, subs: dict[str, str]) -> str:
-    """Replace every ``var_<X>`` or ``ret_<i>`` token in ``line`` per ``subs``.
+    """Replace every ``var_<X>``, ``ret_<i>`` or ``adj_<X>`` token in ``line``
+    per ``subs``.
 
     Uses ``\\b`` word boundaries so we substitute whole identifiers only —
     no mid-identifier matches and no recursion into the replacement value.
+
+    ``adj_`` tokens only appear when inlining a function's *reverse* body;
+    forward bodies never contain them, so including the prefix here is a
+    no-op for the forward path. Note ``adj_ret_0`` matches as one token
+    (``\\w+`` is greedy and ``_r`` is not a word boundary), so a multi-value
+    return's adjoints never collide with a local named ``ret_0``.
     """
     if not subs:
         return line
@@ -1217,9 +1353,9 @@ def _substitute_var_refs(line: str, subs: dict[str, str]) -> str:
         full = m.group(0)
         return subs.get(full, full)
 
-    # Match both forms in one sweep so ``ret_0 = var_x;`` translates
+    # Match all forms in one sweep so ``ret_0 = var_x;`` translates
     # correctly. Order doesn't matter because each match is local.
-    return re.sub(r"\b(?:var_|ret_)\w+\b", repl, line)
+    return re.sub(r"\b(?:var_|ret_|adj_)\w+\b", repl, line)
 
 
 def _build_function_overload_table(adj) -> dict[str, list[Any]]:
@@ -1643,7 +1779,7 @@ def _inline_one_call(
     # kernel's ``adj.variables`` table, so the standard declaration loop in
     # ``generate_msl_kernel`` doesn't see them. We emit them as raw lines
     # at the splice point.
-    from warp._src.codegen_metal import _msl_constant_str  # noqa: PLC0415
+    from warp._src.codegen_metal import _msl_constant_str, _msl_local_init  # noqa: PLC0415
 
     # Param copies first: the callee body reads them from its first line.
     decls: list[Node] = [*param_copy_decls]
@@ -1669,7 +1805,7 @@ def _inline_one_call(
         mangled_label = f"{inline_id}__{var.label}"
         mangled = f"var_{mangled_label}"
         if var.constant is None:
-            decls.append(_RawLine(raw=f"    {msl_type} {mangled};"))
+            decls.append(_RawLine(raw=f"    {msl_type} {mangled}{_msl_local_init(msl_type)};"))
         else:
             decls.append(_RawLine(raw=f"    const {msl_type} {mangled} = {_msl_constant_str(var.constant)};"))
             # Record int constants so downstream passes (notably
@@ -1692,6 +1828,371 @@ def _inline_one_call(
     return [*decls, *fn_folded]
 
 
+# ---------------------------------------------------------------------------
+# Reverse-mode (adjoint) function inlining
+# ---------------------------------------------------------------------------
+# Warp lowers each ``return`` in a ``@wp.func`` to ``goto label<N>;`` in the
+# replay (forward-recompute) body and a matching ``label<N>:;`` in the reverse
+# body, so an early return jumps out of the recompute and lands part-way into
+# the reverse sweep. **Metal supports neither** — the shader compiler rejects
+# both outright ("'goto' is not supported in Metal", "labeled statements are
+# not supported in Metal"), so the jump has to be re-expressed structurally.
+#
+# The jump-free equivalent is a small program counter. Each ``goto label<N>``
+# becomes ``pc = N`` plus an exit from the recompute region; the reverse sweep
+# then guards each statement so it runs only when the label it belongs to was
+# reached. In the reversed stream labels appear in *decreasing* order, and
+# everything ahead of the first one belongs to the fall-through path alone:
+#
+#     <fall-through segment>       runs iff pc >= <label count>
+#     label2:;  <segment>          runs iff pc >= 2
+#     label1:;  <segment>          runs iff pc >= 1
+#     label0:;  <segment>          always runs
+#
+# which is exactly "execute everything at or after the label we jumped to".
+#
+# The guard is applied per statement rather than per segment, because a label
+# can sit *inside* a block: ``if c: return x`` puts one in the middle of the
+# reversed ``if``, and no single guarded region can start there and end past
+# the closing brace. Leaving the block's own ``if (c) {`` ungated is right —
+# a return inside the block is only reachable when ``c`` held, so the block
+# condition already encodes it. Structural lines (block delimiters, loop
+# labels and their gotos, range constructions) therefore pass through
+# unguarded, which also keeps the for-loop fold's contiguous line window
+# intact.
+
+_RE_RET_LABEL = re.compile(r"^\s*label(?P<n>\d+)\s*:\s*;\s*$")
+_RE_RET_GOTO = re.compile(r"^\s*goto\s+label(?P<n>\d+)\s*;\s*$")
+
+
+def _is_inert_line(line: str) -> bool:
+    """True for lines that carry no statement (blank, comment, ``#line``)."""
+    return bool(_RE_EMPTY.match(line) or _RE_COMMENT.match(line) or _RE_PRAGMA.match(line))
+
+
+def _is_structural_line(line: str) -> bool:
+    """True for lines that carry control flow rather than a value computation.
+
+    These must never be wrapped in a guard: block delimiters would nest
+    unbalanced, and the loop opener's four lines have to stay contiguous for
+    :func:`_match_for_opener` to recognise them.
+    """
+    return bool(
+        _is_inert_line(line)
+        or _RE_BLOCK_OPEN.match(line)
+        or _RE_BLOCK_ELSE.match(line)
+        or _RE_BLOCK_CLOSE.match(line)
+        or _RE_LABEL.match(line)
+        or _RE_GOTO.match(line)
+        or _RE_FOR_ITER_CMP.match(line)
+        or _RE_WHILE_COND.match(line)
+        or _RANGE_LINE.match(line)
+        or _ITER_REVERSE_LINE.match(line)
+        or _ITER_NEXT_LINE.match(line)
+    )
+
+
+def _lower_return_labels(
+    replay: list[str], reverse: list[str], pc_var: str, what: str
+) -> tuple[list[str], list[str], int | None]:
+    """Replace Warp's return ``goto``/label pairs with structured control flow.
+
+    Returns ``(replay, reverse, n_labels)``. ``n_labels`` is ``None`` when the
+    pattern needed no program counter — either the function never returns
+    early, or it has the one shape that needs no bookkeeping at all: a single
+    ``return`` as the last statement, whose jump and label are adjacent across
+    the replay/reverse seam and so cancel out.
+    """
+    from warp._src.codegen_metal import MetalCodegenError  # noqa: PLC0415
+
+    labels = [int(m.group("n")) for line in reverse if (m := _RE_RET_LABEL.match(line))]
+    if not labels:
+        return replay, reverse, None
+
+    gotos = [i for i, line in enumerate(replay) if _RE_RET_GOTO.match(line)]
+    live_replay = [i for i, line in enumerate(replay) if not _is_inert_line(line)]
+    live_reverse = [i for i, line in enumerate(reverse) if not _is_inert_line(line)]
+    if (
+        len(labels) == 1
+        and len(gotos) == 1
+        and live_replay
+        and gotos[0] == live_replay[-1]
+        and live_reverse
+        and _RE_RET_LABEL.match(reverse[live_reverse[0]])
+    ):
+        # Single trailing return: the jump is a no-op forward hop to the very
+        # next statement. Drop both and the two bodies simply concatenate.
+        return (
+            [line for i, line in enumerate(replay) if i != gotos[0]],
+            [line for i, line in enumerate(reverse) if i != live_reverse[0]],
+            None,
+        )
+
+    # A ``return`` from inside a loop lands the jump in the middle of the
+    # reverse loop body, with the iterator left wherever the forward pass
+    # stopped. A program counter cannot express that: the guard is one value
+    # tested on every iteration, so it would either skip the statement in all
+    # iterations or none.
+    loop_depth = 0
+    for line in reverse:
+        m = _RE_LABEL.match(line)
+        if m is not None:
+            loop_depth += 1 if m.group("name").startswith("start_") else -1
+            continue
+        if _RE_RET_LABEL.match(line) and loop_depth != 0:
+            raise MetalCodegenError(
+                f"adjoint of {what}: `return` from inside a loop is not supported on Metal. "
+                f"Metal has no `goto`, and the reverse pass needs one to re-enter the loop body "
+                f"at the point the function returned from."
+            )
+
+    n_labels = max(labels) + 1
+
+    replay_out: list[str] = []
+    for line in replay:
+        m = _RE_RET_GOTO.match(line)
+        if m is None:
+            replay_out.append(line)
+            continue
+        indent = _leading_indent(line)
+        replay_out.append(f"{indent}{pc_var} = {m.group('n')};")
+        # ``return;`` is the marker ``_rewrite_returns_to_breaks`` turns into
+        # a ``break`` out of the do-while-0 that wraps the recompute region.
+        replay_out.append(f"{indent}return;")
+
+    reverse_out: list[str] = []
+    guard = n_labels
+    open_guard = False
+
+    def _close():
+        nonlocal open_guard
+        if open_guard:
+            reverse_out.append("    }")
+            open_guard = False
+
+    for line in reverse:
+        m = _RE_RET_LABEL.match(line)
+        if m is not None:
+            _close()
+            guard = int(m.group("n"))
+            continue
+        if guard == 0 or _is_structural_line(line):
+            _close()
+            reverse_out.append(line)
+            continue
+        if not open_guard:
+            reverse_out.append(f"    if ({pc_var} >= {guard}) {{")
+            open_guard = True
+        reverse_out.append(f"    {line}")
+    _close()
+
+    return replay_out, reverse_out, n_labels
+
+
+def _ensure_func_backward_built(fn_overload) -> None:
+    """Build ``fn_overload.adj`` with reverse-mode bodies if it lacks them.
+
+    A ``@wp.func`` reached through the forward inliner is built with
+    ``enable_backward=False``, so ``body_reverse`` is empty even though
+    ``blocks`` exists. Rebuilding is safe: ``Adjoint.build`` resets its own
+    state, and the forward splice already consumed the lines it needed.
+    """
+    blocks = getattr(fn_overload.adj, "blocks", None)
+    if blocks and getattr(blocks[0], "body_reverse", None):
+        return
+    fn_overload.adj.build(
+        builder=None,
+        default_builder_options={
+            "enable_backward": True,
+            "output_arch": None,
+            "block_dim": 256,
+        },
+    )
+
+
+def _inline_one_adj_call(
+    fn_overload,
+    caller_args: tuple[str, ...],
+    fn_map: dict[str, list[Any]],
+    depth: int,
+    max_depth: int,
+    const_ints_out: dict[str, int],
+    struct_locals_out: dict[str, Any],
+    var_types: dict[str, str],
+) -> list[Node]:
+    """Inline a single ``adj_<func>(...)`` call. Returns the spliced nodes.
+
+    The callee's own reverse-mode body is spliced in as *replay followed by
+    reversed reverse*, the same shape ``generate_msl_kernel`` uses for the
+    kernel itself. The replay is needed: it recomputes the callee's locals,
+    which the reverse statements read and which no longer exist by the time
+    the kernel's reverse sweep reaches this call.
+    """
+    from warp._src.codegen import Struct  # noqa: PLC0415
+    from warp._src.codegen_metal import (  # noqa: PLC0415
+        MetalCodegenError,
+        _msl_constant_str,
+        _msl_local_init,
+        _msl_var_type,
+        _msl_zero_init,
+        _rewrite_adj_aggregate_init,
+    )
+
+    if depth > max_depth:
+        raise MetalCodegenError(
+            f"function inlining exceeded max depth {max_depth} — possible recursion in {fn_overload.key!r}"
+        )
+
+    _ensure_func_backward_built(fn_overload)
+    adj = fn_overload.adj
+    block = adj.blocks[0]
+
+    param_labels = [a.label for a in adj.args]
+    n_params = len(param_labels)
+    n_rets = len(adj.return_var or ())
+    n_args = len(caller_args)
+
+    # Call ABI (see ``Adjoint.add_call`` in codegen.py): user functions take
+    # ``adj_f(primal inputs..., [primal outputs...,] adjoint inputs...,
+    # adjoint outputs...)``. Primal outputs are passed only when the function
+    # returns more than one value — a lone return value comes back by C++
+    # return, so it has no output slot on either the forward or adjoint call.
+    fwd_args = caller_args[:n_params]
+    if n_rets == 1 and n_args == 2 * n_params + 1:
+        fwd_rets: tuple[str, ...] = ()
+        adj_args = caller_args[n_params : 2 * n_params]
+        adj_rets = caller_args[2 * n_params :]
+    elif n_args == 2 * (n_params + n_rets):
+        fwd_rets = caller_args[n_params : n_params + n_rets]
+        adj_args = caller_args[n_params + n_rets : 2 * n_params + n_rets]
+        adj_rets = caller_args[2 * n_params + n_rets :]
+    else:
+        raise MetalCodegenError(
+            f"adjoint of {fn_overload.key!r}: unexpected call arity ({n_args} arguments for "
+            f"{n_params} parameters and {n_rets} return values)"
+        )
+
+    inline_id = _next_inline_id()
+    param_set = set(param_labels)
+
+    # Zero-init rewrites run against the callee's own labels, before
+    # substitution — including the parameters', which alias the caller's
+    # adjoint slots exactly as the C++ reference parameters do.
+    zero_by_label: dict[str, str | None] = {}
+    for var in adj.variables:
+        try:
+            zero_by_label[str(var.label)] = _msl_zero_init(_msl_var_type(var.ctype(value_type=True)))
+        except Exception:
+            zero_by_label[str(var.label)] = None
+
+    def _rewrite(lines):
+        out = (_rewrite_adj_aggregate_init(line, zero_by_label) for line in lines)
+        return [line for line in out if line is not None]
+
+    replay_lines = _rewrite(block.body_replay)
+    reverse_lines = _rewrite(reversed(block.body_reverse))
+
+    pc_var = f"var_{inline_id}__retpc"
+    what = repr(fn_overload.key)
+    replay_lines, reverse_lines, n_labels = _lower_return_labels(replay_lines, reverse_lines, pc_var, what)
+
+    # ``iter_reverse`` openers reference range constructions that live in the
+    # replay, so both halves have to be resolved against one table.
+    callee_const_ints = {
+        str(v.label): v.constant
+        for v in adj.variables
+        if isinstance(v.constant, int) and not isinstance(v.constant, bool)
+    }
+    replay_lines, reverse_lines = lower_reverse_ranges([replay_lines, reverse_lines], callee_const_ints, what)
+
+    subs: dict[str, str] = {}
+    for pname, fwd, grad in zip(param_labels, fwd_args, adj_args, strict=True):
+        subs[f"var_{pname}"] = fwd
+        subs[f"adj_{pname}"] = grad
+    if n_rets == 1 and not fwd_rets:
+        subs["adj_ret"] = adj_rets[0]
+    else:
+        for i in range(n_rets):
+            subs[f"ret_{i}"] = fwd_rets[i]
+            subs[f"adj_ret_{i}"] = adj_rets[i]
+    for var in adj.variables:
+        if var.label in param_set:
+            continue
+        subs[f"var_{var.label}"] = f"var_{inline_id}__{var.label}"
+        subs[f"adj_{var.label}"] = f"adj_{inline_id}__{var.label}"
+
+    replay_lines = [_substitute_var_refs(line, subs) for line in replay_lines]
+    reverse_lines = [_substitute_var_refs(line, subs) for line in reverse_lines]
+
+    query_iters = query_iterator_vars(adj, subs)
+    replay_nodes, replay_skip = fold(parse(replay_lines), query_iter_vars=query_iters)
+    reverse_nodes, reverse_skip = fold(parse(reverse_lines), query_iter_vars=query_iters)
+
+    # Merge the callee's own overload table so helpers it calls (which the
+    # kernel may never reference directly) resolve during the recursive walk.
+    callee_fn_map = _build_function_overload_table(adj)
+    if callee_fn_map:
+        merged: dict[str, list[Any]] = {k: list(v) for k, v in fn_map.items()}
+        for k, v in callee_fn_map.items():
+            existing = merged.get(k, [])
+            seen = {id(o) for o in existing}
+            merged[k] = existing + [o for o in v if id(o) not in seen]
+        fn_map = merged
+
+    for var in adj.variables:
+        if var.label in param_set:
+            continue
+        try:
+            var_types[f"{inline_id}__{var.label}"] = var.ctype()
+        except Exception:
+            pass
+        if isinstance(var.type, Struct):
+            struct_locals_out[f"{inline_id}__{var.label}"] = var.type
+
+    replay_nodes = _inline_walk(
+        replay_nodes, fn_map, depth + 1, max_depth, const_ints_out, struct_locals_out, var_types
+    )
+    reverse_nodes = _inline_walk(
+        reverse_nodes, fn_map, depth + 1, max_depth, const_ints_out, struct_locals_out, var_types
+    )
+
+    # Declarations for the inlined locals: one primal and one dual per
+    # variable. The duals must be zeroed — they accumulate.
+    decls: list[Node] = []
+    if n_labels is not None:
+        decls.append(_RawLine(raw=f"    int {pc_var} = {n_labels};"))
+    fold_skip = replay_skip | reverse_skip
+    for var in adj.variables:
+        if var.label in param_set or var.label.startswith("ret_"):
+            continue
+        ctype = var.ctype()
+        if ctype == "wp::range_t":
+            continue
+        try:
+            msl_type = _msl_var_type(ctype)
+            dual_type = _msl_var_type(var.ctype(value_type=True))
+        except Exception:
+            continue
+        mangled = f"var_{inline_id}__{var.label}"
+        if var.label not in fold_skip:
+            if var.constant is None:
+                decls.append(_RawLine(raw=f"    {msl_type} {mangled}{_msl_local_init(msl_type)};"))
+            else:
+                decls.append(_RawLine(raw=f"    const {msl_type} {mangled} = {_msl_constant_str(var.constant)};"))
+                if isinstance(var.constant, int) and not isinstance(var.constant, bool):
+                    const_ints_out[f"{inline_id}__{var.label}"] = var.constant
+        decls.append(_RawLine(raw=f"    {dual_type} adj_{inline_id}__{var.label} = {_msl_zero_init(dual_type)};"))
+
+    if _has_return(replay_nodes):
+        ret_flag = None
+        if _has_loop_nested_return(replay_nodes):
+            ret_flag = f"var_{inline_id}__ret_flag"
+            decls.append(_RawLine(raw=f"    bool {ret_flag} = false;"))
+        replay_nodes = [_DoWhileZero(raw="", body=tuple(_rewrite_returns_to_breaks(replay_nodes, None, ret_flag)))]
+
+    return [*decls, *replay_nodes, *reverse_nodes]
+
+
 def _inline_walk(
     nodes: tuple[Node, ...] | list[Node],
     fn_map: dict[str, list[Any]],
@@ -1703,6 +2204,26 @@ def _inline_walk(
 ) -> list[Node]:
     out: list[Node] = []
     for n in nodes:
+        # Adjoint of a user function: ``adj_<native_func>(...)``. Emitted into
+        # the reverse body for every ``@wp.func`` the kernel calls.
+        if isinstance(n, VoidCall) and n.op == "user_call":
+            name = dict(n.extra).get("name") or ""
+            if name.startswith("adj_") and name[len("adj_") :] in fn_map:
+                ovl = _pick_overload(fn_map[name[len("adj_") :]], n.args, var_types)
+                out.extend(
+                    _inline_one_adj_call(
+                        ovl,
+                        n.args,
+                        fn_map,
+                        depth,
+                        max_depth,
+                        const_ints_out,
+                        struct_locals_out,
+                        var_types,
+                    )
+                )
+                continue
+
         # Void user-function call.
         if isinstance(n, VoidCall) and n.op == "user_call":
             name = dict(n.extra).get("name")

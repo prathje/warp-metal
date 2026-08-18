@@ -145,6 +145,7 @@ from warp._src.codegen_metal_ast import fold_indexref_writes as _ast_fold_indexr
 from warp._src.codegen_metal_ast import fold_multidim_atomics as _ast_fold_multidim_atomics
 from warp._src.codegen_metal_ast import fold_views as _ast_fold_views
 from warp._src.codegen_metal_ast import inline_user_calls as _ast_inline
+from warp._src.codegen_metal_ast import lower_reverse_ranges as _ast_lower_reverse_ranges
 from warp._src.codegen_metal_ast import parse as _ast_parse
 from warp._src.codegen_metal_ast import query_iterator_vars as _ast_query_iterator_vars
 
@@ -1152,6 +1153,73 @@ template <typename T> inline void wp_adj_min(T a, T b, thread T& aa, thread T& a
 template <typename T> inline void wp_adj_max(T a, T b, thread T& aa, thread T& ab, T r) {
     if (a > b) aa += r; else ab += r;
 }
+template <typename T> inline void wp_adj_clamp(T x, T a, T b, thread T& ax, thread T& aa, thread T& ab, T r) {
+    if (x < a) aa += r; else if (x > b) ab += r; else ax += r;
+}
+// ``mod`` on real types feeds the whole adjoint back through the dividend.
+// The integer overload in ``warp/native/builtin.h`` is a no-op, but integer
+// adjoints are dead values (no array of integers carries a gradient), so one
+// template covers both without a wrong result reaching a float.
+template <typename T> inline void wp_adj_mod(T a, T b, thread T& aa, thread T& ab, T r) { aa += r; }
+template <typename T> inline void wp_adj_floordiv(T a, T b, thread T& aa, thread T& ab, T r) { }
+template <typename T> inline void wp_adj_sign(T x, thread T& ax, T r) { }
+template <typename T> inline void wp_adj_step(T x, thread T& ax, T r) { }
+template <typename T> inline void wp_adj_nonzero(T x, thread T& ax, T r) { }
+template <typename T> inline void wp_adj_round(T x, thread T& ax, T r) { }
+template <typename T> inline void wp_adj_rint(T x, thread T& ax, T r) { }
+template <typename T> inline void wp_adj_trunc(T x, thread T& ax, T r) { }
+template <typename T> inline void wp_adj_floor(T x, thread T& ax, T r) { }
+template <typename T> inline void wp_adj_ceil(T x, thread T& ax, T r) { }
+template <typename T> inline void wp_adj_isfinite(T x, thread T& ax, bool r) { }
+// Guarded exactly as ``warp/native/builtin.h`` guards them without FP checks:
+// skip the update rather than propagate an infinity at the singular point.
+template <typename T> inline void wp_adj_log2(T x, thread T& ax, T r) {
+    ax += (T(1) / x) * (T(1) / metal::log(T(2))) * r;
+}
+template <typename T> inline void wp_adj_log10(T x, thread T& ax, T r) {
+    ax += (T(1) / x) * (T(1) / metal::log(T(10))) * r;
+}
+template <typename T> inline void wp_adj_pow(T a, T b, T ret, thread T& aa, thread T& ab, T r) {
+    aa += b * metal::pow(a, b - T(1)) * r;
+    ab += metal::log(a) * ret * r;
+}
+template <typename T> inline void wp_adj_tan(T x, thread T& ax, T r) {
+    T c = metal::cos(x);
+    if (c != T(0)) ax += (T(1) / (c * c)) * r;
+}
+template <typename T> inline void wp_adj_asin(T x, thread T& ax, T r) {
+    T d = metal::sqrt(T(1) - x * x);
+    if (d > T(0)) ax += (T(1) / d) * r;
+}
+template <typename T> inline void wp_adj_acos(T x, thread T& ax, T r) {
+    T d = metal::sqrt(T(1) - x * x);
+    if (d > T(0)) ax -= (T(1) / d) * r;
+}
+template <typename T> inline void wp_adj_atan(T x, thread T& ax, T r) { ax += r / (x * x + T(1)); }
+template <typename T> inline void wp_adj_atan2(T y, T x, thread T& ay, thread T& ax, T r) {
+    T d = x * x + y * y;
+    if (d > T(0)) { ax -= (y / d) * r; ay += (x / d) * r; }
+}
+template <typename T> inline void wp_adj_sinh(T x, thread T& ax, T r) { ax += metal::cosh(x) * r; }
+template <typename T> inline void wp_adj_cosh(T x, thread T& ax, T r) { ax += metal::sinh(x) * r; }
+template <typename T> inline void wp_adj_lerp(T a, T b, T t, thread T& aa, thread T& ab, thread T& at, T r) {
+    aa += r * (T(1) - t);
+    ab += r * t;
+    at += b * r - a * r;
+}
+template <typename T>
+inline void wp_adj_smoothstep(T e0, T e1, T x, thread T& ae0, thread T& ae1, thread T& ax, T r) {
+    T ab = e0 - e1;
+    T a_x = e0 - x;
+    T bx = e1 - x;
+    T xb = x - e1;
+    if (bx / ab >= T(0) || a_x / ab <= T(0)) return;
+    T ab3 = ab * ab * ab;
+    T ab4 = ab3 * ab;
+    ae0 += r * ((T(6) * a_x * bx * bx) / ab4);
+    ae1 += r * ((T(6) * a_x * a_x * xb) / ab4);
+    ax += r * ((T(6) * a_x * bx) / ab3);
+}
 // ``wp.float32(x)`` / ``wp.int32(x)`` style casts. Warp emits
 // ``adj_<type>(x, adj_x, adj_ret)``; integer results carry no gradient.
 template <typename T, typename U> inline void wp_adj_cast(T x, thread T& ax, U r) { ax += T(r); }
@@ -1237,6 +1305,30 @@ _ADJ_SUPPORTED = frozenset(
         "normalize",
         "cross",
         "extract",
+        "clamp",
+        "mod",
+        "floordiv",
+        "sign",
+        "step",
+        "nonzero",
+        "round",
+        "rint",
+        "trunc",
+        "floor",
+        "ceil",
+        "isfinite",
+        "log2",
+        "log10",
+        "pow",
+        "tan",
+        "asin",
+        "acos",
+        "atan",
+        "atan2",
+        "sinh",
+        "cosh",
+        "lerp",
+        "smoothstep",
     }
 )
 
@@ -1256,6 +1348,31 @@ def _msl_zero_init(msl_type: str) -> str:
     return f"{msl_type}()" if msl_type.startswith(("wp_mat", "wp_vec")) else f"{msl_type}(0)"
 
 
+# Types a local declaration can safely be zeroed with (see ``_msl_local_init``).
+_ZEROABLE_LOCAL_PAT = re.compile(
+    r"^(?:bool|char|uchar|short|ushort|int|uint|long|ulong|half|float|double)[234]?$|"
+    r"^(?:half|float)[234]x[234]$|"
+    r"^wp_(?:vec|mat)\w*$"
+)
+
+
+def _msl_local_init(msl_type: str) -> str:
+    """`` = <zero>`` suffix for a local declaration, or ``""`` if not safe.
+
+    Warp's C++ codegen leaves primal locals uninitialised, and its reverse
+    pass then reads them *unconditionally* — ``adj_where(c, a, b, ...)`` takes
+    both branches by value even where the forward pass only assigned one of
+    them under an ``if``. That latent UB is benign on CUDA; the Metal compiler
+    propagates the resulting ``undef`` and drops the enclosing select outright,
+    which silently returns the wrong branch (``cyclic_index``'s wrap-around
+    correction was applied to every thread, not just the negative ones).
+
+    Zeroing removes the undefined read. It costs nothing where the local is
+    genuinely assigned first — the store is dead and gets eliminated.
+    """
+    return f" = {_msl_zero_init(msl_type)}" if _ZEROABLE_LOCAL_PAT.match(msl_type) else ""
+
+
 _ADJ_CALL_PAT = re.compile(r"\bwp::adj_([A-Za-z_]\w*)\s*\(")
 
 # The three array-indexed adjoints, lowered inside the generator (they need
@@ -1265,24 +1382,34 @@ _ADJ_ARRAY_PAT = re.compile(
 )
 
 
-_ADJ_AGGREGATE_INIT_PAT = re.compile(r"^(?P<indent>\s*)adj_(?P<label>\w+)\s*=\s*\{\s*\}\s*;\s*$")
+_ADJ_AGGREGATE_INIT_PAT = re.compile(r"^(?P<indent>\s*)(?P<pfx>adj_|var_)(?P<label>\w+)\s*=\s*\{\s*\}\s*;\s*$")
 
 
-def _rewrite_adj_aggregate_init(line: str, zero_by_label: dict[str, str]) -> str:
-    """Turn ``adj_X = {};`` into a typed MSL zero assignment.
+def _rewrite_adj_aggregate_init(line: str, zero_by_label: dict[str, str | None]) -> str | None:
+    """Turn ``adj_X = {};`` / ``var_X = {};`` into a typed MSL zero assignment.
 
     Warp emits C++ aggregate initialisation to reset a dual variable (loop-
-    carried adjoints, and the reset after an ``assign``). MSL has no ``= {}``
-    form, and the IR parser rejects the statement outright, so translate it
-    here using the same zero-init the declaration used.
+    carried adjoints, and the reset after an ``assign``), and to zero the
+    adjoint accumulators that ``wp.grad(f)`` builds inside a *forward* body.
+    MSL has no ``= {}`` form, and the IR parser rejects the statement
+    outright, so translate it here using the same zero-init the declaration
+    used.
+
+    Returns ``None`` when the statement should be dropped: a label mapped
+    explicitly to ``None`` has a type with no MSL representation (a loop's
+    ``wp::range_t``, say), so no dual was declared for it and resetting one
+    is meaningless.
     """
     m = _ADJ_AGGREGATE_INIT_PAT.match(line)
     if m is None:
         return line
-    zero = zero_by_label.get(m.group("label"))
-    if zero is None:
+    label = m.group("label")
+    if label not in zero_by_label:
         return line
-    return f"{m.group('indent')}adj_{m.group('label')} = {zero};"
+    zero = zero_by_label[label]
+    if zero is None:
+        return None
+    return f"{m.group('indent')}{m.group('pfx')}{label} = {zero};"
 
 
 def _split_top_level_args(s: str) -> list[str]:
@@ -8794,18 +8921,28 @@ def _generate_msl_kernel_uncached(
     # the CPU/CUDA backends emit.
     if adjoint:
         _ir_lines = list(adj.blocks[0].body_replay) + list(reversed(adj.blocks[0].body_reverse))
-        # Warp resets a dual var with C++ aggregate init (``adj_15 = {};``),
-        # which MSL has no equivalent for. Rewrite to the typed zero the
-        # declaration used; the type comes from the variable's value type.
-        _adj_zero_types: dict[str, str] = {}
-        for _v in adj.variables:
-            try:
-                _adj_zero_types[str(_v.label)] = _msl_zero_init(_msl_var_type(_v.ctype(value_type=True)))
-            except MetalCodegenError:
-                pass
-        _ir_lines = [_rewrite_adj_aggregate_init(ln, _adj_zero_types) for ln in _ir_lines]
     else:
-        _ir_lines = adj.blocks[0].body_forward
+        _ir_lines = list(adj.blocks[0].body_forward)
+    # Warp resets a dual var with C++ aggregate init (``adj_15 = {};``), which
+    # MSL has no equivalent for. Rewrite to the typed zero the declaration
+    # used; the type comes from the variable's value type. Forward bodies need
+    # this too — ``wp.grad(f)(x)`` builds its adjoint accumulators inline.
+    _adj_zero_types: dict[str, str | None] = {}
+    for _v in adj.variables:
+        try:
+            _adj_zero_types[str(_v.label)] = _msl_zero_init(_msl_var_type(_v.ctype(value_type=True)))
+        except MetalCodegenError:
+            _adj_zero_types[str(_v.label)] = None
+    _ir_lines = [_l for _l in (_rewrite_adj_aggregate_init(ln, _adj_zero_types) for ln in _ir_lines) if _l is not None]
+    # A ``for`` loop's reverse pass reopens its range through
+    # ``wp::iter_reverse``; resolve that to a concrete reversed range so the
+    # ordinary for-loop fold can take it from here.
+    _const_ints = {
+        str(_v.label): _v.constant
+        for _v in adj.variables
+        if isinstance(_v.constant, int) and not isinstance(_v.constant, bool)
+    }
+    (_ir_lines,) = _ast_lower_reverse_ranges([_ir_lines], _const_ints, adj.fun_name)
     _ast_nodes = _ast_parse(_ir_lines)
     _ast_nodes, _struct_skip = _ast_fold(_ast_nodes, query_iter_vars=_ast_query_iterator_vars(adj))
     # Inline ``@wp.func`` user-function calls into the kernel body before
@@ -9516,7 +9653,10 @@ def _generate_msl_kernel_uncached(
         ctype = var.ctype()
         msl_type = _msl_var_type(ctype)
         if var.constant is None:
-            body_lines.append(f"    {msl_type} var_{var.label};")
+            # Reverse mode reads primal locals the forward pass only wrote
+            # under a guard, so they must not be left undefined there.
+            init = _msl_local_init(msl_type) if adjoint else ""
+            body_lines.append(f"    {msl_type} var_{var.label}{init};")
         else:
             body_lines.append(f"    const {msl_type} var_{var.label} = {_msl_constant_str(var.constant)};")
 
@@ -9819,9 +9959,10 @@ def _generate_msl_kernel_uncached(
         translated = _rewrite_quat_mul(translated)
         # Reverse-mode builtin calls (``wp::adj_mul`` -> ``wp_adj_mul``).
         # Only the operand names still need substituting after this, and
-        # the adjoint operands are plain locals, so order is free.
-        if adjoint:
-            translated = _translate_adjoint_intrinsics(translated)
+        # the adjoint operands are plain locals, so order is free. This runs
+        # for forward bodies too: ``wp.grad(f)(x)`` inlines f's reverse pass
+        # into an ordinary kernel.
+        translated = _translate_adjoint_intrinsics(translated)
         # Lower tile intrinsics *before* the subscript-substitute pass —
         # the tile pattern matches on the raw ``wp::tile_*<...>`` shape,
         # which contains ``var_X`` operands that the substitute would
@@ -11333,7 +11474,7 @@ def _generate_msl_kernel_uncached(
 # closure-kernel instantiations previously collided (same kernel.key,
 # args, and IR statements; different baked ``const`` declarations).
 # v11: native packed arrays go bindless (``ptr_table`` / ``__arg_ptrs``).
-_ARTIFACT_CACHE_VERSION = 12
+_ARTIFACT_CACHE_VERSION = 13
 _codegen_source_hash_cached: str | None = None
 
 
