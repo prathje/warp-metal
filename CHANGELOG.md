@@ -30,8 +30,12 @@
   atomically, so kernels whose threads read the same array element are handled correctly. Requires
   `warp.config.metal_native_dispatch` (`WARP_METAL_NATIVE_DISPATCH=1`); the MLX dispatch path raises, since it
   allocates output buffers from a pool and cannot accumulate into caller-owned gradient arrays. Kernels using
-  builtins whose adjoint is not yet implemented, or calling a `@wp.func` from a differentiated statement, raise a
-  `MetalCodegenError` naming the missing piece.
+  builtins whose adjoint is not yet implemented raise a `MetalCodegenError` naming the missing piece.
+- Extend reverse-mode differentiation on Metal devices to `@wp.func` calls, `for` loops (including dynamic bounds,
+  negative steps, and nesting), and `wp.grad(f)(x)`, which evaluates a `@wp.func`'s gradient inside an ordinary
+  forward kernel. Adjoints are now available for `wp.clamp()`, `wp.mod()`, `wp.pow()`, `wp.lerp()`,
+  `wp.smoothstep()`, `wp.atan2()`, the remaining trigonometric and rounding builtins, and the non-differentiable
+  integer operations. Differentiating through a struct field is still unsupported and raises.
 - Support `wp.tile_full()`, `wp.tile_scan_inclusive()`, and `wp.tile_scan_exclusive()` on Metal devices.
 - Support `wp.atomic_cas()` and `wp.atomic_exch()` on Metal devices, including through `wp.array` fields of
   struct kernel arguments. Note that mutual-exclusion spin locks built on these deadlock on Apple GPUs, which
@@ -74,6 +78,10 @@
   and the call is distinguished only by a kernel argument. Any process holding both a 2D and a 3D `warp.fem`
   geometry of the same family (`Quadmesh2D` plus `Quadmesh3D`, say) hit this, producing either an MSL compile error
   or silently wrong element types.
+- Fix Metal reverse-mode kernels taking the wrong branch of a conditional assignment. A local that the forward pass
+  writes only inside an `if` is read unconditionally by the reverse pass, and the Metal compiler folded the
+  resulting undefined value by dropping the select entirely, so every thread got the guarded value. Locals are now
+  zero-initialised in reverse mode.
 - Support `wp.ddot()` on non-square matrices on Metal, which `warp.fem` uses for surface-embedded geometries.
 - Fix Metal launches rejecting a scalar kernel argument passed as a Warp scalar type rather than a Python number
   (`wp.float32(0.5)`), which `warp.sparse` does for its `alpha` and `beta` factors.

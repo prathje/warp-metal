@@ -9554,6 +9554,268 @@ class TestMetalAdjoint(unittest.TestCase):
         )
         _run_with_metal_native(self, snippet)
 
+    def test_user_function_adjoint_matches_cpu(self):
+        # The adjoint of a ``@wp.func`` is a separate C++ entry point that
+        # Metal has to inline as replay + reversed reverse, including the
+        # helper's own early-return join point.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            N_GRID = 8
+
+            @wp.func
+            def poly(x: wp.float32, y: wp.float32) -> wp.float32:
+                a = x * y
+                if a > 0.0:
+                    a = a * 2.0
+                return a + wp.sqrt(y * y + 1.0)
+
+            @wp.func
+            def two_out(x: wp.float32, y: wp.float32):
+                return x + y, x - y
+
+            @wp.func
+            def cyclic_index(idx: wp.int32):
+                ret_idx = idx % N_GRID
+                if ret_idx < 0:
+                    ret_idx += N_GRID
+                return ret_idx
+
+            @wp.kernel
+            def k(x: wp.array(dtype=wp.float32), y: wp.array(dtype=wp.float32),
+                  out: wp.array(dtype=wp.float32)):
+                i = wp.tid()
+                a, b = two_out(x[i], y[i])
+                out[i] = poly(a, b) + x[cyclic_index(i - 3)]
+
+            n = 16
+            rng = np.random.default_rng(11)
+            x_np = rng.standard_normal(n).astype(np.float32) + 2.0
+            y_np = rng.standard_normal(n).astype(np.float32) + 3.0
+            got = {}
+            for dev in ('cpu', 'metal:0'):
+                x = wp.array(x_np, device=dev, requires_grad=True)
+                y = wp.array(y_np, device=dev, requires_grad=True)
+                out = wp.zeros(n, dtype=wp.float32, device=dev, requires_grad=True)
+                tape = wp.Tape()
+                with tape:
+                    wp.launch(k, dim=n, inputs=[x, y], outputs=[out], device=dev)
+                out.grad = wp.array(np.ones(n, np.float32), device=dev)
+                tape.backward()
+                wp.synchronize_device(dev)
+                got[dev] = (x.grad.numpy().copy(), y.grad.numpy().copy())
+            np.testing.assert_allclose(got['metal:0'][0], got['cpu'][0], rtol=1e-5, atol=1e-6)
+            np.testing.assert_allclose(got['metal:0'][1], got['cpu'][1], rtol=1e-5, atol=1e-6)
+            """
+        )
+        _run_with_metal_native(self, snippet)
+
+    def test_user_function_early_return_adjoint_matches_cpu(self):
+        # Warp lowers each ``return`` to a ``goto``, which Metal rejects
+        # outright. The reverse sweep has to reproduce the jump with a
+        # program counter instead, including when the landing label sits
+        # inside the reversed ``if`` the return was written in.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            @wp.func
+            def two_returns(x: wp.float32, y: wp.float32) -> wp.float32:
+                if x < 0.0:
+                    return -x * y
+                if y < 0.0:
+                    return x * -y
+                return x * y + x
+
+            @wp.kernel
+            def k(x: wp.array(dtype=wp.float32), y: wp.array(dtype=wp.float32),
+                  out: wp.array(dtype=wp.float32)):
+                i = wp.tid()
+                out[i] = two_returns(x[i], y[i])
+
+            n = 16
+            rng = np.random.default_rng(19)
+            x_np = rng.standard_normal(n).astype(np.float32) * 1.5
+            y_np = rng.standard_normal(n).astype(np.float32) * 1.5
+            got = {}
+            for dev in ('cpu', 'metal:0'):
+                x = wp.array(x_np, device=dev, requires_grad=True)
+                y = wp.array(y_np, device=dev, requires_grad=True)
+                out = wp.zeros(n, dtype=wp.float32, device=dev, requires_grad=True)
+                tape = wp.Tape()
+                with tape:
+                    wp.launch(k, dim=n, inputs=[x, y], outputs=[out], device=dev)
+                fwd = out.numpy().copy()
+                out.grad = wp.array(np.ones(n, np.float32), device=dev)
+                tape.backward()
+                wp.synchronize_device(dev)
+                got[dev] = (fwd, x.grad.numpy().copy(), y.grad.numpy().copy())
+            for a, b in zip(got['metal:0'], got['cpu']):
+                np.testing.assert_allclose(a, b, rtol=1e-5, atol=1e-6)
+            """
+        )
+        _run_with_metal_native(self, snippet)
+
+    def test_return_from_loop_adjoint_raises(self):
+        # No program counter can express re-entering a loop body part-way
+        # through, so this must name the gap rather than miscompile.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            @wp.func
+            def early(x: wp.float32, n: wp.int32) -> wp.float32:
+                acc = wp.float32(0.0)
+                for j in range(n):
+                    acc += x
+                    if acc > 6.0:
+                        return acc
+                return acc
+
+            @wp.kernel
+            def k(x: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
+                i = wp.tid()
+                out[i] = early(x[i], 4)
+
+            dev = 'metal:0'
+            x = wp.array(np.ones(4, np.float32), device=dev, requires_grad=True)
+            out = wp.zeros(4, dtype=wp.float32, device=dev, requires_grad=True)
+            tape = wp.Tape()
+            with tape:
+                wp.launch(k, dim=4, inputs=[x], outputs=[out], device=dev)
+            out.grad = wp.array(np.ones(4, np.float32), device=dev)
+            try:
+                tape.backward()
+            except NotImplementedError as e:
+                assert 'return' in str(e) and 'loop' in str(e), str(e)
+            else:
+                raise AssertionError('expected a MetalCodegenError naming the gap')
+            """
+        )
+        _run_with_metal_native(self, snippet)
+
+    def test_conditional_assignment_survives_reverse_mode(self):
+        # ``wp.where``'s adjoint reads *both* branches by value, including
+        # the one the forward pass only assigned under an ``if``. Leaving
+        # that local uninitialised let the Metal compiler fold the select
+        # away and take the wrong branch on every thread.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            @wp.kernel
+            def k(x: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
+                i = wp.tid()
+                v = x[i]
+                if v < 0.0:
+                    v = v * -3.0
+                out[i] = v * 2.0
+
+            n = 16
+            x_np = (np.arange(n, dtype=np.float32) - 8.0) * 0.5
+            got = {}
+            for dev in ('cpu', 'metal:0'):
+                x = wp.array(x_np, device=dev, requires_grad=True)
+                out = wp.zeros(n, dtype=wp.float32, device=dev, requires_grad=True)
+                tape = wp.Tape()
+                with tape:
+                    wp.launch(k, dim=n, inputs=[x], outputs=[out], device=dev)
+                out.grad = wp.array(np.ones(n, np.float32), device=dev)
+                tape.backward()
+                wp.synchronize_device(dev)
+                got[dev] = (out.numpy().copy(), x.grad.numpy().copy())
+            np.testing.assert_allclose(got['metal:0'][0], got['cpu'][0], rtol=1e-6, atol=1e-6)
+            np.testing.assert_allclose(got['metal:0'][1], got['cpu'][1], rtol=1e-6, atol=1e-6)
+            """
+        )
+        _run_with_metal_native(self, snippet)
+
+    def test_loop_adjoint_matches_cpu(self):
+        # A loop's reverse pass is opened by ``wp::iter_reverse``, which
+        # Metal has to turn back into a concrete reversed range: the whole
+        # loop (forward recompute included) lives in the reverse body.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            @wp.kernel
+            def k_dynamic(x: wp.array(dtype=wp.float32), n: wp.int32,
+                          out: wp.array(dtype=wp.float32)):
+                i = wp.tid()
+                acc = wp.float32(0.0)
+                for j in range(n):
+                    acc += x[i] * x[i] * wp.float32(j + 1)
+                out[i] = acc
+
+            @wp.kernel
+            def k_negative_step(x: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
+                i = wp.tid()
+                acc = wp.float32(0.0)
+                for j in range(5, 0, -2):
+                    acc += x[i] * wp.float32(j)
+                out[i] = acc
+
+            @wp.kernel
+            def k_nested(x: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
+                i = wp.tid()
+                acc = wp.float32(0.0)
+                for a in range(3):
+                    for b in range(2):
+                        acc += x[i] * wp.float32(a + 1) * wp.float32(b + 2)
+                out[i] = acc
+
+            n = 8
+            x_np = np.linspace(-1.5, 2.5, n, dtype=np.float32)
+            for kernel, extra in ((k_dynamic, [3]), (k_negative_step, []), (k_nested, [])):
+                got = {}
+                for dev in ('cpu', 'metal:0'):
+                    x = wp.array(x_np, device=dev, requires_grad=True)
+                    out = wp.zeros(n, dtype=wp.float32, device=dev, requires_grad=True)
+                    tape = wp.Tape()
+                    with tape:
+                        wp.launch(kernel, dim=n, inputs=[x, *extra], outputs=[out], device=dev)
+                    out.grad = wp.array(np.ones(n, np.float32), device=dev)
+                    tape.backward()
+                    wp.synchronize_device(dev)
+                    got[dev] = x.grad.numpy().copy()
+                np.testing.assert_allclose(
+                    got['metal:0'], got['cpu'], rtol=1e-5, atol=1e-6, err_msg=kernel.key
+                )
+            """
+        )
+        _run_with_metal_native(self, snippet)
+
+    def test_wp_grad_of_user_function_in_forward_kernel(self):
+        # ``wp.grad(f)(x)`` splices f's reverse pass into an ordinary
+        # forward kernel — no tape, no backward launch.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            @wp.func
+            def potential(d: wp.vec3):
+                return 1.0 / (wp.length(d) + 1.0e-6)
+
+            @wp.kernel
+            def k(d: wp.array(dtype=wp.vec3), out: wp.array(dtype=wp.vec3)):
+                i = wp.tid()
+                out[i] = wp.grad(potential)(d[i])
+
+            n = 12
+            d_np = np.random.default_rng(3).standard_normal((n, 3)).astype(np.float32)
+            got = {}
+            for dev in ('cpu', 'metal:0'):
+                d = wp.array(d_np, dtype=wp.vec3, device=dev)
+                out = wp.zeros(n, dtype=wp.vec3, device=dev)
+                wp.launch(k, dim=n, inputs=[d], outputs=[out], device=dev)
+                wp.synchronize_device(dev)
+                got[dev] = out.numpy().copy()
+            np.testing.assert_allclose(got['metal:0'], got['cpu'], rtol=1e-5, atol=1e-6)
+            """
+        )
+        _run_with_metal_native(self, snippet)
+
     def test_mlx_dispatch_rejects_adjoint_launch(self):
         # The default (MLX) path must say why rather than silently leaving
         # every gradient at zero.
