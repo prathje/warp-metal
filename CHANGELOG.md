@@ -35,7 +35,14 @@
   negative steps, and nesting), and `wp.grad(f)(x)`, which evaluates a `@wp.func`'s gradient inside an ordinary
   forward kernel. Adjoints are now available for `wp.clamp()`, `wp.mod()`, `wp.pow()`, `wp.lerp()`,
   `wp.smoothstep()`, `wp.atan2()`, the remaining trigonometric and rounding builtins, and the non-differentiable
-  integer operations. Differentiating through a struct field is still unsupported and raises.
+  integer operations.
+- Extend reverse-mode differentiation on Metal devices to struct kernel arguments, including `wp.array` fields
+  and nested structs. A field array's gradient is bound from the adjoint struct `wp.Tape()` builds for it.
+  Differentiating through a field of a struct *local* is still unsupported and raises.
+- Extend reverse-mode differentiation on Metal devices to `wp.tile_load()`, `wp.tile_store()`,
+  `wp.tile_atomic_add()`, `wp.tile_sum()`, `wp.tile()`, and element-wise tile arithmetic. Tile operations whose
+  adjoint is not yet implemented raise a `MetalCodegenError` naming the operation.
+- Support `wp.tile_mul_elementwise()` (`tile * tile`) on Metal devices.
 - Support `wp.tile_full()`, `wp.tile_scan_inclusive()`, and `wp.tile_scan_exclusive()` on Metal devices.
 - Support `wp.atomic_cas()` and `wp.atomic_exch()` on Metal devices, including through `wp.array` fields of
   struct kernel arguments. Note that mutual-exclusion spin locks built on these deadlock on Apple GPUs, which

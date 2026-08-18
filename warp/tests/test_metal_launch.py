@@ -9864,6 +9864,271 @@ class TestMetalAdjoint(unittest.TestCase):
             f"\n--- stderr ---\n{result.stderr}",
         )
 
+    def test_struct_arg_adjoint_matches_cpu(self):
+        """Reverse mode through struct kernel args: value, array and nested fields.
+
+        A struct's ``wp.array`` field gets its gradient through the field
+        array's own ``grad`` buffer (bound as a synthetic ``adj_<arg>__<field>``
+        argument), never through the adjoint struct — so this is the case that
+        would silently produce zeros if the binding were missed.
+        """
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            @wp.struct
+            class Params:
+                scale: wp.float32
+                offset: wp.vec3
+                values: wp.array(dtype=wp.float32)
+
+            @wp.struct
+            class Inner:
+                weights: wp.array(dtype=wp.float32)
+                gain: wp.float32
+
+            @wp.struct
+            class Outer:
+                inner: Inner
+                bias: wp.float32
+
+            @wp.kernel
+            def k_mixed(p: Params, x: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
+                i = wp.tid()
+                out[i] = p.values[i] * p.scale + wp.length(p.offset) * x[i]
+
+            @wp.kernel
+            def k_nested(o: Outer, out: wp.array(dtype=wp.float32)):
+                i = wp.tid()
+                out[i] = o.inner.weights[i] * o.inner.gain + o.bias
+
+            N = 8
+            rng = np.random.default_rng(7)
+            x_np = rng.standard_normal(N).astype(np.float32) + 2.0
+            v_np = rng.standard_normal(N).astype(np.float32) + 1.5
+            w_np = rng.standard_normal(N).astype(np.float32) - 0.5
+
+            def run(dev):
+                x = wp.array(x_np, dtype=wp.float32, device=dev, requires_grad=True)
+                vals = wp.array(v_np, dtype=wp.float32, device=dev, requires_grad=True)
+                wts = wp.array(w_np, dtype=wp.float32, device=dev, requires_grad=True)
+                p = Params()
+                p.scale = 2.5
+                p.offset = wp.vec3(0.5, -1.0, 2.0)
+                p.values = vals
+                inner = Inner()
+                inner.weights = wts
+                inner.gain = 1.75
+                o = Outer()
+                o.inner = inner
+                o.bias = 0.25
+
+                out = wp.zeros(N, dtype=wp.float32, device=dev, requires_grad=True)
+                tape = wp.Tape()
+                with tape:
+                    wp.launch(k_mixed, dim=N, inputs=[p, x], outputs=[out], device=dev)
+                out.grad.assign(np.ones(N, np.float32))
+                tape.backward()
+                got = {'values': vals.grad.numpy().copy(), 'x': x.grad.numpy().copy()}
+
+                out2 = wp.zeros(N, dtype=wp.float32, device=dev, requires_grad=True)
+                tape2 = wp.Tape()
+                with tape2:
+                    wp.launch(k_nested, dim=N, inputs=[o], outputs=[out2], device=dev)
+                out2.grad.assign(np.ones(N, np.float32))
+                tape2.backward()
+                got['weights'] = wts.grad.numpy().copy()
+                wp.synchronize_device(dev)
+                return got
+
+            ref = run('cpu')
+            got = run('metal:0')
+            for key in ref:
+                np.testing.assert_allclose(got[key], ref[key], rtol=1e-5, atol=1e-6,
+                                           err_msg=f'gradient mismatch for {key}')
+            # The array-field gradients must actually be non-trivial, or the
+            # comparison above would pass on two all-zero arrays.
+            assert np.abs(ref['values']).max() > 0.0
+            assert np.abs(ref['weights']).max() > 0.0
+            """
+        )
+        _run_with_metal_native(self, snippet)
+
+    def test_struct_local_field_adjoint_raises(self):
+        """A struct dual that is genuinely read must not be silently dropped."""
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            @wp.struct
+            class Pair:
+                a: wp.float32
+                b: wp.float32
+
+            @wp.func
+            def make_pair(x: wp.float32) -> Pair:
+                p = Pair()
+                p.a = x * 2.0
+                p.b = x * x
+                return p
+
+            @wp.kernel
+            def k(x: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
+                i = wp.tid()
+                p = make_pair(x[i])
+                out[i] = p.a + p.b
+
+            dev = 'metal:0'
+            x = wp.array(np.ones(4, np.float32), device=dev, requires_grad=True)
+            out = wp.zeros(4, dtype=wp.float32, device=dev, requires_grad=True)
+            tape = wp.Tape()
+            with tape:
+                wp.launch(k, dim=4, inputs=[x], outputs=[out], device=dev)
+            out.grad.assign(np.ones(4, np.float32))
+            try:
+                tape.backward()
+            except Exception as e:
+                msg = str(e)
+                assert 'struct' in msg, msg
+            else:
+                # If it ever starts working, it must agree with the CPU
+                # rather than quietly return zeros.
+                xc = wp.array(np.ones(4, np.float32), device='cpu', requires_grad=True)
+                oc = wp.zeros(4, dtype=wp.float32, device='cpu', requires_grad=True)
+                tc = wp.Tape()
+                with tc:
+                    wp.launch(k, dim=4, inputs=[xc], outputs=[oc], device='cpu')
+                oc.grad.assign(np.ones(4, np.float32))
+                tc.backward()
+                np.testing.assert_allclose(x.grad.numpy(), xc.grad.numpy(), rtol=1e-5, atol=1e-6)
+            """
+        )
+        _run_with_metal_native(self, snippet)
+
+    def test_tile_adjoint_matches_cpu(self):
+        """``tile_load`` / ``tile_store`` / ``tile_sum`` / ``tile_atomic_add`` in reverse."""
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            TILE = 8
+            NBLOCK = 4
+            N = TILE * NBLOCK
+
+            @wp.kernel
+            def k_load_store(x: wp.array(dtype=wp.float32), y: wp.array(dtype=wp.float32)):
+                b = wp.tid()
+                t = wp.tile_load(x, shape=TILE, offset=b * TILE)
+                wp.tile_store(y, t * 2.0, offset=b * TILE)
+
+            @wp.kernel
+            def k_sum_atomic(x: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
+                b = wp.tid()
+                t = wp.tile_load(x, shape=TILE, offset=b * TILE)
+                wp.tile_atomic_add(out, wp.tile_sum(t * t), offset=0)
+
+            @wp.kernel
+            def k_tile_of_scalar(x: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
+                i = wp.tid()
+                wp.tile_atomic_add(out, wp.tile_sum(wp.tile(x[i] * 2.0)), offset=0)
+
+            @wp.struct
+            class TileParams:
+                src: wp.array(dtype=wp.float32)
+
+            @wp.kernel
+            def k_struct_field_tile(p: TileParams, y: wp.array(dtype=wp.float32)):
+                b = wp.tid()
+                t = wp.tile_load(p.src, shape=TILE, offset=b * TILE)
+                wp.tile_store(y, t * 2.0, offset=b * TILE)
+
+            rng = np.random.default_rng(3)
+            x_np = rng.standard_normal(N).astype(np.float32)
+
+            def run(dev):
+                got = {}
+                for name, kernel, dim, n_out in (
+                    ('load_store', k_load_store, NBLOCK, N),
+                    ('sum_atomic', k_sum_atomic, NBLOCK, 1),
+                    ('tile_of_scalar', k_tile_of_scalar, N, 1),
+                ):
+                    x = wp.array(x_np, dtype=wp.float32, device=dev, requires_grad=True)
+                    y = wp.zeros(n_out, dtype=wp.float32, device=dev, requires_grad=True)
+                    tape = wp.Tape()
+                    with tape:
+                        wp.launch_tiled(kernel, dim=[dim], inputs=[x], outputs=[y],
+                                        block_dim=1, device=dev)
+                    y.grad.assign(np.ones(n_out, np.float32))
+                    tape.backward()
+                    got[name + '.x'] = x.grad.numpy().copy()
+                    got[name + '.y'] = y.numpy().copy()
+
+                # A tile loaded from a struct arg's array field — the
+                # reverse-mode tile ops must resolve the same synthetic
+                # array name the forward pass uses.
+                src = wp.array(x_np, dtype=wp.float32, device=dev, requires_grad=True)
+                p = TileParams()
+                p.src = src
+                y = wp.zeros(N, dtype=wp.float32, device=dev, requires_grad=True)
+                tape = wp.Tape()
+                with tape:
+                    wp.launch_tiled(k_struct_field_tile, dim=[NBLOCK], inputs=[p], outputs=[y],
+                                    block_dim=1, device=dev)
+                y.grad.assign(np.ones(N, np.float32))
+                tape.backward()
+                got['struct_field_tile.x'] = src.grad.numpy().copy()
+                got['struct_field_tile.y'] = y.numpy().copy()
+
+                wp.synchronize_device(dev)
+                return got
+
+            ref = run('cpu')
+            got = run('metal:0')
+            for key in ref:
+                np.testing.assert_allclose(got[key], ref[key], rtol=1e-5, atol=1e-6,
+                                           err_msg=f'mismatch for {key}')
+                assert np.abs(ref[key]).max() > 0.0, key
+            """
+        )
+        _run_with_metal_native(self, snippet)
+
+    def test_unsupported_tile_adjoint_raises(self):
+        """An unimplemented tile adjoint must name the gap, not emit bad MSL.
+
+        These lose their ``wp::`` prefix in the tile translator, so without an
+        explicit check they reach the Metal compiler as undeclared identifiers.
+        """
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            TILE = 4
+
+            @wp.kernel
+            def k(x: wp.array2d(dtype=wp.vec2f), y: wp.array2d(dtype=wp.vec2f)):
+                t = wp.tile_load(x, shape=(1, TILE))
+                wp.tile_fft(t)
+                wp.tile_store(y, t)
+
+            dev = 'metal:0'
+            x = wp.array(np.zeros((1, TILE, 2), np.float32), dtype=wp.vec2f, device=dev, requires_grad=True)
+            y = wp.zeros((1, TILE), dtype=wp.vec2f, device=dev, requires_grad=True)
+            tape = wp.Tape()
+            with tape:
+                wp.launch_tiled(k, dim=[1], inputs=[x], outputs=[y], block_dim=1, device=dev)
+            y.grad.assign(np.ones((1, TILE, 2), np.float32))
+            try:
+                tape.backward()
+            except Exception as e:
+                msg = str(e)
+                assert 'tile_fft' in msg, msg
+                assert 'not supported' in msg, msg
+            else:
+                raise AssertionError('adjoint of tile_fft should have raised')
+            """
+        )
+        _run_with_metal_native(self, snippet)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
