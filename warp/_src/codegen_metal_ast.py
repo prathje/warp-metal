@@ -1594,6 +1594,46 @@ def _has_loop_nested_return(nodes: tuple[Node, ...] | list[Node], in_loop: bool 
 # import cycle.
 
 
+def assemble_adjoint_body(
+    replay_lines: list[str],
+    reverse_lines: list[str],
+    const_ints: dict[str, int],
+    what: str,
+    query_iter_vars=(),
+) -> tuple[list[Node], set[str]]:
+    """Fold a kernel's reverse-mode body into one node list.
+
+    The two halves — the replay (forward recompute) and the reversed adjoint
+    statements — have to be folded separately because a kernel-level early
+    ``return`` straddles them: Warp emits ``goto labelN`` in the replay and
+    puts ``labelN:`` at the matching point of the *reverse* sweep, so the jump
+    lands part-way into the backward pass. Metal has no ``goto``, so
+    :func:`_lower_return_labels` re-expresses that as a program counter, and
+    the replay's now-``return``-terminated region becomes a ``do { } while
+    (0)`` whose ``break`` exits it in one hop.
+
+    Returns ``(nodes, skip_decls)``. Any program-counter or return-flag
+    declaration the lowering needs is prepended to ``nodes`` as a raw line, so
+    callers do not have to thread it through the declaration pass.
+    """
+    pc_var = "var__kernel_retpc"
+    replay_lines, reverse_lines, n_labels = _lower_return_labels(replay_lines, reverse_lines, pc_var, what)
+    replay_lines, reverse_lines = lower_reverse_ranges([replay_lines, reverse_lines], const_ints, what)
+    replay_nodes, replay_skip = fold(parse(replay_lines), query_iter_vars=query_iter_vars)
+    reverse_nodes, reverse_skip = fold(parse(reverse_lines), query_iter_vars=query_iter_vars)
+
+    decls: list[Node] = []
+    if n_labels is not None:
+        decls.append(_RawLine(raw=f"    int {pc_var} = {n_labels};"))
+    if _has_return(replay_nodes):
+        ret_flag = None
+        if _has_loop_nested_return(replay_nodes):
+            ret_flag = "var__kernel_ret_flag"
+            decls.append(_RawLine(raw=f"    bool {ret_flag} = false;"))
+        replay_nodes = [_DoWhileZero(raw="", body=tuple(_rewrite_returns_to_breaks(replay_nodes, None, ret_flag)))]
+    return [*decls, *replay_nodes, *reverse_nodes], replay_skip | reverse_skip
+
+
 def _inline_one_call(
     fn_overload,
     caller_args: tuple[str, ...],

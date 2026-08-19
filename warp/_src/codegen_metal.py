@@ -137,6 +137,7 @@ import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from warp._src.codegen_metal_ast import assemble_adjoint_body as _ast_assemble_adjoint_body
 from warp._src.codegen_metal_ast import emit as _ast_emit
 from warp._src.codegen_metal_ast import fold as _ast_fold
 from warp._src.codegen_metal_ast import fold_const_branches as _ast_fold_const_branches
@@ -1245,8 +1246,12 @@ def _adj_vec_helpers(n: int) -> str:
     comps = "".join(f"    a{i} += r[{i}];\n" for i in range(n))
     args = ", ".join(f"float c{i}" for i in range(n))
     refs = ", ".join(f"thread float& a{i}" for i in range(n))
+    # ``wp.vec2(s)`` broadcasts one scalar into every component, so its
+    # adjoint sums the whole gradient back into that scalar.
+    bcast = " + ".join(f"r[{i}]" for i in range(n))
     return (
         f"inline void wp_adj_vec_t({args}, {refs}, {v} r) {{\n{comps}}}\n"
+        f"inline void wp_adj_vec_t(float c, thread float& a, {v} r) {{ a += {bcast}; }}\n"
         f"inline void wp_adj_mul({v} a, float b, thread {v}& aa, thread float& ab, {v} r) {{\n"
         f"    aa += b * r;\n    ab += metal::dot(a, r);\n}}\n"
         f"inline void wp_adj_mul(float a, {v} b, thread float& aa, thread {v}& ab, {v} r) {{\n"
@@ -1265,6 +1270,135 @@ def _adj_vec_helpers(n: int) -> str:
         # into the indexed component. The index itself is non-differentiable.
         f"inline void wp_adj_extract({v} a, int i, thread {v}& aa, thread int& ai, float r) {{\n"
         f"    aa[i] += r;\n}}\n"
+        # Component-wise products. MSL's ``*`` on vectors is already
+        # component-wise, so these mirror the scalar rules per lane.
+        f"inline void wp_adj_cw_mul({v} a, {v} b, thread {v}& aa, thread {v}& ab, {v} r) {{\n"
+        f"    aa += b * r;\n    ab += a * r;\n}}\n"
+        f"inline void wp_adj_cw_div({v} a, {v} b, {v} ret, thread {v}& aa, thread {v}& ab, {v} r) {{\n"
+        f"    aa += r / b;\n    ab -= r * ret / b;\n}}\n"
+    )
+
+
+def _adj_int_vec_helpers(n: int, scalar: str) -> str:
+    """Adjoint helpers for the integer vector types (``int2``, ``uint3``, ...).
+
+    Integer values carry no gradient, but Warp's reverse pass still emits
+    ``adj_extract`` / ``adj_vec_t`` for them (warp.fem indexes a ``vec2i``
+    grid resolution this way). The CPU backend accumulates into the integer
+    dual and then discards it, so mirror that rather than dropping the
+    statement — a dropped statement would leave an undeclared identifier if
+    the dual is read later.
+    """
+    v = f"{scalar}{n}"
+    comps = "".join(f"    a{i} += r[{i}];\n" for i in range(n))
+    args = ", ".join(f"{scalar} c{i}" for i in range(n))
+    refs = ", ".join(f"thread {scalar}& a{i}" for i in range(n))
+    bcast = " + ".join(f"r[{i}]" for i in range(n))
+    return (
+        f"inline void wp_adj_vec_t({args}, {refs}, {v} r) {{\n{comps}}}\n"
+        f"inline void wp_adj_vec_t({scalar} c, thread {scalar}& a, {v} r) {{ a += {bcast}; }}\n"
+        f"inline void wp_adj_extract({v} a, int i, thread {v}& aa, thread int& ai, {scalar} r) {{\n"
+        f"    aa[i] += r;\n}}\n"
+    )
+
+
+def _adj_mat_helpers(n: int) -> str:
+    """MSL adjoint helpers for the native square ``floatNxN`` matrix type.
+
+    Native MSL matrices are column-major (``m[col][row]``) while Warp's IR is
+    row-major, so a logical element ``(i, j)`` is ``m[j][i]`` here. Products,
+    ``metal::transpose`` and ``metal::determinant`` are layout-agnostic — they
+    operate on the same logical matrix — so the formulas below match
+    ``warp/native/mat.h`` directly; only the explicit element indices swap.
+
+    Concrete overloads matter beyond convenience: the generic scalar
+    ``wp_adj_mul`` template would otherwise deduce ``T = floatNxN`` and
+    compute ``aa += b * r``, which compiles but is the wrong adjoint for a
+    matrix product.
+    """
+    m = f"float{n}x{n}"
+    v = f"float{n}"
+    diag = "".join(f"    am[{i}][{i}] += r;\n" for i in range(n))
+    diag_get = "".join(f"    ad[{i}] += r[{i}][{i}];\n" for i in range(n))
+    diag_put = "".join(f"    am[{i}][{i}] += r[{i}];\n" for i in range(n))
+    cw = "".join(f"    aa[{i}] += b[{i}] * r[{i}];\n    ab[{i}] += a[{i}] * r[{i}];\n" for i in range(n))
+    cw_div = "".join(f"    aa[{i}] += r[{i}] / b[{i}];\n    ab[{i}] -= r[{i}] * ret[{i}] / b[{i}];\n" for i in range(n))
+    # ``outer(u, w)`` is logical ``u wᵀ``; in column-major storage its column
+    # j is ``u * w[j]``.
+    outer_rb = ", ".join(f"r * b[{i}]" for i in range(n))
+    outer_br = ", ".join(f"b * r[{i}]" for i in range(n))
+    ddot = " + ".join(f"metal::dot(a[{i}], r[{i}])" for i in range(n))
+    ddot_ret = " + ".join(f"metal::dot(ret[{i}], r[{i}])" for i in range(n))
+    if n == 2:
+        det_body = (
+            "    am[0][0] += m[1][1] * r;\n"
+            "    am[1][1] += m[0][0] * r;\n"
+            "    am[1][0] -= m[0][1] * r;\n"
+            "    am[0][1] -= m[1][0] * r;\n"
+        )
+    else:
+        # Cofactor expansion: d(det)/d(i,j) = (-1)^(i+j) * det(minor(i, j)).
+        # Written as a loop so 3x3 and 4x4 share one obviously-correct form.
+        det_body = (
+            f"    for (int i = 0; i < {n}; ++i) for (int j = 0; j < {n}; ++j) {{\n"
+            f"        float{n - 1}x{n - 1} sub;\n"
+            f"        int rr = 0;\n"
+            f"        for (int a = 0; a < {n}; ++a) {{\n"
+            f"            if (a == i) continue;\n"
+            f"            int cc = 0;\n"
+            f"            for (int b = 0; b < {n}; ++b) {{\n"
+            f"                if (b == j) continue;\n"
+            f"                sub[cc][rr] = m[b][a];\n"
+            f"                ++cc;\n"
+            f"            }}\n"
+            f"            ++rr;\n"
+            f"        }}\n"
+            f"        float sgn = ((i + j) % 2 == 0) ? 1.0f : -1.0f;\n"
+            f"        am[j][i] += sgn * metal::determinant(sub) * r;\n"
+            f"    }}\n"
+        )
+    return (
+        f"inline void wp_adj_mul({m} a, {m} b, thread {m}& aa, thread {m}& ab, {m} r) {{\n"
+        f"    aa += r * metal::transpose(b);\n    ab += metal::transpose(a) * r;\n}}\n"
+        f"inline void wp_adj_mul({m} a, {v} b, thread {m}& aa, thread {v}& ab, {v} r) {{\n"
+        f"    aa += {m}({outer_rb});\n    ab += metal::transpose(a) * r;\n}}\n"
+        f"inline void wp_adj_mul({v} b, {m} a, thread {v}& ab, thread {m}& aa, {v} r) {{\n"
+        f"    aa += {m}({outer_br});\n    ab += r * metal::transpose(a);\n}}\n"
+        f"inline void wp_adj_mul({m} a, float b, thread {m}& aa, thread float& ab, {m} r) {{\n"
+        f"    aa += b * r;\n    ab += {ddot};\n}}\n"
+        f"inline void wp_adj_mul(float b, {m} a, thread float& ab, thread {m}& aa, {m} r) {{\n"
+        f"    aa += b * r;\n    ab += {ddot};\n}}\n"
+        f"inline void wp_adj_div({m} a, float b, {m} ret, thread {m}& aa, thread float& ab, {m} r) {{\n"
+        f"    aa += r / b;\n    ab -= ({ddot_ret}) / b;\n}}\n"
+        f"inline void wp_adj_ddot({m} a, {m} b, thread {m}& aa, thread {m}& ab, float r) {{\n"
+        f"    aa += b * r;\n    ab += a * r;\n}}\n"
+        f"inline void wp_adj_cw_mul({m} a, {m} b, thread {m}& aa, thread {m}& ab, {m} r) {{\n{cw}}}\n"
+        f"inline void wp_adj_cw_div({m} a, {m} b, {m} ret, thread {m}& aa, thread {m}& ab, {m} r) {{\n{cw_div}}}\n"
+        f"inline void wp_adj_transpose({m} a, thread {m}& aa, {m} r) {{ aa += metal::transpose(r); }}\n"
+        f"inline void wp_adj_trace({m} m, thread {m}& am, float r) {{\n{diag}}}\n"
+        f"inline void wp_adj_diag({v} d, thread {v}& ad, {m} r) {{\n{diag_get}}}\n"
+        f"inline void wp_adj_get_diag({m} m, thread {m}& am, {v} r) {{\n{diag_put}}}\n"
+        f"inline void wp_adj_outer({v} a, {v} b, thread {v}& aa, thread {v}& ab, {m} r) {{\n"
+        f"    aa += r * b;\n    ab += metal::transpose(r) * a;\n}}\n"
+        # ``wp.extract(m, i, j)`` — logical (i, j) is ``m[j][i]`` here.
+        f"inline void wp_adj_extract({m} m, int i, int j, thread {m}& am, "
+        f"thread int& ai, thread int& aj, float r) {{\n    am[j][i] += r;\n}}\n"
+        # Row extract: ``wp.extract(m, i)`` yields logical row i, whose
+        # components live one per column.
+        f"inline void wp_adj_extract({m} m, int i, thread {m}& am, thread int& ai, {v} r) {{\n"
+        f"    for (int j = 0; j < {n}; ++j) am[j][i] += r[j];\n}}\n"
+        f"inline void wp_adj_determinant({m} m, thread {m}& am, float r) {{\n{det_body}}}\n"
+        # d(inv)/dM, see Giles, "An extended collection of matrix derivative
+        # results for forward and reverse mode AD", 2.2.3.
+        f"inline void wp_adj_inverse({m} m, {m} ret, thread {m}& am, {m} r) {{\n"
+        f"    {m} invt = metal::transpose(ret);\n    am -= invt * r * invt;\n}}\n"
+        f"inline void wp_adj_matrix_from_cols({', '.join(f'{v} c{i}' for i in range(n))}, "
+        f"{', '.join(f'thread {v}& ac{i}' for i in range(n))}, {m} r) {{\n"
+        + "".join(f"    ac{i} += r[{i}];\n" for i in range(n))
+        + "}\n"
+        f"inline void wp_adj_matrix_from_rows({', '.join(f'{v} c{i}' for i in range(n))}, "
+        f"{', '.join(f'thread {v}& ac{i}' for i in range(n))}, {m} r) {{\n"
+        f"    {m} rt = metal::transpose(r);\n" + "".join(f"    ac{i} += rt[{i}];\n" for i in range(n)) + "}\n"
     )
 
 
@@ -1329,6 +1463,22 @@ _ADJ_SUPPORTED = frozenset(
         "cosh",
         "lerp",
         "smoothstep",
+        # Matrix / component-wise family (``_adj_mat_helpers``). Defined for
+        # the MSL-native square shapes only: on a non-native ``wp_matRxC_*``
+        # struct these still rename and then fail at MSL compile time with an
+        # overload error rather than a named codegen one.
+        "cw_mul",
+        "cw_div",
+        "ddot",
+        "transpose",
+        "trace",
+        "diag",
+        "get_diag",
+        "outer",
+        "determinant",
+        "inverse",
+        "matrix_from_cols",
+        "matrix_from_rows",
     }
 )
 
@@ -1398,77 +1548,59 @@ _ADJ_TILE_ARRAY_FIXED = {"tile_load": 3, "tile_store": 4, "tile_atomic_add": 5}
 
 # ``adj_p.offset += adj_6;`` / ``adj_p.values = adj_1;`` — the adjoint of a
 # struct field read, emitted by ``Adjoint.emit_Attribute`` (``+=`` for
-# differentiable value types, ``=`` for everything else). See
-# ``_dead_struct_duals`` for what the Metal backend does with it.
+# differentiable value types, ``=`` for everything else).
+#
+# Metal has no dual for a struct *value*: forward-mode splits every struct
+# into per-field locals (``var_<root>__<field>``), so reverse mode mirrors
+# that split with per-field duals (``adj_<root>__<field>``, see
+# ``_per_field_dual``) and lowers these stores one scalar leaf at a time.
+# ``wp.array`` fields have no leaf and no dual — their gradients reach the
+# tape through the field array's own ``grad`` buffer, bound as a synthetic
+# ``adj_<arg>__<field>`` argument — so a store into one is dropped.
 _ADJ_STRUCT_FIELD_STORE_PAT = re.compile(
-    r"^\s*adj_(?P<root>\w+)(?P<path>(?:\.\w+)+)\s*(?:\+=|-=|=)\s*(?P<rhs>.+?)\s*;\s*$"
+    r"^(?P<indent>\s*)adj_(?P<root>\w+)(?P<path>(?:\.\w+)+)\s*(?P<op>\+=|-=|=)\s*(?P<rhs>.+?)\s*;\s*$"
 )
 
+# ``adj_A += adj_B;`` — whole-struct dual accumulation, emitted for the
+# reverse of a struct copy (``t = s``). Expanded per scalar leaf.
+_ADJ_STRUCT_WHOLE_PAT = re.compile(r"^(?P<indent>\s*)adj_(?P<dst>\w+)\s*(?P<op>\+=|-=|=)\s*adj_(?P<src>\w+)\s*;\s*$")
 
-def _dead_struct_duals(lines: list[str], struct_arg_labels: set[str]) -> set[str]:
-    """Labels whose ``adj_<label>.<field>`` stores can be dropped.
+# ``adj_Sample_9043e1d0(f0.., adj_f0.., adj_ret);`` — the adjoint of a struct
+# *constructor*, generated by ``codegen.codegen_struct``. Its body propagates
+# ``adj_ret.<field_i>`` into ``adj_<arg_i>`` (``+=`` for value fields, plain
+# ``=`` for array fields, which Metal drops). The call carries n forward
+# args, then n adjoint args, then one ``adj_ret`` — so n follows from the
+# arity. Matched only when the name is a struct the kernel actually uses;
+# builtin adjoints all carry a ``wp::`` prefix and user ``@wp.func`` adjoints
+# have been inlined away by this point.
+_ADJ_STRUCT_CTOR_PAT = re.compile(r"^(?P<indent>\s*)adj_(?P<name>[A-Za-z_]\w*)\s*\((?P<args>.*)\)\s*;\s*$")
 
-    Warp emits one such store for every struct-field *read*
-    (``Adjoint.emit_Attribute``). Where the struct is a kernel argument the
-    store has no reader anywhere: the backward entry point takes the adjoint
-    struct **by value**, so accumulating into ``adj_p.scale`` dies with the
-    thread. Gradients for a struct's ``wp.array`` fields do not travel this
-    way either — they reach the tape through the field array's own ``grad``
-    buffer, which the Metal backend binds as a synthetic
-    ``adj_<arg>__<field>`` argument. The ``adj_p.values = adj_1;`` companion
-    line is likewise a dead store: it runs *after* the ``adj_address`` that
-    would have consumed it, since the reverse block is stored forward-order
-    and executed reversed.
+# ``wp::adj_copy(src, adj_src, adj_dest);`` / ``wp::adj_assign(dest, src,
+# adj_dest, adj_src);`` — the reverse of a whole-value copy. When the value is
+# a struct there is nothing to call: both duals are per-field splits, so the
+# statement expands to one accumulate-and-clear per scalar leaf.
+_ADJ_STRUCT_COPY_PAT = re.compile(r"^(?P<indent>\s*)wp::adj_(?P<op>copy|assign)\s*\((?P<args>.*)\)\s*;\s*$")
 
-    Struct *locals* are the harder case — a nested field read
-    (``o.inner.gain``) routes through Reference-typed intermediates, and
-    warp.fem stacks half a dozen of them per integrand. So rather than
-    enumerate shapes, this computes a greatest fixpoint: assume every struct
-    dual is dead, then disqualify any whose value is genuinely *read*
-    somewhere. The only reads that keep a dual alive are the ones a fold
-    cannot see through — a call argument, a copy into a live struct — and
-    those make the field store an error rather than a silent gradient drop.
+# Sentinel emitted in place of ``adj_<struct> = {};`` so the statement
+# survives the IR parser (which rejects C++ aggregate init) and can be
+# expanded per leaf once the struct layouts are known.
+_STRUCT_DUAL_ZERO_CALL = "wp::__metal_struct_dual_zero"
+_STRUCT_DUAL_ZERO_PAT = re.compile(
+    rf"^(?P<indent>\s*){re.escape(_STRUCT_DUAL_ZERO_CALL)}\s*\(\s*(?P<root>\w+)\s*\)\s*;\s*$"
+)
+_STRUCT_DUAL_ZERO = object()
+"""Marker stored in ``_rewrite_adj_aggregate_init``'s type map for struct-typed
+labels, whose dual is a set of per-leaf locals rather than one MSL value."""
 
-    A line does not disqualify ``adj_R`` when it is R's own zero-init, a
-    store *into* one of R's fields, or a store of R as a whole into another
-    dead dual (that store is dropped too, so R's value goes nowhere).
+
+def _per_field_dual(struct_label: str, field_path: str) -> str:
+    """Dual local for one scalar leaf of a struct value.
+
+    Mirrors the forward per-field split (``_per_field_local``) so a struct's
+    dual is a set of leaf locals rather than a struct MSL has no type for.
+    ``field_path`` is ``__``-joined, as produced by ``_iter_scalar_leaves``.
     """
-    roots: set[str] = set(struct_arg_labels)
-    for line in lines:
-        m = _ADJ_STRUCT_FIELD_STORE_PAT.match(line)
-        if m:
-            roots.add(m.group("root"))
-
-    # Lines mentioning each candidate, so the fixpoint below rescans only
-    # what is relevant instead of the whole body per iteration.
-    mentions: dict[str, list[str]] = {}
-    for label in roots:
-        tok = re.compile(rf"\badj_{re.escape(label)}\b")
-        mentions[label] = [ln for ln in lines if tok.search(ln)]
-
-    def is_read_by(label: str, line: str, dead: set[str]) -> bool:
-        """True if ``line`` reads ``adj_<label>`` in a way that keeps it live."""
-        if _ADJ_AGGREGATE_INIT_PAT.match(line):
-            return False
-        m = _ADJ_STRUCT_FIELD_STORE_PAT.match(line)
-        if m is None:
-            return True
-        if m.group("root") == label:
-            # Writing one of R's own fields is not a read of R. (The RHS
-            # could in principle name R too; nothing Warp emits does.)
-            return False
-        # ``adj_X.f = adj_R;`` — harmless only if that store is itself dropped.
-        return not (m.group("root") in dead and m.group("rhs").strip() == f"adj_{label}")
-
-    dead = set(roots)
-    changed = True
-    while changed:
-        changed = False
-        for label in sorted(dead):
-            if any(is_read_by(label, ln, dead) for ln in mentions[label]):
-                dead.discard(label)
-                changed = True
-    return dead
+    return f"adj_{struct_label}__{field_path}"
 
 
 _ADJ_AGGREGATE_INIT_PAT = re.compile(r"^(?P<indent>\s*)(?P<pfx>adj_|var_)(?P<label>\w+)\s*=\s*\{\s*\}\s*;\s*$")
@@ -1488,6 +1620,10 @@ def _rewrite_adj_aggregate_init(line: str, zero_by_label: dict[str, str | None])
     explicitly to ``None`` has a type with no MSL representation (a loop's
     ``wp::range_t``, say), so no dual was declared for it and resetting one
     is meaningless.
+
+    Struct-typed labels map to ``_STRUCT_DUAL_ZERO``: their dual is a set of
+    per-leaf locals, so the reset is rewritten to a sentinel call the body
+    emitter expands once the struct layout is in hand.
     """
     m = _ADJ_AGGREGATE_INIT_PAT.match(line)
     if m is None:
@@ -1498,6 +1634,12 @@ def _rewrite_adj_aggregate_init(line: str, zero_by_label: dict[str, str | None])
     zero = zero_by_label[label]
     if zero is None:
         return None
+    if zero is _STRUCT_DUAL_ZERO:
+        if m.group("pfx") != "adj_":
+            # ``var_X = {};`` on a struct value has its own per-leaf
+            # expansion in the body emitter (which knows the primal split).
+            return line
+        return f"{m.group('indent')}{_STRUCT_DUAL_ZERO_CALL}({label});"
     return f"{m.group('indent')}{m.group('pfx')}{label} = {zero};"
 
 
@@ -5844,6 +5986,16 @@ def _build_kernel_header(source: str) -> str:
         for _n in _ADJ_VEC_HELPER_LENGTHS:
             if f"float{_n}" in source:
                 parts.append(_adj_vec_helpers(_n))
+        for _n in _ADJ_VEC_HELPER_LENGTHS:
+            for _s in ("int", "uint"):
+                if f"{_s}{_n}" in source:
+                    parts.append(_adj_int_vec_helpers(_n, _s))
+        for _n in _ADJ_VEC_HELPER_LENGTHS:
+            # ``float2x2`` needs no smaller minor; 3x3/4x4 expand cofactors
+            # through ``float2x2``/``float3x3`` determinants, so emit in
+            # ascending order and only for shapes the kernel names.
+            if f"float{_n}x{_n}" in source:
+                parts.append(_adj_mat_helpers(_n))
         if "wp_adj_cross" in source:
             parts.append(_ADJ_VEC3_EXTRA)
     # Always emitted: kernels reference ``wp_normalize``/``wp_quat_normalize``
@@ -9151,21 +9303,29 @@ def _generate_msl_kernel_uncached(
     # ``for l in reversed(...)``); nested blocks are pre-reversed when they
     # are spliced in, so one flat reverse here is correct and matches what
     # the CPU/CUDA backends emit.
-    if adjoint:
-        _ir_lines = list(adj.blocks[0].body_replay) + list(reversed(adj.blocks[0].body_reverse))
-    else:
-        _ir_lines = list(adj.blocks[0].body_forward)
+    _replay_lines = list(adj.blocks[0].body_replay) if adjoint else []
+    _ir_lines = list(reversed(adj.blocks[0].body_reverse)) if adjoint else list(adj.blocks[0].body_forward)
     # Warp resets a dual var with C++ aggregate init (``adj_15 = {};``), which
     # MSL has no equivalent for. Rewrite to the typed zero the declaration
     # used; the type comes from the variable's value type. Forward bodies need
     # this too — ``wp.grad(f)(x)`` builds its adjoint accumulators inline.
-    _adj_zero_types: dict[str, str | None] = {}
+    from warp._src.codegen import Struct as _StructEarly  # noqa: PLC0415
+
+    _adj_zero_types: dict[str, str | object | None] = {}
     for _v in adj.variables:
+        if isinstance(_v.type, _StructEarly):
+            _adj_zero_types[str(_v.label)] = _STRUCT_DUAL_ZERO
+            continue
         try:
             _adj_zero_types[str(_v.label)] = _msl_zero_init(_msl_var_type(_v.ctype(value_type=True)))
         except MetalCodegenError:
             _adj_zero_types[str(_v.label)] = None
-    _ir_lines = [_l for _l in (_rewrite_adj_aggregate_init(ln, _adj_zero_types) for ln in _ir_lines) if _l is not None]
+
+    def _rewrite_aggregate_inits(lines):
+        return [_l for _l in (_rewrite_adj_aggregate_init(ln, _adj_zero_types) for ln in lines) if _l is not None]
+
+    _ir_lines = _rewrite_aggregate_inits(_ir_lines)
+    _replay_lines = _rewrite_aggregate_inits(_replay_lines)
     # A ``for`` loop's reverse pass reopens its range through
     # ``wp::iter_reverse``; resolve that to a concrete reversed range so the
     # ordinary for-loop fold can take it from here.
@@ -9174,9 +9334,21 @@ def _generate_msl_kernel_uncached(
         for _v in adj.variables
         if isinstance(_v.constant, int) and not isinstance(_v.constant, bool)
     }
-    (_ir_lines,) = _ast_lower_reverse_ranges([_ir_lines], _const_ints, adj.fun_name)
-    _ast_nodes = _ast_parse(_ir_lines)
-    _ast_nodes, _struct_skip = _ast_fold(_ast_nodes, query_iter_vars=_ast_query_iterator_vars(adj))
+    if adjoint:
+        # Replay and reverse fold separately: a kernel-level early ``return``
+        # jumps from the replay into the middle of the reverse sweep, which
+        # Metal expresses as a program counter rather than a ``goto``.
+        _ast_nodes, _struct_skip = _ast_assemble_adjoint_body(
+            _replay_lines,
+            _ir_lines,
+            _const_ints,
+            repr(adj.fun_name),
+            query_iter_vars=_ast_query_iterator_vars(adj),
+        )
+    else:
+        (_ir_lines,) = _ast_lower_reverse_ranges([_ir_lines], _const_ints, adj.fun_name)
+        _ast_nodes = _ast_parse(_ir_lines)
+        _ast_nodes, _struct_skip = _ast_fold(_ast_nodes, query_iter_vars=_ast_query_iterator_vars(adj))
     # Inline ``@wp.func`` user-function calls into the kernel body before
     # the view / indexref / drop folds run, so those folds see the spliced-
     # in writes (otherwise kernels that write outputs only via helper
@@ -9228,6 +9400,12 @@ def _generate_msl_kernel_uncached(
     # here; constant steps resolve from ``adj.variables`` and the
     # inliner's surfaced constants.
     forward_lines = _fix_negative_step_for_loops(forward_lines, adj=adj, extra_const_ints=_inlined_const_ints)
+
+    if os.environ.get("WARP_METAL_DUMP_IR"):
+        _dump = os.path.join(os.environ["WARP_METAL_DUMP_IR"], f"{adj.fun_name}{'__adj' if adjoint else ''}.ir")
+        os.makedirs(os.environ["WARP_METAL_DUMP_IR"], exist_ok=True)
+        with open(_dump, "w") as _f:
+            _f.write("\n".join(forward_lines))
 
     vars_to_skip_decl: set[str] = _struct_skip | _drop_skip | _view_skip | _indexref_skip
 
@@ -9410,10 +9588,10 @@ def _generate_msl_kernel_uncached(
             output_args.append(gvar)
 
         # ``wp.array`` fields of struct args get the same treatment. Their
-        # gradients never travel through the adjoint struct (see
-        # ``_dead_struct_duals``) — the tape hands the field's
-        # own grad array to the launcher, which binds it here under the
-        # synthetic field name the forward pass already uses.
+        # gradients never travel through the adjoint struct (an array field
+        # is not a scalar leaf and so has no per-field dual) — the tape hands
+        # the field's own grad array to the launcher, which binds it here
+        # under the synthetic field name the forward pass already uses.
         for syn_var in struct_field_array_vars:
             if syn_var.label not in grad_args:
                 continue
@@ -9948,6 +10126,95 @@ def _generate_msl_kernel_uncached(
             )
             body_lines.append(f"    {field_info.msl_type} {local_name} = {_zero};")
 
+    # --- Per-field struct duals ----------------------------------------
+    # A struct value has no MSL type here (forward mode splits it into
+    # per-field locals), so its dual is the matching split: one
+    # zero-initialised ``adj_<root>__<leaf>`` per scalar leaf. Struct
+    # *arguments* get them too — like the scalar ``adj_<arg>`` sinks above
+    # they are write-only, because Warp's backward entry point takes the
+    # adjoint struct by value, but the reverse statements name them.
+    # ``wp.array`` fields are not leaves and get no dual: their gradients
+    # travel through the field array's own ``grad`` buffer instead.
+    #
+    # Pointers into a struct also need one: a nested read (``o.inner.gain``)
+    # goes through a Reference local whose dual is the *pointee* value, and
+    # Warp names it in the same field-store form. Where that pointee lives in
+    # flat buffer storage owned by a struct ARRAY, the dual has nowhere to go
+    # — record those and reject a store rather than drop the gradient.
+    struct_dual_layouts: dict[str, _StructLayout] = {}
+    struct_dual_no_sink: set[str] = set()
+    if adjoint:
+        struct_dual_layouts = {**struct_arg_layouts, **struct_local_layouts}
+        for ptr_label, (_prefix, ptr_layout) in struct_ptr_locals.items():
+            struct_dual_layouts.setdefault(ptr_label, ptr_layout)
+        for ptr_label, (ptr_buf, _base, ptr_layout) in struct_ptr_bases.items():
+            struct_dual_layouts.setdefault(ptr_label, ptr_layout)
+            if ptr_buf not in struct_arg_layouts:
+                struct_dual_no_sink.add(ptr_label)
+        for root, layout in struct_dual_layouts.items():
+            for field_path, _off, field_info in _iter_scalar_leaves(layout):
+                dual_name = _per_field_dual(root, field_path)
+                body_lines.append(f"    {field_info.msl_type} {dual_name} = {_msl_zero_init(field_info.msl_type)};")
+
+    # Struct native/mangled name -> layout, for resolving the struct
+    # *constructor* adjoints (``adj_Sample_9043e1d0(...)``) the fem
+    # integrands emit. Only structs this kernel actually uses are listed,
+    # so the pattern cannot capture an unrelated call.
+    struct_layout_by_name: dict[str, _StructLayout] = {}
+    for _layout in struct_dual_layouts.values():
+        struct_layout_by_name[_layout.name] = _layout
+        if _layout.native_name:
+            struct_layout_by_name[_layout.native_name] = _layout
+
+    def _resolve_struct_dual_field(root: str, parts: list[str]):
+        """Resolve ``adj_<root>.<parts...>`` against the struct layouts.
+
+        Returns ``("array", None)`` for a ``wp.array`` field (no dual),
+        ``("leaf", finfo)`` for a scalar/vec/mat field, ``("struct", sub)``
+        when the path stops on a nested struct, or ``None`` if ``root`` is
+        not a struct or the path does not exist.
+        """
+        layout = struct_dual_layouts.get(root)
+        if layout is None:
+            return None
+        for i, fname in enumerate(parts):
+            finfo = layout.fields.get(fname) if layout is not None else None
+            if finfo is None:
+                return None
+            last = i == len(parts) - 1
+            if finfo.kind == _STRUCT_FIELD_KIND_ARRAY_UNUSED:
+                return ("array", None)
+            if finfo.kind == _STRUCT_FIELD_KIND_STRUCT:
+                if last:
+                    return ("struct", finfo.sub)
+                layout = finfo.sub
+                continue
+            return ("leaf", finfo) if last else None
+        return None
+
+    def _struct_dual_leaf_copy(
+        indent: str, dst_root: str, dst_prefix: str, dst_layout: _StructLayout, src_root: str, op: str
+    ) -> list[str]:
+        """Per-leaf ``adj_dst__<leaf> op adj_src__<leaf>;`` lines.
+
+        Used wherever Warp names a whole struct dual — a nested-struct field
+        store, a whole-struct accumulation, or a constructor adjoint.
+        """
+        src_layout = struct_dual_layouts.get(src_root)
+        if src_layout is None:
+            raise MetalCodegenError(
+                f"Kernel {adj.fun_name!r}: reverse mode needs the layout of struct dual "
+                f"'adj_{src_root}', which is not a struct local or argument of this kernel"
+            )
+        dst_leaves = {p for p, _o, _f in _iter_scalar_leaves(dst_layout)}
+        out = []
+        for fpath, _off, _fi in _iter_scalar_leaves(src_layout):
+            if fpath not in dst_leaves:
+                continue
+            dst_name = _per_field_dual(dst_root, f"{dst_prefix}{fpath}")
+            out.append(f"{indent}{dst_name} {op} {_per_field_dual(src_root, fpath)};")
+        return out
+
     # Map tile-typed locals to ``(rows, cols, msl_scalar)`` for the tile-
     # intrinsic translator (it needs the result-tile shape for cholesky /
     # cholesky_solve, where dimensions don't appear in the call's template
@@ -10343,24 +10610,165 @@ def _generate_msl_kernel_uncached(
     # itself once we know the local is aliased away.
     inlined_decl_pat = re.compile(r"^\s*[\w<>:*\s]+?\s+var_(\w+)\s*;\s*$")
 
-    # Labels whose ``adj_<label>.<field>`` stores are dead (see
-    # ``_dead_struct_duals``).
-    dead_struct_duals = _dead_struct_duals(forward_lines, {a.label for a in adj.args if isinstance(a.type, _Struct)})
-
     for raw in forward_lines:
         line = _strip_comments_and_directives(raw)
         if line is None:
             continue
+        # --- Struct duals (reverse mode) --------------------------------
+        # Lowered against the per-field split declared above. Every shape
+        # Warp emits is handled explicitly; anything else raises rather
+        # than silently dropping a gradient.
         m_adj_field = _ADJ_STRUCT_FIELD_STORE_PAT.match(line)
         if m_adj_field:
-            if m_adj_field.group("root") in dead_struct_duals:
+            root = m_adj_field.group("root")
+            parts = m_adj_field.group("path").lstrip(".").split(".")
+            resolved = _resolve_struct_dual_field(root, parts)
+            if resolved is None:
+                raise MetalCodegenError(
+                    f"Kernel {adj.fun_name!r}: reverse mode through a field of the struct value "
+                    f"'var_{root}' is not supported yet (line: {line.strip()}) — the struct's "
+                    f"layout is not known to the Metal backend."
+                )
+            if root in struct_dual_no_sink:
+                raise MetalCodegenError(
+                    f"Kernel {adj.fun_name!r}: reverse mode through a field of a struct held in "
+                    f"array storage is not supported on Metal yet (line: {line.strip()}) — the "
+                    f"dual of 'var_{root}' has no gradient buffer to accumulate into."
+                )
+            kind, info = resolved
+            if kind == "array":
+                # No dual: the field array's gradients reach the tape
+                # through its own ``grad`` buffer, bound separately.
                 continue
-            raise MetalCodegenError(
-                f"Kernel {adj.fun_name!r}: reverse mode through a field of the struct local "
-                f"'var_{m_adj_field.group('root')}' is not supported yet (line: {line.strip()}). "
-                f"The Metal backend splits struct values into per-field locals and has no dual "
-                f"for the struct itself."
+            indent = m_adj_field.group("indent")
+            op = m_adj_field.group("op")
+            rhs = m_adj_field.group("rhs").strip()
+            path = "__".join(parts)
+            if kind == "leaf":
+                body_lines.append(_finalize(f"{indent}{_per_field_dual(root, path)} {op} {rhs};"))
+                continue
+            # Nested-struct field: the RHS names a whole struct dual.
+            if not rhs.startswith("adj_"):
+                raise MetalCodegenError(
+                    f"Kernel {adj.fun_name!r}: expected a struct dual on the right of "
+                    f"{line.strip()!r}, which stores into nested struct field {path!r}"
+                )
+            body_lines.extend(_struct_dual_leaf_copy(indent, root, f"{path}__", info, rhs[len("adj_") :], op))
+            continue
+        m_adj_whole = _ADJ_STRUCT_WHOLE_PAT.match(line)
+        if m_adj_whole and m_adj_whole.group("dst") in struct_dual_layouts:
+            dst = m_adj_whole.group("dst")
+            body_lines.extend(
+                _struct_dual_leaf_copy(
+                    m_adj_whole.group("indent"),
+                    dst,
+                    "",
+                    struct_dual_layouts[dst],
+                    m_adj_whole.group("src"),
+                    m_adj_whole.group("op"),
+                )
             )
+            continue
+        m_dual_zero = _STRUCT_DUAL_ZERO_PAT.match(line)
+        if m_dual_zero:
+            root = m_dual_zero.group("root")
+            layout = struct_dual_layouts.get(root)
+            if layout is None:
+                raise MetalCodegenError(
+                    f"Kernel {adj.fun_name!r}: cannot reset the dual of struct value 'var_{root}' — "
+                    f"its layout is not known to the Metal backend"
+                )
+            for fpath, _off, finfo in _iter_scalar_leaves(layout):
+                body_lines.append(
+                    f"{m_dual_zero.group('indent')}{_per_field_dual(root, fpath)} = {_msl_zero_init(finfo.msl_type)};"
+                )
+            continue
+        m_adj_copy = _ADJ_STRUCT_COPY_PAT.match(line)
+        if m_adj_copy:
+            copy_args = [a.strip() for a in _split_top_level_args(m_adj_copy.group("args"))]
+            # ``copy(src)`` -> (adj_src, adj_dest); ``assign(dest, src)`` ->
+            # (adj_dest, adj_src) in that positional order.
+            if m_adj_copy.group("op") == "copy" and len(copy_args) == 3:
+                adj_src, adj_dst = copy_args[1], copy_args[2]
+            elif m_adj_copy.group("op") == "assign" and len(copy_args) == 4:
+                adj_src, adj_dst = copy_args[3], copy_args[2]
+            else:
+                adj_src = adj_dst = ""
+            src_root = adj_src[len("adj_") :] if adj_src.startswith("adj_") else ""
+            dst_root = adj_dst[len("adj_") :] if adj_dst.startswith("adj_") else ""
+            if src_root in struct_dual_layouts or dst_root in struct_dual_layouts:
+                src_layout = struct_dual_layouts.get(src_root)
+                dst_layout = struct_dual_layouts.get(dst_root)
+                if src_layout is None or dst_layout is None:
+                    raise MetalCodegenError(
+                        f"Kernel {adj.fun_name!r}: reverse mode through a whole-struct copy needs "
+                        f"a per-field dual for both sides (line: {line.strip()})"
+                    )
+                indent = m_adj_copy.group("indent")
+                dst_leaves = {p: fi for p, _o, fi in _iter_scalar_leaves(dst_layout)}
+                for fpath, _off, _fi in _iter_scalar_leaves(src_layout):
+                    finfo = dst_leaves.get(fpath)
+                    if finfo is None:
+                        continue
+                    # ``copy`` accumulates into the source dual; ``assign``
+                    # overwrites it. Both then clear the destination.
+                    op = "+=" if m_adj_copy.group("op") == "copy" else "="
+                    body_lines.append(
+                        f"{indent}{_per_field_dual(src_root, fpath)} {op} {_per_field_dual(dst_root, fpath)};"
+                    )
+                    body_lines.append(f"{indent}{_per_field_dual(dst_root, fpath)} = {_msl_zero_init(finfo.msl_type)};")
+                continue
+        m_adj_ctor = _ADJ_STRUCT_CTOR_PAT.match(line)
+        if m_adj_ctor and m_adj_ctor.group("name") in struct_layout_by_name:
+            layout = struct_layout_by_name[m_adj_ctor.group("name")]
+            ctor_args = [a.strip() for a in _split_top_level_args(m_adj_ctor.group("args"))]
+            nfields = len(layout.fields)
+            if len(ctor_args) != 2 * nfields + 1:
+                raise MetalCodegenError(
+                    f"Kernel {adj.fun_name!r}: adjoint of struct constructor {layout.name!r} called "
+                    f"with {len(ctor_args)} args; expected {2 * nfields + 1} for {nfields} fields "
+                    f"(line: {line.strip()})"
+                )
+            indent = m_adj_ctor.group("indent")
+            ret = ctor_args[-1]
+            if not ret.startswith("adj_") or ret[len("adj_") :] not in struct_dual_layouts:
+                raise MetalCodegenError(
+                    f"Kernel {adj.fun_name!r}: adjoint of struct constructor {layout.name!r} returns "
+                    f"into {ret!r}, which has no per-field dual (line: {line.strip()})"
+                )
+            ret_root = ret[len("adj_") :]
+            # ``codegen_struct``'s reverse body is one statement per field:
+            # ``adj_<field> += adj_ret.<field>`` (plain ``=`` for arrays,
+            # which carry no dual here and are skipped).
+            for (fname, finfo), tgt in zip(layout.fields.items(), ctor_args[nfields:-1], strict=True):
+                if finfo.kind == _STRUCT_FIELD_KIND_ARRAY_UNUSED:
+                    continue
+                if finfo.kind == _STRUCT_FIELD_KIND_STRUCT:
+                    if not tgt.startswith("adj_"):
+                        raise MetalCodegenError(
+                            f"Kernel {adj.fun_name!r}: adjoint of struct constructor {layout.name!r} "
+                            f"writes nested struct field {fname!r} into {tgt!r}, which is not a dual"
+                        )
+                    src_root, src_prefix = ret_root, f"{fname}__"
+                    dst_root = tgt[len("adj_") :]
+                    dst_layout = struct_dual_layouts.get(dst_root)
+                    if dst_layout is None:
+                        raise MetalCodegenError(
+                            f"Kernel {adj.fun_name!r}: adjoint of struct constructor {layout.name!r} "
+                            f"writes nested struct field {fname!r} into 'adj_{dst_root}', which has "
+                            f"no per-field dual"
+                        )
+                    dst_leaves = {p for p, _o, _f in _iter_scalar_leaves(dst_layout)}
+                    for fpath, _off, _fi in _iter_scalar_leaves(finfo.sub):
+                        if fpath not in dst_leaves:
+                            continue
+                        body_lines.append(
+                            f"{indent}{_per_field_dual(dst_root, fpath)} += "
+                            f"{_per_field_dual(src_root, f'{src_prefix}{fpath}')};"
+                        )
+                    continue
+                body_lines.append(_finalize(f"{indent}{tgt} += {_per_field_dual(ret_root, fname)};"))
+            continue
         # Drop inliner-emitted decls for locals that the address-fold pass
         # aliased into ``subscript_map`` — leaving them in place would let
         # ``_finalize`` substitute the alias expression *into* the decl,
@@ -10407,14 +10815,32 @@ def _generate_msl_kernel_uncached(
                 adj_val = args[-2] if op == "atomic_add" else args[-1]
                 flat = _flat_index_expr(arr, indices)
                 vec_n = vec_arr_info.get(arr, (None,))[0]
-                if arr in mat_arr_info or arr in struct_arr_info:
+                if arr in struct_arr_info:
                     raise MetalCodegenError(
-                        f"Kernel {adj.fun_name!r}: reverse mode through a mat- or struct-element "
+                        f"Kernel {adj.fun_name!r}: reverse mode through a struct-element "
                         f"array ({arr!r}) is not supported on Metal yet"
                     )
-                slots = (
-                    [(f"({flat}) * {vec_n} + {k}", f"[{k}]") for k in range(vec_n)] if vec_n else [(f"({flat})", "")]
-                )
+                if arr in mat_arr_info:
+                    # Mirror the forward gather: element (r, c) of the logical
+                    # matrix is the row-major slot ``r * cols + c``, and lives
+                    # at ``[c][r]`` in the column-major MSL dual (or at
+                    # ``.c[i]`` in the row-major struct for other shapes).
+                    _rows, _cols, _ = mat_arr_info[arr]
+                    _stride = _rows * _cols
+                    if _rows == _cols and _rows in _MSL_VEC_NATIVE_N:
+                        slots = [
+                            (f"({flat}) * {_stride} + {r * _cols + c}", f"[{c}][{r}]")
+                            for r in range(_rows)
+                            for c in range(_cols)
+                        ]
+                    else:
+                        slots = [(f"({flat}) * {_stride} + {i}", f".c[{i}]") for i in range(_stride)]
+                else:
+                    slots = (
+                        [(f"({flat}) * {vec_n} + {k}", f"[{k}]") for k in range(vec_n)]
+                        if vec_n
+                        else [(f"({flat})", "")]
+                    )
                 for idx_expr, comp in slots:
                     tgt = f"{grad_name}[{idx_expr}]"
                     if op == "address":
@@ -11810,7 +12236,7 @@ def _generate_msl_kernel_uncached(
 # closure-kernel instantiations previously collided (same kernel.key,
 # args, and IR statements; different baked ``const`` declarations).
 # v11: native packed arrays go bindless (``ptr_table`` / ``__arg_ptrs``).
-_ARTIFACT_CACHE_VERSION = 14
+_ARTIFACT_CACHE_VERSION = 15
 _codegen_source_hash_cached: str | None = None
 
 
