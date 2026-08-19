@@ -38,11 +38,15 @@
   integer operations.
 - Extend reverse-mode differentiation on Metal devices to struct kernel arguments, including `wp.array` fields
   and nested structs. A field array's gradient is bound from the adjoint struct `wp.Tape()` builds for it.
-  Differentiating through a field of a struct *local* is still unsupported and raises.
 - Extend reverse-mode differentiation on Metal devices to `wp.tile_load()`, `wp.tile_store()`,
   `wp.tile_atomic_add()`, `wp.tile_sum()`, `wp.tile()`, and element-wise tile arithmetic. Tile operations whose
   adjoint is not yet implemented raise a `MetalCodegenError` naming the operation.
 - Support `wp.tile_mul_elementwise()` (`tile * tile`) on Metal devices.
+- Extend reverse-mode differentiation on Metal devices to structs built inside a kernel (including nested ones
+  and whole-struct copies), to an early `return` in the kernel body, and to arrays of matrices. Adjoints are now
+  available for `wp.determinant()`, `wp.inverse()`, `wp.diag()`, `wp.get_diag()`, `wp.trace()`, `wp.transpose()`,
+  `wp.outer()`, `wp.ddot()`, `wp.cw_mul()`, `wp.cw_div()`, `wp.matrix_from_cols()`, `wp.matrix_from_rows()`, the
+  matrix products, and component access on integer vectors.
 - Support `wp.tile_full()`, `wp.tile_scan_inclusive()`, and `wp.tile_scan_exclusive()` on Metal devices.
 - Support `wp.atomic_cas()` and `wp.atomic_exch()` on Metal devices, including through `wp.array` fields of
   struct kernel arguments. Note that mutual-exclusion spin locks built on these deadlock on Apple GPUs, which

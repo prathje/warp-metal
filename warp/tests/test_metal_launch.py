@@ -9954,8 +9954,208 @@ class TestMetalAdjoint(unittest.TestCase):
         )
         _run_with_metal_native(self, snippet)
 
-    def test_struct_local_field_adjoint_raises(self):
-        """A struct dual that is genuinely read must not be silently dropped."""
+    def test_struct_built_in_kernel_adjoint_matches_cpu(self):
+        """Reverse mode through a struct *constructor* call, nested case included.
+
+        A struct built in-kernel has its dual read as a whole by
+        ``adj_<Struct>(...)``; Metal splits that into the per-field duals
+        that mirror the forward per-field locals. warp.fem's integrands
+        build ``Sample`` / ``ElementEvalArg`` structs exactly this way.
+        """
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            @wp.struct
+            class Inner:
+                gain: wp.float32
+                shift: wp.vec3
+
+            @wp.struct
+            class Outer:
+                inner: Inner
+                scale: wp.float32
+
+            @wp.func
+            def build(x: wp.float32, v: wp.vec3) -> Outer:
+                # Positional construction, so Warp emits a real constructor
+                # call rather than field-by-field assignment.
+                return Outer(Inner(x * 2.0, v * 3.0), x * x)
+
+            @wp.kernel
+            def k(x: wp.array(dtype=wp.float32), v: wp.array(dtype=wp.vec3),
+                  out: wp.array(dtype=wp.float32)):
+                i = wp.tid()
+                o = build(x[i], v[i])
+                out[i] = o.scale * o.inner.gain + wp.length_sq(o.inner.shift)
+
+            n = 16
+            rng = np.random.default_rng(21)
+            x_np = rng.standard_normal(n).astype(np.float32)
+            v_np = rng.standard_normal((n, 3)).astype(np.float32)
+            got = {}
+            for dev in ('cpu', 'metal:0'):
+                x = wp.array(x_np, dtype=wp.float32, device=dev, requires_grad=True)
+                v = wp.array(v_np, dtype=wp.vec3, device=dev, requires_grad=True)
+                out = wp.zeros(n, dtype=wp.float32, device=dev, requires_grad=True)
+                tape = wp.Tape()
+                with tape:
+                    wp.launch(k, dim=n, inputs=[x, v], outputs=[out], device=dev)
+                out.grad.assign(np.ones(n, np.float32))
+                tape.backward()
+                wp.synchronize_device(dev)
+                got[dev] = (x.grad.numpy().copy(), v.grad.numpy().copy())
+            # Guard against two all-zero arrays comparing equal.
+            assert np.abs(got['cpu'][0]).max() > 0.0
+            assert np.abs(got['cpu'][1]).max() > 0.0
+            np.testing.assert_allclose(got['metal:0'][0], got['cpu'][0], rtol=1e-5, atol=1e-6)
+            np.testing.assert_allclose(got['metal:0'][1], got['cpu'][1], rtol=1e-5, atol=1e-6)
+            """
+        )
+        _run_with_metal_native(self, snippet)
+
+    def test_matrix_builtin_adjoints_match_cpu(self):
+        """``determinant`` / ``inverse`` / ``diag`` / ``cw_mul`` and the matrix products.
+
+        Native MSL matrices are column-major while Warp's IR is row-major, so
+        a transposed adjoint here would still compile and return plausible
+        numbers — hence the comparison against the CPU rather than a formula.
+        """
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            @wp.kernel
+            def k(a: wp.array(dtype=wp.vec3), b: wp.array(dtype=wp.vec3),
+                  out: wp.array(dtype=wp.float32)):
+                i = wp.tid()
+                # Build the matrices in-kernel: mat-typed arrays take a
+                # different reverse-mode path (see the mat-array test).
+                m = wp.matrix_from_rows(a[i], b[i], wp.cw_mul(a[i], b[i]))
+                d = wp.diag(a[i])
+                p = m * d
+                inv = wp.inverse(p + wp.identity(n=3, dtype=wp.float32) * 4.0)
+                out[i] = (wp.determinant(p) + wp.trace(inv)
+                          + wp.dot(p * b[i], a[i]) + wp.ddot(p, d))
+
+            n = 12
+            rng = np.random.default_rng(23)
+            a_np = (rng.standard_normal((n, 3)) + 2.0).astype(np.float32)
+            b_np = (rng.standard_normal((n, 3)) + 2.0).astype(np.float32)
+            got = {}
+            for dev in ('cpu', 'metal:0'):
+                a = wp.array(a_np, dtype=wp.vec3, device=dev, requires_grad=True)
+                b = wp.array(b_np, dtype=wp.vec3, device=dev, requires_grad=True)
+                out = wp.zeros(n, dtype=wp.float32, device=dev, requires_grad=True)
+                tape = wp.Tape()
+                with tape:
+                    wp.launch(k, dim=n, inputs=[a, b], outputs=[out], device=dev)
+                out.grad.assign(np.ones(n, np.float32))
+                tape.backward()
+                wp.synchronize_device(dev)
+                got[dev] = (out.numpy().copy(), a.grad.numpy().copy(), b.grad.numpy().copy())
+            assert np.abs(got['cpu'][1]).max() > 0.0
+            for j in range(3):
+                np.testing.assert_allclose(got['metal:0'][j], got['cpu'][j], rtol=2e-4, atol=2e-5)
+            """
+        )
+        _run_with_metal_native(self, snippet)
+
+    def test_mat_element_array_adjoint_matches_cpu(self):
+        """Reverse mode reading a ``wp.array(dtype=wp.mat33)``.
+
+        The forward pass gathers each element from row-major storage into a
+        column-major MSL matrix; the gradient has to scatter back the same way.
+        """
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            @wp.kernel
+            def k(m: wp.array(dtype=wp.mat33), v: wp.array(dtype=wp.vec3),
+                  out: wp.array(dtype=wp.float32)):
+                i = wp.tid()
+                r = m[i] * v[i]
+                out[i] = r[0] + 2.0 * r[1] + 3.0 * r[2] + wp.determinant(m[i])
+
+            n = 8
+            rng = np.random.default_rng(29)
+            m_np = (rng.standard_normal((n, 3, 3)) + 3.0 * np.eye(3)).astype(np.float32)
+            v_np = rng.standard_normal((n, 3)).astype(np.float32)
+            got = {}
+            for dev in ('cpu', 'metal:0'):
+                m = wp.array(m_np, dtype=wp.mat33, device=dev, requires_grad=True)
+                v = wp.array(v_np, dtype=wp.vec3, device=dev, requires_grad=True)
+                out = wp.zeros(n, dtype=wp.float32, device=dev, requires_grad=True)
+                tape = wp.Tape()
+                with tape:
+                    wp.launch(k, dim=n, inputs=[m, v], outputs=[out], device=dev)
+                out.grad.assign(np.ones(n, np.float32))
+                tape.backward()
+                wp.synchronize_device(dev)
+                got[dev] = (m.grad.numpy().copy(), v.grad.numpy().copy())
+            assert np.abs(got['cpu'][0]).max() > 0.0
+            np.testing.assert_allclose(got['metal:0'][0], got['cpu'][0], rtol=1e-5, atol=1e-5)
+            np.testing.assert_allclose(got['metal:0'][1], got['cpu'][1], rtol=1e-5, atol=1e-5)
+            """
+        )
+        _run_with_metal_native(self, snippet)
+
+    def test_kernel_early_return_adjoint_matches_cpu(self):
+        """An early ``return`` in the kernel body itself, not in a ``@wp.func``.
+
+        Warp lowers it to ``goto labelN`` in the replay with ``labelN:`` in the
+        middle of the reverse sweep. Metal has neither ``goto`` nor labels, so
+        the two halves are re-joined through a program counter.
+        """
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            @wp.kernel
+            def k(x: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
+                i = wp.tid()
+                if x[i] < 0.0:
+                    out[i] = x[i] * 3.0
+                    return
+                out[i] = x[i] * x[i] + 1.0
+
+            n = 24
+            rng = np.random.default_rng(31)
+            x_np = rng.standard_normal(n).astype(np.float32)
+            got = {}
+            for dev in ('cpu', 'metal:0'):
+                x = wp.array(x_np, dtype=wp.float32, device=dev, requires_grad=True)
+                out = wp.zeros(n, dtype=wp.float32, device=dev, requires_grad=True)
+                tape = wp.Tape()
+                with tape:
+                    wp.launch(k, dim=n, inputs=[x], outputs=[out], device=dev)
+                out.grad.assign(np.ones(n, np.float32))
+                tape.backward()
+                wp.synchronize_device(dev)
+                got[dev] = (out.numpy().copy(), x.grad.numpy().copy())
+            # Both branches must be exercised, or the guard is untested.
+            assert (x_np < 0.0).any() and (x_np >= 0.0).any()
+            np.testing.assert_allclose(got['metal:0'][0], got['cpu'][0], rtol=1e-5, atol=1e-6)
+            np.testing.assert_allclose(got['metal:0'][1], got['cpu'][1], rtol=1e-5, atol=1e-6)
+            """
+        )
+        _run_with_metal_native(self, snippet)
+
+    def test_struct_returned_from_func_adjoint_matches_cpu(self):
+        """A struct assembled field-by-field in a ``@wp.func`` and returned.
+
+        The whole-struct copy out of the helper has no MSL counterpart — both
+        duals are per-field splits — so ``adj_copy`` expands per scalar leaf.
+
+        Note this case yields **zero** gradients on the CPU too (Warp does not
+        carry the adjoint back through a field-by-field struct build), so the
+        assertion is only that Metal does not diverge from the reference —
+        it is not evidence that the gradient is right. The positional-
+        constructor case in
+        :meth:`test_struct_built_in_kernel_adjoint_matches_cpu` is the one
+        that checks a non-trivial number.
+        """
         snippet = textwrap.dedent(
             """
             import numpy as np
@@ -9978,29 +10178,20 @@ class TestMetalAdjoint(unittest.TestCase):
                 p = make_pair(x[i])
                 out[i] = p.a + p.b
 
-            dev = 'metal:0'
-            x = wp.array(np.ones(4, np.float32), device=dev, requires_grad=True)
-            out = wp.zeros(4, dtype=wp.float32, device=dev, requires_grad=True)
-            tape = wp.Tape()
-            with tape:
-                wp.launch(k, dim=4, inputs=[x], outputs=[out], device=dev)
-            out.grad.assign(np.ones(4, np.float32))
-            try:
+            n = 8
+            x_np = (np.arange(n, dtype=np.float32) - 3.0) * 0.5
+            got = {}
+            for dev in ('cpu', 'metal:0'):
+                x = wp.array(x_np, dtype=wp.float32, device=dev, requires_grad=True)
+                out = wp.zeros(n, dtype=wp.float32, device=dev, requires_grad=True)
+                tape = wp.Tape()
+                with tape:
+                    wp.launch(k, dim=n, inputs=[x], outputs=[out], device=dev)
+                out.grad.assign(np.ones(n, np.float32))
                 tape.backward()
-            except Exception as e:
-                msg = str(e)
-                assert 'struct' in msg, msg
-            else:
-                # If it ever starts working, it must agree with the CPU
-                # rather than quietly return zeros.
-                xc = wp.array(np.ones(4, np.float32), device='cpu', requires_grad=True)
-                oc = wp.zeros(4, dtype=wp.float32, device='cpu', requires_grad=True)
-                tc = wp.Tape()
-                with tc:
-                    wp.launch(k, dim=4, inputs=[xc], outputs=[oc], device='cpu')
-                oc.grad.assign(np.ones(4, np.float32))
-                tc.backward()
-                np.testing.assert_allclose(x.grad.numpy(), xc.grad.numpy(), rtol=1e-5, atol=1e-6)
+                wp.synchronize_device(dev)
+                got[dev] = x.grad.numpy().copy()
+            np.testing.assert_allclose(got['metal:0'], got['cpu'], rtol=1e-5, atol=1e-6)
             """
         )
         _run_with_metal_native(self, snippet)
