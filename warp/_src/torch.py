@@ -240,9 +240,11 @@ def _from_torch_mps(t, dtype, shape, strides, requires_grad, grad, return_ctype,
         )
     if requires_grad or (requires_grad is None and t.requires_grad) or grad is not None:
         raise RuntimeError(
-            "wp.from_torch on an MPS tensor does not support gradients — the Metal "
-            "backend has no adjoint kernel support. Pass requires_grad=False (and "
-            "detach the tensor if it requires grad)."
+            "wp.from_torch on an MPS tensor does not support gradients — a tensor's "
+            ".grad is a separate MPS allocation, and Torch's MPS allocator hands out "
+            "private-storage MTLBuffers that Warp cannot wrap (see the storage-mode "
+            "check below). Pass requires_grad=False (and detach the tensor if it "
+            "requires grad), or allocate in Warp and view it in Torch via wp.to_torch."
         )
     if return_ctype:
         raise RuntimeError("wp.from_torch(..., return_ctype=True) is not supported for MPS tensors")
