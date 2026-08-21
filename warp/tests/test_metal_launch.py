@@ -9657,9 +9657,214 @@ class TestMetalAdjoint(unittest.TestCase):
         )
         _run_with_metal_native(self, snippet)
 
-    def test_return_from_loop_adjoint_raises(self):
-        # No program counter can express re-entering a loop body part-way
-        # through, so this must name the gap rather than miscompile.
+    def test_return_from_loop_adjoint_matches_cpu(self):
+        # Warp emits a ``return`` from inside a loop as a ``goto``/label pair
+        # that lands in the *same* reverse loop body, always jumping forward:
+        # it skips the statements the forward pass never reached in the
+        # iteration that returned. That is a within-iteration hop, so a flag
+        # set at the jump and cleared at the label reproduces it exactly --
+        # no ``goto``, and no need to record which iteration returned.
+        #
+        # ``find_idx`` is warp.fem's ``find_node_in_element`` shape;
+        # ``with_tail`` puts statements after the return so the hop skips a
+        # real span (including a loop-carried assignment that earlier reverse
+        # iterations depend on); ``nested`` returns from an inner loop; and
+        # ``two`` needs two independent flags live at once.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            @wp.func
+            def find_idx(keys: wp.array(dtype=wp.int32), n: wp.int32, want: wp.int32) -> wp.int32:
+                for k in range(n):
+                    if keys[k] == want:
+                        return k
+                return -1
+
+            @wp.func
+            def with_tail(keys: wp.array(dtype=wp.int32), n: wp.int32, want: wp.int32) -> wp.int32:
+                total = wp.int32(0)
+                for k in range(n):
+                    if keys[k] == want:
+                        return total
+                    total += keys[k] % 3
+                return total
+
+            @wp.func
+            def nested(keys: wp.array(dtype=wp.int32), n: wp.int32, m: wp.int32, want: wp.int32) -> wp.int32:
+                for k in range(n):
+                    for j in range(m):
+                        if keys[k] + j == want:
+                            return k + j
+                return -1
+
+            @wp.func
+            def two(keys: wp.array(dtype=wp.int32), n: wp.int32, a: wp.int32, b: wp.int32) -> wp.int32:
+                for k in range(n):
+                    if keys[k] == a:
+                        return k
+                    if keys[k] == b:
+                        return k + 1
+                return 0
+
+            @wp.kernel
+            def k_idx(keys: wp.array(dtype=wp.int32), want: wp.int32,
+                      x: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
+                i = find_idx(keys, keys.shape[0], want)
+                out[0] = x[wp.max(i, 0)] * x[wp.max(i, 0)] * 3.0
+
+            @wp.kernel
+            def k_tail(keys: wp.array(dtype=wp.int32), want: wp.int32,
+                       x: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
+                i = with_tail(keys, keys.shape[0], want)
+                out[0] = x[wp.clamp(i, 0, 4)] * 5.0 + x[0] * x[0]
+
+            @wp.kernel
+            def k_nested(keys: wp.array(dtype=wp.int32), want: wp.int32,
+                         x: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
+                i = nested(keys, keys.shape[0], 3, want)
+                out[0] = x[wp.clamp(i, 0, 4)] * x[wp.clamp(i, 0, 4)] * 2.0
+
+            @wp.kernel
+            def k_two(keys: wp.array(dtype=wp.int32), a: wp.int32, b: wp.int32,
+                      x: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
+                i = two(keys, keys.shape[0], a, b)
+                out[0] = x[wp.clamp(i, 0, 4)] * 7.0
+
+            keys_np = np.array([10, 20, 30, 40, 50], dtype=np.int32)
+            x_np = np.array([1.0, 2.0, 3.0, 4.0, 5.0], dtype=np.float32)
+
+            # Mid-loop return, last-iteration return, and no return at all.
+            cases = [
+                (k_idx, (30,)), (k_idx, (50,)), (k_idx, (99,)),
+                (k_tail, (30,)), (k_tail, (99,)),
+                (k_nested, (31,)), (k_nested, (999,)),
+                (k_two, (30, 40)), (k_two, (999, 40)), (k_two, (111, 222)),
+            ]
+
+            def run(kernel, extra, dev):
+                keys = wp.array(keys_np, dtype=wp.int32, device=dev)
+                x = wp.array(x_np, device=dev, requires_grad=True)
+                out = wp.zeros(1, dtype=wp.float32, device=dev, requires_grad=True)
+                tape = wp.Tape()
+                with tape:
+                    wp.launch(kernel, dim=1, inputs=[keys, *extra, x, out], device=dev)
+                fwd = out.numpy().copy()
+                out.grad = wp.array(np.ones(1, np.float32), device=dev)
+                tape.backward()
+                wp.synchronize_device(dev)
+                return fwd, x.grad.numpy().copy()
+
+            for kernel, extra in cases:
+                f_cpu, g_cpu = run(kernel, extra, 'cpu')
+                # A gradient check against an all-zero reference proves nothing.
+                assert np.abs(g_cpu).max() > 0, (kernel.key, extra)
+                f_m, g_m = run(kernel, extra, 'metal:0')
+                np.testing.assert_allclose(f_m, f_cpu, rtol=1e-5, atol=1e-6)
+                np.testing.assert_allclose(g_m, g_cpu, rtol=1e-5, atol=1e-6)
+            """
+        )
+        _run_with_metal_native(self, snippet)
+
+    def test_inplace_element_write_adjoint_matches_cpu(self):
+        # ``v[i] op= s`` / ``m[i, j] op= s`` lower to ``wp::add_inplace`` and
+        # friends; upstream their whole adjoint is to read the container's dual
+        # at that index into the scalar's dual. warp.fem's
+        # ``dispatch_linear_kernel_fn`` reaches only add-on-a-vector, so the
+        # matrix arity and the sub/assign spellings are pinned here too.
+        # The matrix cases source ``m`` from an array rather than
+        # ``wp.mat22(...)``: the constructor needs ``adj_mat_t``, a separate
+        # gap, which would raise before reaching the in-place adjoint. They also
+        # confirm the column-major element mapping, since they route through
+        # ``wp_mat_extract`` rather than indexing the MSL matrix directly.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            @wp.kernel
+            def k_vec_add(x: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
+                v = wp.vec3(0.0, 0.0, 0.0)
+                v[0] += x[0] * 2.0
+                v[1] += x[1] * 3.0
+                v[2] += x[2] * x[2]
+                out[0] = v[0] + v[1] * 10.0 + v[2] * 100.0
+
+            @wp.kernel
+            def k_vec_sub(x: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
+                v = wp.vec3(1.0, 1.0, 1.0)
+                v[0] -= x[0] * 2.0
+                v[1] -= x[1] * x[1]
+                out[0] = v[0] * 5.0 + v[1] * 7.0
+
+            @wp.kernel
+            def k_vec_assign(x: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
+                v = wp.vec3(0.0, 0.0, 0.0)
+                v[0] = x[0] * 4.0
+                v[1] = x[1] * x[1] * 2.0
+                out[0] = v[0] * 3.0 + v[1]
+
+            @wp.kernel
+            def k_mat_add(m_in: wp.array(dtype=wp.mat22), x: wp.array(dtype=wp.float32),
+                          out: wp.array(dtype=wp.float32)):
+                m = m_in[0]
+                m[0, 0] += x[0] * 2.0
+                m[1, 1] += x[1] * x[1]
+                out[0] = m[0, 0] * 5.0 + m[1, 1] * 7.0
+
+            @wp.kernel
+            def k_mat_sub(m_in: wp.array(dtype=wp.mat22), x: wp.array(dtype=wp.float32),
+                          out: wp.array(dtype=wp.float32)):
+                m = m_in[0]
+                m[0, 1] -= x[0] * 3.0
+                out[0] = m[0, 1] * 11.0
+
+            x_np = np.array([1.5, 2.5, 3.5, 4.5], dtype=np.float32)
+            m_np = np.array([[[1.0, 2.0], [3.0, 4.0]]], dtype=np.float32)
+
+            # Exact analytic gradients, so a matching pair of wrong answers
+            # cannot pass. (Central differences cannot check these: f is ~1e3
+            # while d/dx is ~7e2, which fp32 cannot resolve.)
+            expect = {
+                'k_vec_add':    [2.0, 30.0, 700.0, 0.0],
+                'k_vec_sub':    [-10.0, -35.0, 0.0, 0.0],
+                'k_vec_assign': [12.0, 10.0, 0.0, 0.0],
+                'k_mat_add':    [10.0, 35.0],
+                'k_mat_sub':    [-33.0, 0.0],
+            }
+
+            def run(kernel, dev, mat):
+                n = 2 if mat else 4
+                x = wp.array(x_np[:n], device=dev, requires_grad=True)
+                out = wp.zeros(1, dtype=wp.float32, device=dev, requires_grad=True)
+                args = [wp.array(m_np, dtype=wp.mat22, device=dev), x] if mat else [x]
+                tape = wp.Tape()
+                with tape:
+                    wp.launch(kernel, dim=1, inputs=[*args, out], device=dev)
+                fwd = out.numpy().copy()
+                out.grad = wp.array(np.ones(1, np.float32), device=dev)
+                tape.backward()
+                wp.synchronize_device(dev)
+                return fwd, x.grad.numpy().copy()
+
+            for kernel, mat in ((k_vec_add, False), (k_vec_sub, False), (k_vec_assign, False),
+                                (k_mat_add, True), (k_mat_sub, True)):
+                f_cpu, g_cpu = run(kernel, 'cpu', mat)
+                f_m, g_m = run(kernel, 'metal:0', mat)
+                np.testing.assert_allclose(g_cpu, expect[kernel.key], rtol=1e-6, atol=1e-6)
+                np.testing.assert_allclose(f_m, f_cpu, rtol=1e-5, atol=1e-6)
+                np.testing.assert_allclose(g_m, g_cpu, rtol=1e-5, atol=1e-6)
+            """
+        )
+        _run_with_metal_native(self, snippet)
+
+    def test_return_from_loop_with_accumulator_matches_cpu(self):
+        # A float accumulator carried across a *dynamic* loop is a shape Warp's
+        # own reverse mode gets wrong -- it ignores how an early return
+        # shortens the trip count, so the CPU gradient here is [4, 4, 4, 4]
+        # where the exact one is [4, 3, 1, 4]. That is an upstream Warp
+        # limitation, not a Metal one, and the backend's contract is to
+        # reproduce the reference rather than silently diverge from it. Pinned
+        # so a future change to either side is noticed.
         snippet = textwrap.dedent(
             """
             import numpy as np
@@ -9678,19 +9883,24 @@ class TestMetalAdjoint(unittest.TestCase):
                 i = wp.tid()
                 out[i] = early(x[i], 4)
 
-            dev = 'metal:0'
-            x = wp.array(np.ones(4, np.float32), device=dev, requires_grad=True)
-            out = wp.zeros(4, dtype=wp.float32, device=dev, requires_grad=True)
-            tape = wp.Tape()
-            with tape:
-                wp.launch(k, dim=4, inputs=[x], outputs=[out], device=dev)
-            out.grad = wp.array(np.ones(4, np.float32), device=dev)
-            try:
+            # Trips the early return at iteration 3, 2, 0 and never.
+            x_np = np.array([1.0, 2.5, 7.0, 0.5], dtype=np.float32)
+            got = {}
+            for dev in ('cpu', 'metal:0'):
+                x = wp.array(x_np, device=dev, requires_grad=True)
+                out = wp.zeros(4, dtype=wp.float32, device=dev, requires_grad=True)
+                tape = wp.Tape()
+                with tape:
+                    wp.launch(k, dim=4, inputs=[x], outputs=[out], device=dev)
+                fwd = out.numpy().copy()
+                out.grad = wp.array(np.ones(4, np.float32), device=dev)
                 tape.backward()
-            except NotImplementedError as e:
-                assert 'return' in str(e) and 'loop' in str(e), str(e)
-            else:
-                raise AssertionError('expected a MetalCodegenError naming the gap')
+                wp.synchronize_device(dev)
+                got[dev] = (fwd, x.grad.numpy().copy())
+            # The forward value IS correct on both; only the gradient is off.
+            np.testing.assert_allclose(got['cpu'][0], [4.0, 7.5, 7.0, 2.0], rtol=1e-6)
+            for a, b in zip(got['metal:0'], got['cpu']):
+                np.testing.assert_allclose(a, b, rtol=1e-5, atol=1e-6)
             """
         )
         _run_with_metal_native(self, snippet)

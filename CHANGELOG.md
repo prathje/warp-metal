@@ -54,6 +54,10 @@
 - Support `wp.tile_atomic_add()` and `wp.outer()` on vectors of differing lengths on Metal devices.
 - Support `wp.atomic_add()` and the other atomic operations on matrix-valued arrays on Metal devices, which
   `warp.sparse.bsr_mm()` uses to accumulate block values.
+- Extend reverse-mode differentiation on Metal devices to a `return` from inside a `for` or `while` loop,
+  including from a nested loop and from several places in one loop body. Adjoints are now available for in-place
+  element writes on vectors and matrices (`v[i] += s`, `m[i, j] -= s`), and gradients now flow through a sliced
+  view of an array (`row = arr[i]`) and through reads of an array's `shape`.
 
 ### Removed
 
