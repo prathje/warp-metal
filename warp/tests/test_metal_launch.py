@@ -7032,6 +7032,234 @@ class TestMetalSerialTileOps(unittest.TestCase):
 
 @unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
 @unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
+class TestMetalTileMapUserFunc(unittest.TestCase):
+    """``wp.tile_map`` with a user ``@wp.func``.
+
+    ``tile_map`` passes its op by NAME, so the AST inliner — which only
+    walks direct call sites — never saw the body and the flat lowering
+    emitted a call to a function nothing defined (``use of undeclared
+    identifier``). The map is now expanded into an element loop holding a
+    real call before inlining, so the body is spliced once inside the loop.
+    """
+
+    def test_tile_map_user_func_scalar_tile_matches_cpu(self):
+        # Deliberately non-trivial callee: a nested ``@wp.func`` call, a
+        # loop, and an early return from inside that loop — the shape
+        # example_tile_mcgp's ``walk`` has. A body that merely doubled its
+        # argument would not exercise the return lowering.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            TILE = 32
+
+            @wp.func
+            def stir(x: float):
+                return x * 1.5 - 0.25
+
+            @wp.func
+            def ramp(i: int, cap: int, bias: float):
+                acc = float(0.0)
+                for k in range(0, 8):
+                    acc = stir(acc) + float((i + k) % 5)
+                    if k >= cap:
+                        return acc + bias
+                return acc - bias
+
+            @wp.kernel
+            def k_map(cap: wp.array(dtype=int), bias: float, out: wp.array(dtype=float)):
+                i = wp.tid()
+                idx = wp.tile_arange(TILE, dtype=int)
+                idx += wp.tile_full(TILE, value=i * TILE, dtype=int)
+                res = wp.tile_map(ramp, idx, cap[0], bias)
+                wp.tile_store(out, wp.tile_sum(res), offset=(i,))
+
+            def run(device):
+                cap = wp.array([3], dtype=int, device=device)
+                out = wp.zeros(4, dtype=float, device=device)
+                wp.launch_tiled(k_map, dim=4, inputs=[cap, 0.75, out], block_dim=1, device=device)
+                wp.synchronize_device(device)
+                return out.numpy()
+
+            ref = run("cpu")
+            assert np.isfinite(ref).all(), "cpu reference is not finite"
+            assert np.abs(ref).max() > 0, "cpu reference is all zeros"
+            assert ref.std() > 1e-6, f"cpu reference is constant: {ref}"
+            got = run("metal:0")
+            np.testing.assert_allclose(got, ref, rtol=1e-5, atol=1e-6)
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=180)
+
+    def test_tile_map_user_func_vec_tile_matches_cpu(self):
+        # Vec-ELEMENT tile through a user func: mujoco_warp's dense-Jacobian
+        # ``_compute_jacp`` shape (a vec6 tile plus broadcast scalars). This
+        # is the path the hand-written ``_USER_FUNC_MSL_DEFS`` table used to
+        # cover by name, and it reads/writes ``vec_n`` consecutive scalars
+        # per element rather than one.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            TILE = 16
+
+            @wp.func
+            def jac_like(cdof: wp.spatial_vector, offset: wp.vec3, affect: int):
+                if affect == 0:
+                    return wp.vec3(0.0, 0.0, 0.0)
+                lin = wp.vec3(cdof[3], cdof[4], cdof[5])
+                ang = wp.vec3(cdof[0], cdof[1], cdof[2])
+                return lin + wp.cross(ang, offset)
+
+            @wp.kernel
+            def k_vec_map(cdof: wp.array2d(dtype=wp.spatial_vector), off: wp.vec3,
+                          affect: wp.array(dtype=int), out: wp.array2d(dtype=wp.vec3)):
+                i = wp.tid()
+                t = wp.tile_load(cdof[i], shape=TILE)
+                r = wp.tile_map(jac_like, t, off, affect[0])
+                wp.tile_store(out[i], r)
+
+            def run(device):
+                rng = np.random.default_rng(3)
+                cd = wp.array(rng.standard_normal((2, TILE, 6)).astype(np.float32),
+                              dtype=wp.spatial_vector, device=device)
+                affect = wp.array([1], dtype=int, device=device)
+                out = wp.zeros((2, TILE), dtype=wp.vec3, device=device)
+                wp.launch_tiled(k_vec_map, dim=2, inputs=[cd, wp.vec3(0.5, -1.25, 2.0), affect, out],
+                                block_dim=1, device=device)
+                wp.synchronize_device(device)
+                return out.numpy()
+
+            ref = run("cpu")
+            assert np.isfinite(ref).all(), "cpu reference is not finite"
+            assert np.abs(ref).max() > 0, "cpu reference is all zeros"
+            # Every component must vary — a lowering that filled only the
+            # first scalar of each vec element would still pass a bare
+            # allclose against a mostly-zero reference.
+            assert (ref.std(axis=(0, 1)) > 1e-3).all(), f"cpu reference has a constant component: {ref.std(axis=(0, 1))}"
+            got = run("metal:0")
+            np.testing.assert_allclose(got, ref, rtol=1e-5, atol=1e-5)
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=180)
+
+
+@unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
+@unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
+class TestMetalInlinedFuncResolution(unittest.TestCase):
+    """Two things that only resolve for KERNEL-level locals used to break
+    once the same construct appeared inside an inlined ``@wp.func`` body,
+    where every local carries a mangled label that ``adj.variables`` does
+    not list."""
+
+    def test_mesh_query_in_inlined_func_matches_cpu(self):
+        # ``wp.mesh_query_point`` inside a @wp.func: the query struct is a
+        # builtin value struct, so ``q.result`` / ``q.face`` field pointers
+        # must alias to plain member access. Keyed off adj.variables alone,
+        # the inlined struct went unrecognised and each field emitted as a
+        # raw ``device T*`` assigned into a scalar.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            @wp.func
+            def signed_dist(mesh_id: wp.uint64, p: wp.vec3):
+                d = float(0.0)
+                q = wp.mesh_query_point(mesh_id, p, 1.0e6)
+                if q.result:
+                    cp = wp.mesh_eval_position(mesh_id, q.face, q.u, q.v)
+                    d = -wp.length(cp - p) * q.sign
+                return d
+
+            @wp.kernel
+            def k_sdf(mesh_id: wp.uint64, pts: wp.array(dtype=wp.vec3), out: wp.array(dtype=float)):
+                i = wp.tid()
+                out[i] = signed_dist(mesh_id, pts[i])
+
+            V = np.array([[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]],
+                         dtype=np.float32)
+            F = np.array([[0, 2, 4], [2, 1, 4], [1, 3, 4], [3, 0, 4],
+                          [2, 0, 5], [1, 2, 5], [3, 1, 5], [0, 3, 5]], dtype=np.int32).flatten()
+
+            def run(device):
+                mesh = wp.Mesh(points=wp.array(V, dtype=wp.vec3, device=device),
+                               indices=wp.array(F, dtype=int, device=device))
+                rng = np.random.default_rng(1)
+                pts = wp.array((rng.random((24, 3)).astype(np.float32) - 0.5) * 1.6,
+                               dtype=wp.vec3, device=device)
+                out = wp.zeros(24, dtype=float, device=device)
+                wp.launch(k_sdf, dim=24, inputs=[mesh.id, pts, out], device=device)
+                wp.synchronize_device(device)
+                return out.numpy()
+
+            ref = run("cpu")
+            assert np.isfinite(ref).all(), "cpu reference is not finite"
+            # Points straddle the surface, so both signs must be present —
+            # otherwise q.sign is untested.
+            assert (ref > 0).any() and (ref < 0).any(), f"reference has one sign only: {ref}"
+            got = run("metal:0")
+            np.testing.assert_allclose(got, ref, rtol=1e-5, atol=1e-6)
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=180)
+
+    def test_nested_ctor_struct_array_field_matches_cpu(self):
+        # warp.fem's ``cell_field_eval_arg`` shape: rebuild a struct from a
+        # struct ARG's array field, nest it in another struct, then read the
+        # array back through ``outer.inner.field[i]``. The field pointer for
+        # the read is an ``&(ptr->field)`` whose pointer targets a plain
+        # struct local (a constructor result), which the field-array fold
+        # resolved for the ``.`` form but not the ``->`` form.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            @wp.struct
+            class Inner:
+                dof_values: wp.array(dtype=float)
+                scale: float
+
+            @wp.struct
+            class Outer:
+                tag: int
+                eval_arg: Inner
+
+            @wp.func
+            def make_outer(a: Inner):
+                return Outer(7, Inner(a.dof_values, a.scale * 2.0))
+
+            @wp.func
+            def read_through(o: Outer, i: int):
+                return o.eval_arg.dof_values[i] * o.eval_arg.scale
+
+            @wp.kernel
+            def k_nested(a: Inner, out: wp.array(dtype=float)):
+                i = wp.tid()
+                o = make_outer(a)
+                out[i] = read_through(o, i) + float(o.tag)
+
+            def run(device):
+                n = 8
+                a = Inner()
+                a.dof_values = wp.array(np.arange(n, dtype=np.float32) + 1.0, dtype=float, device=device)
+                a.scale = 3.0
+                out = wp.zeros(n, dtype=float, device=device)
+                wp.launch(k_nested, dim=n, inputs=[a, out], device=device)
+                wp.synchronize_device(device)
+                return out.numpy()
+
+            expect = (np.arange(8, dtype=np.float32) + 1.0) * 6.0 + 7.0
+            ref = run("cpu")
+            np.testing.assert_allclose(ref, expect, rtol=1e-6)
+            got = run("metal:0")
+            np.testing.assert_allclose(got, ref, rtol=1e-6, atol=1e-6)
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=180)
+
+
+@unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
+@unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
 class TestMetalCoopTiles(unittest.TestCase):
     """Distributed cooperative register tiles: eligible launch-tiled
     kernels build their IR at the honest block_dim and dispatch one

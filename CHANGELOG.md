@@ -119,6 +119,16 @@
   composing the two transforms. A transform lowers to a struct that has an `operator*`, so the generic multiply
   lowering compiled and produced a plausible-looking wrong answer with no diagnostic.
   `wp.transform_multiply()` was unaffected.
+- Fix Metal codegen failing on a mesh query (`wp.mesh_query_point()`, `wp.mesh_query_ray()`) performed inside a
+  `@wp.func`, where reading a field of the returned query struct emitted a pointer where a value was expected.
+  The same query at kernel scope was unaffected.
+- Support reading a `wp.array` field of a struct kernel argument through a struct that was rebuilt from it and
+  nested inside another struct, which `warp.fem` does when evaluating a cell field on a side of the domain.
+
+### Changed
+
+- Support `wp.tile_map()` with a user `@wp.func` on Metal devices, for scalar- and vector-element tiles. The
+  mapped function may itself call other `@wp.func`s, loop, and `return` from inside a loop.
 
 ## [1.18.0] - 2026-10-05
 

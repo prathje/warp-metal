@@ -2488,7 +2488,7 @@ def _inline_walk(
 
 
 def inline_user_calls(
-    nodes: list[Node], kernel_adj, max_depth: int = 24
+    nodes: list[Node], kernel_adj, max_depth: int = 24, extra_var_types: dict[str, str] | None = None
 ) -> tuple[list[Node], dict[str, int], dict[str, Any], dict[str, str]]:
     """Splice every user-``@wp.func`` call into the AST tree.
 
@@ -2515,6 +2515,13 @@ def inline_user_calls(
     ``kernel_adj`` is the top-level kernel's ``Adjoint`` object — used
     for the references table that resolves call-site mangled names
     back to Function overloads.
+
+    ``extra_var_types`` types call-site arguments that are NOT in
+    ``kernel_adj`` — currently the temporaries the ``tile_map`` expansion
+    synthesises (see ``codegen_metal._expand_user_tile_map``). Without them
+    a mapped generic ``@wp.func`` would resolve by wildcard and could take
+    ``overloads[0]``, which is the silent-wrong-types failure the seeding
+    comment below describes.
     """
     fn_map = _build_function_overload_table(kernel_adj)
     if not fn_map:
@@ -2542,6 +2549,8 @@ def inline_user_calls(
             var_types[var.label] = var.ctype()
         except Exception:
             pass
+    if extra_var_types:
+        var_types.update(extra_var_types)
     out = _inline_walk(
         nodes,
         fn_map,
@@ -3216,6 +3225,42 @@ def _collect_field_aliases_round(
                     field_ptrs[n.lhs] = key
                     changed = True
                 changed |= _seed_arg_field(key, ptr_paths[key[0]], n.lhs)
+            elif (
+                isinstance(n, Assign)
+                and isinstance(n.expr, AddrOf)
+                and n.expr.inner_kind == "field_arrow"
+                and n.expr.inner_target in ptr_sources
+                and n.expr.inner_field != "shape"
+            ):
+                # Same nested chain, but the pointer targets a PLAIN struct
+                # local rather than an arg-rooted one — i.e. a constructor
+                # result that carries its own array-field backings:
+                #
+                #   var_C = Inner(<array alias>, ...)   # ctor binds the field
+                #   var_D = Outer(..., var_C)           # field_struct_sources
+                #   var_R = &(var_D.eval_arg)           # -> ptr_sources
+                #   var_S = &(var_R->dof_values)        # <-- here
+                #
+                # ``field_dot`` already resolves against ``ptr_sources``; the
+                # arrow form did not, so warp.fem's ``cell_field_eval_arg``
+                # (which rebuilds an EvalArg from a struct arg's array field
+                # and nests it) left the array unresolvable and the address
+                # line raised. Re-key onto the SOURCE struct label so the
+                # backing the ctor bound is the one we look up.
+                src_struct = ptr_sources[n.expr.inner_target]
+                key = (src_struct, n.expr.inner_field or "")
+                if field_ptrs.get(n.lhs) != key:
+                    field_ptrs[n.lhs] = key
+                    changed = True
+                # Struct-kind fields chain onward exactly as in ``field_dot``.
+                fvp = field_value_paths.get(key)
+                if fvp is not None and ptr_paths.get(n.lhs) != fvp:
+                    ptr_paths[n.lhs] = fvp
+                    changed = True
+                nested_src = field_struct_sources.get(key)
+                if nested_src is not None and ptr_sources.get(n.lhs) != nested_src:
+                    ptr_sources[n.lhs] = nested_src
+                    changed = True
             elif isinstance(n, VoidCall) and n.op == "store" and len(n.args) == 2:
                 p = _strip_var_prefix(n.args[0].strip())
                 s = _strip_var_prefix(n.args[1].strip())
