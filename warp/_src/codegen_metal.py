@@ -1139,6 +1139,42 @@ template <typename C, typename T>
 inline void wp_adj_where(C c, T a, T b, thread C& ac, thread T& aa, thread T& ab, T r) {
     if (!!c) aa += r; else ab += r;
 }
+// In-place element writes: ``v[i] op= value`` on a vector (3-arg forward) or
+// ``m[i, j] op= value`` on a matrix (4-arg forward). Per ``warp/native/vec.h``
+// and ``mat.h`` the whole adjoint is to read the container's dual at that
+// index into the value's dual; the container dual is left alone, and the index
+// is non-differentiable. ``assign_inplace`` accumulates exactly like
+// ``add_inplace`` upstream (it does NOT clear the slot), so it is spelled the
+// same way here rather than "corrected" -- matching the reference backend is
+// the contract. ``mul_inplace``/``div_inplace`` have no upstream adjoint for
+// these arities, so they are deliberately absent and still raise.
+// Routed through ``wp_extract``/``wp_mat_extract`` so the ``wp_vecN_*`` and
+// ``wp_matRxC_*`` structs and the layout-swapped native matrices are all
+// handled by the same overload set the forward pass uses.
+template <typename V, typename I, typename T>
+inline void wp_adj_add_inplace(V v, I i, T value, thread V& av, I ai, thread T& avalue) {
+    avalue += wp_extract(av, (int)i);
+}
+template <typename V, typename I, typename T>
+inline void wp_adj_assign_inplace(V v, I i, T value, thread V& av, I ai, thread T& avalue) {
+    avalue += wp_extract(av, (int)i);
+}
+template <typename V, typename I, typename T>
+inline void wp_adj_sub_inplace(V v, I i, T value, thread V& av, I ai, thread T& avalue) {
+    avalue -= wp_extract(av, (int)i);
+}
+template <typename M, typename I, typename T>
+inline void wp_adj_add_inplace(M m, I i, I j, T value, thread M& am, I ai, I aj, thread T& avalue) {
+    avalue += wp_mat_extract(am, (int)i, (int)j);
+}
+template <typename M, typename I, typename T>
+inline void wp_adj_assign_inplace(M m, I i, I j, T value, thread M& am, I ai, I aj, thread T& avalue) {
+    avalue += wp_mat_extract(am, (int)i, (int)j);
+}
+template <typename M, typename I, typename T>
+inline void wp_adj_sub_inplace(M m, I i, I j, T value, thread M& am, I ai, I aj, thread T& avalue) {
+    avalue -= wp_mat_extract(am, (int)i, (int)j);
+}
 template <typename T> inline void wp_adj_sqrt(T x, T ret, thread T& ax, T r) {
     ax += T(0.5) * (T(1) / ret) * r;
 }
@@ -1479,6 +1515,12 @@ _ADJ_SUPPORTED = frozenset(
         "inverse",
         "matrix_from_cols",
         "matrix_from_rows",
+        # In-place element writes (templates in ``_ADJ_HELPERS``). Only the
+        # arities upstream defines an adjoint for; ``mul_inplace`` and
+        # ``div_inplace`` are intentionally omitted so they keep raising.
+        "add_inplace",
+        "sub_inplace",
+        "assign_inplace",
     }
 )
 
@@ -1560,6 +1602,11 @@ _ADJ_TILE_ARRAY_FIXED = {"tile_load": 3, "tile_store": 4, "tile_atomic_add": 5}
 _ADJ_STRUCT_FIELD_STORE_PAT = re.compile(
     r"^(?P<indent>\s*)adj_(?P<root>\w+)(?P<path>(?:\.\w+)+)\s*(?P<op>\+=|-=|=)\s*(?P<rhs>.+?)\s*;\s*$"
 )
+
+# ``wp::adj_extract(var_S, k, adj_S, adj_k, adj_ret);`` — matched to identify
+# extracts whose source is an array *shape* descriptor, which carries no
+# gradient. Only the source operand is needed to make that call.
+_ADJ_EXTRACT_SRC_PAT = re.compile(r"^\s*wp::adj_extract\s*\(\s*var_(?P<src>\w+)\s*,")
 
 # ``adj_A += adj_B;`` — whole-struct dual accumulation, emitted for the
 # reverse of a struct copy (``t = s``). Expanded per scalar leaf.
@@ -10156,6 +10203,15 @@ def _generate_msl_kernel_uncached(
                 dual_name = _per_field_dual(root, field_path)
                 body_lines.append(f"    {field_info.msl_type} {dual_name} = {_msl_zero_init(field_info.msl_type)};")
 
+    # Roots that are ``wp.array``s rather than structs. Warp lowers the read
+    # ``arr.shape[i]`` to a dual store ``adj_arr.shape = adj_N;`` — an array's
+    # shape is an integer descriptor, not a differentiable value, so that store
+    # carries no gradient and is dropped. Reaching it is routine: the common
+    # ``for i in range(arr.shape[0])`` idiom emits one via ``wp::adj_range``.
+    # Only ``.shape`` is dropped; any other descriptor path still raises.
+    array_dual_roots: set[str] = {str(a.label) for a in adj.args if _is_array_arg(a)}
+    array_dual_roots.update(str(v.label) for v in adj.variables if _is_array_arg(v))
+
     # Struct native/mangled name -> layout, for resolving the struct
     # *constructor* adjoints (``adj_Sample_9043e1d0(...)``) the fem
     # integrands emit. Only structs this kernel actually uses are listed,
@@ -10614,6 +10670,15 @@ def _generate_msl_kernel_uncached(
         line = _strip_comments_and_directives(raw)
         if line is None:
             continue
+        # ``arr.shape[k]`` reverses to ``wp::adj_extract(<shape>, k, ...)``
+        # feeding the dual of the shape struct. An array's shape is an integer
+        # descriptor, so there is no gradient to propagate and the whole chain
+        # is dropped — the forward pass already collapsed the shape locals into
+        # ``<arr>_shape`` subscripts, so neither the dual nor the ``shape_t``
+        # temporary it names is even declared.
+        m_adj_shape_extract = _ADJ_EXTRACT_SRC_PAT.match(line)
+        if m_adj_shape_extract and m_adj_shape_extract.group("src") in shape_aliases:
+            continue
         # --- Struct duals (reverse mode) --------------------------------
         # Lowered against the per-field split declared above. Every shape
         # Warp emits is handled explicitly; anything else raises rather
@@ -10622,6 +10687,8 @@ def _generate_msl_kernel_uncached(
         if m_adj_field:
             root = m_adj_field.group("root")
             parts = m_adj_field.group("path").lstrip(".").split(".")
+            if parts == ["shape"] and root in array_dual_roots:
+                continue
             resolved = _resolve_struct_dual_field(root, parts)
             if resolved is None:
                 raise MetalCodegenError(

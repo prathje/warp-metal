@@ -1617,7 +1617,7 @@ def assemble_adjoint_body(
     callers do not have to thread it through the declaration pass.
     """
     pc_var = "var__kernel_retpc"
-    replay_lines, reverse_lines, n_labels = _lower_return_labels(replay_lines, reverse_lines, pc_var, what)
+    replay_lines, reverse_lines, n_labels, hop_decls = _lower_return_labels(replay_lines, reverse_lines, pc_var, what)
     replay_lines, reverse_lines = lower_reverse_ranges([replay_lines, reverse_lines], const_ints, what)
     replay_nodes, replay_skip = fold(parse(replay_lines), query_iter_vars=query_iter_vars)
     reverse_nodes, reverse_skip = fold(parse(reverse_lines), query_iter_vars=query_iter_vars)
@@ -1625,6 +1625,7 @@ def assemble_adjoint_body(
     decls: list[Node] = []
     if n_labels is not None:
         decls.append(_RawLine(raw=f"    int {pc_var} = {n_labels};"))
+    decls.extend(_RawLine(raw=line) for line in hop_decls)
     if _has_return(replay_nodes):
         ret_flag = None
         if _has_loop_nested_return(replay_nodes):
@@ -1929,22 +1930,158 @@ def _is_structural_line(line: str) -> bool:
     )
 
 
+def _loop_depths(lines: list[str]) -> list[int]:
+    """Loop-nesting depth of each line, from the ``start_``/``end_`` labels.
+
+    Warp brackets every reverse loop body with ``start_for_N:;`` … ``end_for_N:;``
+    (in execution order), so the depth is a running count over those markers.
+    Both markers report the depth *inside* the loop they delimit.
+    """
+    depths = [0] * len(lines)
+    depth = 0
+    for i, line in enumerate(lines):
+        m = _RE_LABEL.match(line)
+        if m is None:
+            depths[i] = depth
+            continue
+        if m.group("name").startswith("start_"):
+            depth += 1
+            depths[i] = depth
+        else:
+            depths[i] = depth
+            depth -= 1
+    return depths
+
+
+def _lower_loop_local_return_hops(
+    reverse: list[str], hop_prefix: str, what: str
+) -> tuple[list[str], list[str], set[int]]:
+    """Re-express a ``return`` from inside a loop as a per-iteration skip flag.
+
+    Warp puts the replay of a loop body *inside* the reverse sweep, so a
+    ``return`` from inside a loop emits its ``goto label<N>`` and its matching
+    ``label<N>:;`` into the **same** reverse stream, both within the same loop
+    body, and the jump always points forward:
+
+        if (cond) { <replay tail>   goto label2; }
+        <replay and adjoint of the statements after the return>
+        if (cond) { label2:;        <adjoint of the return> }
+
+    So the jump means "for the iteration that returned, skip the statements the
+    forward pass never reached" — a forward hop within a single iteration. A
+    boolean set at the jump and cleared at the label expresses that exactly,
+    with no ``goto`` and no program counter carried across iterations.
+
+    This is why the earlier "a single PC cannot re-enter the loop at iteration
+    k, statement p" reading was wrong: the reverse sweep never re-enters the
+    loop part-way. It re-runs every iteration and skips a span within one of
+    them, which needs no iteration number at all.
+
+    Returns ``(reverse, decls, handled)`` where ``handled`` is the set of label
+    numbers consumed here, so the caller's program-counter pass skips them.
+    """
+    from warp._src.codegen_metal import MetalCodegenError  # noqa: PLC0415
+
+    depths = _loop_depths(reverse)
+    labels: dict[int, int] = {}
+    gotos: dict[int, list[int]] = {}
+    for i, line in enumerate(reverse):
+        if (m := _RE_RET_LABEL.match(line)) is not None:
+            labels[int(m.group("n"))] = i
+        elif (m := _RE_RET_GOTO.match(line)) is not None:
+            gotos.setdefault(int(m.group("n")), []).append(i)
+
+    spans: dict[int, tuple[int, int]] = {}
+    for n, lab_i in labels.items():
+        if depths[lab_i] == 0:
+            continue  # function-level label: the caller's PC pass owns it
+        targets = gotos.get(n, ())
+        # The hop is only a within-iteration skip if there is exactly one jump,
+        # it precedes the label, and control never leaves the loop nest in
+        # between. Anything else (a second jump, a backward jump, or a jump from
+        # outside the loop) would genuinely need to re-enter the loop body,
+        # which Metal cannot express — and would otherwise leave a raw ``goto``
+        # behind for the shader compiler to reject with a worse message.
+        if len(targets) != 1 or targets[0] >= lab_i or min(depths[targets[0] : lab_i + 1]) < depths[lab_i]:
+            raise MetalCodegenError(
+                f"adjoint of {what}: `return` from inside a loop is not supported on Metal in this "
+                f"shape (label{n} is not a forward hop within one loop iteration). Metal has no "
+                f"`goto`, and the reverse pass would need one to re-enter the loop body."
+            )
+        spans[n] = (targets[0], lab_i)
+
+    if not spans:
+        return reverse, [], set()
+
+    hop_vars = {n: f"{hop_prefix}{n}" for n in sorted(spans)}
+    goto_at = {g: n for n, (g, _) in spans.items()}
+    label_at = {lb: n for n, (_, lb) in spans.items()}
+
+    out: list[str] = []
+    run: list[str] = []
+    run_cond: str | None = None
+
+    def _flush() -> None:
+        nonlocal run, run_cond
+        if run_cond is not None:
+            out.append(f"    if ({run_cond}) {{")
+            out.extend(f"    {line}" for line in run)
+            out.append("    }")
+        else:
+            out.extend(run)
+        run = []
+        run_cond = None
+
+    for i, line in enumerate(reverse):
+        indent = _leading_indent(line)
+        if i in goto_at:
+            _flush()
+            out.append(f"{indent}{hop_vars[goto_at[i]]} = true;")
+            continue
+        if i in label_at:
+            # Clearing at the label keeps the flag scoped to this iteration.
+            _flush()
+            out.append(f"{indent}{hop_vars[label_at[i]]} = false;")
+            continue
+        active = sorted(hop_vars[n] for n, (g, lb) in spans.items() if g < i < lb)
+        # Structural lines pass through unguarded so block delimiters stay
+        # balanced and the for-loop fold's contiguous line window survives.
+        cond = " && ".join(f"!{v}" for v in active) if active and not _is_structural_line(line) else None
+        if cond != run_cond:
+            _flush()
+            run_cond = cond
+        run.append(line)
+    _flush()
+
+    return out, [f"    bool {v} = false;" for v in hop_vars.values()], set(spans)
+
+
 def _lower_return_labels(
     replay: list[str], reverse: list[str], pc_var: str, what: str
-) -> tuple[list[str], list[str], int | None]:
+) -> tuple[list[str], list[str], int | None, list[str]]:
     """Replace Warp's return ``goto``/label pairs with structured control flow.
 
-    Returns ``(replay, reverse, n_labels)``. ``n_labels`` is ``None`` when the
-    pattern needed no program counter — either the function never returns
-    early, or it has the one shape that needs no bookkeeping at all: a single
-    ``return`` as the last statement, whose jump and label are adjacent across
-    the replay/reverse seam and so cancel out.
+    Returns ``(replay, reverse, n_labels, decls)``. ``n_labels`` is ``None``
+    when the pattern needed no program counter — either the function never
+    returns early, or it has the one shape that needs no bookkeeping at all: a
+    single ``return`` as the last statement, whose jump and label are adjacent
+    across the replay/reverse seam and so cancel out. ``decls`` holds any
+    declarations the lowering introduced.
     """
     from warp._src.codegen_metal import MetalCodegenError  # noqa: PLC0415
 
     labels = [int(m.group("n")) for line in reverse if (m := _RE_RET_LABEL.match(line))]
     if not labels:
-        return replay, reverse, None
+        return replay, reverse, None, []
+
+    # Returns from inside a loop are self-contained within the reverse stream;
+    # lower them first so the program-counter pass below sees only the
+    # function-level labels that genuinely straddle the replay/reverse seam.
+    reverse, hop_decls, handled = _lower_loop_local_return_hops(reverse, f"{pc_var}_hop", what)
+    if handled:
+        labels = [int(m.group("n")) for line in reverse if (m := _RE_RET_LABEL.match(line))]
+        if not labels:
+            return replay, reverse, None, hop_decls
 
     gotos = [i for i, line in enumerate(replay) if _RE_RET_GOTO.match(line)]
     live_replay = [i for i, line in enumerate(replay) if not _is_inert_line(line)]
@@ -1963,20 +2100,15 @@ def _lower_return_labels(
             [line for i, line in enumerate(replay) if i != gotos[0]],
             [line for i, line in enumerate(reverse) if i != live_reverse[0]],
             None,
+            hop_decls,
         )
 
-    # A ``return`` from inside a loop lands the jump in the middle of the
-    # reverse loop body, with the iterator left wherever the forward pass
-    # stopped. A program counter cannot express that: the guard is one value
-    # tested on every iteration, so it would either skip the statement in all
-    # iterations or none.
-    loop_depth = 0
-    for line in reverse:
-        m = _RE_LABEL.match(line)
-        if m is not None:
-            loop_depth += 1 if m.group("name").startswith("start_") else -1
-            continue
-        if _RE_RET_LABEL.match(line) and loop_depth != 0:
+    # Any label still inside a loop here is one the hop lowering declined to
+    # take (it raises on those), so this only fires if that classification and
+    # this one ever disagree.
+    depths = _loop_depths(reverse)
+    for i, line in enumerate(reverse):
+        if _RE_RET_LABEL.match(line) and depths[i] != 0:
             raise MetalCodegenError(
                 f"adjoint of {what}: `return` from inside a loop is not supported on Metal. "
                 f"Metal has no `goto`, and the reverse pass needs one to re-enter the loop body "
@@ -2023,7 +2155,7 @@ def _lower_return_labels(
         reverse_out.append(f"    {line}")
     _close()
 
-    return replay_out, reverse_out, n_labels
+    return replay_out, reverse_out, n_labels, hop_decls
 
 
 def _ensure_func_backward_built(fn_overload) -> None:
@@ -2131,7 +2263,7 @@ def _inline_one_adj_call(
 
     pc_var = f"var_{inline_id}__retpc"
     what = repr(fn_overload.key)
-    replay_lines, reverse_lines, n_labels = _lower_return_labels(replay_lines, reverse_lines, pc_var, what)
+    replay_lines, reverse_lines, n_labels, hop_decls = _lower_return_labels(replay_lines, reverse_lines, pc_var, what)
 
     # ``iter_reverse`` openers reference range constructions that live in the
     # replay, so both halves have to be resolved against one table.
@@ -2198,6 +2330,7 @@ def _inline_one_adj_call(
     decls: list[Node] = []
     if n_labels is not None:
         decls.append(_RawLine(raw=f"    int {pc_var} = {n_labels};"))
+    decls.extend(_RawLine(raw=line) for line in hop_decls)
     fold_skip = replay_skip | reverse_skip
     for var in adj.variables:
         if var.label in param_set or var.label.startswith("ret_"):
@@ -3437,18 +3570,57 @@ def _apply_view_rewrites(
                 )
                 continue
 
+        # ``wp::adj_view`` is an empty function for every arity upstream (see
+        # ``warp/native/array.h``) — a view aliases its base array's storage, so
+        # there is no gradient to move. The accesses *through* the view are what
+        # carry it, and the rewrite below repoints those at the base array's
+        # grad buffer. Dropping is therefore exact, not an approximation.
+        if isinstance(n, VoidCall) and n.op == "adj_view":
+            continue
+
         # ``wp::adj_address`` / ``wp::adj_array_store`` / ``wp::adj_atomic_add``
-        # on a resolved alias. Only zero-lead backings are rewritten — that
-        # covers the case this exists for, a ``wp.array`` field of a struct
-        # kernel arg, where the synthetic array *is* the field. A sliced view
-        # would need the leading indices threaded into both the primal and
-        # the adjoint index list; leaving it alone makes the flat emitter
-        # raise on the unresolved name rather than quietly dropping the
-        # gradient.
+        # (and the tile equivalents) on a resolved alias. A zero-lead backing —
+        # a ``wp.array`` field of a struct kernel arg, where the synthetic array
+        # *is* the field — only needs the array name swapped. A sliced view
+        # (``qp_result = local_result[qp_eval_index]``, which warp.fem's
+        # ``dispatch_linear_kernel_fn`` builds) additionally needs the view's
+        # leading indices spliced into the index list, exactly as the forward
+        # ``wp::address`` rewrite above does. The adjoint index list has to grow
+        # in step: the flat emitter derives ``ndim`` from the total arity, so
+        # inserting on only one side would silently shift which arguments it
+        # reads as indices. The adjoint slots themselves are never read (a slice
+        # index is an integer), but they are named honestly.
         if isinstance(n, VoidCall) and n.op in _ADJ_ARRAY_VIEW_OPS:
             adj_arr_l = _strip_var_prefix(n.args[0]) if n.args else None
-            if adj_arr_l is not None and adj_arr_l in view_aliases and not view_aliases[adj_arr_l][1]:
-                new_args = (f"var_{view_aliases[adj_arr_l][0]}", *n.args[1:])
+            if adj_arr_l is not None and adj_arr_l in view_aliases:
+                arr_name, lead_idx_labels = view_aliases[adj_arr_l]
+                extras = _ADJ_ARRAY_VIEW_EXTRAS.get(n.op)
+                if not lead_idx_labels:
+                    new_args = (f"var_{arr_name}", *n.args[1:])
+                elif extras is None:
+                    # Unknown argument layout — leave it for the flat emitter to
+                    # reject by name rather than guess where the indices sit.
+                    out.append(n)
+                    continue
+                else:
+                    n_prim_extra, n_adj_extra = extras
+                    ndim2 = len(n.args) - 2 - n_prim_extra - n_adj_extra
+                    if ndim2 < 0 or ndim2 % 2 != 0:
+                        out.append(n)
+                        continue
+                    ndim = ndim2 // 2
+                    prim_end = 1 + ndim + n_prim_extra
+                    adj_idx_start = prim_end + 1
+                    lead_prim = [f"var_{lbl}" for lbl in lead_idx_labels]
+                    lead_adj = [f"adj_{lbl}" for lbl in lead_idx_labels]
+                    new_args = (
+                        f"var_{arr_name}",
+                        *lead_prim,
+                        *n.args[1:prim_end],
+                        f"adj_{arr_name}",
+                        *lead_adj,
+                        *n.args[adj_idx_start:],
+                    )
                 indent = _leading_indent(n.raw)
                 new_raw = f"{indent}wp::{n.op}({', '.join(new_args)});"
                 out.append(VoidCall(raw=new_raw, op=n.op, args=new_args, extra=n.extra))
@@ -3667,6 +3839,28 @@ _ADJ_ARRAY_VIEW_OPS = (
     "adj_tile_store",
     "adj_tile_atomic_add",
 )
+
+# Argument layout of each of the above, as
+# ``(primal args after the indices, adjoint args after the adjoint indices)``.
+# The full shape is
+# ``arr, idx.., <primal extras>, adj_arr, adj_idx.., <adjoint extras>``:
+#
+#   adj_address:     arr, i..,        adj_arr, adj_i.., adj_ret      -> (0, 1)
+#   adj_array_store: arr, i.., value, adj_arr, adj_i.., adj_value    -> (1, 1)
+#   adj_atomic_add:  arr, i.., value, adj_arr, adj_i.., adj_value, adj_ret -> (1, 2)
+#
+# Needed only to splice a sliced view's leading indices in at the right offset.
+# The tile trio (``adj_tile_load`` / ``adj_tile_store`` / ``adj_tile_atomic_add``)
+# mirrors this layout with ``dest, off.., t`` in place of ``arr, i.., value``, but
+# is deliberately ABSENT: no test or example reaches a tile op on a *sliced* view
+# in reverse mode, so there is nothing to validate a splice against. Leaving them
+# out keeps them on the zero-lead path and raising, rather than silently emitting
+# an index list nothing has checked.
+_ADJ_ARRAY_VIEW_EXTRAS = {
+    "adj_address": (0, 1),
+    "adj_array_store": (1, 1),
+    "adj_atomic_add": (1, 2),
+}
 _ATOMIC_TO_MSL = {
     "atomic_add": "atomic_fetch_add_explicit",
     "atomic_sub": "atomic_fetch_sub_explicit",
