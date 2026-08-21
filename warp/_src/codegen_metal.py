@@ -496,6 +496,24 @@ def _emit_big_vec_struct(name: str, n: int, msl_scalar: str) -> str:
             body_lines.append(f"    r.c[{i}] = s {op} a.c[{i}];")
         body_lines.append("    return r;")
         body_lines.append("}")
+    # Compound assignment. Defining ``operator+`` does NOT give C++ (or
+    # MSL) ``operator+=``, and the generic reverse-mode templates in
+    # ``_ADJ_HELPERS`` accumulate with ``+=`` / ``-=`` on whatever type
+    # they deduce — ``wp_adj_add``, ``wp_adj_sub``, ``wp_adj_where``,
+    # ``wp_adj_mul``, ``wp_adj_div``. Without these, differentiating any
+    # kernel that carries a big-vec value (warp.fem's ``vec1`` scalar-space
+    # dofs, spatial vectors) fails with "no viable overloaded '+='".
+    for op in ("+", "-", "*", "/"):
+        body_lines.append(f"inline thread {name}& operator{op}=(thread {name}& a, {name} b) {{")
+        for i in range(n):
+            body_lines.append(f"    a.c[{i}] {op}= b.c[{i}];")
+        body_lines.append("    return a;")
+        body_lines.append("}")
+        body_lines.append(f"inline thread {name}& operator{op}=(thread {name}& a, {msl_scalar} s) {{")
+        for i in range(n):
+            body_lines.append(f"    a.c[{i}] {op}= s;")
+        body_lines.append("    return a;")
+        body_lines.append("}")
     # Unary minus: ``-spatial_vec``. The IR lowers ``wp.neg(v)`` to
     # ``-v`` for native vec types but for our big-vec structs the codegen
     # path still funnels through ``wp_neg`` (see ``_INTRINSIC_PATTERNS``).
@@ -529,6 +547,91 @@ def _emit_big_vec_struct(name: str, n: int, msl_scalar: str) -> str:
         f"    for (int i = 0; i < {n}; ++i) r.c[i] = (l > ({msl_scalar})0) ? (v.c[i] / l) : ({msl_scalar})0;"
     )
     body_lines.append("    return r;")
+    body_lines.append("}")
+    # Reverse-mode overloads for this struct shape. The generic templates in
+    # ``_ADJ_HELPERS`` (``wp_adj_add``, ``wp_adj_where``, ...) already work
+    # off the compound-assignment operators above, but the constructor and
+    # element-extract adjoints are shape-specific and have no template form,
+    # so emit them per struct rather than hand-listing widths. Unused
+    # overloads are inline and cost nothing.
+    ctor_args = ", ".join(f"{msl_scalar} c{i}" for i in range(n))
+    ctor_refs = ", ".join(f"thread {msl_scalar}& a{i}" for i in range(n))
+    body_lines.append(f"inline void wp_adj_vec_t({ctor_args}, {ctor_refs}, {name} r) {{")
+    for i in range(n):
+        body_lines.append(f"    a{i} += r.c[{i}];")
+    body_lines.append("}")
+    # One-scalar form broadcasts, so its adjoint sums the whole gradient.
+    # At n == 1 that signature is identical to the per-component form above,
+    # and emitting both is a redefinition.
+    if n > 1:
+        bcast_sum = " + ".join(f"r.c[{i}]" for i in range(n))
+        body_lines.append(
+            f"inline void wp_adj_vec_t({msl_scalar} c, thread {msl_scalar}& a, {name} r) {{ a += {bcast_sum}; }}"
+        )
+    # Copy / element-cast constructor.
+    body_lines.append(f"inline void wp_adj_vec_t({name} other, thread {name}& ao, {name} r) {{ ao += r; }}")
+    # ``wp.extract(v, i)`` — scatter the scalar adjoint into component i.
+    # The index is non-differentiable but Warp still names its dual.
+    body_lines.append(
+        f"inline void wp_adj_extract({name} v, int i, thread {name}& av, thread int& ai, {msl_scalar} r) "
+        f"{{ av.c[i] += r; }}"
+    )
+    # Scalar scale / divide. The generic ``wp_adj_mul`` template deduces a
+    # single ``T`` for both operands, so a struct-by-scalar product has no
+    # candidate without these.
+    body_lines.append(
+        f"inline void wp_adj_mul({name} a, {msl_scalar} b, thread {name}& aa, thread {msl_scalar}& ab, {name} r) {{"
+    )
+    body_lines.append("    aa += r * b;")
+    body_lines.append(f"    for (int i = 0; i < {n}; ++i) ab += a.c[i] * r.c[i];")
+    body_lines.append("}")
+    body_lines.append(
+        f"inline void wp_adj_mul({msl_scalar} a, {name} b, thread {msl_scalar}& aa, thread {name}& ab, {name} r) {{"
+    )
+    body_lines.append("    ab += r * a;")
+    body_lines.append(f"    for (int i = 0; i < {n}; ++i) aa += b.c[i] * r.c[i];")
+    body_lines.append("}")
+    body_lines.append(
+        f"inline void wp_adj_div({name} a, {msl_scalar} b, {name} ret, thread {name}& aa, "
+        f"thread {msl_scalar}& ab, {name} r) {{"
+    )
+    body_lines.append("    aa += r / b;")
+    body_lines.append(f"    for (int i = 0; i < {n}; ++i) ab -= r.c[i] * ret.c[i] / b;")
+    body_lines.append("}")
+    # dot / length / length_sq / normalize, mirroring ``_adj_vec_helpers``
+    # for the native widths.
+    body_lines.append(
+        f"inline void wp_adj_dot({name} a, {name} b, thread {name}& aa, thread {name}& ab, {msl_scalar} r) {{"
+    )
+    body_lines.append(f"    for (int i = 0; i < {n}; ++i) {{ aa.c[i] += b.c[i] * r; ab.c[i] += a.c[i] * r; }}")
+    body_lines.append("}")
+    body_lines.append(f"inline void wp_adj_length({name} a, {msl_scalar} ret, thread {name}& aa, {msl_scalar} r) {{")
+    body_lines.append(f"    if (ret > ({msl_scalar})0) for (int i = 0; i < {n}; ++i) aa.c[i] += a.c[i] * (r / ret);")
+    body_lines.append("}")
+    body_lines.append(f"inline void wp_adj_length_sq({name} a, thread {name}& aa, {msl_scalar} r) {{")
+    body_lines.append(f"    for (int i = 0; i < {n}; ++i) aa.c[i] += a.c[i] * (({msl_scalar})2 * r);")
+    body_lines.append("}")
+    body_lines.append(f"inline void wp_adj_normalize({name} a, {name} ret, thread {name}& aa, {name} r) {{")
+    body_lines.append(f"    {msl_scalar} d = wp_length(a);")
+    body_lines.append(f"    if (d <= ({msl_scalar})0) return;")
+    body_lines.append(f"    {msl_scalar} rd = ({msl_scalar})0;")
+    body_lines.append(f"    for (int i = 0; i < {n}; ++i) rd += ret.c[i] * r.c[i];")
+    body_lines.append(f"    for (int i = 0; i < {n}; ++i) aa.c[i] += (r.c[i] - ret.c[i] * rd) / d;")
+    body_lines.append("}")
+    # Component-wise products.
+    body_lines.append(
+        f"inline void wp_adj_cw_mul({name} a, {name} b, thread {name}& aa, thread {name}& ab, {name} r) {{"
+    )
+    body_lines.append(
+        f"    for (int i = 0; i < {n}; ++i) {{ aa.c[i] += b.c[i] * r.c[i]; ab.c[i] += a.c[i] * r.c[i]; }}"
+    )
+    body_lines.append("}")
+    body_lines.append(
+        f"inline void wp_adj_cw_div({name} a, {name} b, {name} ret, thread {name}& aa, thread {name}& ab, {name} r) {{"
+    )
+    body_lines.append(
+        f"    for (int i = 0; i < {n}; ++i) {{ aa.c[i] += r.c[i] / b.c[i]; ab.c[i] -= r.c[i] * ret.c[i] / b.c[i]; }}"
+    )
     body_lines.append("}")
     return "\n".join(body_lines)
 
@@ -682,6 +785,19 @@ def _emit_big_mat_struct(name: str, rows: int, cols: int, msl_scalar: str) -> st
     body.append(f"    for (int i = 0; i < {n}; ++i) r.c[i] = -a.c[i];")
     body.append("    return r;")
     body.append("}")
+    # Compound assignment — needed by the generic reverse-mode templates
+    # for the same reason as the big-vec structs (see ``_emit_vec_struct``):
+    # ``operator+`` does not imply ``operator+=``.
+    for op in ("+", "-"):
+        body.append(f"inline thread {name}& operator{op}=(thread {name}& a, {name} b) {{")
+        body.append(f"    for (int i = 0; i < {n}; ++i) a.c[i] {op}= b.c[i];")
+        body.append("    return a;")
+        body.append("}")
+    for op in ("*", "/"):
+        body.append(f"inline thread {name}& operator{op}=(thread {name}& a, {msl_scalar} s) {{")
+        body.append(f"    for (int i = 0; i < {n}; ++i) a.c[i] {op}= s;")
+        body.append("    return a;")
+        body.append("}")
     for lhs, rhs, expr in (
         (f"{name} a", f"{msl_scalar} s", "a.c[i] * s"),
         (f"{msl_scalar} s", f"{name} a", "s * a.c[i]"),
@@ -1125,15 +1241,19 @@ template <typename T> inline void wp_adj_div(T a, T b, T ret, thread T& aa, thre
     ab -= r * ret / b;
 }
 template <typename T> inline void wp_adj_neg(T x, thread T& ax, T r) { ax -= r; }
+// ``T()`` rather than ``T(0)``: these templates are instantiated on the
+// generated ``wp_vecN`` / ``wp_matRxC`` PODs too (warp.fem's ``vec1``
+// scalar-space dofs), and those have no one-arg constructor. Value-init
+// zeroes scalars, MSL's native vectors, and the PODs alike.
 template <typename T> inline void wp_adj_copy(T src, thread T& adj_src, thread T& adj_dest) {
     adj_src += adj_dest;
-    adj_dest = T(0);
+    adj_dest = T();
 }
 // Matches ``warp/native/builtin.h``: assign is non-differentiable except
 // through read-modify-write, where the adjoint MOVES (``=``, not ``+=``).
 template <typename T> inline void wp_adj_assign(T dest, T src, thread T& adj_dest, thread T& adj_src) {
     adj_src = adj_dest;
-    adj_dest = T(0);
+    adj_dest = T();
 }
 template <typename C, typename T>
 inline void wp_adj_where(C c, T a, T b, thread C& ac, thread T& aa, thread T& ab, T r) {
@@ -1288,6 +1408,10 @@ def _adj_vec_helpers(n: int) -> str:
     return (
         f"inline void wp_adj_vec_t({args}, {refs}, {v} r) {{\n{comps}}}\n"
         f"inline void wp_adj_vec_t(float c, thread float& a, {v} r) {{ a += {bcast}; }}\n"
+        # Copy / element-cast constructor (``wp.vec2(other)``), which
+        # warp.fem's dispatch kernels emit when narrowing an accumulator.
+        # Same-length, so the adjoint is a straight accumulation.
+        f"inline void wp_adj_vec_t({v} other, thread {v}& adj_other, {v} r) {{ adj_other += r; }}\n"
         f"inline void wp_adj_mul({v} a, float b, thread {v}& aa, thread float& ab, {v} r) {{\n"
         f"    aa += b * r;\n    ab += metal::dot(a, r);\n}}\n"
         f"inline void wp_adj_mul(float a, {v} b, thread float& aa, thread {v}& ab, {v} r) {{\n"
@@ -1521,6 +1645,21 @@ _ADJ_SUPPORTED = frozenset(
         "add_inplace",
         "sub_inplace",
         "assign_inplace",
+        # Quat / rigid-transform family (``_ADJ_QUAT_HELPERS``). ``mul`` and
+        # ``normalize`` on quats are NOT here: they share a name with the
+        # component-wise vector rules and are routed by operand type in
+        # ``_rewrite_quat_mul`` instead.
+        "quat_t",
+        "quat_rotate",
+        "quat_rotate_inv",
+        "quat_inverse",
+        "transform_t",
+        "transform_get_translation",
+        "transform_get_rotation",
+        "transform_vector",
+        "transform_point",
+        "transform_multiply",
+        "transform_inverse",
     }
 )
 
@@ -1534,11 +1673,15 @@ def _msl_zero_init(msl_type: str) -> str:
     """Zero-initialiser expression for an MSL value type.
 
     Native types (``float``, ``float3``, ``float3x3``, ``int``) take the
-    broadcasting one-arg form; the generated ``wp_vecN`` / ``wp_matRxC`` /
-    ``wp_tile_RxC_*`` structs have no such constructor and need aggregate
-    value-init.
+    broadcasting one-arg form. Every ``wp_``-prefixed type is one of the
+    plain-POD structs this module emits (``wp_vecN``, ``wp_matRxC``,
+    ``wp_tile_RxC_*``, ``wp_slice_t``, the mesh/BVH query results): none of
+    them declares a constructor, so they need aggregate value-init. Naming
+    a struct with the one-arg form instead produces
+    ``no matching conversion for functional-style cast from 'int'``, which
+    is what a ``wp_slice_t`` dual used to hit in warp.fem's matrix slicing.
     """
-    return f"{msl_type}()" if msl_type.startswith(("wp_mat", "wp_vec", "wp_tile")) else f"{msl_type}(0)"
+    return f"{msl_type}()" if msl_type.startswith("wp_") else f"{msl_type}(0)"
 
 
 # Types a local declaration can safely be zeroed with (see ``_msl_local_init``).
@@ -1960,6 +2103,204 @@ inline wp_vec7_float wp_transform_multiply(wp_vec7_float a, wp_vec7_float b) {
 inline wp_vec7_float wp_transform_inverse(wp_vec7_float t) {
     float4 q_inv = wp_quat_inverse(wp_transform_get_rotation(t));
     return wp_vec7_float_make(-wp_quat_rotate(q_inv, wp_transform_get_translation(t)), q_inv);
+}"""
+
+
+# Reverse-mode counterparts of ``_QUAT_HELPERS`` / ``_TRANSFORM_HELPERS``,
+# ported from ``warp/native/quat.h`` and ``warp/native/spatial.h``.
+#
+# Quats are ``float4`` and transforms are ``wp_vec7_float`` here, so the
+# native ``adj_t.p`` / ``adj_t.q`` sub-object accumulations become the
+# ``wp_transform_adj_add_*`` component writes below. A transform dual is
+# passed as a whole ``thread wp_vec7_float&``, matching how the native code
+# takes ``transform_t<Type>&``.
+#
+# ``wp_adj_mul`` and ``wp_adj_normalize`` on quats are deliberately NOT
+# defined as ``float4`` overloads. Both names already carry the
+# component-wise vector rule, and a quat is indistinguishable from a vec4
+# once types are erased — an overload reachable by resolution alone would
+# silently return the Hamilton-product gradient for a component-wise
+# multiply. They are routed by *operand type* instead (see
+# ``_rewrite_quat_mul``), which is exactly how the forward pass keeps
+# ``wp::mul`` and ``wp::normalize`` honest, and means a non-quat operand
+# fails loudly rather than quietly.
+#
+# ``wp_adj_extract`` on a transform is not defined either: extracting a
+# transform component is a plain ``wp_vec7_float`` element access, already
+# covered by the big-vec helpers.
+_ADJ_QUAT_HELPERS = """\
+inline void wp_adj_quat_rotate(float4 q, float3 p, thread float4& aq, thread float3& ap, float3 r) {
+    {
+        float t2 = p[2] * q.z * 2.0f;
+        float t3 = p[1] * q.w * 2.0f;
+        float t4 = p[0] * q.w * 2.0f;
+        float t5 = p[0] * q.x * 2.0f;
+        float t6 = p[1] * q.y * 2.0f;
+        float t7 = p[2] * q.y * 2.0f;
+        float t8 = p[0] * q.z * 2.0f;
+        float t9 = p[0] * q.y * 2.0f;
+        float t10 = p[1] * q.x * 2.0f;
+        aq.x += r[2] * (t3 + t8) + r[0] * (t2 + t6 + p[0] * q.x * 4.0f) + r[1] * (t9 - p[2] * q.w * 2.0f);
+        aq.y += r[1] * (t2 + t5 + p[1] * q.y * 4.0f) + r[0] * (t10 + p[2] * q.w * 2.0f)
+            - r[2] * (t4 - p[1] * q.z * 2.0f);
+        aq.z += r[1] * (t4 + t7) + r[2] * (t5 + t6 + p[2] * q.z * 4.0f) - r[0] * (t3 - p[2] * q.x * 2.0f);
+        aq.w += r[0] * (t7 + p[0] * q.w * 4.0f - p[1] * q.z * 2.0f)
+            + r[1] * (t8 + p[1] * q.w * 4.0f - p[2] * q.x * 2.0f)
+            + r[2] * (-t9 + t10 + p[2] * q.w * 4.0f);
+    }
+    {
+        float t2 = q.w * q.w;
+        float t3 = t2 * 2.0f;
+        float t4 = q.w * q.z * 2.0f;
+        float t5 = q.x * q.y * 2.0f;
+        float t6 = q.w * q.y * 2.0f;
+        float t7 = q.w * q.x * 2.0f;
+        float t8 = q.y * q.z * 2.0f;
+        ap[0] += r[1] * (t4 + t5) + r[0] * (t3 + (q.x * q.x) * 2.0f - 1.0f) - r[2] * (t6 - q.x * q.z * 2.0f);
+        ap[1] += r[2] * (t7 + t8) - r[0] * (t4 - t5) + r[1] * (t3 + (q.y * q.y) * 2.0f - 1.0f);
+        ap[2] += -r[1] * (t7 - t8) + r[2] * (t3 + (q.z * q.z) * 2.0f - 1.0f) + r[0] * (t6 + q.x * q.z * 2.0f);
+    }
+}
+inline void wp_adj_quat_rotate_inv(float4 q, float3 p, thread float4& aq, thread float3& ap, float3 r) {
+    {
+        float t2 = p[2] * q.w * 2.0f;
+        float t3 = p[2] * q.z * 2.0f;
+        float t4 = p[1] * q.w * 2.0f;
+        float t5 = p[0] * q.w * 2.0f;
+        float t6 = p[0] * q.x * 2.0f;
+        float t7 = p[1] * q.y * 2.0f;
+        float t8 = p[1] * q.z * 2.0f;
+        float t9 = p[2] * q.x * 2.0f;
+        float t10 = p[0] * q.y * 2.0f;
+        aq.x += r[1] * (t2 + t10) + r[0] * (t3 + t7 + p[0] * q.x * 4.0f) - r[2] * (t4 - p[0] * q.z * 2.0f);
+        aq.y += r[2] * (t5 + t8) + r[1] * (t3 + t6 + p[1] * q.y * 4.0f) - r[0] * (t2 - p[1] * q.x * 2.0f);
+        aq.z += r[0] * (t4 + t9) + r[2] * (t6 + t7 + p[2] * q.z * 4.0f) - r[1] * (t5 - p[2] * q.y * 2.0f);
+        aq.w += r[0] * (t8 + p[0] * q.w * 4.0f - p[2] * q.y * 2.0f)
+            + r[1] * (t9 + p[1] * q.w * 4.0f - p[0] * q.z * 2.0f)
+            + r[2] * (t10 - p[1] * q.x * 2.0f + p[2] * q.w * 4.0f);
+    }
+    {
+        float t2 = q.w * q.w;
+        float t3 = t2 * 2.0f;
+        float t4 = q.w * q.z * 2.0f;
+        float t5 = q.w * q.y * 2.0f;
+        float t6 = q.x * q.z * 2.0f;
+        float t7 = q.w * q.x * 2.0f;
+        ap[0] += r[2] * (t5 + t6) + r[0] * (t3 + (q.x * q.x) * 2.0f - 1.0f) - r[1] * (t4 - q.x * q.y * 2.0f);
+        ap[1] += r[1] * (t3 + (q.y * q.y) * 2.0f - 1.0f) + r[0] * (t4 + q.x * q.y * 2.0f)
+            - r[2] * (t7 - q.y * q.z * 2.0f);
+        ap[2] += -r[0] * (t5 - t6) + r[2] * (t3 + (q.z * q.z) * 2.0f - 1.0f) + r[1] * (t7 + q.y * q.z * 2.0f);
+    }
+}
+inline void wp_adj_quat_inverse(float4 q, thread float4& aq, float4 r) {
+    aq.x -= r.x;
+    aq.y -= r.y;
+    aq.z -= r.z;
+    aq.w += r.w;
+}
+inline void wp_adj_quat_mul(float4 a, float4 b, thread float4& aa, thread float4& ab, float4 r) {
+    aa += float4(
+        b.w * r.x - b.x * r.w + b.y * r.z - b.z * r.y,
+        b.w * r.y - b.y * r.w - b.x * r.z + b.z * r.x,
+        b.w * r.z + b.x * r.y - b.y * r.x - b.z * r.w,
+        b.w * r.w + b.x * r.x + b.y * r.y + b.z * r.z);
+    ab += float4(
+        a.w * r.x - a.x * r.w - a.y * r.z + a.z * r.y,
+        a.w * r.y - a.y * r.w + a.x * r.z - a.z * r.x,
+        a.w * r.z - a.x * r.y + a.y * r.x - a.z * r.w,
+        a.w * r.w + a.x * r.x + a.y * r.y + a.z * r.z);
+}
+inline void wp_adj_quat_t(
+    float x, float y, float z, float w,
+    thread float& ax, thread float& ay, thread float& az, thread float& aw, float4 r) {
+    ax += r[0];
+    ay += r[1];
+    az += r[2];
+    aw += r[3];
+}
+inline void wp_adj_quat_t(float3 v, float w, thread float3& av, thread float& aw, float4 r) {
+    av[0] += r[0];
+    av[1] += r[1];
+    av[2] += r[2];
+    aw += r[3];
+}
+inline void wp_adj_quat_t(float4 other, thread float4& adj_other, float4 r) { adj_other += r; }
+inline void wp_adj_quat_normalize(float4 q, thread float4& aq, float4 r) {
+    float l = metal::length(q);
+    if (l > 0.0f) {
+        float l_inv = 1.0f / l;
+        aq += r * l_inv - q * (l_inv * l_inv * l_inv * metal::dot(q, r));
+    }
+}"""
+
+
+# Rigid-transform adjoints. Split from ``_ADJ_QUAT_HELPERS`` because these
+# bodies name ``wp_vec7_float`` and the ``wp_transform_get_*`` accessors,
+# which only exist when ``_TRANSFORM_HELPERS`` is emitted — a kernel that
+# differentiates a bare ``wp.quat_rotate`` gets the quat block alone.
+_ADJ_TRANSFORM_HELPERS = """\
+inline void wp_transform_adj_add_translation(thread wp_vec7_float& at, float3 v) {
+    at.c[0] += v.x;
+    at.c[1] += v.y;
+    at.c[2] += v.z;
+}
+inline void wp_transform_adj_add_rotation(thread wp_vec7_float& at, float4 v) {
+    at.c[3] += v.x;
+    at.c[4] += v.y;
+    at.c[5] += v.z;
+    at.c[6] += v.w;
+}
+inline void wp_adj_transform_get_translation(wp_vec7_float t, thread wp_vec7_float& at, float3 r) {
+    wp_transform_adj_add_translation(at, r);
+}
+inline void wp_adj_transform_get_rotation(wp_vec7_float t, thread wp_vec7_float& at, float4 r) {
+    wp_transform_adj_add_rotation(at, r);
+}
+inline void wp_adj_transform_t(float3 p, float4 q, thread float3& ap, thread float4& aq, wp_vec7_float r) {
+    ap += wp_transform_get_translation(r);
+    aq += wp_transform_get_rotation(r);
+}
+inline void wp_adj_transform_vector(
+    wp_vec7_float t, float3 x, thread wp_vec7_float& at, thread float3& ax, float3 r) {
+    float4 aq = float4(0.0f);
+    wp_adj_quat_rotate(wp_transform_get_rotation(t), x, aq, ax, r);
+    wp_transform_adj_add_rotation(at, aq);
+}
+inline void wp_adj_transform_point(
+    wp_vec7_float t, float3 x, thread wp_vec7_float& at, thread float3& ax, float3 r) {
+    float4 aq = float4(0.0f);
+    wp_adj_quat_rotate(wp_transform_get_rotation(t), x, aq, ax, r);
+    wp_transform_adj_add_rotation(at, aq);
+    wp_transform_adj_add_translation(at, r);
+}
+inline void wp_adj_transform_multiply(
+    wp_vec7_float a, wp_vec7_float b, thread wp_vec7_float& aa, thread wp_vec7_float& ab, wp_vec7_float r) {
+    float4 aq_a = float4(0.0f);
+    float3 ap_b = float3(0.0f);
+    float3 rp = wp_transform_get_translation(r);
+    wp_adj_quat_rotate(wp_transform_get_rotation(a), wp_transform_get_translation(b), aq_a, ap_b, rp);
+    wp_transform_adj_add_translation(ab, ap_b);
+    wp_transform_adj_add_translation(aa, rp);
+    float4 aq_b = float4(0.0f);
+    wp_adj_quat_mul(
+        wp_transform_get_rotation(a), wp_transform_get_rotation(b), aq_a, aq_b, wp_transform_get_rotation(r));
+    wp_transform_adj_add_rotation(aa, aq_a);
+    wp_transform_adj_add_rotation(ab, aq_b);
+}
+inline void wp_adj_transform_inverse(wp_vec7_float t, thread wp_vec7_float& at, wp_vec7_float r) {
+    float4 q = wp_transform_get_rotation(t);
+    float4 q_inv = wp_quat_inverse(q);
+    // adj_transform_t(np, q_inv, adj_np, adj_q_inv, adj_ret)
+    float3 adj_np = wp_transform_get_translation(r);
+    float4 adj_q_inv = wp_transform_get_rotation(r);
+    float3 adj_p = -adj_np;
+    // accumulates into adj_q_inv, which adj_quat_inverse below then reads
+    float3 at_p = float3(0.0f);
+    wp_adj_quat_rotate(q_inv, wp_transform_get_translation(t), adj_q_inv, at_p, adj_p);
+    wp_transform_adj_add_translation(at, at_p);
+    float4 at_q = float4(0.0f);
+    wp_adj_quat_inverse(q, at_q, adj_q_inv);
+    wp_transform_adj_add_rotation(at, at_q);
 }"""
 
 
@@ -6050,10 +6391,20 @@ def _build_kernel_header(source: str) -> str:
     # ``wp_normalize`` internally (mirroring native code's guarded
     # ``normalize``), so it must precede all of them.
     parts.append(_NORMALIZE_HELPERS)
-    if "wp_quat_" in source or "wp_transform_" in source:
+    # The quat/transform adjoint bodies call the forward ``wp_quat_rotate`` /
+    # ``wp_quat_inverse`` / ``wp_transform_get_*``, so the forward blocks are
+    # pulled in whenever their adjoints are needed — not just when the kernel
+    # names a forward op itself.
+    needs_adj_quat = "wp_adj_quat_" in source
+    needs_adj_transform = "wp_adj_transform_" in source
+    if "wp_quat_" in source or "wp_transform_" in source or needs_adj_quat or needs_adj_transform:
         parts.append(_QUAT_HELPERS)
-    if "wp_transform_" in source:
+    if "wp_transform_" in source or needs_adj_transform:
         parts.append(_TRANSFORM_HELPERS)
+    if needs_adj_quat or needs_adj_transform:
+        parts.append(_ADJ_QUAT_HELPERS)
+    if needs_adj_transform:
+        parts.append(_ADJ_TRANSFORM_HELPERS)
     if (
         "wp_rand" in source
         or "wp_sample_" in source
@@ -6321,6 +6672,49 @@ def _rewrite_vec_t_brace_constructor(text: str) -> str:
         return f"wp_vec{n}_{msl_scalar}_make({args_str})"
 
     return pat.sub(repl, text)
+
+
+_ADJ_INIT_LIST_PAT = re.compile(
+    r"wp::adj_(vec|mat)_t\s*\(\s*\{(?P<vals>[^{}]*)\}\s*,\s*\{(?P<duals>[^{}]*)\}\s*,\s*(?P<ret>[^,()]+?)\s*\)"
+)
+
+
+def _rewrite_adj_init_list_constructor(text: str) -> str:
+    """Lower the ``initializer_array`` constructor adjoint to per-component adds.
+
+    For vec5+ (and the flat matrix form) Warp builds the value from a braced
+    list and emits the matching adjoint as
+
+        adj_vec_t({v0, v1, ...}, {&adj_0, &adj_1, ...}, adj_ret)
+
+    taking ``initializer_array<N, T>`` and ``initializer_array<N, T*>``.
+    MSL has no initializer-list type and no way to spell an array of
+    pointers-to-thread-local here, so expand the call the way
+    ``warp/native/vec.h`` defines it — ``*adj_l[i] += adj_ret[i]`` — against
+    the duals named at the call site. Both the generated ``wp_vecN`` /
+    ``wp_matRxC`` structs and MSL's native vectors provide ``operator[]``,
+    so one form covers every width.
+
+    Wrapped in ``do { ... } while(0)`` so the statement's own trailing
+    semicolon stays valid.
+    """
+
+    def repl(m: re.Match[str]) -> str:
+        duals = [d.strip() for d in m.group("duals").split(",") if d.strip()]
+        vals = [v.strip() for v in m.group("vals").split(",") if v.strip()]
+        if not duals or len(duals) != len(vals):
+            return m.group(0)
+        ret = m.group("ret").strip()
+        adds = []
+        for i, d in enumerate(duals):
+            # entries are ``&adj_X`` (address-of a thread local)
+            name = d[1:].strip() if d.startswith("&") else d
+            if not name.isidentifier():
+                return m.group(0)
+            adds.append(f"{name} += {ret}[{i}];")
+        return "do { " + " ".join(adds) + " } while(0)"
+
+    return _ADJ_INIT_LIST_PAT.sub(repl, text)
 
 
 def _rewrite_mat_t_constructor(text: str) -> str:
@@ -10448,13 +10842,43 @@ def _generate_msl_kernel_uncached(
     for raw in forward_lines:
         for m in _quat_decl_pat.finditer(raw):
             quat_var_labels.add(m.group(1))
+
+    # ---- Transform-typed locals ---------------------------------------
+    # Exactly the same type-erasure hazard, one level up. A transform is
+    # ``vec_t<7>``/``wp_vec7_float`` here, and ``wp::mul`` on two of them is
+    # rigid composition (rotate-then-translate, Hamilton product on the
+    # rotation) — but ``wp_vec7_float`` has an ``operator*`` from the big-vec
+    # struct machinery, so the generic ``wp::mul`` -> ``(a * b)`` lowering
+    # compiles happily and multiplies the 7 stored scalars pairwise. That is
+    # a wrong answer with no diagnostic, so route these to
+    # ``wp_transform_multiply`` the way quats go to ``wp_quat_mul``.
+    transform_var_labels: set[str] = set()
+    for var in adj.variables:
+        if getattr(var.type, "_wp_generic_type_str_", None) == "transform_t":
+            transform_var_labels.add(var.label)
+    for arg in adj.args:
+        if getattr(arg.type, "_wp_generic_type_str_", None) == "transform_t":
+            transform_var_labels.add(arg.label)
+    _transform_decl_pat = re.compile(r"wp::transform_t\s*<\s*wp::\w+\s*>\s+var_(\w+)")
+    for raw in forward_lines:
+        for m in _transform_decl_pat.finditer(raw):
+            transform_var_labels.add(m.group(1))
+
     _quat_mul_call_pat = re.compile(r"wp::mul\s*\(\s*var_(\w+)\s*,\s*var_(\w+)\s*\)")
     _quat_normalize_call_pat = re.compile(r"wp::normalize\s*\(\s*var_(\w+)\s*\)")
+    # Reverse-mode counterparts. ``adj_mul(a, b, adj_a, adj_b, adj_ret)`` and
+    # ``adj_normalize(q, adj_q, adj_ret)`` are matched on their *primal*
+    # leading operands only — the duals that follow are ``adj_<label>``
+    # tokens, not ``var_<label>``, so they can't be confused for operands.
+    _quat_adj_mul_call_pat = re.compile(r"wp::adj_mul\s*\(\s*var_(\w+)\s*,\s*var_(\w+)\s*,")
+    _quat_adj_normalize_call_pat = re.compile(r"wp::adj_normalize\s*\(\s*var_(\w+)\s*,")
 
     def _rewrite_quat_mul(text: str) -> str:
         def repl(m: re.Match[str]) -> str:
             if m.group(1) in quat_var_labels and m.group(2) in quat_var_labels:
                 return f"wp_quat_mul(var_{m.group(1)}, var_{m.group(2)})"
+            if m.group(1) in transform_var_labels and m.group(2) in transform_var_labels:
+                return f"wp_transform_multiply(var_{m.group(1)}, var_{m.group(2)})"
             return m.group(0)
 
         text = _quat_mul_call_pat.sub(repl, text)
@@ -10469,7 +10893,30 @@ def _generate_msl_kernel_uncached(
                 return f"wp_quat_normalize(var_{m.group(1)})"
             return m.group(0)
 
-        return _quat_normalize_call_pat.sub(repl_normalize, text)
+        text = _quat_normalize_call_pat.sub(repl_normalize, text)
+
+        # The adjoints carry the identical hazard, and worse: unlike the
+        # forward case a wrong dispatch here would compile and return a
+        # plausible-looking gradient. ``wp_adj_mul(float4, float4, ...)``
+        # and the 3-arity ``wp_adj_normalize(float4, ...)`` are therefore
+        # left undefined, so anything this pass fails to route trips
+        # ``_check_no_unsupported_intrinsics`` or an MSL overload error
+        # instead of silently using the component-wise rule.
+        def repl_adj_mul(m: re.Match[str]) -> str:
+            if m.group(1) in quat_var_labels and m.group(2) in quat_var_labels:
+                return f"wp_adj_quat_mul(var_{m.group(1)}, var_{m.group(2)},"
+            if m.group(1) in transform_var_labels and m.group(2) in transform_var_labels:
+                return f"wp_adj_transform_multiply(var_{m.group(1)}, var_{m.group(2)},"
+            return m.group(0)
+
+        text = _quat_adj_mul_call_pat.sub(repl_adj_mul, text)
+
+        def repl_adj_normalize(m: re.Match[str]) -> str:
+            if m.group(1) in quat_var_labels:
+                return f"wp_adj_quat_normalize(var_{m.group(1)},"
+            return m.group(0)
+
+        return _quat_adj_normalize_call_pat.sub(repl_adj_normalize, text)
 
     # Subscript substitution table keyed by the full ``var_<label>`` token.
     # ``subscript_map`` is fully populated by the pre-passes above, so one
@@ -10526,6 +10973,10 @@ def _generate_msl_kernel_uncached(
         # subscript inlining rewrites the ``var_X`` operand names the
         # type lookup keys on.
         translated = _rewrite_quat_mul(translated)
+        # The ``initializer_array`` constructor adjoint has no MSL callable
+        # form at all, so expand it before the generic rename below turns it
+        # into a ``wp_adj_vec_t`` call with no viable overload.
+        translated = _rewrite_adj_init_list_constructor(translated)
         # Reverse-mode builtin calls (``wp::adj_mul`` -> ``wp_adj_mul``).
         # Only the operand names still need substituting after this, and
         # the adjoint operands are plain locals, so order is free. This runs
@@ -11196,6 +11647,49 @@ def _generate_msl_kernel_uncached(
                 b_local = _per_field_local(src_b, fpath)
                 body_lines.append(_finalize(f"{indent}{dst_local} = ({cond}) ? {a_local} : {b_local};"))
             continue
+        # Reverse of the above. ``adj_where(cond, a, b, adj_cond, adj_a,
+        # adj_b, adj_ret)`` is ``if (cond) adj_a += adj_ret; else adj_b +=
+        # adj_ret;`` upstream (``warp/native/builtin.h``). With struct
+        # operands there is no whole-struct dual to accumulate, so expand
+        # into one guarded accumulation per scalar leaf. The condition is
+        # re-read here rather than saved: it is a primal local that the
+        # replay has already restored, which is the same value the forward
+        # ternary selected on.
+        m_adj_struct_where = re.match(r"^(?P<indent>\s*)wp::adj_where\s*\((?P<args>.*)\)\s*;\s*$", raw)
+        if m_adj_struct_where:
+            _aw_args = [a.strip() for a in _split_top_level_args(m_adj_struct_where.group("args"))]
+            _aw_roots = [a[4:] if a.startswith("var_") else (a[4:] if a.startswith("adj_") else None) for a in _aw_args]
+            if (
+                len(_aw_args) == 7
+                and _aw_args[1].startswith("var_")
+                and _aw_args[2].startswith("var_")
+                and _aw_args[5].startswith("adj_")
+                and _aw_args[6].startswith("adj_")
+                and _aw_roots[1] in struct_dual_layouts
+                and _aw_roots[2] in struct_dual_layouts
+                and _aw_roots[6] in struct_dual_layouts
+            ):
+                indent = m_adj_struct_where.group("indent")
+                cond = _aw_args[0]
+                a_root, b_root, ret_root = _aw_roots[1], _aw_roots[2], _aw_roots[6]
+                ret_leaves = {p for p, _o, _f in _iter_scalar_leaves(struct_dual_layouts[ret_root])}
+                a_leaves = {p for p, _o, _f in _iter_scalar_leaves(struct_dual_layouts[a_root])}
+                b_leaves = {p for p, _o, _f in _iter_scalar_leaves(struct_dual_layouts[b_root])}
+                then_lines = [
+                    f"{indent}    {_per_field_dual(a_root, p)} += {_per_field_dual(ret_root, p)};"
+                    for p in sorted(ret_leaves & a_leaves)
+                ]
+                else_lines = [
+                    f"{indent}    {_per_field_dual(b_root, p)} += {_per_field_dual(ret_root, p)};"
+                    for p in sorted(ret_leaves & b_leaves)
+                ]
+                if then_lines or else_lines:
+                    body_lines.append(f"{indent}if ({cond}) {{")
+                    body_lines.extend(then_lines)
+                    body_lines.append(f"{indent}}} else {{")
+                    body_lines.extend(else_lines)
+                    body_lines.append(f"{indent}}}")
+                continue
         # Whole-struct load from flat float32 storage into a struct value
         # local: ``t = items[i]`` / ``t = o.inner`` lowers to
         # ``var_X = wp::load(var_ptr);`` where ``var_ptr`` points into a
