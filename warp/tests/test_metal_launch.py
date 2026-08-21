@@ -4753,6 +4753,56 @@ class TestMetalTransformBuiltins(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet)
 
+    def test_transform_operator_multiply_composes(self):
+        """``a * b`` on transforms must compose, not multiply the 7 scalars.
+
+        A transform is ``wp_vec7_float`` here and that struct has an
+        ``operator*``, so the generic ``wp::mul`` lowering used to compile
+        into a component-wise product — a wrong answer with no diagnostic.
+        The component-wise result is asserted against explicitly so this
+        cannot pass by coincidence.
+        """
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            @wp.kernel
+            def k(a: wp.array(dtype=wp.transform), b: wp.array(dtype=wp.transform),
+                  out_op: wp.array(dtype=wp.transform), out_fn: wp.array(dtype=wp.transform)):
+                tid = wp.tid()
+                out_op[tid] = a[tid] * b[tid]
+                out_fn[tid] = wp.transform_multiply(a[tid], b[tid])
+
+            N = 16
+            rng = np.random.default_rng(11)
+            an = rng.standard_normal((N, 7)).astype(np.float32)
+            bn = rng.standard_normal((N, 7)).astype(np.float32)
+            an[:, 3:] /= np.linalg.norm(an[:, 3:], axis=1, keepdims=True)
+            bn[:, 3:] /= np.linalg.norm(bn[:, 3:], axis=1, keepdims=True)
+
+            outs = {}
+            for dev in ('cpu', 'metal:0'):
+                out_op = wp.zeros(N, dtype=wp.transform, device=dev)
+                out_fn = wp.zeros(N, dtype=wp.transform, device=dev)
+                wp.launch(k, dim=N,
+                          inputs=[wp.array(an, dtype=wp.transform, device=dev),
+                                  wp.array(bn, dtype=wp.transform, device=dev)],
+                          outputs=[out_op, out_fn], device=dev)
+                outs[dev] = (out_op.numpy().copy(), out_fn.numpy().copy())
+
+            # the operator and function forms must agree, on both backends
+            np.testing.assert_allclose(outs['metal:0'][0], outs['metal:0'][1], rtol=1e-5, atol=1e-5)
+            np.testing.assert_allclose(outs['metal:0'][0], outs['cpu'][0], rtol=1e-5, atol=1e-5)
+
+            # and must NOT be the component-wise product of the stored scalars
+            cw = an * bn
+            assert not np.allclose(outs['metal:0'][0], cw, atol=1e-4), (
+                "transform * transform returned the component-wise product")
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
 
 @unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
 @unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
@@ -10526,6 +10576,283 @@ class TestMetalAdjoint(unittest.TestCase):
                 assert 'not supported' in msg, msg
             else:
                 raise AssertionError('adjoint of tile_fft should have raised')
+            """
+        )
+        _run_with_metal_native(self, snippet)
+
+    def test_big_vec_struct_adjoints_match_cpu(self):
+        """Reverse mode through the generated ``wp_vecN`` POD structs.
+
+        warp.fem's scalar function spaces produce ``vec1`` dof values, so the
+        generic adjoint templates get instantiated on a struct rather than an
+        MSL native vector — which needs the compound-assignment operators and
+        the shape-specific constructor / extract adjoints. ``vec5`` also
+        covers the ``initializer_array`` constructor adjoint, which has no
+        callable MSL form and is expanded at codegen time.
+        """
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            vec1 = wp.types.vector(1, wp.float32)
+            vec5 = wp.types.vector(5, wp.float32)
+
+            @wp.kernel
+            def k_add(x: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
+                c = vec1(x[0]) + vec1(x[1])
+                out[0] = c[0] * 2.0
+
+            @wp.kernel
+            def k_scale(x: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
+                c = (vec1(x[0]) - vec1(x[1])) * 3.0
+                out[0] = c[0]
+
+            @wp.kernel
+            def k_copy(x: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
+                b = vec1(vec1(x[0] * 2.0))
+                out[0] = b[0] * b[0]
+
+            @wp.kernel
+            def k_accum(x: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
+                acc = vec1(0.0)
+                for i in range(4):
+                    acc = acc + vec1(x[i] * float(i + 1))
+                out[0] = acc[0]
+
+            @wp.kernel
+            def k_where(x: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
+                c = wp.where(x[2] > 0.0, vec1(x[0]), vec1(x[1]))
+                out[0] = c[0] * 5.0
+
+            @wp.kernel
+            def k_dot(x: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
+                out[0] = wp.dot(vec1(x[0]), vec1(x[1]))
+
+            @wp.kernel
+            def k_vec5(x: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
+                a = vec5(x[0], x[1], x[2], x[3], x[4])
+                b = a + a
+                out[0] = b[0] + 2.0 * b[2] + 3.0 * b[4]
+
+            kernels = [('add', k_add), ('scale', k_scale), ('copy_ctor', k_copy),
+                       ('loop_accum', k_accum), ('where', k_where), ('dot', k_dot),
+                       ('vec5_initlist', k_vec5)]
+
+            x_np = np.array([1.5, -0.75, 2.25, 0.5, -1.25], dtype=np.float32)
+
+            def run(kernel, dev):
+                x = wp.array(x_np, dtype=wp.float32, device=dev, requires_grad=True)
+                out = wp.zeros(1, dtype=wp.float32, device=dev, requires_grad=True)
+                tape = wp.Tape()
+                with tape:
+                    wp.launch(kernel, dim=1, inputs=[x, out], device=dev)
+                tape.backward(loss=out)
+                wp.synchronize_device(dev)
+                return out.numpy().copy(), x.grad.numpy().copy()
+
+            for name, kernel in kernels:
+                f_c, g_c = run(kernel, 'cpu')
+                assert np.abs(g_c).max() > 0, name + ': CPU grad is all zero'
+                f_m, g_m = run(kernel, 'metal:0')
+                np.testing.assert_allclose(f_m, f_c, rtol=1e-5, atol=1e-6, err_msg=name + ' value')
+                np.testing.assert_allclose(g_m, g_c, rtol=1e-5, atol=1e-6, err_msg=name + ' grad')
+            """
+        )
+        _run_with_metal_native(self, snippet)
+
+    def test_struct_where_adjoint_matches_cpu(self):
+        """``wp.where`` on struct values, in reverse mode.
+
+        Struct values are split into per-field locals on Metal, so there is no
+        whole-struct dual for the generic ``adj_where`` to accumulate into and
+        the call has to be expanded per scalar leaf under the original
+        condition. warp.fem's ``interpolate_at_nodes`` reaches this when it
+        merges a struct across an early return.
+
+        Note this case does NOT assert a non-zero reference gradient:
+        ``wp.where`` on a struct is a gradient **sink in Warp itself** (the
+        CPU backend never populates the result struct's dual, so its
+        ``adj_a += adj_ret`` is a no-op). Matching the reference is the
+        contract, so what is pinned here is that the kernel compiles, the
+        forward value is right, and Metal agrees with CPU — including
+        agreeing that the gradient is zero. Both branches are still taken so
+        a lowering that wrote outside the guard would show up as a
+        divergence, and the two float branches would expose a non-zero
+        gradient the day Warp starts propagating one.
+        """
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            @wp.struct
+            class Pair:
+                a: wp.float32
+                b: wp.vec2f
+
+            @wp.func
+            def pick(flag: wp.float32, p: wp.float32, q: wp.float32):
+                u = Pair()
+                u.a = p * 2.0
+                u.b = wp.vec2f(p, q)
+                v = Pair()
+                v.a = q * 3.0
+                v.b = wp.vec2f(q, p)
+                r = wp.where(flag > 0.0, u, v)
+                return r.a + r.b[0] * 5.0 + r.b[1] * 7.0
+
+            @wp.kernel
+            def k(flag: wp.array(dtype=wp.float32), x: wp.array(dtype=wp.float32),
+                  out: wp.array(dtype=wp.float32)):
+                i = wp.tid()
+                out[i] = pick(flag[i], x[2 * i], x[2 * i + 1])
+
+            n = 2  # i=0 takes the true branch, i=1 the false branch
+            flag_np = np.array([1.0, -1.0], dtype=np.float32)
+            x_np = np.array([1.5, -0.75, 2.25, 0.5], dtype=np.float32)
+
+            got = {}
+            for dev in ('cpu', 'metal:0'):
+                flag = wp.array(flag_np, device=dev)
+                x = wp.array(x_np, device=dev, requires_grad=True)
+                out = wp.zeros(n, dtype=wp.float32, device=dev, requires_grad=True)
+                tape = wp.Tape()
+                with tape:
+                    wp.launch(k, dim=n, inputs=[flag, x], outputs=[out], device=dev)
+                out.grad = wp.array(np.ones(n, np.float32), device=dev)
+                tape.backward()
+                wp.synchronize_device(dev)
+                got[dev] = (out.numpy().copy(), x.grad.numpy().copy())
+
+            # forward must be non-trivial and correct on both branches
+            expected = np.array([1.5 * 2.0 + 1.5 * 5.0 + -0.75 * 7.0,
+                                 0.5 * 3.0 + 0.5 * 5.0 + 2.25 * 7.0], dtype=np.float32)
+            np.testing.assert_allclose(got['cpu'][0], expected, rtol=1e-5, atol=1e-6)
+            np.testing.assert_allclose(got['metal:0'][0], got['cpu'][0], rtol=1e-5, atol=1e-6)
+            np.testing.assert_allclose(got['metal:0'][1], got['cpu'][1], rtol=1e-5, atol=1e-6)
+            """
+        )
+        _run_with_metal_native(self, snippet)
+
+    def test_quat_transform_adjoints_match_cpu(self):
+        """Reverse mode through the quat / rigid-transform family.
+
+        Covers the operations ``optim/example_diffray`` differentiates:
+        ``quat_rotate``, the quat Hamilton product and normalize, and
+        ``transform_point`` / ``transform_vector`` / ``transform_inverse`` /
+        ``transform_multiply``. Each case asserts the CPU reference gradient
+        is non-zero, so a dead adjoint cannot pass by matching zeros.
+        """
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            @wp.kernel
+            def k_rotate(q: wp.array(dtype=wp.quatf), x: wp.array(dtype=wp.vec3),
+                         out: wp.array(dtype=wp.float32)):
+                r = wp.quat_rotate(q[0], x[0])
+                wp.atomic_add(out, 0, r[0] + 2.0 * r[1] + 3.0 * r[2])
+
+            @wp.kernel
+            def k_rotate_inv(q: wp.array(dtype=wp.quatf), x: wp.array(dtype=wp.vec3),
+                             out: wp.array(dtype=wp.float32)):
+                r = wp.quat_rotate_inv(q[0], x[0])
+                wp.atomic_add(out, 0, r[0] + 2.0 * r[1] + 3.0 * r[2])
+
+            @wp.kernel
+            def k_inverse(q: wp.array(dtype=wp.quatf), x: wp.array(dtype=wp.vec3),
+                          out: wp.array(dtype=wp.float32)):
+                r = wp.quat_rotate(wp.quat_inverse(q[0]), x[0])
+                wp.atomic_add(out, 0, r[0] + 2.0 * r[1] + 3.0 * r[2])
+
+            # Hamilton product: must not use the component-wise vec4 rule.
+            @wp.kernel
+            def k_quat_mul(q: wp.array(dtype=wp.quatf), x: wp.array(dtype=wp.vec3),
+                           out: wp.array(dtype=wp.float32)):
+                b = wp.quat(x[0][0], x[0][1], x[0][2], 0.5)
+                r = wp.quat_rotate(q[0] * b, wp.vec3(1.0, 2.0, -0.5))
+                wp.atomic_add(out, 0, r[0] + 2.0 * r[1] + 3.0 * r[2])
+
+            # quat normalize has its own 3-arity adjoint (a zero-length quat
+            # normalizes to identity, unlike a vec4).
+            @wp.kernel
+            def k_quat_norm(q: wp.array(dtype=wp.quatf), x: wp.array(dtype=wp.vec3),
+                            out: wp.array(dtype=wp.float32)):
+                b = wp.quat(x[0][0], x[0][1], x[0][2], 0.5)
+                r = wp.quat_rotate(wp.normalize(q[0] * b), wp.vec3(1.0, 2.0, -0.5))
+                wp.atomic_add(out, 0, r[0] + 2.0 * r[1] + 3.0 * r[2])
+
+            @wp.kernel
+            def k_tf_vector(q: wp.array(dtype=wp.quatf), x: wp.array(dtype=wp.vec3),
+                            out: wp.array(dtype=wp.float32)):
+                t = wp.transform(wp.vec3(0.5, -1.5, 2.0), q[0])
+                r = wp.transform_vector(t, x[0])
+                wp.atomic_add(out, 0, r[0] + 2.0 * r[1] + 3.0 * r[2])
+
+            @wp.kernel
+            def k_tf_point(q: wp.array(dtype=wp.quatf), x: wp.array(dtype=wp.vec3),
+                           out: wp.array(dtype=wp.float32)):
+                r = wp.transform_point(wp.transform(x[0], q[0]), wp.vec3(1.0, 2.0, -0.5))
+                wp.atomic_add(out, 0, r[0] + 2.0 * r[1] + 3.0 * r[2])
+
+            @wp.kernel
+            def k_tf_inverse(q: wp.array(dtype=wp.quatf), x: wp.array(dtype=wp.vec3),
+                             out: wp.array(dtype=wp.float32)):
+                inv = wp.transform_inverse(wp.transform(x[0], q[0]))
+                r = wp.transform_point(inv, wp.vec3(1.0, 2.0, -0.5))
+                wp.atomic_add(out, 0, r[0] + 2.0 * r[1] + 3.0 * r[2])
+
+            @wp.kernel
+            def k_tf_multiply(q: wp.array(dtype=wp.quatf), x: wp.array(dtype=wp.vec3),
+                              out: wp.array(dtype=wp.float32)):
+                a = wp.transform(x[0], q[0])
+                b = wp.transform(wp.vec3(0.25, 0.5, -0.75), wp.quat_identity())
+                r = wp.transform_point(a * b, wp.vec3(1.0, 2.0, -0.5))
+                wp.atomic_add(out, 0, r[0] + 2.0 * r[1] + 3.0 * r[2])
+
+            # example_diffray's shape: a world ray transformed into mesh space
+            # through the inverse of a transform built from arrays.
+            @wp.kernel
+            def k_diffray(q: wp.array(dtype=wp.quatf), x: wp.array(dtype=wp.vec3),
+                          out: wp.array(dtype=wp.float32)):
+                rd_world = wp.normalize(wp.quat_rotate(q[0], wp.vec3(0.3, -0.4, -1.0)))
+                inv = wp.transform_inverse(wp.transform(x[0], q[0]))
+                ro = wp.transform_point(inv, wp.vec3(0.0, 1.0, 5.0))
+                rd = wp.transform_vector(inv, rd_world)
+                wp.atomic_add(out, 0, wp.dot(ro, wp.vec3(1.0, 2.0, 3.0))
+                                      + wp.dot(rd, wp.vec3(-1.0, 0.5, 2.0)))
+
+            kernels = [
+                ('quat_rotate', k_rotate), ('quat_rotate_inv', k_rotate_inv),
+                ('quat_inverse', k_inverse), ('quat_mul', k_quat_mul),
+                ('quat_normalize', k_quat_norm), ('transform_vector', k_tf_vector),
+                ('transform_point', k_tf_point), ('transform_inverse', k_tf_inverse),
+                ('transform_multiply', k_tf_multiply), ('diffray', k_diffray),
+            ]
+
+            q_np = np.array([[0.2, -0.3, 0.5, 0.78]], dtype=np.float32)
+            q_np /= np.linalg.norm(q_np)
+            x_np = np.array([[1.5, -0.5, 2.25]], dtype=np.float32)
+
+            def run(kernel, dev):
+                q = wp.array(q_np, dtype=wp.quatf, device=dev, requires_grad=True)
+                x = wp.array(x_np, dtype=wp.vec3, device=dev, requires_grad=True)
+                out = wp.zeros(1, dtype=wp.float32, device=dev, requires_grad=True)
+                tape = wp.Tape()
+                with tape:
+                    wp.launch(kernel, dim=1, inputs=[q, x, out], device=dev)
+                tape.backward(loss=out)
+                wp.synchronize_device(dev)
+                return q.grad.numpy().copy(), x.grad.numpy().copy()
+
+            for name, kernel in kernels:
+                gq_c, gx_c = run(kernel, 'cpu')
+                assert np.abs(gq_c).max() > 0, name + ': CPU quat grad is all zero'
+                assert np.abs(gx_c).max() > 0, name + ': CPU vec grad is all zero'
+                gq_m, gx_m = run(kernel, 'metal:0')
+                np.testing.assert_allclose(gq_m, gq_c, rtol=2e-5, atol=2e-6,
+                                           err_msg=name + ' quat grad')
+                np.testing.assert_allclose(gx_m, gx_c, rtol=2e-5, atol=2e-6,
+                                           err_msg=name + ' vec grad')
             """
         )
         _run_with_metal_native(self, snippet)

@@ -58,6 +58,13 @@
   including from a nested loop and from several places in one loop body. Adjoints are now available for in-place
   element writes on vectors and matrices (`v[i] += s`, `m[i, j] -= s`), and gradients now flow through a sliced
   view of an array (`row = arr[i]`) and through reads of an array's `shape`.
+- Extend reverse-mode differentiation on Metal devices to quaternions and rigid transforms: `wp.quat_rotate()`,
+  `wp.quat_rotate_inv()`, `wp.quat_inverse()`, the quaternion product and `wp.normalize()`, `wp.transform_point()`,
+  `wp.transform_vector()`, `wp.transform_multiply()`, `wp.transform_inverse()`, and the `wp.quat()` /
+  `wp.transform()` constructors.
+- Extend reverse-mode differentiation on Metal devices to vectors of widths MSL has no native type for
+  (`wp.vec1`, `wp.vec5`, `wp.spatial_vector`, ...), which `warp.fem`'s scalar function spaces produce, and to
+  `wp.where()` on struct values.
 
 ### Fixed
 
@@ -108,6 +115,10 @@
   outside its extents. Non-contiguous array arguments are now rejected on Metal (the backend derives flat
   indices from an array's shape, so a strided or broadcast view would be read at the wrong offsets), and
   `wp.copy()` of a non-contiguous Metal array no longer reads stale data.
+- Fix `transform * transform` on Metal returning the component-wise product of the seven stored scalars instead of
+  composing the two transforms. A transform lowers to a struct that has an `operator*`, so the generic multiply
+  lowering compiled and produced a plausible-looking wrong answer with no diagnostic.
+  `wp.transform_multiply()` was unaffected.
 
 ## [1.18.0] - 2026-10-05
 
