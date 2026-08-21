@@ -137,6 +137,15 @@ import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from warp._src.codegen_metal_ast import Assign as _AstAssign
+from warp._src.codegen_metal_ast import Builtin as _AstBuiltin
+from warp._src.codegen_metal_ast import For as _AstFor
+from warp._src.codegen_metal_ast import If as _AstIf
+from warp._src.codegen_metal_ast import UserCall as _AstUserCall
+from warp._src.codegen_metal_ast import While as _AstWhile
+from warp._src.codegen_metal_ast import _build_function_overload_table as _ast_fn_overload_table
+from warp._src.codegen_metal_ast import _DoWhileZero as _AstDoWhileZero
+from warp._src.codegen_metal_ast import _RawLine as _AstRawLine
 from warp._src.codegen_metal_ast import assemble_adjoint_body as _ast_assemble_adjoint_body
 from warp._src.codegen_metal_ast import emit as _ast_emit
 from warp._src.codegen_metal_ast import fold as _ast_fold
@@ -9184,14 +9193,18 @@ def _translate_tile_intrinsics(
 
 
 # ---------------------------------------------------------------------------
-# Hand-written MSL definitions for mujoco_warp ``@wp.func`` helpers
-# that are referenced by ``wp::tile_map`` (which passes them by name —
-# the AST inliner only walks DIRECT calls, so functions passed by
-# reference don't get inlined and the body is left as an unresolved
-# call). The proper fix is a full user-function-emit pipeline that
-# mirrors ``generate_msl_kernel`` for ``@wp.func`` bodies; these
-# hand-emitted entries are a stop-gap to unblock the dense-Jacobian
-# path on Metal until that arrives.
+# FALLBACK hand-written MSL definitions for mujoco_warp ``@wp.func`` helpers
+# referenced by ``wp::tile_map``.
+#
+# ``_expand_user_tile_map`` now rewrites a user-function ``tile_map`` into an
+# element loop holding a direct call BEFORE the inliner runs, so these names
+# normally never reach the flat lowering and nothing here is emitted. They
+# remain as a safety net for the cases that expansion declines (a tile whose
+# shape or element type it cannot read), where the flat path still emits a
+# bare call that would otherwise be an undeclared identifier.
+#
+# Being name-keyed, this table only ever covered these four helpers; the
+# expansion is what generalises to any mapped ``@wp.func``.
 # ---------------------------------------------------------------------------
 _USER_FUNC_MSL_DEFS: dict[str, str] = {
     # mujoco_warp/_src/support.py:_compute_jacp
@@ -9236,6 +9249,218 @@ def _emit_referenced_user_funcs(source: str) -> str:
     if not seen:
         return ""
     return "\n".join(_USER_FUNC_MSL_DEFS[n] for n in sorted(seen)) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# ``tile_map`` with a user ``@wp.func``
+# ---------------------------------------------------------------------------
+# ``wp.tile_map(fn, ...)`` passes ``fn`` by NAME, so the AST inliner — which
+# only walks DIRECT call sites — never splices its body and the flat
+# lowering emits a call to a function nothing ever defines (``use of
+# undeclared identifier 'walk_0'``).
+#
+# This pass runs BEFORE the inliner and rewrites the map into the element
+# loop the flat lowering would have produced, except that the per-element
+# call is a real ``UserCall`` node. The inliner then splices the body once,
+# inside the loop, and everything downstream (return-inside-loop lowering,
+# by-value param copies, nested ``@wp.func`` calls, mesh queries) comes for
+# free. It supersedes ``_USER_FUNC_MSL_DEFS``, which only ever covered four
+# hand-transcribed mujoco_warp helpers by name.
+_TILE_MAP_BUILTIN_NAMES = frozenset({"tile_map", "tile_binary_map"})
+
+_TILE_MAP_EXPAND_SEQ = [0]
+
+_BARE_VAR_PAT = re.compile(r"^var_(\w+)$")
+
+
+def _next_tile_map_id() -> int:
+    _TILE_MAP_EXPAND_SEQ[0] += 1
+    return _TILE_MAP_EXPAND_SEQ[0]
+
+
+def _tile_elem_read(tile_label: str, idx_expr: str, elem_ctype: str) -> str | None:
+    """Per-element read of a serial-model tile local, or None if the element
+    type isn't expressible.
+
+    Serial tiles are ``wp_tile_RxC_<scalar>`` structs holding a flat ``c[]``,
+    so element ``i`` of a scalar tile is ``c[i]`` and element ``i`` of a
+    vec-element tile is the ``vec_n`` consecutive scalars at ``i * vec_n``
+    — the same layout the flat ``repl_tile_map_notpl`` lowering reads.
+    """
+    if elem_ctype in _SCALAR_CTYPE_TO_MSL:
+        return f"var_{tile_label}.c[{idx_expr}]"
+    v = _vec_dtype_inner(elem_ctype)
+    if v is None:
+        return None
+    vec_n, inner_ctype = v
+    msl_scalar = _SCALAR_CTYPE_TO_MSL.get(inner_ctype)
+    if msl_scalar is None:
+        return None
+    comps = [f"var_{tile_label}.c[({idx_expr}) * {vec_n} + {k}]" for k in range(vec_n)]
+    return f"{_msl_vec_ctor(vec_n, msl_scalar)}({', '.join(comps)})"
+
+
+def _tile_elem_write(tile_label: str, idx_expr: str, elem_ctype: str, value: str) -> list[str] | None:
+    """Statements storing ``value`` into element ``idx_expr`` of a tile local."""
+    if elem_ctype in _SCALAR_CTYPE_TO_MSL:
+        return [f"var_{tile_label}.c[{idx_expr}] = {value};"]
+    v = _vec_dtype_inner(elem_ctype)
+    if v is None:
+        return None
+    vec_n, inner_ctype = v
+    if inner_ctype not in _SCALAR_CTYPE_TO_MSL:
+        return None
+    return [f"var_{tile_label}.c[({idx_expr}) * {vec_n} + {k}] = {value}[{k}];" for k in range(vec_n)]
+
+
+def _expand_user_tile_map(nodes: list, adj, tile_info: dict[str, tuple[str, int, int]]) -> tuple[list, dict[str, str]]:
+    """Rewrite ``var_R = wp::tile_map(<user fn>, args...)`` into an element
+    loop wrapping a direct call.
+
+    ``tile_info`` maps a tile local's label to ``(element ctype, rows, cols)``.
+    Returns ``(nodes, extra_var_types)``; the second value types the synthetic
+    temporaries so the inliner's overload selection can discriminate a
+    generic ``@wp.func`` by argument type instead of silently taking
+    ``overloads[0]``.
+
+    Anything not recognised is left untouched for the flat lowering: a
+    ``wp::`` builtin op, an unresolvable function name, an element type we
+    can't express, or a tile whose shape we couldn't read.
+    """
+    fn_map = _ast_fn_overload_table(adj)
+    if not fn_map:
+        return nodes, {}
+    extra_var_types: dict[str, str] = {}
+
+    def try_expand(n) -> list | None:
+        if not (isinstance(n, _AstAssign) and isinstance(n.expr, _AstBuiltin)):
+            return None
+        if n.expr.name not in _TILE_MAP_BUILTIN_NAMES:
+            return None
+        args = [a.strip() for a in n.expr.args]
+        if len(args) < 2 or args[0] not in fn_map:
+            return None
+        fn_name, fn_args = args[0], args[1:]
+
+        res = tile_info.get(n.lhs)
+        if res is None:
+            return None
+        res_elem, res_rows, res_cols = res
+        n_elem = res_rows * res_cols
+
+        if n_elem == 1:
+            # A 1x1 tile collapses to a plain MSL value (see
+            # ``_msl_var_type``), so the map degenerates to a direct call on
+            # the args as-is — no indexing, no loop.
+            return [
+                _AstAssign(
+                    raw=n.raw,
+                    lhs=n.lhs,
+                    expr=_AstUserCall(
+                        raw=f"{fn_name}({', '.join(fn_args)})",
+                        name=fn_name,
+                        args=tuple(fn_args),
+                    ),
+                )
+            ]
+
+        uid = _next_tile_map_id()
+        idx_label = f"tm{uid}_i"
+        decls = [f"    int var_{idx_label} = 0;"]
+        reads: list = []
+        call_args: list[str] = []
+        for k, a in enumerate(fn_args):
+            m = _BARE_VAR_PAT.match(a)
+            info = tile_info.get(m.group(1)) if m else None
+            if info is None:
+                # Broadcast scalar (or any non-tile value) — pass verbatim.
+                call_args.append(a)
+                continue
+            a_elem = info[0]
+            acc = _tile_elem_read(m.group(1), f"var_{idx_label}", a_elem)
+            if acc is None:
+                return None
+            t_label = f"tm{uid}_a{k}"
+            t_msl = _msl_var_type(a_elem)
+            decls.append(f"    {t_msl} var_{t_label} = {_msl_zero_init(t_msl)};")
+            extra_var_types[t_label] = a_elem
+            reads.append(_AstRawLine(raw=f"var_{t_label} = {acc};"))
+            call_args.append(f"var_{t_label}")
+
+        r_label = f"tm{uid}_r"
+        r_msl = _msl_var_type(res_elem)
+        writes = _tile_elem_write(n.lhs, f"var_{idx_label}", res_elem, f"var_{r_label}")
+        if writes is None:
+            return None
+        decls.append(f"    {r_msl} var_{r_label} = {_msl_zero_init(r_msl)};")
+        extra_var_types[r_label] = res_elem
+
+        body = [
+            *reads,
+            _AstAssign(
+                raw=f"var_{r_label} = {fn_name}({', '.join(call_args)});",
+                lhs=r_label,
+                expr=_AstUserCall(
+                    raw=f"{fn_name}({', '.join(call_args)})",
+                    name=fn_name,
+                    args=tuple(call_args),
+                ),
+            ),
+            *[_AstRawLine(raw=w) for w in writes],
+        ]
+        return [
+            *[_AstRawLine(raw=d) for d in decls],
+            _AstFor(
+                raw="",
+                iter_var=idx_label,
+                # No ``wp::range_t`` backs this loop — the field is only read
+                # by the structural fold that creates For nodes from Warp's
+                # goto form, which has already run.
+                range_var="",
+                start="0",
+                stop=str(n_elem),
+                body=tuple(body),
+            ),
+        ]
+
+    def rewrite(ns: list) -> list:
+        out: list = []
+        for n in ns:
+            if isinstance(n, _AstIf):
+                out.append(
+                    _AstIf(
+                        raw=n.raw,
+                        cond=n.cond,
+                        body=tuple(rewrite(list(n.body))),
+                        raw_open=n.raw_open,
+                        raw_close=n.raw_close,
+                    )
+                )
+                continue
+            if isinstance(n, _AstFor):
+                out.append(
+                    _AstFor(
+                        raw=n.raw,
+                        iter_var=n.iter_var,
+                        range_var=n.range_var,
+                        start=n.start,
+                        stop=n.stop,
+                        body=tuple(rewrite(list(n.body))),
+                        step=n.step,
+                    )
+                )
+                continue
+            if isinstance(n, _AstWhile):
+                out.append(_AstWhile(raw=n.raw, label_k=n.label_k, body=tuple(rewrite(list(n.body)))))
+                continue
+            if isinstance(n, _AstDoWhileZero):
+                out.append(_AstDoWhileZero(raw=n.raw, body=tuple(rewrite(list(n.body)))))
+                continue
+            expanded = try_expand(n)
+            out.extend(expanded if expanded is not None else [n])
+        return out
+
+    return rewrite(nodes), extra_var_types
 
 
 # A tile adjoint that survived translation. These lose their ``wp::`` on the
@@ -9797,7 +10022,18 @@ def _generate_msl_kernel_uncached(
     # surfaces inlined int-constants and inlined struct locals so the
     # downstream slice-step recogniser and field-pointer pass can treat
     # them the same as kernel-level ones.
-    _ast_nodes, _inlined_const_ints, _inlined_struct_locals, _inlined_var_ctypes = _ast_inline(_ast_nodes, adj)
+    # ``wp.tile_map(user_fn, ...)`` passes its op by name, which the inliner
+    # cannot see — expand it into an element loop holding a direct call
+    # first, so the splice below covers the mapped function too.
+    _tile_elem_info: dict[str, tuple[str, int, int]] = {}
+    for _v in adj.variables:
+        _parsed = _parse_tile_ctype(_v.ctype())
+        if _parsed is not None:
+            _tile_elem_info[_v.label] = (_parsed[1], _parsed[2], _parsed[3])
+    _ast_nodes, _tile_map_var_types = _expand_user_tile_map(_ast_nodes, adj, _tile_elem_info)
+    _ast_nodes, _inlined_const_ints, _inlined_struct_locals, _inlined_var_ctypes = _ast_inline(
+        _ast_nodes, adj, extra_var_types=_tile_map_var_types
+    )
     # Drop statically-dead branches (geom-type constants baked by kernel
     # builders) BEFORE the view/field folds — dead mesh-only branches
     # reference array struct fields that are never assigned for the live
@@ -10262,9 +10498,17 @@ def _generate_msl_kernel_uncached(
     # Unlike ``@wp.struct`` locals they ARE materialised as real MSL structs
     # (their ctype is in ``_SCALAR_CTYPE_TO_MSL``), so field addresses alias
     # to plain member access on the local instead of per-field splitting.
+    # ``_inlined_var_ctypes`` matters as much as ``adj.variables``: a query
+    # struct constructed inside an inlined ``@wp.func`` body (warp's own
+    # ``wp.mesh_query_point`` wrappers, and any user helper that queries a
+    # mesh and returns a scalar) only exists under a mangled label, which
+    # ``adj.variables`` never carries. Missing it left the field-pointer
+    # lines unaliased, so ``q.result`` emitted as a raw ``device bool*``
+    # assigned straight into a ``bool`` — an MSL type error per field per
+    # call site.
     builtin_struct_locals: set[str] = {
         var.label for var in adj.variables if var.ctype() in _BUILTIN_FIELD_STRUCT_CTYPES
-    }
+    } | {label for label, ctype in _inlined_var_ctypes.items() if ctype in _BUILTIN_FIELD_STRUCT_CTYPES}
 
     def _per_field_local(struct_label: str, field_name: str) -> str:
         # Double underscore separates struct label from field name to avoid

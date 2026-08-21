@@ -77,12 +77,19 @@
   actionable error when missing ([GH-1339](https://github.com/NVIDIA/warp/issues/1339)).
 - Allow `launch_dims` to be specified when `enable_backward=True` in `warp.jax_experimental.jax_kernel()`
   ([GH-1380](https://github.com/NVIDIA/warp/issues/1380)).
+- Support `wp.tile_map()` with a user `@wp.func` on Metal devices, for scalar- and vector-element tiles. The
+  mapped function may itself call other `@wp.func`s, loop, and `return` from inside a loop.
 
 ### Fixed
 
 - Include Metal devices in `wp.get_devices()`, `wp.is_device_available()`, and the `wp.init()` device listing
   when `warp.config.enable_metal` is set. `wp.get_preferred_device()` now returns `metal:0` on builds without CUDA
   support when Metal is enabled.
+- Fix Metal codegen failing on a mesh query (`wp.mesh_query_point()`, `wp.mesh_query_ray()`) performed inside a
+  `@wp.func`, where reading a field of the returned query struct emitted a pointer where a value was expected.
+  The same query at kernel scope was unaffected.
+- Support reading a `wp.array` field of a struct kernel argument through a struct that was rebuilt from it and
+  nested inside another struct, which `warp.fem` does when evaluating a cell field on a side of the domain.
 - Fix an `AttributeError` when generating Metal kernels for modules whose globals reference a Warp built-in
   function by name, which affected `warp.fem` examples.
 - Fix Metal kernels silently truncating `wp.constant()` values declared with a Warp scalar type
