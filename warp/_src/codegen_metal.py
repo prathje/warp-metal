@@ -137,6 +137,7 @@ import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from warp._src.codegen_metal_ast import _STRUCT_DUAL_RESET_MARKER
 from warp._src.codegen_metal_ast import Assign as _AstAssign
 from warp._src.codegen_metal_ast import Builtin as _AstBuiltin
 from warp._src.codegen_metal_ast import For as _AstFor
@@ -1790,6 +1791,51 @@ _STRUCT_DUAL_ZERO_PAT = re.compile(
 _STRUCT_DUAL_ZERO = object()
 """Marker stored in ``_rewrite_adj_aggregate_init``'s type map for struct-typed
 labels, whose dual is a set of per-leaf locals rather than one MSL value."""
+
+
+def _expand_struct_dual_resets(lines: list[str], struct_dual_layouts: dict[str, _StructLayout]) -> list[str]:
+    """Replace each inliner marker with per-leaf struct-dual zero assignments.
+
+    ``_inline_one_adj_call`` emits ``// @@WP_METAL_RESET_STRUCT_DUALS <id>`` at
+    every inlined adjoint call site. Each is replaced by one assignment per
+    scalar leaf of every struct dual root belonging to that body — that is,
+    every root named ``<id>__<label>``.
+
+    The declarations themselves live in the kernel prologue and so are zeroed
+    only once. When the call site is inside a loop, the reverse sweep re-enters
+    the body per iteration and the leaves must start from zero each time, or
+    they accumulate (and chained struct duals compound). Expanding here rather
+    than in the inliner is deliberate: ``struct_dual_layouts`` is assembled
+    from struct args, struct locals, and struct pointer bases, so it is the
+    only complete list of roots.
+    """
+    marker = _STRUCT_DUAL_RESET_MARKER
+    if not any(marker in ln for ln in lines):
+        return lines
+    # Group roots by their inline-id prefix so each marker is O(its own body).
+    by_inline: dict[str, list[str]] = {}
+    for root, layout in struct_dual_layouts.items():
+        head, sep, _rest = root.partition("__")
+        if not sep:
+            continue
+        for field_path, _off, finfo in _iter_scalar_leaves(layout):
+            by_inline.setdefault(head, []).append(
+                f"{_per_field_dual(root, field_path)} = {_msl_zero_init(finfo.msl_type)};"
+            )
+    out: list[str] = []
+    for ln in lines:
+        idx = ln.find(marker)
+        if idx < 0:
+            out.append(ln)
+            continue
+        inline_id = ln[idx + len(marker) :].strip()
+        indent = ln[:idx]
+        resets = by_inline.get(inline_id, ())
+        if not resets:
+            # No struct duals in this body: drop the marker entirely.
+            continue
+        out.extend(f"{indent}{r}" for r in resets)
+    return out
 
 
 def _per_field_dual(struct_label: str, field_path: str) -> str:
@@ -10840,6 +10886,11 @@ def _generate_msl_kernel_uncached(
             for field_path, _off, field_info in _iter_scalar_leaves(layout):
                 dual_name = _per_field_dual(root, field_path)
                 body_lines.append(f"    {field_info.msl_type} {dual_name} = {_msl_zero_init(field_info.msl_type)};")
+        # Those declarations sit in the prologue and are therefore zeroed ONCE.
+        # An inlined adjoint body that runs inside a loop needs its own struct
+        # duals re-zeroed on every iteration, so the inliner marks each call
+        # site and we expand the marker here, where the full root set is known.
+        forward_lines = _expand_struct_dual_resets(forward_lines, struct_dual_layouts)
 
     # Roots that are ``wp.array``s rather than structs. Warp lowers the read
     # ``arr.shape[i]`` to a dual store ``adj_arr.shape = adj_N;`` — an array's
