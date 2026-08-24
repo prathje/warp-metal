@@ -2179,6 +2179,15 @@ def _ensure_func_backward_built(fn_overload) -> None:
     )
 
 
+# Placeholder line emitted at each inlined ADJOINT call site, expanded by
+# ``codegen_metal._expand_struct_dual_resets`` into one zero assignment per
+# scalar leaf of every struct dual belonging to that inlined body. Written as
+# a comment so that a build which somehow skips the expansion still compiles
+# (with the old, wrong accumulate-across-iterations behaviour) rather than
+# emitting a bare identifier.
+_STRUCT_DUAL_RESET_MARKER = "// @@WP_METAL_RESET_STRUCT_DUALS"
+
+
 def _inline_one_adj_call(
     fn_overload,
     caller_args: tuple[str, ...],
@@ -2331,12 +2340,33 @@ def _inline_one_adj_call(
     if n_labels is not None:
         decls.append(_RawLine(raw=f"    int {pc_var} = {n_labels};"))
     decls.extend(_RawLine(raw=line) for line in hop_decls)
+    # A struct-typed local has no single MSL dual: ``codegen_metal`` splits it
+    # into one local per scalar leaf and declares those in the kernel
+    # PROLOGUE, once. That is fine when the inlined body runs once, but this
+    # call site may sit inside a reverse loop — and then the leaves accumulate
+    # across iterations instead of starting from zero each time the callee's
+    # reverse body runs. Chained struct duals compound, so the error grows
+    # super-linearly in the trip count: warp.fem's ``fem.lookup`` builds a
+    # Sample from a Sample, and darcy's velocity gradient came out 1x/3x/14x/
+    # 99x too large at nodes touched by 1/2/4/8 elements (the loop's trip
+    # count is the node's incident-element count).
+    #
+    # Emit a marker rather than the resets themselves: only ``codegen_metal``
+    # knows the full set of per-leaf dual roots for this body (it builds them
+    # from several sources, not just ``adj.variables``), and it expands every
+    # root prefixed with this inline id. See ``_expand_struct_dual_resets``.
+    decls.append(_RawLine(raw=f"    {_STRUCT_DUAL_RESET_MARKER} {inline_id}"))
     fold_skip = replay_skip | reverse_skip
     for var in adj.variables:
         if var.label in param_set or var.label.startswith("ret_"):
             continue
         ctype = var.ctype()
         if ctype == "wp::range_t":
+            continue
+        if isinstance(var.type, Struct):
+            # Struct-typed locals get no dual declaration here: the kernel
+            # prologue declares one local per scalar leaf, and the marker
+            # emitted above re-zeroes them per entry to this body.
             continue
         try:
             msl_type = _msl_var_type(ctype)

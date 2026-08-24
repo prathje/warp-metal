@@ -10961,6 +10961,84 @@ class TestMetalAdjoint(unittest.TestCase):
         )
         _run_with_metal_native(self, snippet)
 
+    def test_struct_duals_rezeroed_per_loop_iteration(self):
+        """A struct-returning ``@wp.func`` differentiated inside a loop.
+
+        A struct-typed local of an inlined ``@wp.func`` has no single MSL
+        dual, so codegen splits it into one local per scalar leaf and
+        declares those in the kernel prologue — once. When the call site is
+        inside a loop, the reverse sweep re-enters the body per iteration and
+        the leaves must start from zero each time or they accumulate. Chained
+        struct duals compound, so the error grows super-linearly with the trip
+        count: this used to be 1x/3x/14x/99x too large at trip counts
+        1/2/4/8, which is exactly how ``fem/example_darcy_ls_optimization``
+        (whose ``fem.lookup`` builds a Sample from a Sample, inside a loop
+        over a node's incident elements) got a valence-dependent gradient
+        while still exiting 0.
+
+        The trip count is swept because at k=1 the bug is invisible.
+        """
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            @wp.struct
+            class Inner:
+                a: float
+                v: wp.vec3
+
+            @wp.struct
+            class Outer:
+                inner: Inner
+                scale: float
+
+            @wp.func
+            def make_inner(x: float):
+                return Inner(x * 2.0, wp.vec3(x, x * x, 1.0))
+
+            @wp.func
+            def make_outer(x: float):
+                # Nested: a struct built from another struct, which is what
+                # makes the duals chain and the error compound.
+                return Outer(make_inner(x), x + 0.5)
+
+            @wp.func
+            def use_structs(x: float):
+                o = make_outer(x)
+                return o.inner.a + o.inner.v[0] + o.inner.v[1] * 0.5 + o.scale
+
+            @wp.kernel
+            def k_loop(n: wp.array(dtype=int), x: wp.array(dtype=float),
+                       out: wp.array(dtype=float)):
+                i = wp.tid()
+                acc = float(0.0)
+                for j in range(n[i]):
+                    acc += use_structs(x[i]) * float(j + 1)
+                out[i] = acc
+
+            def run(device, k):
+                n = wp.array([k], dtype=int, device=device)
+                x = wp.array(np.array([1.5], dtype=np.float32), dtype=float,
+                             device=device, requires_grad=True)
+                out = wp.zeros(1, dtype=float, device=device, requires_grad=True)
+                tape = wp.Tape()
+                with tape:
+                    wp.launch(k_loop, dim=1, inputs=[n, x, out], device=device)
+                tape.backward(grads={out: wp.ones(1, dtype=float, device=device)})
+                wp.synchronize_device(device)
+                return float(out.numpy()[0]), float(x.grad.numpy()[0])
+
+            for k in range(1, 9):
+                fc, gc = run("cpu", k)
+                fm, gm = run("metal:0", k)
+                assert np.isfinite(gc), f"k={k}: cpu grad not finite"
+                assert abs(gc) > 0, f"k={k}: cpu grad is zero -- useless assertion"
+                np.testing.assert_allclose(fm, fc, rtol=1e-5, atol=1e-6)
+                np.testing.assert_allclose(gm, gc, rtol=1e-5, atol=1e-5)
+            """
+        )
+        _run_with_metal_native(self, snippet, timeout=300)
+
     def test_quat_transform_adjoints_match_cpu(self):
         """Reverse mode through the quat / rigid-transform family.
 

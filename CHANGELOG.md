@@ -124,6 +124,10 @@
   The same query at kernel scope was unaffected.
 - Support reading a `wp.array` field of a struct kernel argument through a struct that was rebuilt from it and
   nested inside another struct, which `warp.fem` does when evaluating a cell field on a side of the domain.
+- Fix wrong gradients on Metal devices for a struct-returning `@wp.func` differentiated inside a loop. The
+  struct's per-field adjoints were zeroed once instead of on each iteration, so they accumulated across the
+  loop; nested structs compounded the error, making it grow with the iteration count. This affected
+  `wp.fem.lookup()`, and so the gradients of semi-Lagrangian advection in `warp.fem`.
 
 ### Changed
 
