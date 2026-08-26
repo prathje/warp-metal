@@ -65,6 +65,8 @@
 - Extend reverse-mode differentiation on Metal devices to vectors of widths MSL has no native type for
   (`wp.vec1`, `wp.vec5`, `wp.spatial_vector`, ...), which `warp.fem`'s scalar function spaces produce, and to
   `wp.where()` on struct values.
+- Extend reverse-mode differentiation on Metal devices to `wp.mesh_query_ray()`, propagating the hit distance
+  and barycentric coordinates back to the ray origin and direction.
 
 ### Removed
 
