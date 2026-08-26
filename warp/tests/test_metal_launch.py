@@ -9559,6 +9559,100 @@ class TestMetalTileFullAndScan(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet, timeout=180)
 
+    def test_tile_from_thread_and_store_indexed_match_cpu(self):
+        """``wp.tile_from_thread()`` broadcast plus an indexed scatter.
+
+        ``thread_idx`` is the launch's only lane, so the broadcast is a
+        constant fill in the serial model. The index tile deliberately holds
+        one position past the end of the destination, which both backends must
+        drop rather than write.
+        """
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            N = 8
+
+            @wp.kernel(enable_backward=False)
+            def k(vals: wp.array(dtype=wp.float32), data: wp.array(dtype=wp.float32),
+                  index: wp.array(dtype=wp.int32), out: wp.array(dtype=wp.float32)):
+                b, lane = wp.tid()
+                bias = wp.tile_from_thread(shape=N, value=vals[b] * 2.0,
+                                           thread_idx=lane, storage="shared")
+                d = wp.tile_load(data, shape=N, offset=b * N)
+                idx = wp.tile_load(index, shape=N, offset=b * N)
+                wp.tile_store_indexed(out, idx, d + bias, axis=0)
+
+            B = 3
+            rng = np.random.default_rng(11)
+            vals_np = rng.standard_normal(B).astype(np.float32)
+            data_np = rng.standard_normal(B * N).astype(np.float32)
+            # A permutation per block, then one index pushed out of range so
+            # the drop path is covered. Negative indices are NOT used: the
+            # native compute_index only rejects indices past the end, so a -1
+            # writes one element before the array on CPU / CUDA.
+            idx_np = np.concatenate(
+                [rng.permutation(N).astype(np.int32) + b * N for b in range(B)]
+            )
+            dropped = 3
+            idx_np[dropped] = B * N + 5
+
+            got = {}
+            for dev in ('cpu', 'metal:0'):
+                vals = wp.array(vals_np, dtype=wp.float32, device=dev)
+                data = wp.array(data_np, dtype=wp.float32, device=dev)
+                index = wp.array(idx_np, dtype=wp.int32, device=dev)
+                out = wp.full(B * N, -99.0, dtype=wp.float32, device=dev)
+                wp.launch_tiled(k, dim=B, inputs=[vals, data, index], outputs=[out],
+                                block_dim=1, device=dev)
+                wp.synchronize_device(dev)
+                got[dev] = out.numpy().copy()
+
+            want = np.full(B * N, -99.0, dtype=np.float32)
+            for e in range(B * N):
+                if e == dropped:
+                    continue
+                want[idx_np[e]] = data_np[e] + vals_np[e // N] * 2.0
+            assert (want == -99.0).sum() == 1, 'exactly one slot should stay unwritten'
+            for dev in ('cpu', 'metal:0'):
+                np.testing.assert_allclose(got[dev], want, rtol=1e-6, err_msg=dev)
+            """
+        )
+        _run_with_metal_native(self, snippet, timeout=180)
+
+    def test_tile_extract_by_block_dim_raises(self):
+        """``tile_extract(t, wp.block_dim() - 1)`` must not answer wrongly.
+
+        The serial model runs one thread per tile, so ``wp.block_dim()`` is 1
+        and that index folds to 0 — the first element of a tile that still has
+        ``block_dim`` of them. ``tile/example_tile_stream_compaction`` reads a
+        block total that way; it has to raise, not return element 0.
+        """
+        snippet = textwrap.dedent(
+            """
+            N = 16
+
+            @wp.kernel(enable_backward=False)
+            def k(data: wp.array(dtype=wp.int32), out: wp.array(dtype=wp.int32)):
+                b, lane = wp.tid()
+                t = wp.tile_load(data, shape=N, offset=b * N)
+                s = wp.tile_scan_inclusive(t)
+                if lane == wp.block_dim() - 1:
+                    out[b] = wp.tile_extract(s, wp.block_dim() - 1)
+
+            data = wp.zeros(N, dtype=wp.int32, device='metal:0')
+            out = wp.zeros(1, dtype=wp.int32, device='metal:0')
+            try:
+                wp.launch_tiled(k, dim=1, inputs=[data], outputs=[out],
+                                block_dim=N, device='metal:0')
+            except Exception as e:
+                assert 'tile_extract indexed by wp.block_dim()' in str(e), str(e)
+            else:
+                raise AssertionError('expected a MetalCodegenError')
+            """
+        )
+        _run_with_metal_native(self, snippet, timeout=180)
+
 
 @unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
 @unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")

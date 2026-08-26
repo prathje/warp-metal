@@ -7950,6 +7950,15 @@ _TILE_ONES_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_ones\s*<\s*(?:wp::)?(\w
 # ``wp::tile_full<dtype, ...>(value)`` — the same constant fill with a
 # runtime value instead of a literal 0 / 1.
 _TILE_FULL_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_full\s*<\s*(?:wp::)?(\w+)\s*[^>]*>\s*\(([^)]*)\)")
+# ``wp::tile_from_thread<dtype, N>(value, thread_idx)`` — broadcast the
+# ``value`` held by lane ``thread_idx`` to every element of an N-tile. The
+# serial model runs one lane per tile, so that lane's ``value`` is the only
+# one there is and the result is the same constant fill as ``tile_full``.
+# ``thread_idx`` is dropped: it is written as ``wp.block_dim() - 1``, and
+# ``wp.block_dim()`` lowers to literal 1 here, so it names lane 0 anyway.
+_TILE_FROM_THREAD_PAT = re.compile(
+    r"\bvar_(\w+)\s*=\s*wp::tile_from_thread\s*<\s*(?:wp::)?(\w+)\s*[^>]*>\s*\(([^)]*)\)"
+)
 # ``wp::tile_arange<int>(N)`` with N=1 → ``var_X = 0``.
 _TILE_ARANGE_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_arange\s*<[^>]*>\s*\(\s*\d+\s*\)")
 # ``wp::tile_arange<dtype, N>(start, stop, step)`` — multi-element form
@@ -8084,6 +8093,11 @@ _TILE_STORE_PAT = re.compile(
     r"(wp::vec_t<\d+,\s*wp::\w+>|wp::\w+|wp_vec\d+_\w+|wp_mat\d+x\d+_\w+)"
     r"\s*,\s*\w+\s*,\s*\w+\s*>\s*\(([^)]*)\)"
 )
+# ``wp::tile_store_indexed(dest, indices, axis, offset, src)`` — scatter
+# ``src`` into ``dest`` at the positions named by the ``indices`` tile. Emitted
+# without template arguments, so the element type comes from the tile
+# bookkeeping rather than the statement.
+_TILE_STORE_INDEXED_PAT = re.compile(r"\bwp::tile_store_indexed\s*\(([^)]*)\)")
 # ``var_X = wp::tile_atomic_add<dtype, bounds_check>(arr, off_0[, off_1], tile)``
 # — same ``(a, *offset, t)`` operand layout as ``tile_store``, but two
 # template args instead of three, and it yields a tile holding the
@@ -8837,9 +8851,16 @@ def _translate_tile_intrinsics(
             return m.group(0)
         return _emit_tile_const_fill(m.group(1), m.group(2), f"({value})")
 
+    def repl_from_thread(m: re.Match[str]) -> str:
+        args = [a.strip() for a in _split_top_level_args(m.group(3))]
+        if len(args) != 2 or not args[0]:
+            return m.group(0)
+        return _emit_tile_const_fill(m.group(1), m.group(2), f"({args[0]})")
+
     line = _TILE_ZEROS_PAT.sub(repl_zeros, line)
     line = _TILE_ONES_PAT.sub(repl_ones, line)
     line = _TILE_FULL_PAT.sub(repl_full, line)
+    line = _TILE_FROM_THREAD_PAT.sub(repl_from_thread, line)
     line = _TILE_ARANGE_PAT.sub(r"var_\1 = 0", line)
 
     def repl_tile_arange_3(m: re.Match[str]) -> str:
@@ -9415,8 +9436,71 @@ def _translate_tile_intrinsics(
 
     line = _TILE_VIEW_PAT.sub(repl_view, line)
 
+    def repl_store_indexed(m: re.Match[str]) -> str:
+        # ``tile_store_indexed(dest, indices, axis, offset, src)``: for every
+        # element of ``src``, take the write position from ``indices`` at the
+        # same coordinate and scatter. Only the 1-D form is lowered — a 2-D
+        # scatter would need the non-indexed coordinate to walk the other
+        # axis, and nothing emits it yet.
+        args = [a.strip() for a in _split_top_level_args(m.group(1))]
+        if len(args) != 5:
+            raise MetalCodegenError(
+                f"MSL codegen: tile_store_indexed with {len(args)} arguments is not supported "
+                f"(statement: {m.group(0)!r})"
+            )
+        arr, idx_var, axis, offset, src_var = args
+
+        def _label(v: str) -> str:
+            return v[len("var_") :] if v.startswith("var_") else v
+
+        idx_label, src_label = _label(idx_var), _label(src_var)
+        src_dims = tile_var_dims.get(src_label)
+        idx_dims = tile_var_dims.get(idx_label)
+        if src_dims is None or idx_dims is None:
+            raise MetalCodegenError(
+                f"MSL codegen: tile_store_indexed needs tile shapes for both the source and the "
+                f"index tile (statement: {m.group(0)!r})"
+            )
+        if src_dims[1] > 1 or idx_dims[1] > 1:
+            raise MetalCodegenError(
+                f"MSL codegen: tile_store_indexed is only supported for 1-D tiles (statement: {m.group(0)!r})"
+            )
+        # ``axis`` needs no check: a single offset argument means the
+        # destination is indexed as 1-D, and Warp's value func already rejects
+        # an axis outside the array's dimensions, so it can only be 0 here.
+        del axis
+        n = src_dims[0]
+        if idx_dims[0] != n:
+            raise MetalCodegenError(
+                f"MSL codegen: tile_store_indexed index tile has {idx_dims[0]} elements but the "
+                f"source tile has {n} (statement: {m.group(0)!r})"
+            )
+        arr_name = _label(arr)
+
+        def _elem(label: str, var: str, i: str) -> str:
+            if label in smem_tiles:
+                return f"({_SMEM_ARENA_NAME} + {smem_tiles[label][0]})[{i}]"
+            return f"{var}.c[{i}]" if n > 1 else var
+
+        target = f"{arr}[_tsi_ix]"
+        write = (
+            f"atomic_store_explicit(&{target}, {_elem(src_label, src_var, '_tsi_i')}, memory_order_relaxed);"
+            if arr_name in atomic_output_names
+            else f"{target} = {_elem(src_label, src_var, '_tsi_i')};"
+        )
+        # Skip negative positions. The example idiom marks a dropped element
+        # with -1, and the native ``compute_index`` only rejects indices past
+        # the end, so a -1 there writes one element before the array; there is
+        # no reason to reproduce that here.
+        return (
+            f"{{ for (int _tsi_i = 0; _tsi_i < {n}; ++_tsi_i) {{ "
+            f"const int _tsi_ix = ({offset}) + (int)({_elem(idx_label, idx_var, '_tsi_i')}); "
+            f"if (_tsi_ix >= 0 && _tsi_ix < (int){arr_name}_shape[0]) {{ {write} }} }} }}"
+        )
+
     line = _TILE_LOAD_PAT.sub(repl_load, line)
     line = _TILE_STORE_PAT.sub(repl_store, line)
+    line = _TILE_STORE_INDEXED_PAT.sub(repl_store_indexed, line)
     line = _TILE_ATOMIC_ADD_PAT.sub(repl_tile_atomic_add, line)
     line = _TILE_CHOLESKY_PAT.sub(repl_cholesky, line)
     line = _TILE_CHOLESKY_SOLVE_PAT.sub(repl_cholesky_solve, line)
@@ -10365,6 +10449,10 @@ def _generate_msl_kernel_uncached(
     # ``wp::tile_store<...>(arr, tile, off...)`` — the blocked-Cholesky
     # path writes through tile_store directly (no array_store wrapper).
     tile_store_pat = re.compile(r"wp::tile_store\s*<[^()]*>\s*\(\s*var_([A-Za-z_]\w*)")
+    # ``wp::tile_store_indexed(arr, indices, axis, off, tile)`` scatters into
+    # ``arr``. Emitted without template arguments, so ``tile_store_pat``
+    # (which requires a ``<...>`` list) does not see it.
+    tile_store_indexed_pat = re.compile(r"wp::tile_store_indexed\s*\(\s*var_([A-Za-z_]\w*)")
     # ``wp::tile_atomic_add<...>(arr, off..., tile)`` accumulates a tile
     # into ``arr``. It is both a write (so ``arr`` is an output) and an
     # atomic op (so ``arr`` must be typed ``device atomic<T>*``); without
@@ -10404,6 +10492,10 @@ def _generate_msl_kernel_uncached(
         m = tile_store_pat.search(raw)
         if m:
             written_arg_names.add(m.group(1))
+        m = tile_store_indexed_pat.search(raw)
+        if m:
+            written_arg_names.add(m.group(1))
+            plain_store_arg_names.add(m.group(1))
         m = tile_atomic_add_pat.search(raw)
         if m:
             written_arg_names.add(m.group(1))
@@ -11216,6 +11308,40 @@ def _generate_msl_kernel_uncached(
             continue
         _kind, dtype_ctype, rows, cols = parsed
         _record_tile(label, dtype_ctype, rows, cols)
+
+    # ``wp.tile_extract(t, wp.block_dim() - 1)`` — "the last lane's element" —
+    # cannot be honoured by the serial model and must not be answered wrongly.
+    # A launch-tiled kernel runs as ONE thread per tile here, so
+    # ``wp.block_dim()`` lowers to literal 1 and that index folds to 0: the
+    # FIRST element of a tile that still has ``block_dim`` of them. The read
+    # compiles and returns a plausible number, so reject it instead.
+    # ``block_dim`` as a lane *identity* (``if j == wp.block_dim() - 1``,
+    # ``tile_from_thread(thread_idx=wp.block_dim() - 1)``) stays fine: the
+    # single serial thread is the whole block, so it is that lane.
+    # ``coop_block_n > 0`` means the IR was rebuilt at the honest block_dim
+    # and ``builtin_block_dim()`` was already substituted with it above, so
+    # the index is genuine there and nothing to reject.
+    if coop_block_n == 0:
+        _bd_tainted: set[str] = set()
+        for raw in forward_lines:
+            m_def = re.match(r"\s*var_(\w+)\s*=\s*(.+?);\s*$", raw)
+            if m_def is None:
+                continue
+            rhs = m_def.group(2)
+            if "builtin_block_dim" in rhs or any(f"var_{t}" in rhs for t in _bd_tainted):
+                _bd_tainted.add(m_def.group(1))
+        if _bd_tainted:
+            for raw in forward_lines:
+                for m_ex in re.finditer(r"wp::tile_extract\s*\(\s*var_(\w+)\s*,\s*var_(\w+)\s*\)", raw):
+                    dims = tile_var_dims.get(m_ex.group(1))
+                    if m_ex.group(2) in _bd_tainted and dims is not None and dims[0] * dims[1] > 1:
+                        raise MetalCodegenError(
+                            f"Kernel {adj.fun_name!r}: tile_extract indexed by wp.block_dim() on a "
+                            f"{dims[0]}x{dims[1]} tile is not supported on Metal — a launch-tiled "
+                            f"kernel runs as one thread per tile here, so wp.block_dim() is 1 and the "
+                            f"index would read element 0 instead of the last one. Index with the "
+                            f"tile's own extent (a literal or a module constant) instead."
+                        )
 
     # When ``atomic_outputs=True`` is passed to ``mx.fast.metal_kernel``,
     # *every* output buffer comes through as ``device atomic<T>*``. Reads
