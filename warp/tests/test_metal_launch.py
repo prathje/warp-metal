@@ -11163,6 +11163,78 @@ class TestMetalAdjoint(unittest.TestCase):
         )
         _run_with_metal_native(self, snippet)
 
+    def test_mesh_query_ray_adjoint_matches_cpu(self):
+        """Reverse mode through ``wp.mesh_query_ray``.
+
+        Two things have to hold. The query result is a builtin value struct,
+        so its dual is a real MSL struct and reverse mode must accept the
+        ``adj_q.u`` / ``adj_q.v`` member stores. And the query itself is
+        differentiable: ``wp::adj_mesh_query_ray`` propagates the hit distance
+        and barycentric duals back to the ray origin and direction, which is
+        the gradient ``optim/example_diffray`` optimises through.
+
+        The kernel differentiates w.r.t. both the ray origin and the direction
+        so a dropped query adjoint cannot pass — with the query adjoint gone,
+        those two gradients are exactly zero for the ``t``/``u``/``v`` terms.
+        """
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            # Two triangles forming a non-planar quad, so u/v and t both vary
+            # across the ray bundle and neither is degenerate.
+            pts_np = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0],
+                               [0.0, 1.0, 0.0], [1.0, 1.0, 0.2]], dtype=np.float32)
+            idx_np = np.array([0, 1, 2, 1, 3, 2], dtype=np.int32)
+
+            @wp.kernel
+            def k_query_ray(mesh: wp.uint64, origins: wp.array(dtype=wp.vec3),
+                            dirs: wp.array(dtype=wp.vec3), normals: wp.array(dtype=wp.vec3),
+                            out: wp.array(dtype=wp.float32)):
+                i = wp.tid()
+                q = wp.mesh_query_ray(mesh, origins[i], dirs[i], 1.0e6)
+                if q.result:
+                    w = 1.0 - q.u - q.v
+                    n = q.u * normals[0] + q.v * normals[1] + w * normals[2]
+                    out[i] = wp.length(n) + 0.5 * q.t
+
+            rng = np.random.default_rng(7)
+            xy = rng.uniform(0.15, 0.85, size=(12, 2)).astype(np.float32)
+            o_np = np.concatenate([xy, np.full((12, 1), 1.0, dtype=np.float32)], axis=1)
+            d_np = np.concatenate([rng.uniform(-0.05, 0.05, size=(12, 2)).astype(np.float32),
+                                   np.full((12, 1), -1.0, dtype=np.float32)], axis=1)
+            n_np = np.array([[1.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 3.0]], dtype=np.float32)
+
+            def run(dev):
+                pts = wp.array(pts_np, dtype=wp.vec3, device=dev)
+                idx = wp.array(idx_np, dtype=wp.int32, device=dev)
+                mesh = wp.Mesh(points=pts, indices=idx)
+                origins = wp.array(o_np, dtype=wp.vec3, device=dev, requires_grad=True)
+                dirs = wp.array(d_np, dtype=wp.vec3, device=dev, requires_grad=True)
+                normals = wp.array(n_np, dtype=wp.vec3, device=dev, requires_grad=True)
+                out = wp.zeros(len(o_np), dtype=wp.float32, device=dev, requires_grad=True)
+                tape = wp.Tape()
+                with tape:
+                    wp.launch(k_query_ray, dim=len(o_np),
+                              inputs=[mesh.id, origins, dirs, normals, out], device=dev)
+                tape.backward(grads={out: wp.ones(len(o_np), dtype=wp.float32, device=dev)})
+                wp.synchronize_device(dev)
+                return (out.numpy().copy(), origins.grad.numpy().copy(),
+                        dirs.grad.numpy().copy(), normals.grad.numpy().copy())
+
+            out_c, go_c, gd_c, gn_c = run('cpu')
+            assert np.abs(out_c).max() > 0, 'CPU forward is all zero — no ray hit the mesh'
+            for name, g in (('origin', go_c), ('dir', gd_c), ('normal', gn_c)):
+                assert np.abs(g).max() > 0, 'CPU ' + name + ' grad is all zero'
+            out_m, go_m, gd_m, gn_m = run('metal:0')
+            np.testing.assert_allclose(out_m, out_c, rtol=2e-5, atol=2e-6, err_msg='forward')
+            np.testing.assert_allclose(go_m, go_c, rtol=2e-5, atol=2e-6, err_msg='origin grad')
+            np.testing.assert_allclose(gd_m, gd_c, rtol=2e-5, atol=2e-6, err_msg='dir grad')
+            np.testing.assert_allclose(gn_m, gn_c, rtol=2e-5, atol=2e-6, err_msg='normal grad')
+            """
+        )
+        _run_with_metal_native(self, snippet)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -4016,6 +4016,214 @@ inline wp_mesh_query_ray_t wp_mesh_query_ray(ulong id, float3 start, float3 dir,
         id, start, dir, max_t, query.t, query.u, query.v, query.sign, query.normal, query.face, root);
     return query;
 }
+// Reverse mode for the Woop ray-triangle intersection — a line-by-line port
+// of ``wp::adj_intersect_ray_tri_woop`` (warp/native/intersect.h). The native
+// version computes vertex adjoints but never writes them back, so only the
+// ray origin and direction sinks are carried over. The explicit d<X>_d<Y>
+// constants are kept verbatim (the compiler folds them) so this stays
+// diffable against the source rather than hand-simplified.
+inline void wp_bvh_adj_intersect_ray_tri_woop(
+    float3 p, float3 dir, float3 a, float3 b, float3 c,
+    float adj_t, float adj_u, float adj_v,
+    thread float3& adj_p, thread float3& adj_dir)
+{
+    int kz = wp_bvh_ray_max_dim(dir);
+    int kx = kz + 1;
+    if (kx == 3) { kx = 0; }
+    int ky = kx + 1;
+    if (ky == 3) { ky = 0; }
+    if (dir[kz] < 0.0f) {
+        int tmp = kx;
+        kx = ky;
+        ky = tmp;
+    }
+    const float Dx = dir[kx];
+    const float Dy = dir[ky];
+    const float Sx = dir[kx] / dir[kz];
+    const float Sy = dir[ky] / dir[kz];
+    const float Sz = 1.0f / dir[kz];
+    const float3 A = a - p;
+    const float3 B = b - p;
+    const float3 C = c - p;
+    const float Ax = A[kx] - Sx * A[kz];
+    const float Ay = A[ky] - Sy * A[kz];
+    const float Bx = B[kx] - Sx * B[kz];
+    const float By = B[ky] - Sy * B[kz];
+    const float Cx = C[kx] - Sx * C[kz];
+    const float Cy = C[ky] - Sy * C[kz];
+    // ``wp_bvh_diff_product``, not the plain products the native adjoint uses:
+    // these must reproduce the U/V/W the *forward* MSL pass computed, and that
+    // one is fma-compensated. Native refines exact zeros in double precision;
+    // MSL has no double, the same caveat as the forward port.
+    const float U = wp_bvh_diff_product(Cx, By, Cy, Bx);
+    const float V = wp_bvh_diff_product(Ax, Cy, Ay, Cx);
+    const float W = wp_bvh_diff_product(Bx, Ay, By, Ax);
+    if ((U < 0.0f || V < 0.0f || W < 0.0f) && (U > 0.0f || V > 0.0f || W > 0.0f)) { return; }
+    const float det = U + V + W;
+    if (det == 0.0f) { return; }
+    const float Az = Sz * A[kz];
+    const float Bz = Sz * B[kz];
+    const float Cz = Sz * C[kz];
+    const float T = U * Az + V * Bz + W * Cz;
+    const int det_sign = as_type<int>(det) & int(0x80000000u);
+    if (as_type<float>(as_type<int>(T) ^ det_sign) < 0.0f) { return; }
+    const float rcp_det = 1.0f / det;
+    const float rcp_det_sq = rcp_det * rcp_det;
+
+    // --- adj_p -------------------------------------------------------
+    const float dAx_dpx = -1.0f;
+    const float dBx_dpx = -1.0f;
+    const float dCx_dpx = -1.0f;
+    const float dAy_dpx = 0.0f;
+    const float dBy_dpx = 0.0f;
+    const float dCy_dpx = 0.0f;
+    const float dAz_dpx = 0.0f;
+    const float dBz_dpx = 0.0f;
+    const float dCz_dpx = 0.0f;
+
+    const float dAx_dpy = 0.0f;
+    const float dBx_dpy = 0.0f;
+    const float dCx_dpy = 0.0f;
+    const float dAy_dpy = -1.0f;
+    const float dBy_dpy = -1.0f;
+    const float dCy_dpy = -1.0f;
+    const float dAz_dpy = 0.0f;
+    const float dBz_dpy = 0.0f;
+    const float dCz_dpy = 0.0f;
+
+    const float dAx_dpz = Sx;
+    const float dBx_dpz = Sx;
+    const float dCx_dpz = Sx;
+    const float dAy_dpz = Sy;
+    const float dBy_dpz = Sy;
+    const float dCy_dpz = Sy;
+    const float dAz_dpz = -Sz;
+    const float dBz_dpz = -Sz;
+    const float dCz_dpz = -Sz;
+
+    const float dU_dpx = Cx * dBy_dpx + By * dCx_dpx - Cy * dBx_dpx - Bx * dCy_dpx;
+    const float dU_dpy = Cx * dBy_dpy + By * dCx_dpy - Cy * dBx_dpy - Bx * dCy_dpy;
+    const float dU_dpz = Cx * dBy_dpz + By * dCx_dpz - Cy * dBx_dpz - Bx * dCy_dpz;
+    const float3 dU_dp = float3(dU_dpx, dU_dpy, dU_dpz);
+
+    const float dV_dpx = Ax * dCy_dpx + Cy * dAx_dpx - Ay * dCx_dpx - Cx * dAy_dpx;
+    const float dV_dpy = Ax * dCy_dpy + Cy * dAx_dpy - Ay * dCx_dpy - Cx * dAy_dpy;
+    const float dV_dpz = Ax * dCy_dpz + Cy * dAx_dpz - Ay * dCx_dpz - Cx * dAy_dpz;
+    const float3 dV_dp = float3(dV_dpx, dV_dpy, dV_dpz);
+
+    const float dW_dpx = Bx * dAy_dpx + Ay * dBx_dpx - By * dAx_dpx - Ax * dBy_dpx;
+    const float dW_dpy = Bx * dAy_dpy + Ay * dBx_dpy - By * dAx_dpy - Ax * dBy_dpy;
+    const float dW_dpz = Bx * dAy_dpz + Ay * dBx_dpz - By * dAx_dpz - Ax * dBy_dpz;
+    const float3 dW_dp = float3(dW_dpx, dW_dpy, dW_dpz);
+
+    const float dT_dpx = dU_dpx * Az + U * dAz_dpx + dV_dpx * Bz + V * dBz_dpx + dW_dpx * Cz + W * dCz_dpx;
+    const float dT_dpy = dU_dpy * Az + U * dAz_dpy + dV_dpy * Bz + V * dBz_dpy + dW_dpy * Cz + W * dCz_dpy;
+    const float dT_dpz = dU_dpz * Az + U * dAz_dpz + dV_dpz * Bz + V * dBz_dpz + dW_dpz * Cz + W * dCz_dpz;
+    const float3 dT_dp = float3(dT_dpx, dT_dpy, dT_dpz);
+
+    const float dDet_dpx = dU_dpx + dV_dpx + dW_dpx;
+    const float dDet_dpy = dU_dpy + dV_dpy + dW_dpy;
+    const float dDet_dpz = dU_dpz + dV_dpz + dW_dpz;
+    const float3 dDet_dp = float3(dDet_dpx, dDet_dpy, dDet_dpz);
+
+    const float3 du_dp = rcp_det * dU_dp + -U * rcp_det_sq * dDet_dp;
+    const float3 dv_dp = rcp_det * dV_dp + -V * rcp_det_sq * dDet_dp;
+    const float3 dt_dp = rcp_det * dT_dp + -T * rcp_det_sq * dDet_dp;
+
+    const float3 adj_p_swapped = adj_u * du_dp + adj_v * dv_dp + adj_t * dt_dp;
+    adj_p[kx] += adj_p_swapped[0];
+    adj_p[ky] += adj_p_swapped[1];
+    adj_p[kz] += adj_p_swapped[2];
+
+    // --- adj_dir -----------------------------------------------------
+    const float dAx_dDx = -Sz * A[kz];
+    const float dBx_dDx = -Sz * B[kz];
+    const float dCx_dDx = -Sz * C[kz];
+    const float dAy_dDx = 0.0f;
+    const float dBy_dDx = 0.0f;
+    const float dCy_dDx = 0.0f;
+    const float dAz_dDx = 0.0f;
+    const float dBz_dDx = 0.0f;
+    const float dCz_dDx = 0.0f;
+
+    const float dAx_dDy = 0.0f;
+    const float dBx_dDy = 0.0f;
+    const float dCx_dDy = 0.0f;
+    const float dAy_dDy = -Sz * A[kz];
+    const float dBy_dDy = -Sz * B[kz];
+    const float dCy_dDy = -Sz * C[kz];
+    const float dAz_dDy = 0.0f;
+    const float dBz_dDy = 0.0f;
+    const float dCz_dDy = 0.0f;
+
+    const float dAx_dDz = Dx * Sz * Sz * A[kz];
+    const float dBx_dDz = Dx * Sz * Sz * B[kz];
+    const float dCx_dDz = Dx * Sz * Sz * C[kz];
+    const float dAy_dDz = Dy * Sz * Sz * A[kz];
+    const float dBy_dDz = Dy * Sz * Sz * B[kz];
+    const float dCy_dDz = Dy * Sz * Sz * C[kz];
+    const float dAz_dDz = -Sz * Sz * A[kz];
+    const float dBz_dDz = -Sz * Sz * B[kz];
+    const float dCz_dDz = -Sz * Sz * C[kz];
+
+    const float dU_dDx = Cx * dBy_dDx + By * dCx_dDx - Cy * dBx_dDx - Bx * dCy_dDx;
+    const float dU_dDy = Cx * dBy_dDy + By * dCx_dDy - Cy * dBx_dDy - Bx * dCy_dDy;
+    const float dU_dDz = Cx * dBy_dDz + By * dCx_dDz - Cy * dBx_dDz - Bx * dCy_dDz;
+    const float3 dU_dD = float3(dU_dDx, dU_dDy, dU_dDz);
+
+    const float dV_dDx = Ax * dCy_dDx + Cy * dAx_dDx - Ay * dCx_dDx - Cx * dAy_dDx;
+    const float dV_dDy = Ax * dCy_dDy + Cy * dAx_dDy - Ay * dCx_dDy - Cx * dAy_dDy;
+    const float dV_dDz = Ax * dCy_dDz + Cy * dAx_dDz - Ay * dCx_dDz - Cx * dAy_dDz;
+    const float3 dV_dD = float3(dV_dDx, dV_dDy, dV_dDz);
+
+    const float dW_dDx = Bx * dAy_dDx + Ay * dBx_dDx - By * dAx_dDx - Ax * dBy_dDx;
+    const float dW_dDy = Bx * dAy_dDy + Ay * dBx_dDy - By * dAx_dDy - Ax * dBy_dDy;
+    const float dW_dDz = Bx * dAy_dDz + Ay * dBx_dDz - By * dAx_dDz - Ax * dBy_dDz;
+    const float3 dW_dD = float3(dW_dDx, dW_dDy, dW_dDz);
+
+    const float dT_dDx = dU_dDx * Az + U * dAz_dDx + dV_dDx * Bz + V * dBz_dDx + dW_dDx * Cz + W * dCz_dDx;
+    const float dT_dDy = dU_dDy * Az + U * dAz_dDy + dV_dDy * Bz + V * dBz_dDy + dW_dDy * Cz + W * dCz_dDy;
+    const float dT_dDz = dU_dDz * Az + U * dAz_dDz + dV_dDz * Bz + V * dBz_dDz + dW_dDz * Cz + W * dCz_dDz;
+    const float3 dT_dD = float3(dT_dDx, dT_dDy, dT_dDz);
+
+    const float dDet_dDx = dU_dDx + dV_dDx + dW_dDx;
+    const float dDet_dDy = dU_dDy + dV_dDy + dW_dDy;
+    const float dDet_dDz = dU_dDz + dV_dDz + dW_dDz;
+    const float3 dDet_dD = float3(dDet_dDx, dDet_dDy, dDet_dDz);
+
+    const float3 du_dD = rcp_det * dU_dD + -U * rcp_det_sq * dDet_dD;
+    const float3 dv_dD = rcp_det * dV_dD + -V * rcp_det_sq * dDet_dD;
+    const float3 dt_dD = rcp_det * dT_dD + -T * rcp_det_sq * dDet_dD;
+
+    const float3 adj_dir_swapped = adj_u * du_dD + adj_v * dv_dD + adj_t * dt_dD;
+    adj_dir[kx] += adj_dir_swapped[0];
+    adj_dir[ky] += adj_dir_swapped[1];
+    adj_dir[kz] += adj_dir_swapped[2];
+}
+// Struct-form reverse mode for ``wp.mesh_query_ray``, mirroring the native
+// wrapper: look the hit triangle back up (the BVH already picked the face in
+// the forward pass) and hand the barycentric/distance duals to the Woop
+// adjoint. A miss carries no gradient — its query fields were never read, so
+// their duals are zero and the whole body would cancel out anyway.
+inline void wp_adj_mesh_query_ray(
+    ulong id, float3 start, float3 dir, float max_t, int root,
+    const thread wp_mesh_query_ray_t& ret,
+    ulong adj_id, thread float3& adj_start, thread float3& adj_dir,
+    thread float& adj_max_t, thread int& adj_root,
+    thread wp_mesh_query_ray_t& adj_ret)
+{
+    if (!ret.result) { return; }
+    wp_mesh_desc_t mesh = wp_mesh_get_desc(id);
+    const device int* tri_indices = wp_bvh_int_ptr(mesh.indices);
+    const int i = tri_indices[ret.face * 3 + 0];
+    const int j = tri_indices[ret.face * 3 + 1];
+    const int k = tri_indices[ret.face * 3 + 2];
+    const float3 a = wp_bvh_load_v3(mesh.points, i);
+    const float3 b = wp_bvh_load_v3(mesh.points, j);
+    const float3 c = wp_bvh_load_v3(mesh.points, k);
+    wp_bvh_adj_intersect_ray_tri_woop(
+        start, dir, a, b, c, adj_ret.t, adj_ret.u, adj_ret.v, adj_start, adj_dir);
+}
 inline wp_mesh_query_point_t wp_mesh_query_point(ulong id, float3 point, float max_dist) {
     wp_mesh_query_point_t query;
     query.result = false;
@@ -7462,6 +7670,10 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bwp::bvh_query_next\b"), "wp_bvh_query_next"),
     (re.compile(r"\bwp::bvh_get_group_root\b"), "wp_bvh_get_group_root"),
     (re.compile(r"\bwp::mesh_query_ray_anyhit\b"), "wp_mesh_query_ray_anyhit"),
+    # Reverse mode for the ray query: differentiates the hit distance and
+    # barycentric coords w.r.t. the ray origin and direction (ports of
+    # mesh.h / intersect.h; the vertex adjoints are dropped upstream too).
+    (re.compile(r"\bwp::adj_mesh_query_ray\b"), "wp_adj_mesh_query_ray"),
     (re.compile(r"\bwp::mesh_query_ray\b"), "wp_mesh_query_ray"),
     (re.compile(r"\bwp::mesh_get_group_root\b"), "wp_mesh_get_group_root"),
     (re.compile(r"\bwp::mesh_query_point_t\b"), "wp_mesh_query_point_t"),
@@ -11434,6 +11646,13 @@ def _generate_msl_kernel_uncached(
             root = m_adj_field.group("root")
             parts = m_adj_field.group("path").lstrip(".").split(".")
             if parts == ["shape"] and root in array_dual_roots:
+                continue
+            if root in builtin_struct_locals and len(parts) == 1:
+                # Builtin query struct (``wp.mesh_query_ray`` / ``_point``).
+                # Forward mode keeps these as real MSL structs rather than
+                # splitting them per field, so their dual is a struct local of
+                # the same type and the member store lowers verbatim.
+                body_lines.append(_finalize(line))
                 continue
             resolved = _resolve_struct_dual_field(root, parts)
             if resolved is None:
