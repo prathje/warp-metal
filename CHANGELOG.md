@@ -67,6 +67,10 @@
   `wp.where()` on struct values.
 - Extend reverse-mode differentiation on Metal devices to `wp.mesh_query_ray()`, propagating the hit distance
   and barycentric coordinates back to the ray origin and direction.
+- Support `wp.tile_from_thread()` and `wp.tile_store_indexed()` (1-D tiles) on Metal devices.
+- Raise a `MetalCodegenError` for `wp.tile_extract(t, wp.block_dim() - 1)` on Metal devices instead of returning
+  the wrong element. A launch-tiled kernel runs as one thread per tile there, so `wp.block_dim()` is 1 and the
+  index reads the first element of the tile rather than the last. Index with the tile's own extent instead.
 
 ### Removed
 
