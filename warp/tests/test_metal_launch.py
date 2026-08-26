@@ -10868,8 +10868,11 @@ class TestMetalAdjoint(unittest.TestCase):
     def test_unsupported_tile_adjoint_raises(self):
         """An unimplemented tile adjoint must name the gap, not emit bad MSL.
 
-        These lose their ``wp::`` prefix in the tile translator, so without an
-        explicit check they reach the Metal compiler as undeclared identifiers.
+        Two spellings reach the check: adjoints that keep their ``wp::``
+        prefix (caught by the generic remaining-intrinsic check) and adjoints
+        the tile translator strips the prefix from, which would otherwise
+        reach the Metal compiler as undeclared identifiers. ``tile_cholesky``
+        is the first kind; either way the message has to name the operation.
         """
         snippet = textwrap.dedent(
             """
@@ -10878,29 +10881,136 @@ class TestMetalAdjoint(unittest.TestCase):
             TILE = 4
 
             @wp.kernel
-            def k(x: wp.array2d(dtype=wp.vec2f), y: wp.array2d(dtype=wp.vec2f)):
-                t = wp.tile_load(x, shape=(1, TILE))
-                wp.tile_fft(t)
-                wp.tile_store(y, t)
+            def k(x: wp.array2d(dtype=wp.float32), y: wp.array2d(dtype=wp.float32)):
+                a = wp.tile_load(x, shape=(TILE, TILE))
+                wp.tile_store(y, wp.tile_cholesky(a))
 
             dev = 'metal:0'
-            x = wp.array(np.zeros((1, TILE, 2), np.float32), dtype=wp.vec2f, device=dev, requires_grad=True)
-            y = wp.zeros((1, TILE), dtype=wp.vec2f, device=dev, requires_grad=True)
+            spd = (np.eye(TILE, dtype=np.float32) * 4.0)
+            x = wp.array(spd, dtype=wp.float32, device=dev, requires_grad=True)
+            y = wp.zeros((TILE, TILE), dtype=wp.float32, device=dev, requires_grad=True)
             tape = wp.Tape()
             with tape:
                 wp.launch_tiled(k, dim=[1], inputs=[x], outputs=[y], block_dim=1, device=dev)
-            y.grad.assign(np.ones((1, TILE, 2), np.float32))
+            y.grad.assign(np.ones((TILE, TILE), np.float32))
             try:
                 tape.backward()
             except Exception as e:
                 msg = str(e)
-                assert 'tile_fft' in msg, msg
-                assert 'not supported' in msg, msg
+                assert 'tile_cholesky' in msg, msg
+                assert ('not supported' in msg or 'does not yet support' in msg), msg
             else:
-                raise AssertionError('adjoint of tile_fft should have raised')
+                raise AssertionError('adjoint of tile_cholesky should have raised')
             """
         )
         _run_with_metal_native(self, snippet)
+
+    def test_tile_fft_transpose_adjoints(self):
+        """Reverse mode through ``wp.tile_fft`` / ``wp.tile_ifft`` / transpose.
+
+        ``optim/example_navier_stokes_perturbation`` differentiates a spectral
+        Navier-Stokes solve through all three. There is no CPU reference for
+        the transforms — the CPU backend has no tile FFT at all — so the FFT
+        adjoints are checked against the analytic adjoint of the unnormalised
+        DFT and against central differences taken through the Metal forward
+        pass. ``tile_transpose`` does run on CPU and is compared to it.
+        """
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            N = 8
+            ROWS = 4
+
+            @wp.kernel(module="fft_probe")
+            def fft_rows(x: wp.array2d(dtype=wp.vec2f), y: wp.array2d(dtype=wp.vec2f)):
+                i, _, _ = wp.tid()
+                t = wp.tile_load(x, shape=(1, N), offset=(i, 0))
+                wp.tile_fft(t)
+                wp.tile_store(y, t, offset=(i, 0))
+
+            @wp.kernel(module="fft_probe")
+            def ifft_rows(x: wp.array2d(dtype=wp.vec2f), y: wp.array2d(dtype=wp.vec2f)):
+                i, _, _ = wp.tid()
+                t = wp.tile_load(x, shape=(1, N), offset=(i, 0))
+                wp.tile_ifft(t)
+                wp.tile_store(y, t, offset=(i, 0))
+
+            @wp.kernel(module="tr_probe")
+            def transpose_tile(x: wp.array2d(dtype=wp.vec2f), y: wp.array2d(dtype=wp.vec2f)):
+                i, j = wp.tid()
+                t = wp.tile_load(x, shape=(N, N), offset=(i * N, j * N), storage="shared")
+                wp.tile_store(y, wp.tile_transpose(t), offset=(j * N, i * N))
+
+            @wp.kernel
+            def weighted_sum(y: wp.array2d(dtype=wp.vec2f), w: wp.array2d(dtype=wp.vec2f),
+                             loss: wp.array(dtype=wp.float32)):
+                i, j = wp.tid()
+                wp.atomic_add(loss, 0, wp.dot(y[i, j], w[i, j]))
+
+            def fwd(kernel, x, y, w, loss, dev, rows, dim, block_dim):
+                wp.launch_tiled(kernel, dim=dim, inputs=[x], outputs=[y], block_dim=block_dim, device=dev)
+                wp.launch(weighted_sum, dim=(rows, N), inputs=[y, w, loss], device=dev)
+
+            def run(kernel, x_np, w_np, dev, rows, dim, block_dim, grad=True):
+                x = wp.array2d(x_np, dtype=wp.vec2f, device=dev, requires_grad=grad)
+                y = wp.zeros((rows, N), dtype=wp.vec2f, device=dev, requires_grad=grad)
+                w = wp.array2d(w_np, dtype=wp.vec2f, device=dev)
+                loss = wp.zeros(1, dtype=wp.float32, device=dev, requires_grad=grad)
+                if not grad:
+                    fwd(kernel, x, y, w, loss, dev, rows, dim, block_dim)
+                    wp.synchronize_device(dev)
+                    return float(loss.numpy()[0]), None, None
+                tape = wp.Tape()
+                with tape:
+                    fwd(kernel, x, y, w, loss, dev, rows, dim, block_dim)
+                tape.backward(loss)
+                wp.synchronize_device(dev)
+                return float(loss.numpy()[0]), y.numpy().copy(), x.grad.numpy().copy()
+
+            dev = 'metal:0'
+            rng = np.random.default_rng(3)
+            x_np = rng.standard_normal((ROWS, N, 2)).astype(np.float32)
+            w_np = rng.standard_normal((ROWS, N, 2)).astype(np.float32)
+            xc = x_np[..., 0] + 1j * x_np[..., 1]
+            wc = w_np[..., 0] + 1j * w_np[..., 1]
+            n = np.arange(N)
+
+            for name, kernel, sign in (('fft', fft_rows, -1.0), ('ifft', ifft_rows, 1.0)):
+                f = np.exp(sign * 2j * np.pi * np.outer(n, n) / N)
+                # L = sum Re(y)Re(w) + Im(y)Im(w), so dL/dx = conj(F)^T w.
+                g_ref_c = wc @ np.conj(f)
+                g_ref = np.stack([g_ref_c.real, g_ref_c.imag], axis=-1).astype(np.float32)
+                _, y, g = run(kernel, x_np, w_np, dev, ROWS, [ROWS, 1], N)
+                y_c = y[..., 0] + 1j * y[..., 1]
+                np.testing.assert_allclose(y_c, xc @ f.T, rtol=2e-4, atol=2e-4, err_msg=name + ' forward')
+                np.testing.assert_allclose(g, g_ref, rtol=2e-4, atol=2e-4, err_msg=name + ' analytic grad')
+                # Central differences through the same forward pass.
+                eps = 1e-2
+                g_fd = np.zeros_like(x_np)
+                for idx in np.ndindex(x_np.shape):
+                    xp, xm = x_np.copy(), x_np.copy()
+                    xp[idx] += eps
+                    xm[idx] -= eps
+                    lp = run(kernel, xp, w_np, dev, ROWS, [ROWS, 1], N, grad=False)[0]
+                    lm = run(kernel, xm, w_np, dev, ROWS, [ROWS, 1], N, grad=False)[0]
+                    g_fd[idx] = (lp - lm) / (2 * eps)
+                np.testing.assert_allclose(g, g_fd, rtol=2e-2, atol=2e-2, err_msg=name + ' vs finite diff')
+
+            # tile_transpose adjoint: CPU runs this one, compare directly. The
+            # dual is flat *scalar* storage, so a vec2 tile holds 2*R*C of
+            # them — accumulating only R*C left the second half of the tile
+            # at zero, which is what this catches.
+            xt = rng.standard_normal((N, N, 2)).astype(np.float32)
+            wt = rng.standard_normal((N, N, 2)).astype(np.float32)
+            ref = run(transpose_tile, xt, wt, 'cpu', N, (1, 1), N * N)
+            got = run(transpose_tile, xt, wt, dev, N, (1, 1), N * N)
+            assert np.abs(ref[2]).max() > 0, 'CPU transpose grad is all zero'
+            np.testing.assert_allclose(got[1], ref[1], rtol=1e-6, err_msg='transpose forward')
+            np.testing.assert_allclose(got[2], ref[2], rtol=1e-6, err_msg='transpose grad')
+            """
+        )
+        _run_with_metal_native(self, snippet, timeout=300)
 
     def test_big_vec_struct_adjoints_match_cpu(self):
         """Reverse mode through the generated ``wp_vecN`` POD structs.

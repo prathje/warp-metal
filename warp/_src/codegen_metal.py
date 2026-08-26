@@ -8019,6 +8019,9 @@ _TILE_ASSIGN_PAT = re.compile(r"\bwp::tile_assign\s*\(([^)]*)\)")
 # ``repl_transpose_notpl`` using ``tile_var_dims``.
 _TILE_TRANSPOSE_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_transpose\s*<[^()]*>\s*\(\s*var_(\w+)\s*\)")
 _TILE_TRANSPOSE_NOTPL_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_transpose\s*\(\s*var_(\w+)\s*\)")
+# ``wp::adj_tile_transpose(var_T, adj_T, adj_RET)`` — transpose is its own
+# adjoint, accumulated: ``adj_T += transpose(adj_RET)`` (see tile.h).
+_ADJ_TILE_TRANSPOSE_PAT = re.compile(r"\bwp::adj_tile_transpose\s*\(\s*var_(\w+)\s*,\s*adj_(\w+)\s*,\s*adj_(\w+)\s*\)")
 # ``wp::tile_matmul_acc(0, 0, 0, A, B, C, alpha, beta)`` — eight args
 # from the cuBLASDx-LTO calling convention. Three leading ints are
 # placeholder LTO ptr/seg args, then A (RxK), B (KxN), C (RxN), then
@@ -8048,6 +8051,15 @@ _TILE_UPPER_SOLVE_INPLACE_PAT = re.compile(r"\btile_upper_solve_inplace\s*\(([^)
 # independent rows, ``size`` the FFT length (the tile's last dim). The
 # transform is in place and unnormalized, matching cuFFTDx semantics.
 _TILE_FFT_PAT = re.compile(r"\btile_i?fft\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*var_(\w+)\s*\)")
+# ``adj_tile_fft(dir, batch, size, var_X, adj_dir, adj_batch, adj_size, adj_X)``
+# — the forward geometry followed by the adjoint's own. The transform is
+# unitary up to scale, so its adjoint is the opposite direction applied in
+# place to the dual (see the adj_tile_fft / adj_tile_ifft macros in
+# warp/native/tile.h, which just call the other LTO on ``adj_Xinout``).
+_ADJ_TILE_FFT_PAT = re.compile(
+    r"\badj_tile_i?fft\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*var_(\w+)\s*,"
+    r"\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*adj_(\w+)\s*\)"
+)
 # ``var_X = wp::tile_view<wp::tile_shared_t<dtype, layout<shape<R,C>,
 # stride<...>>, ...>>(parent, row_off, col_off)``. The template arg
 # carries the view's output shape; the function args are the parent
@@ -9149,6 +9161,39 @@ def _translate_tile_intrinsics(
 
     line = _TILE_TRANSPOSE_NOTPL_PAT.sub(repl_transpose_notpl, line)
 
+    def repl_adj_transpose(m: re.Match[str]) -> str:
+        # ``adj_T += transpose(adj_RET)``. ``adj_RET`` has the transposed
+        # shape, so the helper is keyed on *its* dims and returns ``adj_T``'s.
+        # The helper definition is emitted by scanning the generated source
+        # for its name, so naming it here is enough to bring it into being.
+        dst_label, src_label = m.group(2), m.group(3)
+        src_dims = tile_var_dims.get(src_label)
+        if src_dims is None:
+            return m.group(0)
+        rows, cols, msl_scalar = src_dims
+        if rows == 1 and cols == 1:
+            return f"adj_{dst_label} += adj_{src_label}"
+        if src_label in smem_tiles or dst_label in smem_tiles:
+            raise MetalCodegenError(
+                f"MSL codegen: reverse mode through wp.tile_transpose() on a threadgroup-resident "
+                f"tile is not supported (statement: {m.group(0)!r})"
+            )
+        vec_n = tile_var_vec_n.get(src_label, 0)
+        helper = (
+            f"wp_tile_{rows}x{cols}_vec{vec_n}_{msl_scalar}_transpose"
+            if vec_n > 0
+            else f"wp_tile_{rows}x{cols}_{msl_scalar}_transpose"
+        )
+        # ``c[]`` is flat *scalar* storage, so a vec-element tile holds
+        # ``rows * cols * n_elem`` of them, not one per element.
+        n = rows * cols * max(vec_n, 1)
+        return (
+            f"{{ auto _att = {helper}(adj_{src_label}); "
+            f"for (int _att_i = 0; _att_i < {n}; ++_att_i) adj_{dst_label}.c[_att_i] += _att.c[_att_i]; }}"
+        )
+
+    line = _ADJ_TILE_TRANSPOSE_PAT.sub(repl_adj_transpose, line)
+
     def repl_matmul_acc(m: re.Match[str]) -> str:
         # ``wp::tile_matmul_acc(0, 0, 0, A, B, C, alpha, beta)``
         args = [a.strip() for a in m.group(1).split(",")]
@@ -9264,13 +9309,11 @@ def _translate_tile_intrinsics(
     line = _TILE_LOWER_SOLVE_INPLACE_PAT.sub(lambda m: _repl_solve_inplace("lower", m), line)
     line = _TILE_UPPER_SOLVE_INPLACE_PAT.sub(lambda m: _repl_solve_inplace("upper", m), line)
 
-    def _repl_tile_fft(m: re.Match[str]) -> str:
-        # ``tile_fft(dir, batch, size, var_X)`` — see ``_TILE_FFT_PAT``.
-        direction, size, t_label = int(m.group(1)), int(m.group(3)), m.group(4)
+    def _fft_call(direction: int, size: int, t_label: str, tile_expr: str) -> str:
         dims = tile_var_dims.get(t_label)
         vec_n = tile_var_vec_n.get(t_label, 0)
         if dims is None or vec_n != 2:
-            raise MetalCodegenError(f"tile_fft on Metal requires a vec2f register tile; got tile local 'var_{t_label}'")
+            raise MetalCodegenError(f"tile_fft on Metal requires a vec2f register tile; got tile local {tile_expr!r}")
         rows, cols, scalar = dims
         if scalar != "float":
             raise MetalCodegenError(f"tile_fft on Metal supports vec2f only, got vec2 of {scalar!r} (no fp64 on MSL)")
@@ -9279,7 +9322,22 @@ def _translate_tile_intrinsics(
                 f"tile_fft on Metal requires a power-of-two FFT size matching the tile's last dim, got {cols}"
             )
         inv = "true" if direction == 1 else "false"
-        return f"wp_tile_{rows}x{cols}_vec2_{scalar}_fft(var_{t_label}, {inv})"
+        return f"wp_tile_{rows}x{cols}_vec2_{scalar}_fft({tile_expr}, {inv})"
+
+    def _repl_adj_tile_fft(m: re.Match[str]) -> str:
+        # Reverse mode: run the OPPOSITE direction, in place, on the dual.
+        # The forward geometry is reused — the dual has the same shape, and
+        # the trailing adjoint-geometry arguments repeat it.
+        direction, size = int(m.group(1)), int(m.group(3))
+        label = m.group(5)
+        return _fft_call(1 - direction, size, label, f"adj_{label}")
+
+    line = _ADJ_TILE_FFT_PAT.sub(_repl_adj_tile_fft, line)
+
+    def _repl_tile_fft(m: re.Match[str]) -> str:
+        # ``tile_fft(dir, batch, size, var_X)`` — see ``_TILE_FFT_PAT``.
+        t_label = m.group(4)
+        return _fft_call(int(m.group(1)), int(m.group(3)), t_label, f"var_{t_label}")
 
     line = _TILE_FFT_PAT.sub(_repl_tile_fft, line)
 
