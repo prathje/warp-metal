@@ -9036,6 +9036,60 @@ class TestMetalLaunchDimAndParams(unittest.TestCase):
                 total = count.numpy()[0]
                 written = slots.numpy()
                 assert total == 7, f'{dev}: count {total} != 7 (second launch wiped the first?)'
+    def test_allocate_by_voxels_matches_cpu(self):
+        # ``Volume.allocate_by_voxels`` has no native builder outside CUDA; the
+        # NumPy NanoVDB builder (warp/_src/nanovdb_builder.py) must give the
+        # same index grid on CPU and Metal, from world-space or index-space
+        # points, and index-grid sampling must read through it.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            if not wp.config.metal_native_dispatch:
+                raise SystemExit(0)
+
+            @wp.kernel
+            def k(vol: wp.uint64, pts: wp.array(dtype=wp.vec3), data: wp.array(dtype=float),
+                  idx: wp.array(dtype=int), s: wp.array(dtype=float), w: wp.array(dtype=wp.vec3)):
+                i = wp.tid()
+                p = pts[i]
+                u = wp.volume_world_to_index(vol, p)
+                idx[i] = wp.volume_lookup_index(vol, int(wp.floor(u[0])), int(wp.floor(u[1])), int(wp.floor(u[2])))
+                s[i] = wp.volume_sample_index(vol, u, wp.Volume.LINEAR, data, -1.0)
+                w[i] = wp.volume_index_to_world(vol, u)
+
+            rng = np.random.default_rng(0)
+            world = rng.uniform(-3.0, 3.0, size=(4000, 3)).astype(np.float32)
+            vs, tr = 0.1, (0.5, -0.25, 1.0)
+            ijk = np.floor((world - np.float32(tr)) / np.float32(vs)).astype(np.int32)
+            res = {}
+            for dev in ("cpu", "metal:0"):
+                with wp.ScopedDevice(dev):
+                    v1 = wp.Volume.allocate_by_voxels(wp.array(world, dtype=wp.vec3), voxel_size=vs, translation=tr)
+                    v2 = wp.Volume.allocate_by_voxels(wp.array(ijk, dtype=wp.vec3i), voxel_size=vs, translation=tr)
+                    n = v1.get_voxel_count()
+                    assert n == v2.get_voxel_count() == len(np.unique(ijk, axis=0))
+                    np.testing.assert_array_equal(v1.get_voxels().numpy(), v2.get_voxels().numpy())
+                    data = wp.array(np.arange(n, dtype=np.float32), dtype=float)
+                    pts = wp.array(world, dtype=wp.vec3)
+                    idx = wp.zeros(len(world), dtype=int)
+                    s = wp.zeros(len(world), dtype=float)
+                    w = wp.zeros(len(world), dtype=wp.vec3)
+                    wp.launch(k, dim=len(world), inputs=[v1.id, pts, data, idx, s, w])
+                    wp.synchronize_device()
+                    vox = v1.get_voxels().numpy()
+                    assert (idx.numpy() >= 0).all()
+                    np.testing.assert_array_equal(vox[idx.numpy()], ijk)  # index maps back to the generating voxel
+                    res[dev] = (vox, v1.get_tiles().numpy(), idx.numpy(), s.numpy(), w.numpy())
+            c, m = res["cpu"], res["metal:0"]
+            for a, b in zip(c[:3], m[:3]):
+                np.testing.assert_array_equal(b, a)
+            np.testing.assert_allclose(m[3], c[3], rtol=1e-5, atol=1e-3)
+            np.testing.assert_allclose(m[4], c[4], rtol=1e-6, atol=1e-6)
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=300)
+
                 np.testing.assert_array_equal(np.sort(written[:7]), np.array([1, 1, 1, 2, 2, 2, 2], np.float32))
             """
         )

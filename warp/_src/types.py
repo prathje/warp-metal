@@ -6852,7 +6852,8 @@ class Volume:
         explicit payload but encodes a linearized index for each active voxel, allowing to lookup and
         sample data from arbitrary external arrays.
 
-        This function is only supported for CUDA devices.
+        On CUDA devices the grid is built natively on the GPU; on other devices (CPU, Metal) it is
+        assembled on the host with NumPy and then uploaded.
 
         Args:
             voxel_points (:class:`warp.array`): Array of positions that define the voxels to be allocated.
@@ -6863,10 +6864,9 @@ class Volume:
             translation: Translation between the index and world spaces.
             transform: Linear transform between the index and world spaces.
               If ``None``, deduced from ``voxel_size``.
-            device: The CUDA device to create the volume on, e.g. ``"cuda"`` or ``"cuda:0"``.
+            device: The device to create the volume on, e.g. ``"cuda"`` or ``"cuda:0"``.
 
         Raises:
-            RuntimeError: If the ``device`` is not a CUDA device.
             RuntimeError: If ``voxel_points`` is not a contiguous array of the correct type and shape.
             RuntimeError: If :class:`Volume` creation fails.
             ValueError: If neither ``voxel_size`` nor ``transform`` is provided.
@@ -6874,20 +6874,37 @@ class Volume:
         """
         device = warp.get_device(device)
 
-        if not device.is_cuda:
-            raise RuntimeError("Only CUDA devices are supported for allocate_by_tiles")
         if not _is_contiguous_vec_like_array(voxel_points, vec_length=3, scalar_types=(float32, int32)):
             raise RuntimeError(
                 "voxel_points must be contiguous and either a 1D Warp array of vec3f or vec3i or a 2D n-by-3 array of int32 or float32."
             )
+        in_world_space = type_scalar_type(voxel_points.dtype) is float32
+        transform_buf, translation_buf = Volume._fill_transform_buffers(voxel_size, translation, transform)
+
+        if not device.is_cuda:
+            # No native builder outside CUDA: assemble the NanoVDB grid with NumPy
+            # (see warp/_src/nanovdb_builder.py) and upload it to ``device``.
+            from warp._src.nanovdb_builder import build_onindex_grid  # noqa: PLC0415
+
+            pts = voxel_points.numpy().reshape(-1, 3)
+            mat = np.frombuffer(transform_buf, dtype=np.float32).reshape(3, 3).astype(np.float64)
+            trans = np.frombuffer(translation_buf, dtype=np.float32).astype(np.float64)
+            if in_world_space:
+                # Same as the CUDA path: apply the inverse map in float32, then floor.
+                inv = np.linalg.inv(mat).astype(np.float32)
+                ijk = np.floor((pts.astype(np.float32) - trans.astype(np.float32)) @ inv.T).astype(np.int32)
+            else:
+                ijk = pts.astype(np.int32)
+            grid = array(build_onindex_grid(ijk, mat, trans), dtype=uint8, device=device)
+            volume = cls(grid, copy=False)
+            volume._grid_array = grid  # aliased, so keep the storage alive with the volume
+            return volume
+
         if not voxel_points.device.is_cuda:
             voxel_points = voxel_points.to(device)
 
         volume = cls(data=None)
         volume.device = device
-        in_world_space = type_scalar_type(voxel_points.dtype) is float32
-
-        transform_buf, translation_buf = Volume._fill_transform_buffers(voxel_size, translation, transform)
 
         volume.id = volume.runtime.core.wp_volume_from_active_voxels_device(
             volume.device.context,

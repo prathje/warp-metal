@@ -94,7 +94,10 @@
   introspection API, and the `wp.volume_*` sampling, lookup, store, index-grid and transform builtins for
   `float32`, `int32` and `vec3f` grids, including reverse mode through the sampling and transform functions.
   Volumes are read through the same NanoVDB traversal code as the CPU and CUDA backends (`core/example_nvdb`
-  runs on Metal). `Volume.allocate*()` remains CUDA-only.
+  runs on Metal).
+- Support `Volume.allocate_by_voxels()` on CPU and Metal devices: the NanoVDB index grid is assembled on the host
+  with NumPy when no native builder is available, so `warp.fem`'s `Nanogrid` and `AdaptiveNanogrid` geometries work
+  there. `Volume.allocate()` and `Volume.allocate_by_tiles()` remain CUDA-only.
 
 ### Fixed
 
