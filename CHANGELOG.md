@@ -83,6 +83,12 @@
   `wp.tile_extract()`, `wp.tile_from_thread()`, `wp.tile_arange()`, `wp.tile_map()`, and `wp.tile_store_indexed()`
   lower to per-lane SIMD operations, so `wp.tid()` and `wp.block_dim()` mean the same as on CUDA.
   `tile/example_tile_stream_compaction` runs on Metal.
+- Run 2-D register tiles built by `wp.tile()` from a vector with one column per lane on Metal devices when
+  `block_dim=32`: `wp.tile_matmul()` against a loaded weight tile, `wp.tile_broadcast()` of a loaded bias,
+  element-wise tile ops, `wp.tile_map()`, and `wp.untile()` stay lane-local in both the forward and backward
+  pass, and `wp.tile_load()` gradients into `float16` arrays accumulate through a compare-exchange loop.
+  Kernels indexed with a 1-D `wp.tid()` may be launched with `wp.launch(dim=N, block_dim=32)`.
+  `tile/example_tile_mlp` runs on Metal and accepts `--device`.
 
 ### Fixed
 

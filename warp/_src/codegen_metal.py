@@ -143,6 +143,7 @@ from warp._src.codegen_metal_ast import Builtin as _AstBuiltin
 from warp._src.codegen_metal_ast import For as _AstFor
 from warp._src.codegen_metal_ast import If as _AstIf
 from warp._src.codegen_metal_ast import UserCall as _AstUserCall
+from warp._src.codegen_metal_ast import VoidCall as _AstVoidCall
 from warp._src.codegen_metal_ast import While as _AstWhile
 from warp._src.codegen_metal_ast import _build_function_overload_table as _ast_fn_overload_table
 from warp._src.codegen_metal_ast import _DoWhileZero as _AstDoWhileZero
@@ -1398,6 +1399,22 @@ template <typename T, typename U> inline void wp_adj_cast_nodiff(T x, thread T& 
 inline void wp_adj_accum(device float* p, float v) {
     atomic_fetch_add_explicit((device atomic_float*)p, v, memory_order_relaxed);
 }
+// MSL has no 16-bit atomics: accumulate a half through a compare-exchange
+// loop on the aligned 32-bit word that contains it. Each lane's CAS is
+// independent (no lock is held), so divergent retries make progress.
+inline void wp_adj_accum(device half* p, half v) {
+    const ulong addr = (ulong)p;
+    device atomic_uint* w = (device atomic_uint*)(addr & ~(ulong)3);
+    const bool hi = (addr & 2) != 0;
+    uint old = atomic_load_explicit(w, memory_order_relaxed);
+    while (true) {
+        const ushort bits = hi ? (ushort)(old >> 16) : (ushort)(old & 0xFFFFu);
+        const half cur = as_type<half>(bits);
+        const ushort nb = as_type<ushort>((half)(cur + v));
+        const uint nw = hi ? ((old & 0x0000FFFFu) | ((uint)nb << 16)) : ((old & 0xFFFF0000u) | (uint)nb);
+        if (atomic_compare_exchange_weak_explicit(w, &old, nw, memory_order_relaxed, memory_order_relaxed)) break;
+    }
+}
 """
 
 # Per-vector-length adjoint helpers: component constructors, dot/length/
@@ -1406,39 +1423,42 @@ inline void wp_adj_accum(device float* p, float v) {
 _ADJ_VEC_HELPER_LENGTHS = (2, 3, 4)
 
 
-def _adj_vec_helpers(n: int) -> str:
-    """MSL adjoint helpers for the native ``floatN`` vector type."""
-    v = f"float{n}"
+def _adj_vec_helpers(n: int, scalar: str = "float") -> str:
+    """MSL adjoint helpers for the native ``floatN`` / ``halfN`` vector types."""
+    sc = scalar
+    v = f"{sc}{n}"
     comps = "".join(f"    a{i} += r[{i}];\n" for i in range(n))
-    args = ", ".join(f"float c{i}" for i in range(n))
-    refs = ", ".join(f"thread float& a{i}" for i in range(n))
+    args = ", ".join(f"{sc} c{i}" for i in range(n))
+    refs = ", ".join(f"thread {sc}& a{i}" for i in range(n))
     # ``wp.vec2(s)`` broadcasts one scalar into every component, so its
     # adjoint sums the whole gradient back into that scalar.
     bcast = " + ".join(f"r[{i}]" for i in range(n))
+    zero = f"({sc})0"
+    two = f"({sc})2"
     return (
         f"inline void wp_adj_vec_t({args}, {refs}, {v} r) {{\n{comps}}}\n"
-        f"inline void wp_adj_vec_t(float c, thread float& a, {v} r) {{ a += {bcast}; }}\n"
+        f"inline void wp_adj_vec_t({sc} c, thread {sc}& a, {v} r) {{ a += {bcast}; }}\n"
         # Copy / element-cast constructor (``wp.vec2(other)``), which
         # warp.fem's dispatch kernels emit when narrowing an accumulator.
         # Same-length, so the adjoint is a straight accumulation.
         f"inline void wp_adj_vec_t({v} other, thread {v}& adj_other, {v} r) {{ adj_other += r; }}\n"
-        f"inline void wp_adj_mul({v} a, float b, thread {v}& aa, thread float& ab, {v} r) {{\n"
+        f"inline void wp_adj_mul({v} a, {sc} b, thread {v}& aa, thread {sc}& ab, {v} r) {{\n"
         f"    aa += b * r;\n    ab += metal::dot(a, r);\n}}\n"
-        f"inline void wp_adj_mul(float a, {v} b, thread float& aa, thread {v}& ab, {v} r) {{\n"
+        f"inline void wp_adj_mul({sc} a, {v} b, thread {sc}& aa, thread {v}& ab, {v} r) {{\n"
         f"    aa += metal::dot(b, r);\n    ab += a * r;\n}}\n"
-        f"inline void wp_adj_div({v} a, float b, {v} ret, thread {v}& aa, thread float& ab, {v} r) {{\n"
+        f"inline void wp_adj_div({v} a, {sc} b, {v} ret, thread {v}& aa, thread {sc}& ab, {v} r) {{\n"
         f"    aa += r / b;\n    ab -= metal::dot(r, ret) / b;\n}}\n"
-        f"inline void wp_adj_dot({v} a, {v} b, thread {v}& aa, thread {v}& ab, float r) {{\n"
+        f"inline void wp_adj_dot({v} a, {v} b, thread {v}& aa, thread {v}& ab, {sc} r) {{\n"
         f"    aa += b * r;\n    ab += a * r;\n}}\n"
-        f"inline void wp_adj_length({v} a, float ret, thread {v}& aa, float r) {{\n"
-        f"    if (ret > 0.0f) aa += a * (r / ret);\n}}\n"
-        f"inline void wp_adj_length_sq({v} a, thread {v}& aa, float r) {{ aa += a * (2.0f * r); }}\n"
+        f"inline void wp_adj_length({v} a, {sc} ret, thread {v}& aa, {sc} r) {{\n"
+        f"    if (ret > {zero}) aa += a * (r / ret);\n}}\n"
+        f"inline void wp_adj_length_sq({v} a, thread {v}& aa, {sc} r) {{ aa += a * ({two} * r); }}\n"
         f"inline void wp_adj_normalize({v} a, {v} ret, thread {v}& aa, {v} r) {{\n"
-        f"    float d = metal::length(a);\n"
-        f"    if (d > 0.0f) aa += (r - ret * metal::dot(ret, r)) / d;\n}}\n"
+        f"    {sc} d = metal::length(a);\n"
+        f"    if (d > {zero}) aa += (r - ret * metal::dot(ret, r)) / d;\n}}\n"
         # ``wp.extract(v, i)`` on a vector: scatter the scalar adjoint back
         # into the indexed component. The index itself is non-differentiable.
-        f"inline void wp_adj_extract({v} a, int i, thread {v}& aa, thread int& ai, float r) {{\n"
+        f"inline void wp_adj_extract({v} a, int i, thread {v}& aa, thread int& ai, {sc} r) {{\n"
         f"    aa[i] += r;\n}}\n"
         # Component-wise products. MSL's ``*`` on vectors is already
         # component-wise, so these mirror the scalar rules per lane.
@@ -4458,31 +4478,31 @@ inline uint32_t wp_volume_grid_type(pnanovdb_buf_t buf) {
 inline pnanovdb_root_handle_t wp_volume_root(pnanovdb_buf_t buf) {
     return pnanovdb_tree_get_root(buf, pnanovdb_grid_get_tree(buf, wp_volume_grid()));
 }
-inline pnanovdb_coord_t wp_pn_coord(int i, int j, int k) {
+inline pnanovdb_coord_t wp_on_coord(int i, int j, int k) {
     pnanovdb_coord_t c;
     c.x = i;
     c.y = j;
     c.z = k;
     return c;
 }
-inline pnanovdb_vec3_t wp_pn_vec3(float3 v) {
+inline pnanovdb_vec3_t wp_on_vec3(float3 v) {
     pnanovdb_vec3_t r;
     r.x = v.x;
     r.y = v.y;
     r.z = v.z;
     return r;
 }
-inline float3 wp_pn_float3(pnanovdb_vec3_t v) { return float3(v.x, v.y, v.z); }
+inline float3 wp_on_float3(pnanovdb_vec3_t v) { return float3(v.x, v.y, v.z); }
 // roundf(): halves away from zero, as in volume.h's vec3_round_to_coord.
-inline pnanovdb_coord_t wp_pn_round_coord(float3 p) {
-    return wp_pn_coord(int(metal::round(p.x)), int(metal::round(p.y)), int(metal::round(p.z)));
+inline pnanovdb_coord_t wp_on_round_coord(float3 p) {
+    return wp_on_coord(int(metal::round(p.x)), int(metal::round(p.y)), int(metal::round(p.z)));
 }
 
 // Per-element-type traits (pnano_traits + pnano_read/pnano_write in volume.h).
 // ``load`` reads element ``i`` of a Warp array bound as scalar storage
 // (vec3 arrays are ``device float*`` with 3 floats per element).
-template <typename T> struct wp_pn_traits;
-template <> struct wp_pn_traits<float> {
+template <typename T> struct wp_on_traits;
+template <> struct wp_on_traits<float> {
     static uint32_t grid_type() { return PNANOVDB_GRID_TYPE_FLOAT; }
     static float zero() { return 0.0f; }
     static float read(pnanovdb_buf_t buf, pnanovdb_address_t a) { return pnanovdb_read_float(buf, a); }
@@ -4490,7 +4510,7 @@ template <> struct wp_pn_traits<float> {
     template <typename PtrT> static float load(PtrT p, ulong i) { return float(p[i]); }
     static float dot(float a, float b) { return a * b; }
 };
-template <> struct wp_pn_traits<int> {
+template <> struct wp_on_traits<int> {
     static uint32_t grid_type() { return PNANOVDB_GRID_TYPE_INT32; }
     static int zero() { return 0; }
     static int read(pnanovdb_buf_t buf, pnanovdb_address_t a) { return pnanovdb_read_int32(buf, a); }
@@ -4498,10 +4518,10 @@ template <> struct wp_pn_traits<int> {
     template <typename PtrT> static int load(PtrT p, ulong i) { return int(p[i]); }
     static float dot(int a, int b) { return float(a * b); }
 };
-template <> struct wp_pn_traits<float3> {
+template <> struct wp_on_traits<float3> {
     static uint32_t grid_type() { return PNANOVDB_GRID_TYPE_VEC3F; }
     static float3 zero() { return float3(0.0f); }
-    static float3 read(pnanovdb_buf_t buf, pnanovdb_address_t a) { return wp_pn_float3(pnanovdb_read_vec3(buf, a)); }
+    static float3 read(pnanovdb_buf_t buf, pnanovdb_address_t a) { return wp_on_float3(pnanovdb_read_vec3(buf, a)); }
     static void write(pnanovdb_buf_t buf, pnanovdb_address_t a, float3 v) {
         pnanovdb_write_float(buf, a, v.x);
         pnanovdb_write_float(buf, pnanovdb_address_offset(a, 4u), v.y);
@@ -4549,17 +4569,17 @@ template <typename T> struct wp_volume_leaf_accessor {
     pnanovdb_root_handle_t root;
     pnanovdb_readaccessor_t acc;
     wp_volume_leaf_accessor(pnanovdb_buf_t b) : buf(b), root(wp_volume_root(b)) {}
-    bool is_valid() { return wp_volume_grid_type(buf) == wp_pn_traits<T>::grid_type(); }
+    bool is_valid() { return wp_volume_grid_type(buf) == wp_on_traits<T>::grid_type(); }
     void init_cache() { pnanovdb_readaccessor_init(PNANOVDB_REF(acc), root); }
     T read_single(pnanovdb_coord_t ijk) {
-        const pnanovdb_address_t a = pnanovdb_root_get_value_address(wp_pn_traits<T>::grid_type(), buf, root, PNANOVDB_REF(ijk));
-        return wp_pn_traits<T>::read(buf, a);
+        const pnanovdb_address_t a = pnanovdb_root_get_value_address(wp_on_traits<T>::grid_type(), buf, root, PNANOVDB_REF(ijk));
+        return wp_on_traits<T>::read(buf, a);
     }
     T read_cache(pnanovdb_coord_t ijk) {
         uint32_t level;
         const pnanovdb_address_t a = pnanovdb_readaccessor_get_value_address_and_level(
-            wp_pn_traits<T>::grid_type(), buf, PNANOVDB_REF(acc), PNANOVDB_REF(ijk), PNANOVDB_REF(level));
-        return wp_pn_traits<T>::read(buf, a);
+            wp_on_traits<T>::grid_type(), buf, PNANOVDB_REF(acc), PNANOVDB_REF(ijk), PNANOVDB_REF(level));
+        return wp_on_traits<T>::read(buf, a);
     }
 };
 
@@ -4578,7 +4598,7 @@ template <typename T, typename PtrT> struct wp_volume_index_accessor {
     T read_at(uint32_t level, pnanovdb_address_t a, pnanovdb_coord_t ijk) {
         if (level == 0u) {
             const ulong voxel_index = wp_volume_voxel_index(grid_type, buf, a, ijk);
-            if (voxel_index > 0ul) { return wp_pn_traits<T>::load(data, voxel_index - 1ul); }
+            if (voxel_index > 0ul) { return wp_on_traits<T>::load(data, voxel_index - 1ul); }
         }
         return background;
     }
@@ -4602,20 +4622,20 @@ template <typename T, typename PtrT> struct wp_volume_index_accessor {
 
 template <typename T, typename Acc>
 inline T wp_volume_sample_impl(thread Acc& accessor, float3 uvw, int mode) {
-    if (!accessor.is_valid()) { return wp_pn_traits<T>::zero(); }
-    if (mode == WP_VOLUME_CLOSEST) { return accessor.read_single(wp_pn_round_coord(uvw)); }
-    if (mode != WP_VOLUME_LINEAR) { return wp_pn_traits<T>::zero(); }
+    if (!accessor.is_valid()) { return wp_on_traits<T>::zero(); }
+    if (mode == WP_VOLUME_CLOSEST) { return accessor.read_single(wp_on_round_coord(uvw)); }
+    if (mode != WP_VOLUME_LINEAR) { return wp_on_traits<T>::zero(); }
     const float3 base = metal::floor(uvw);
     const float3 frac = uvw - base;
-    const pnanovdb_coord_t ijk = wp_pn_coord(int(base.x), int(base.y), int(base.z));
+    const pnanovdb_coord_t ijk = wp_on_coord(int(base.x), int(base.y), int(base.z));
     accessor.init_cache();
-    T val = wp_pn_traits<T>::zero();
+    T val = wp_on_traits<T>::zero();
     const float wx[2] = {1.0f - frac.x, frac.x};
     const float wy[2] = {1.0f - frac.y, frac.y};
     const float wz[2] = {1.0f - frac.z, frac.z};
     for (int idx = 0; idx < 8; ++idx) {
         WP_VOLUME_CORNER(idx, ox, oy, oz)
-        const T v = accessor.read_cache(wp_pn_coord(ijk.x + ox, ijk.y + oy, ijk.z + oz));
+        const T v = accessor.read_cache(wp_on_coord(ijk.x + ox, ijk.y + oy, ijk.z + oz));
         const float w = wx[ox] * wy[oy] * wz[oz];
         val = T(val + w * v);
     }
@@ -4626,11 +4646,11 @@ template <typename Acc>
 inline float wp_volume_sample_grad_impl(thread Acc& accessor, float3 uvw, int mode, thread float3& grad) {
     grad = float3(0.0f);
     if (!accessor.is_valid()) { return 0.0f; }
-    if (mode == WP_VOLUME_CLOSEST) { return accessor.read_single(wp_pn_round_coord(uvw)); }
+    if (mode == WP_VOLUME_CLOSEST) { return accessor.read_single(wp_on_round_coord(uvw)); }
     if (mode != WP_VOLUME_LINEAR) { return 0.0f; }
     const float3 base = metal::floor(uvw);
     const float3 frac = uvw - base;
-    const pnanovdb_coord_t ijk = wp_pn_coord(int(base.x), int(base.y), int(base.z));
+    const pnanovdb_coord_t ijk = wp_on_coord(int(base.x), int(base.y), int(base.z));
     accessor.init_cache();
     float val = 0.0f;
     const float wx[2] = {1.0f - frac.x, frac.x};
@@ -4638,7 +4658,7 @@ inline float wp_volume_sample_grad_impl(thread Acc& accessor, float3 uvw, int mo
     const float wz[2] = {1.0f - frac.z, frac.z};
     for (int idx = 0; idx < 8; ++idx) {
         WP_VOLUME_CORNER(idx, ox, oy, oz)
-        const float v = accessor.read_cache(wp_pn_coord(ijk.x + ox, ijk.y + oy, ijk.z + oz));
+        const float v = accessor.read_cache(wp_on_coord(ijk.x + ox, ijk.y + oy, ijk.z + oz));
         const float3 signs = float3(float(ox * 2 - 1), float(oy * 2 - 1), float(oz * 2 - 1));
         const float w = wx[ox] * wy[oy] * wz[oz];
         const float3 grad_w = float3(signs.x * wy[oy] * wz[oz], signs.y * wx[ox] * wz[oz], signs.z * wx[ox] * wy[oy]);
@@ -4654,17 +4674,17 @@ inline void wp_adj_volume_sample_impl(thread Acc& accessor, float3 uvw, int mode
     if (!accessor.is_valid() || mode != WP_VOLUME_LINEAR) { return; }
     const float3 base = metal::floor(uvw);
     const float3 frac = uvw - base;
-    const pnanovdb_coord_t ijk = wp_pn_coord(int(base.x), int(base.y), int(base.z));
+    const pnanovdb_coord_t ijk = wp_on_coord(int(base.x), int(base.y), int(base.z));
     accessor.init_cache();
     const float wx[2] = {1.0f - frac.x, frac.x};
     const float wy[2] = {1.0f - frac.y, frac.y};
     const float wz[2] = {1.0f - frac.z, frac.z};
     for (int idx = 0; idx < 8; ++idx) {
         WP_VOLUME_CORNER(idx, ox, oy, oz)
-        const T v = accessor.read_cache(wp_pn_coord(ijk.x + ox, ijk.y + oy, ijk.z + oz));
+        const T v = accessor.read_cache(wp_on_coord(ijk.x + ox, ijk.y + oy, ijk.z + oz));
         const float3 signs = float3(float(ox * 2 - 1), float(oy * 2 - 1), float(oz * 2 - 1));
         const float3 grad_w = float3(signs.x * wy[oy] * wz[oz], signs.y * wx[ox] * wz[oz], signs.z * wx[ox] * wy[oy]);
-        adj_uvw += wp_pn_traits<T>::dot(v, adj_ret) * grad_w;
+        adj_uvw += wp_on_traits<T>::dot(v, adj_ret) * grad_w;
     }
 }
 
@@ -4674,14 +4694,14 @@ inline void wp_adj_volume_sample_grad_impl(thread Acc& accessor, float3 uvw, int
     if (!accessor.is_valid() || mode != WP_VOLUME_LINEAR) { return; }
     const float3 base = metal::floor(uvw);
     const float3 frac = uvw - base;
-    const pnanovdb_coord_t ijk = wp_pn_coord(int(base.x), int(base.y), int(base.z));
+    const pnanovdb_coord_t ijk = wp_on_coord(int(base.x), int(base.y), int(base.z));
     accessor.init_cache();
     const float wx[2] = {1.0f - frac.x, frac.x};
     const float wy[2] = {1.0f - frac.y, frac.y};
     const float wz[2] = {1.0f - frac.z, frac.z};
     for (int idx = 0; idx < 8; ++idx) {
         WP_VOLUME_CORNER(idx, ox, oy, oz)
-        const float v = accessor.read_cache(wp_pn_coord(ijk.x + ox, ijk.y + oy, ijk.z + oz));
+        const float v = accessor.read_cache(wp_on_coord(ijk.x + ox, ijk.y + oy, ijk.z + oz));
         const float3 s = float3(float(ox * 2 - 1), float(oy * 2 - 1), float(oz * 2 - 1));
         const float3 grad_w = float3(s.x * wy[oy] * wz[oz], s.y * wx[ox] * wz[oz], s.z * wx[ox] * wy[oy]);
         adj_uvw += (v * adj_ret) * grad_w;
@@ -4722,8 +4742,8 @@ inline float wp_volume_sample_grad_index(ulong id, float3 uvw, int mode, PtrT da
 template <typename T>
 inline T wp_volume_lookup(ulong id, int i, int j, int k) {
     wp_volume_leaf_accessor<T> acc(wp_volume_buf(id));
-    if (!acc.is_valid()) { return wp_pn_traits<T>::zero(); }
-    return acc.read_single(wp_pn_coord(i, j, k));
+    if (!acc.is_valid()) { return wp_on_traits<T>::zero(); }
+    return acc.read_single(wp_on_coord(i, j, k));
 }
 inline float wp_volume_lookup_f(ulong id, int i, int j, int k) { return wp_volume_lookup<float>(id, i, j, k); }
 inline float3 wp_volume_lookup_v(ulong id, int i, int j, int k) { return wp_volume_lookup<float3>(id, i, j, k); }
@@ -4732,7 +4752,7 @@ inline int wp_volume_lookup_index(ulong id, int i, int j, int k) {
     const pnanovdb_buf_t buf = wp_volume_buf(id);
     const pnanovdb_root_handle_t root = wp_volume_root(buf);
     const uint32_t grid_type = wp_volume_grid_type(buf);
-    pnanovdb_coord_t ijk = wp_pn_coord(i, j, k);
+    pnanovdb_coord_t ijk = wp_on_coord(i, j, k);
     uint32_t level;
     const pnanovdb_address_t a = pnanovdb_root_get_value_address_and_level(
         grid_type, buf, root, PNANOVDB_REF(ijk), PNANOVDB_REF(level));
@@ -4742,34 +4762,34 @@ inline int wp_volume_lookup_index(ulong id, int i, int j, int k) {
 template <typename T>
 inline void wp_volume_store(ulong id, int i, int j, int k, T value) {
     const pnanovdb_buf_t buf = wp_volume_buf(id);
-    if (wp_volume_grid_type(buf) != wp_pn_traits<T>::grid_type()) { return; }
+    if (wp_volume_grid_type(buf) != wp_on_traits<T>::grid_type()) { return; }
     const pnanovdb_root_handle_t root = wp_volume_root(buf);
-    pnanovdb_coord_t ijk = wp_pn_coord(i, j, k);
+    pnanovdb_coord_t ijk = wp_on_coord(i, j, k);
     uint32_t level;
     const pnanovdb_address_t a = pnanovdb_root_get_value_address_and_level(
-        wp_pn_traits<T>::grid_type(), buf, root, PNANOVDB_REF(ijk), PNANOVDB_REF(level));
+        wp_on_traits<T>::grid_type(), buf, root, PNANOVDB_REF(ijk), PNANOVDB_REF(level));
     // Leaf level only, so the background value is never modified.
-    if (level == 0u) { wp_pn_traits<T>::write(buf, a, value); }
+    if (level == 0u) { wp_on_traits<T>::write(buf, a, value); }
 }
 inline void wp_volume_store_f(ulong id, int i, int j, int k, float value) { wp_volume_store<float>(id, i, j, k, value); }
 inline void wp_volume_store_v(ulong id, int i, int j, int k, float3 value) { wp_volume_store<float3>(id, i, j, k, value); }
 inline void wp_volume_store_i(ulong id, int i, int j, int k, int value) { wp_volume_store<int>(id, i, j, k, value); }
 
 inline float3 wp_volume_index_to_world(ulong id, float3 uvw) {
-    pnanovdb_vec3_t p = wp_pn_vec3(uvw);
-    return wp_pn_float3(pnanovdb_grid_index_to_worldf(wp_volume_buf(id), wp_volume_grid(), PNANOVDB_REF(p)));
+    pnanovdb_vec3_t p = wp_on_vec3(uvw);
+    return wp_on_float3(pnanovdb_grid_index_to_worldf(wp_volume_buf(id), wp_volume_grid(), PNANOVDB_REF(p)));
 }
 inline float3 wp_volume_world_to_index(ulong id, float3 xyz) {
-    pnanovdb_vec3_t p = wp_pn_vec3(xyz);
-    return wp_pn_float3(pnanovdb_grid_world_to_indexf(wp_volume_buf(id), wp_volume_grid(), PNANOVDB_REF(p)));
+    pnanovdb_vec3_t p = wp_on_vec3(xyz);
+    return wp_on_float3(pnanovdb_grid_world_to_indexf(wp_volume_buf(id), wp_volume_grid(), PNANOVDB_REF(p)));
 }
 inline float3 wp_volume_index_to_world_dir(ulong id, float3 uvw) {
-    pnanovdb_vec3_t p = wp_pn_vec3(uvw);
-    return wp_pn_float3(pnanovdb_grid_index_to_world_dirf(wp_volume_buf(id), wp_volume_grid(), PNANOVDB_REF(p)));
+    pnanovdb_vec3_t p = wp_on_vec3(uvw);
+    return wp_on_float3(pnanovdb_grid_index_to_world_dirf(wp_volume_buf(id), wp_volume_grid(), PNANOVDB_REF(p)));
 }
 inline float3 wp_volume_world_to_index_dir(ulong id, float3 xyz) {
-    pnanovdb_vec3_t p = wp_pn_vec3(xyz);
-    return wp_pn_float3(pnanovdb_grid_world_to_index_dirf(wp_volume_buf(id), wp_volume_grid(), PNANOVDB_REF(p)));
+    pnanovdb_vec3_t p = wp_on_vec3(xyz);
+    return wp_on_float3(pnanovdb_grid_world_to_index_dirf(wp_volume_buf(id), wp_volume_grid(), PNANOVDB_REF(p)));
 }
 
 // -- adjoints (same conventions as volume.h; ids and modes carry no gradient) --
@@ -6849,24 +6869,76 @@ def _coop_block_eligible(adj) -> bool:
       distributed tiles (per-lane element ops);
     - ``tile_zeros`` / ``tile_ones`` / ``tile_full`` / ``tile_arange``.
 
-    Other requirements: only 2-D ``wp.tid()`` (launch dims are
-    ``(D, block_dim)``), no tile-typed local produced any other way, and
-    the kernel actually uses block-cooperative features so plain kernels
-    are untouched.
+    A *column-distributed* tile is the 2-D ``(R, block_dim)`` scalar tile
+    ``wp.tile(vec)`` builds — column ``j`` is lane ``j``'s vector — and
+    whatever stays lane-local downstream: ``tile_matmul(W, t)`` with a
+    loaded (*replicated*) ``W``, ``tile_broadcast`` of a loaded ``(R, 1)``
+    tile, the element-wise tile ops, ``tile_map`` with a user function, and
+    ``untile``. Each lane computes its own column, so the translators see
+    these as ``(R, 1)`` private tiles; the reverse pass adds the cross-lane
+    ``simd_sum`` for the replicated operands' duals.
+
+    Other requirements: a 2-D ``wp.tid()`` (launch dims ``(D, block_dim)``)
+    or a 1-D one (``wp.launch(dim=N, block_dim=32)``), no tile-typed local
+    produced any other way, and the kernel actually uses block-cooperative
+    features so plain kernels are untouched.
+    """
+    return _coop_block_classify(adj) is not None
+
+
+@dataclass
+class _CoopPlan:
+    """What the distributed-lane lowering decided about a kernel's tiles.
+
+    ``coldist`` maps a *column-distributed* 2-D tile label to its row count:
+    a ``(R, block_dim)`` scalar tile whose column ``j`` belongs to lane
+    ``j`` (``wp.tile(vec)``'s layout, and everything a matmul/broadcast/
+    element-wise op derives from it). Each lane holds its own R-vector, so
+    the translators see the tile as an ``(R, 1)`` private struct.
+    ``full`` holds the labels of *replicated* tiles — ``tile_load`` results
+    every lane materialises in full (the weight matrices of an MLP layer).
+    ``tid1d`` is set when the kernel indexes with a 1-D ``wp.tid()``
+    (``wp.launch(..., block_dim=32)`` rather than ``wp.launch_tiled``).
+    """
+
+    coldist: dict[str, int]
+    full: set[str]
+    tid1d: bool
+    # Whether every tile adjoint in the reverse IR has a lowering too. The
+    # IR always carries reverse statements, so this is recorded rather than
+    # enforced: a forward-only kernel may keep the lane model even when its
+    # (never generated) backward pass would not be expressible.
+    reverse_ok: bool = True
+
+
+def _coop_block_classify(adj, honest: bool = False) -> _CoopPlan | None:
+    """Classify a kernel's tile locals for the distributed-lane lowering.
+
+    Returns a :class:`_CoopPlan` when every tile op has a per-lane form, or
+    ``None`` to keep the serial model. ``honest`` says whether the IR was
+    built at the real block width (column-distributed tiles then show as
+    ``(R, block_dim)``) or serially (``(R, 1)``); the dataflow rules are the
+    same, only the expected column count differs.
     """
     try:
         lines = list(adj.blocks[0].body_forward)
     except Exception:
-        return False
+        return None
     text = "\n".join(lines)
-    if "builtin_tid2d(" not in text:
-        return False
-    if re.search(r"builtin_tid1d\s*\(|builtin_tid3d\s*\(|builtin_tid4d\s*\(", text):
-        return False
+    tid1d = "builtin_tid1d(" in text
+    if "builtin_tid2d(" not in text and not tid1d:
+        return None
+    if tid1d and "builtin_tid2d(" in text:
+        return None
+    if re.search(r"builtin_tid3d\s*\(|builtin_tid4d\s*\(", text):
+        return None
 
     def _label(tok: str) -> str:
         tok = tok.strip()
-        return tok[len("var_") :] if tok.startswith("var_") else tok
+        for pfx in ("var_", "adj_"):
+            if tok.startswith(pfx):
+                return tok[len(pfx) :]
+        return tok
 
     tile_vars: dict[str, tuple[str, str, int, int]] = {}
     for v in adj.variables:
@@ -6874,12 +6946,40 @@ def _coop_block_eligible(adj) -> bool:
         if parsed is not None:
             tile_vars[str(v.label)] = parsed
     ctor_labels = set(_COOP_TILE_CTOR_PAT.findall(text))
-    distributed: set[str] = set(ctor_labels)
+    # ``wp.tile(vec)`` lifts each lane's N-vector into column ``lane`` of an
+    # ``(N, block_dim)`` scalar tile — column-distributed by construction.
+    expect_cols = _COOP_BLOCK_DIM if honest else 1
+    coldist: dict[str, int] = {}
+    for label in ctor_labels:
+        tv = tile_vars.get(label)
+        if tv is None:
+            continue
+        _kind, dtype_ctype, rows, cols = tv
+        if rows > 1 and cols == expect_cols and dtype_ctype in _SCALAR_CTYPE_TO_MSL:
+            coldist[label] = rows
+    distributed: set[str] = set(ctor_labels) - set(coldist)
     for label, (_kind, dtype_ctype, rows, cols) in tile_vars.items():
+        if label in coldist:
+            continue
         if rows == _COOP_BLOCK_DIM and cols == 1 and dtype_ctype in _SCALAR_CTYPE_TO_MSL:
             distributed.add(label)
-    if not distributed and "builtin_block_dim" not in text and "WP_TILE_SYNC" not in text:
-        return False
+    if not distributed and not coldist and "builtin_block_dim" not in text and "WP_TILE_SYNC" not in text:
+        return None
+    full: set[str] = set()
+
+    def _is_coldist_shape(label: str) -> int | None:
+        tv = tile_vars.get(label)
+        if tv is None:
+            return None
+        _kind, dtype_ctype, rows, cols = tv
+        if cols == expect_cols and dtype_ctype in _SCALAR_CTYPE_TO_MSL:
+            return rows
+        return None
+
+    # ``wp.untile(t)`` hands each lane back its column of a distributed tile.
+    for m in re.finditer(r"\bwp::untile\s*\(\s*var_(\w+)\s*\)", text):
+        if m.group(1) not in ctor_labels and m.group(1) not in tile_vars:
+            return None
 
     reduce_labels: set[str] = set()
     for raw in lines:
@@ -6890,52 +6990,141 @@ def _coop_block_eligible(adj) -> bool:
             args = [a.strip() for a in arg_str.split(",") if a.strip()]
             if op == "reduce":
                 if len(args) != 2 or args[0] not in _COOP_REDUCE_OPS or _label(args[1]) not in distributed:
-                    return False
+                    return None
                 if lhs is not None:
                     reduce_labels.add(lhs)
             elif op in ("scan_inclusive", "scan_exclusive"):
                 if len(args) != 1 or _label(args[0]) not in distributed or lhs is None:
-                    return False
+                    return None
                 distributed.add(lhs)
             elif op == "extract":
                 if len(args) != 2:
-                    return False
+                    return None
                 src = _label(args[0])
                 if src not in distributed and src not in reduce_labels:
-                    return False
+                    return None
             elif op == "from_thread":
                 if len(args) != 2 or lhs not in distributed:
-                    return False
+                    return None
             elif op == "load":
-                if lhs not in distributed or len(args) < 2 or _COOP_LOAD_TPL_1D_PAT.match(tpl) is None:
-                    return False
+                if lhs is None or len(args) < 2:
+                    return None
+                if _COOP_LOAD_TPL_1D_PAT.match(tpl) is not None and lhs in distributed:
+                    pass
+                elif (
+                    lhs not in ctor_labels
+                    and lhs in tile_vars
+                    and tile_vars[lhs][1] in _SCALAR_CTYPE_TO_MSL
+                    and _COOP_LOAD_TPL_1D_PAT.match(tpl) is None
+                ):
+                    # A 2-D load — including ``shape=(block_dim, 1)``, which the
+                    # block-width heuristic above cannot tell from a 1-D
+                    # ``shape=block_dim`` load: every lane materialises the
+                    # whole tile (the serial private-struct helper), so it is
+                    # a replicated operand.
+                    distributed.discard(lhs)
+                    full.add(lhs)
+                else:
+                    return None
+            elif op == "matmul":
+                # ``var_C = wp::tile_matmul(id, id, id, A, B, C, alpha, beta)``
+                # with a replicated ``A`` and column-distributed ``B``: lane
+                # ``j`` computes column ``j`` of ``C`` on its own.
+                if lhs is None or len(args) != 8 or _label(args[5]) != lhs:
+                    return None
+                rows = _is_coldist_shape(lhs)
+                if rows is None or _label(args[3]) not in full or _label(args[4]) not in coldist:
+                    return None
+                coldist[lhs] = rows
+            elif op == "broadcast":
+                # ``tile_broadcast(b, shape=(R, block_dim))`` of a replicated
+                # ``(R, 1)`` tile gives every lane the same column.
+                if lhs is None or len(args) != 1:
+                    return None
+                src = _label(args[0])
+                rows = _is_coldist_shape(lhs)
+                src_tv = tile_vars.get(src)
+                if rows is None or src not in full or src_tv is None or src_tv[3] != 1 or src_tv[2] != rows:
+                    return None
+                coldist[lhs] = rows
+            elif op in ("add", "sub", "mul", "div", "mul_elementwise") and lhs is not None:
+                tile_args = [_label(a) for a in args if _label(a) in tile_vars]
+                if len(args) != 2 or not tile_args or any(a not in coldist for a in tile_args):
+                    return None
+                rows = _is_coldist_shape(lhs)
+                if rows is None or any(coldist[a] != rows for a in tile_args):
+                    return None
+                coldist[lhs] = rows
+            elif op == "unary_map":
+                if lhs is None or len(args) != 2 or _label(args[1]) not in coldist:
+                    return None
+                rows = _is_coldist_shape(lhs)
+                if rows is None or coldist[_label(args[1])] != rows:
+                    return None
+                coldist[lhs] = rows
             elif op == "store":
                 if len(args) < 3 or _label(args[-1]) not in distributed:
-                    return False
+                    return None
             elif op == "store_indexed":
                 if len(args) != 5 or _label(args[1]) not in distributed or _label(args[4]) not in distributed:
-                    return False
+                    return None
             elif op in ("map", "binary_map"):
                 if lhs is None or len(args) < 2:
-                    return False
+                    return None
                 # ``tile_map<fn>(tiles...)`` or ``tile_map(fn, tiles...)`` —
                 # the op name is never a tile local, so scan every arg.
-                for a in args:
-                    la = _label(a)
-                    if la in tile_vars and la not in distributed:
-                        return False
+                tile_args = [_label(a) for a in args if _label(a) in tile_vars]
+                if tile_args and all(a in coldist for a in tile_args):
+                    rows = _is_coldist_shape(lhs)
+                    if rows is None or any(coldist[a] != rows for a in tile_args):
+                        return None
+                    coldist[lhs] = rows
+                    continue
+                if any(a not in distributed for a in tile_args):
+                    return None
                 distributed.add(lhs)
             elif op in ("zeros", "ones", "full", "arange"):
                 if lhs not in distributed:
-                    return False
+                    return None
             else:
-                return False
+                return None
     # Tile-typed locals produced any other way (e.g. returned from a
     # ``@wp.func``) have no distributed lowering.
     for label in tile_vars:
-        if label not in distributed and label not in reduce_labels:
-            return False
-    return True
+        if label not in distributed and label not in reduce_labels and label not in coldist and label not in full:
+            return None
+    # Reverse-mode IR: does every tile adjoint have a per-lane or cross-lane
+    # lowering? Recorded in the plan (see ``_CoopPlan.reverse_ok``).
+    reverse_ok = True
+    for raw in list(getattr(adj.blocks[0], "body_reverse", None) or []):
+        for m in re.finditer(r"\bwp::adj_(un)?tile(?:_(\w+))?\s*\(([^)]*)\)", raw):
+            un, aop, arg_str = m.group(1), m.group(2), m.group(3)
+            args = [a.strip() for a in arg_str.split(",") if a.strip()]
+            ok = True
+            if un:  # adj_untile(var_t, adj_t, adj_v)
+                ok = len(args) == 3 and _label(args[0]) in coldist
+            elif aop is None:  # adj_tile(var_x, adj_x, adj_t)
+                ok = len(args) == 3 and (_label(args[2]) in coldist or _label(args[2]) in distributed)
+            elif aop == "matmul":
+                ok = (
+                    len(args) == 17
+                    and _label(args[3]) in full
+                    and _label(args[4]) in coldist
+                    and _label(args[5]) in coldist
+                )
+            elif aop == "broadcast":
+                ok = len(args) == 3 and _label(args[0]) in full and _label(args[2]) in coldist
+            elif aop in ("add", "sub", "mul", "div", "mul_elementwise"):
+                ok = len(args) == 5 and _label(args[4]) in coldist
+            elif aop in ("unary_map", "map", "binary_map"):
+                ok = _label(args[-1]) in coldist
+            elif aop == "load":
+                ok = _label(args[-1]) in full
+            else:
+                ok = False
+            if not ok:
+                reverse_ok = False
+    return _CoopPlan(coldist=coldist, full=full, tid1d=tid1d, reverse_ok=reverse_ok)
 
 
 _SMEM_LOAD_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_load\s*<")
@@ -7223,6 +7412,8 @@ def _build_kernel_header(source: str) -> str:
         for _n in _ADJ_VEC_HELPER_LENGTHS:
             if f"float{_n}" in source:
                 parts.append(_adj_vec_helpers(_n))
+            if f"half{_n}" in source:
+                parts.append(_adj_vec_helpers(_n, "half"))
         for _n in _ADJ_VEC_HELPER_LENGTHS:
             for _s in ("int", "uint"):
                 if f"{_s}{_n}" in source:
@@ -8549,6 +8740,8 @@ def _translate_intrinsics(line: str) -> str:
 # shape (block_dim,). With block_dim=1 the tile *is* the value, so we
 # lower to a plain assign.
 _TILE_BUILTIN_TILE_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile\s*<[^()]*>\s*\(\s*var_(\w+)\s*\)")
+# ``var_v = wp::untile(var_T)`` — the inverse of ``wp.tile()``.
+_UNTILE_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::untile\s*\(\s*var_(\w+)\s*\)")
 # ``wp::tile_reduce(op_fn, tile)`` — reduce across threads. The op (``wp::add``,
 # user fn, etc.) comes as the first *argument*, not as a template arg.
 # With block_dim=1 the tile is a single element; the reduction is a no-op
@@ -8570,6 +8763,9 @@ _TILE_SUM_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_sum\s*\(\s*var_(\w+)\s*\
 # trailing ``;`` of the original line is kept).
 _ADJ_TILE_CTOR_PAT = re.compile(r"\bwp::adj_tile\s*(?:<[^()]*>)?\s*\(\s*var_(\w+)\s*,\s*(adj_\w+)\s*,\s*(adj_\w+)\s*\)")
 _ADJ_TILE_SUM_PAT = re.compile(r"\bwp::adj_tile_sum\s*\(\s*var_(\w+)\s*,\s*(adj_\w+)\s*,\s*(adj_\w+)\s*\)")
+_ADJ_UNTILE_PAT = re.compile(r"\bwp::adj_untile\s*\(\s*var_(\w+)\s*,\s*(adj_\w+)\s*,\s*(adj_\w+)\s*\)")
+_ADJ_TILE_MATMUL_PAT = re.compile(r"\bwp::adj_tile_matmul\s*\(([^)]*)\)")
+_ADJ_TILE_BROADCAST_PAT = re.compile(r"\bwp::adj_tile_broadcast\s*\(\s*var_(\w+)\s*,\s*(adj_\w+)\s*,\s*(adj_\w+)\s*\)")
 # ``wp::adj_tile_<op>(a, b, adj_a, adj_b, adj_c)`` — the element-wise
 # arithmetic tile ops. ``tile.h`` routes all of them through
 # ``adj_tile_binary_map``, i.e. the scalar adjoint applied per element,
@@ -8604,13 +8800,13 @@ _TILE_ARANGE_3ARG_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_arange\s*<[^>]*>
 # ``wp::tile_map<fn>(args...)`` — element-wise map. With block_dim=1 each
 # tile is a scalar; reduces to a direct call to the target function. The
 # template arg holds the function name (e.g. ``wp_mul`` or a user fn).
-_TILE_MAP_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_map\s*<\s*([^,>]+?)\s*>\s*\(([^)]*)\)")
+_TILE_MAP_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_(?:unary_)?map\s*<\s*([^,>]+?)\s*>\s*\(([^)]*)\)")
 # ``wp::tile_map(fn, args...)`` — no-template form used by the dense-
 # Jacobian path. ``fn`` is a user @wp.func or a wp builtin, and args
 # can mix tiles (scalar- or vec-element) with broadcast scalars. We
 # lower this by emitting an explicit element loop. Distinct from the
 # templated form above.
-_TILE_MAP_NOTPL_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_map\s*\(([^)]*)\)")
+_TILE_MAP_NOTPL_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_(?:unary_)?map\s*\(([^)]*)\)")
 # ``wp::tile_binary_map(fn, a, b)`` — same as tile_map but explicitly
 # binary; mujoco_warp's dense-Jacobian path emits this for ``wp::sub``
 # / ``wp::add`` / ``wp::mul`` over two tiles. Lower identically.
@@ -8877,9 +9073,13 @@ def _translate_tile_intrinsics(
     smem_tiles: dict[str, tuple[int, int, int, str]] | None = None,
     distributed_tiles: dict[str, str] | None = None,
     shaped_array_names: set[str] | None = None,
+    coldist_tiles: dict[str, tuple[int, str]] | None = None,
+    coop_block_n: int = 0,
 ) -> str:
     if shaped_array_names is None:
         shaped_array_names = set()
+    if coldist_tiles is None:
+        coldist_tiles = {}
     if tile_var_vec_n is None:
         tile_var_vec_n = {}
     if atomic_output_names is None:
@@ -9289,6 +9489,35 @@ def _translate_tile_intrinsics(
     # actual use survives downstream, it will trip the unsupported-
     # intrinsic guard with the still-prefixed ``wp::`` name.
     line = re.sub(r"\bvar_(\w+)\s*=\s*wp::tuple\s*\([^)]*\)\s*;?", r"// (elided tuple ctor for var_\1)", line)
+
+    # Column-distributed ``wp.tile(vec)``: lane ``j`` owns column ``j``, so
+    # the lane's vector IS its ``(R, 1)`` column — copy component-wise.
+    def repl_coldist_ctor(m: re.Match[str]) -> str:
+        lhs, src = m.group(1), m.group(2)
+        if lhs not in coldist_tiles:
+            return m.group(0)
+        rows = coldist_tiles[lhs][0]
+        return f"{{ for (int _ct_i = 0; _ct_i < {rows}; ++_ct_i) var_{lhs}.c[_ct_i] = var_{src}[_ct_i]; }}"
+
+    if coldist_tiles:
+        line = _TILE_BUILTIN_TILE_PAT.sub(repl_coldist_ctor, line)
+
+    # ``var_v = wp::untile(var_T)`` — each lane takes back its column as a
+    # vector. Serial ``(R, 1)`` tiles read the same way.
+    def repl_untile(m: re.Match[str]) -> str:
+        lhs, src = m.group(1), m.group(2)
+        dims = tile_var_dims.get(src)
+        if dims is None or dims[1] != 1 or tile_var_vec_n.get(src, 0):
+            raise MetalCodegenError(
+                f"MSL codegen: wp.untile() needs a per-lane (R, 1) scalar tile on Metal (statement: {m.group(0)!r})"
+            )
+        rows, _cols, scalar = dims
+        if rows == 1:
+            return f"var_{lhs} = var_{src}"
+        comps = ", ".join(f"var_{src}.c[{i}]" for i in range(rows))
+        return f"var_{lhs} = {_msl_vec_ctor(rows, scalar)}({comps})"
+
+    line = _UNTILE_PAT.sub(repl_untile, line)
     # Block-dim=1 register-tile reductions to plain scalar / vec values.
     # ``var_X = wp::tile<dtype>(var_x)``  →  ``var_X = var_x``
     line = _TILE_BUILTIN_TILE_PAT.sub(r"var_\1 = var_\2", line)
@@ -9408,7 +9637,13 @@ def _translate_tile_intrinsics(
         # Each thread owns one element, so the adjoint is a plain scalar
         # accumulate (``adj_x += adj_reg.data[0]`` in ``tile.h``).
         src, adj_src, adj_tile = m.group(1), m.group(2), m.group(3)
-        dims = tile_var_dims.get(adj_tile[len("adj_") :])
+        t_label = adj_tile[len("adj_") :]
+        if t_label in coldist_tiles:
+            # Column-distributed ``wp.tile(vec)``: the lane's column IS its
+            # vector, so the dual flows back component-wise.
+            rows = coldist_tiles[t_label][0]
+            return f"{{ for (int _at_i = 0; _at_i < {rows}; ++_at_i) {adj_src}[_at_i] += {adj_tile}.c[_at_i]; }}"
+        dims = tile_var_dims.get(t_label)
         if dims is not None and dims[0] * dims[1] != 1:
             raise MetalCodegenError(
                 f"MSL codegen: reverse mode through wp.tile() on a {dims[0]}x{dims[1]} tile "
@@ -9418,6 +9653,78 @@ def _translate_tile_intrinsics(
         return f"{adj_src} += {adj_tile}"
 
     line = _ADJ_TILE_CTOR_PAT.sub(repl_adj_tile, line)
+
+    def repl_adj_untile(m: re.Match[str]) -> str:
+        # ``wp::adj_untile(var_T, adj_T, adj_v)`` — the lane's vector dual
+        # goes back into its column.
+        t_label, adj_tile, adj_vec = m.group(1), m.group(2), m.group(3)
+        dims = tile_var_dims.get(t_label)
+        if dims is None or dims[1] != 1 or tile_var_vec_n.get(t_label, 0):
+            raise MetalCodegenError(
+                f"MSL codegen: reverse mode through wp.untile() needs a per-lane (R, 1) scalar tile "
+                f"(statement: {m.group(0)!r})"
+            )
+        rows = dims[0]
+        if rows == 1:
+            return f"{adj_tile} += {adj_vec}"
+        return f"{{ for (int _au_i = 0; _au_i < {rows}; ++_au_i) {adj_tile}.c[_au_i] += {adj_vec}[_au_i]; }}"
+
+    line = _ADJ_UNTILE_PAT.sub(repl_adj_untile, line)
+
+    def repl_adj_tile_matmul(m: re.Match[str]) -> str:
+        # ``wp::adj_tile_matmul(id, id, id, A, B, C, alpha, beta, adj_id x3,
+        # adj_A, adj_B, adj_C, adj_alpha, adj_beta, adj_ret)`` for a
+        # replicated ``A`` (R x K) and column-distributed ``B`` (K per lane):
+        #   adj_B[k] += alpha * sum_r A[r][k] * adj_C[r]        (lane-local)
+        #   adj_A[r][k] += alpha * sum_lanes adj_C[r] * B[k]     (simd_sum)
+        # Every lane ends up holding the same replicated ``adj_A``; the
+        # ``adj_tile_load`` that scatters it into the array gradient is
+        # lane-strided so each element is accumulated once per block.
+        args = [a.strip() for a in m.group(1).split(",")]
+        if len(args) != 17:
+            return m.group(0)
+        a_arg, b_arg, alpha_arg = args[3], args[4], args[6]
+        adj_a, adj_b, adj_ret = args[11], args[12], args[16]
+        a_label = a_arg[len("var_") :] if a_arg.startswith("var_") else a_arg
+        b_label = b_arg[len("var_") :] if b_arg.startswith("var_") else b_arg
+        if b_label not in coldist_tiles:
+            return m.group(0)
+        a_dims = tile_var_dims.get(a_label)
+        if a_dims is None:
+            return m.group(0)
+        r, k, scalar = a_dims
+        if coldist_tiles[b_label][0] != k:
+            raise MetalCodegenError(f"MSL codegen: adj_tile_matmul operand shapes disagree in {m.group(0)!r}")
+        return (
+            f"{{ for (int _am_k = 0; _am_k < {k}; ++_am_k) {{ float _am_s = 0.0f; "
+            f"for (int _am_r = 0; _am_r < {r}; ++_am_r) "
+            f"_am_s = metal::fma((float){a_arg}.c[_am_r * {k} + _am_k], (float){adj_ret}.c[_am_r], _am_s); "
+            f"{adj_b}.c[_am_k] += ({scalar})((float){alpha_arg} * _am_s); }} "
+            f"for (int _am_r = 0; _am_r < {r}; ++_am_r) for (int _am_k = 0; _am_k < {k}; ++_am_k) "
+            f"{adj_a}.c[_am_r * {k} + _am_k] += ({scalar})((float){alpha_arg} * "
+            f"metal::simd_sum((float){adj_ret}.c[_am_r] * (float){b_arg}.c[_am_k])); }}"
+        )
+
+    line = _ADJ_TILE_MATMUL_PAT.sub(repl_adj_tile_matmul, line)
+
+    def repl_adj_tile_broadcast(m: re.Match[str]) -> str:
+        # ``wp::adj_tile_broadcast(var_S, adj_S, adj_T)`` with ``T`` column-
+        # distributed: every lane received the same (R, 1) column, so the
+        # source dual is the cross-lane sum.
+        s_label, adj_src, adj_tile = m.group(1), m.group(2), m.group(3)
+        t_label = adj_tile[len("adj_") :]
+        if t_label not in coldist_tiles:
+            return m.group(0)
+        rows, scalar = coldist_tiles[t_label]
+        s_dims = tile_var_dims.get(s_label)
+        if s_dims is None or s_dims[0] != rows or s_dims[1] != 1:
+            raise MetalCodegenError(f"MSL codegen: adj_tile_broadcast source shape unsupported in {m.group(0)!r}")
+        return (
+            f"{{ for (int _ab_i = 0; _ab_i < {rows}; ++_ab_i) "
+            f"{adj_src}.c[_ab_i] += ({scalar})metal::simd_sum((float){adj_tile}.c[_ab_i]); }}"
+        )
+
+    line = _ADJ_TILE_BROADCAST_PAT.sub(repl_adj_tile_broadcast, line)
 
     def repl_adj_tile_sum(m: re.Match[str]) -> str:
         # ``wp::adj_tile_sum(var_T, adj_T, adj_S)`` — every element of the
@@ -9913,7 +10220,15 @@ def _translate_tile_intrinsics(
         # let downstream stages treat the result as already in place.
         # Synthesize the matmul_acc form and re-run that translator.
         synth = f"wp::tile_matmul_acc({m.group(2)})"
-        return _TILE_MATMUL_ACC_PAT.sub(repl_matmul_acc, synth)
+        out = _TILE_MATMUL_ACC_PAT.sub(repl_matmul_acc, synth)
+        # A fresh (``beta == 0``) product into a column-distributed tile:
+        # clear the lane's column first so ``beta * C`` never multiplies
+        # whatever the struct held (0 * NaN is NaN).
+        lhs = m.group(1)
+        if lhs in coldist_tiles and out != synth:
+            rows, scalar = coldist_tiles[lhs]
+            return f"{{ var_{lhs} = wp_tile_{rows}x1_{scalar}(); {out}; }}"
+        return out
 
     line = _TILE_MATMUL_ASSIGN_PAT.sub(_repl_matmul_assign, line)
 
@@ -10354,7 +10669,7 @@ def _emit_referenced_user_funcs(source: str) -> str:
 # by-value param copies, nested ``@wp.func`` calls, mesh queries) comes for
 # free. It supersedes ``_USER_FUNC_MSL_DEFS``, which only ever covered four
 # hand-transcribed mujoco_warp helpers by name.
-_TILE_MAP_BUILTIN_NAMES = frozenset({"tile_map", "tile_binary_map"})
+_TILE_MAP_BUILTIN_NAMES = frozenset({"tile_map", "tile_unary_map", "tile_binary_map"})
 
 _TILE_MAP_EXPAND_SEQ = [0]
 
@@ -10509,6 +10824,146 @@ def _expand_user_tile_map(nodes: list, adj, tile_info: dict[str, tuple[str, int,
                 stop=str(n_elem),
                 body=tuple(body),
             ),
+        ]
+
+    def rewrite(ns: list) -> list:
+        out: list = []
+        for n in ns:
+            if isinstance(n, _AstIf):
+                out.append(
+                    _AstIf(
+                        raw=n.raw,
+                        cond=n.cond,
+                        body=tuple(rewrite(list(n.body))),
+                        raw_open=n.raw_open,
+                        raw_close=n.raw_close,
+                    )
+                )
+                continue
+            if isinstance(n, _AstFor):
+                out.append(
+                    _AstFor(
+                        raw=n.raw,
+                        iter_var=n.iter_var,
+                        range_var=n.range_var,
+                        start=n.start,
+                        stop=n.stop,
+                        body=tuple(rewrite(list(n.body))),
+                        step=n.step,
+                    )
+                )
+                continue
+            if isinstance(n, _AstWhile):
+                out.append(_AstWhile(raw=n.raw, label_k=n.label_k, body=tuple(rewrite(list(n.body)))))
+                continue
+            if isinstance(n, _AstDoWhileZero):
+                out.append(_AstDoWhileZero(raw=n.raw, body=tuple(rewrite(list(n.body)))))
+                continue
+            expanded = try_expand(n)
+            out.extend(expanded if expanded is not None else [n])
+        return out
+
+    return rewrite(nodes), extra_var_types
+
+
+_ADJ_TILE_MAP_OPS = frozenset({"adj_tile_map", "adj_tile_unary_map", "adj_tile_binary_map"})
+
+
+def _expand_user_tile_map_adj(
+    nodes: list, adj, tile_info: dict[str, tuple[str, int, int]]
+) -> tuple[list, dict[str, str]]:
+    """Rewrite ``wp::adj_tile_map(<user fn>, tiles..., adj_fn, adj_tiles...,
+    adj_ret);`` into an element loop around a direct ``adj_<fn>`` call.
+
+    The forward map already ran as an element loop
+    (:func:`_expand_user_tile_map`); its adjoint applies the function's
+    adjoint per element: read the primal elements and the result's dual,
+    call ``adj_<fn>`` into zeroed per-element duals, then accumulate those
+    into the operand tiles' duals. The inliner then splices the user
+    adjoint the same way it does for a scalar ``adj_<fn>`` statement.
+    Scalar-element tiles only; anything else is left for the flat lowering
+    (which reports it as unsupported).
+    """
+    fn_map = _ast_fn_overload_table(adj)
+    if not fn_map:
+        return nodes, {}
+    extra_var_types: dict[str, str] = {}
+
+    def try_expand(n) -> list | None:
+        if not (isinstance(n, _AstVoidCall) and n.op in _ADJ_TILE_MAP_OPS):
+            return None
+        args = [a.strip() for a in n.args]
+        if len(args) < 5 or (len(args) - 1) % 2 != 0 or args[0] not in fn_map:
+            return None
+        n_fwd = (len(args) - 1) // 2
+        fn_name = args[0]
+        fwd_args = args[1:n_fwd]
+        adj_args = args[n_fwd + 1 : 2 * n_fwd]
+        adj_ret = args[-1]
+        res_label = adj_ret[len("adj_") :] if adj_ret.startswith("adj_") else adj_ret
+        res = tile_info.get(res_label)
+        if res is None or res[0] not in _SCALAR_CTYPE_TO_MSL:
+            return None
+        res_elem, res_rows, res_cols = res
+        n_elem = res_rows * res_cols
+        adj_fn = f"adj_{fn_name}"
+        if n_elem == 1:
+            return [
+                _AstVoidCall(
+                    raw=f"{adj_fn}({', '.join(fwd_args + adj_args + [adj_ret])});",
+                    op="user_call",
+                    args=tuple(fwd_args + adj_args + [adj_ret]),
+                    extra=(("name", adj_fn),),
+                )
+            ]
+        uid = _next_tile_map_id()
+        idx = f"var_tm{uid}_i"
+        decls = [f"    int {idx} = 0;"]
+        reads: list = []
+        writes: list = []
+        call_fwd: list[str] = []
+        call_adj: list[str] = []
+        for k, (a, ga) in enumerate(zip(fwd_args, adj_args, strict=True)):
+            m = _BARE_VAR_PAT.match(a)
+            info = tile_info.get(m.group(1)) if m else None
+            if info is None:
+                # Broadcast scalar operand: pass it and its dual through.
+                call_fwd.append(a)
+                call_adj.append(ga)
+                continue
+            a_elem = info[0]
+            if a_elem not in _SCALAR_CTYPE_TO_MSL or info[1] * info[2] != n_elem:
+                return None
+            t_msl = _msl_var_type(a_elem)
+            a_label, g_label = f"tm{uid}_a{k}", f"tm{uid}_g{k}"
+            decls.append(f"    {t_msl} var_{a_label} = {_msl_zero_init(t_msl)};")
+            decls.append(f"    {t_msl} var_{g_label} = {_msl_zero_init(t_msl)};")
+            extra_var_types[a_label] = a_elem
+            extra_var_types[g_label] = a_elem
+            reads.append(_AstRawLine(raw=f"var_{a_label} = var_{m.group(1)}.c[{idx}];"))
+            reads.append(_AstRawLine(raw=f"var_{g_label} = {_msl_zero_init(t_msl)};"))
+            writes.append(_AstRawLine(raw=f"{ga}.c[{idx}] += var_{g_label};"))
+            call_fwd.append(f"var_{a_label}")
+            call_adj.append(f"var_{g_label}")
+        r_label = f"tm{uid}_r"
+        r_msl = _msl_var_type(res_elem)
+        decls.append(f"    {r_msl} var_{r_label} = {_msl_zero_init(r_msl)};")
+        extra_var_types[r_label] = res_elem
+        reads.append(_AstRawLine(raw=f"var_{r_label} = {adj_ret}.c[{idx}];"))
+        call_args = call_fwd + call_adj + [f"var_{r_label}"]
+        body = [
+            *reads,
+            _AstVoidCall(
+                raw=f"{adj_fn}({', '.join(call_args)});",
+                op="user_call",
+                args=tuple(call_args),
+                extra=(("name", adj_fn),),
+            ),
+            *writes,
+        ]
+        return [
+            *[_AstRawLine(raw=d) for d in decls],
+            _AstFor(raw="", iter_var=f"tm{uid}_i", range_var="", start="0", stop=str(n_elem), body=tuple(body)),
         ]
 
     def rewrite(ns: list) -> list:
@@ -10759,6 +11214,11 @@ class MetalKernelArtifact:
     # reductions lower to ``simd_*`` intrinsics. Zero means the serial
     # model (``block_dim() == 1``, trailing launch dim folded away).
     coop_block_n: int = 0
+    # Distributed-lane kernel indexed by a 1-D ``wp.tid()`` (``wp.launch(dim=N,
+    # block_dim=32)``): dispatch ``grid = (N, 1, 1)`` / ``threadgroup = (32,
+    # 1, 1)`` so ``tid`` is the global thread index and each 32-thread group
+    # is one SIMD group. ``False`` is the launch-tiled ``(D, 32)`` geometry.
+    coop_tid1d: bool = False
     # Init-shadow packing: when an atomic kernel has too many init
     # outputs to fit per-output ``__init`` shadow buffers under
     # Metal's 31-buffer cap, we pack them into one float buffer
@@ -10920,69 +11380,102 @@ def _ensure_adj_built(kernel, block_dim: int | None = None, enable_backward: boo
     """
     adj = kernel.adj
 
-    # Reverse-mode codegen needs ``body_replay`` / ``body_reverse``, which
-    # only a backward-enabled build populates. A forward-only build may
-    # already be cached on the kernel, so force a rebuild in that case —
-    # ``Adjoint.build`` fully resets IR state, so this is safe (the forward
-    # artifact is cached separately and keyed off the same ``body_forward``,
-    # which a backward-enabled build produces identically).
-    if enable_backward and not getattr(adj.blocks[0] if getattr(adj, "blocks", None) else None, "body_reverse", None):
+    def _build(bd: int, backward: bool) -> None:
+        # ``output_arch=None`` routes tile-LTO builtins (e.g. ``tile_cholesky``)
+        # to their CPU/no-MathDx dispatch so they emit plain function calls
+        # rather than CUDA cuBLASDx LTO IR; ``metal_backend`` tells those
+        # dispatch funcs to emit their operands into the generated source so
+        # the MSL translators can rewrite the call. ``block_dim=1`` is the
+        # serial model (every cooperative-tile builtin compile-time-shapes
+        # itself as a single-element tile); ``_COOP_BLOCK_DIM`` is the honest
+        # width of the distributed-lane model.
+        # A build that raised leaves ``skip_build`` set, which would turn
+        # the retry at the other width into a silent no-op.
+        adj.skip_build = False
+        # A failed build still leaves ``adj.blocks`` populated (partially),
+        # so completion is tracked explicitly rather than by its presence.
+        adj._metal_ir_ok = False
         adj.build(
             builder=None,
             default_builder_options={
-                "enable_backward": True,
+                "enable_backward": backward,
                 "output_arch": None,
-                "block_dim": 1,
+                "block_dim": bd,
                 "metal_backend": True,
             },
         )
+        adj._metal_built_backward = backward
+        adj._metal_ir_ok = True
 
-    # Build the IR if not already built. Pass enable_backward=False because
-    # we only consume the forward pass — the Metal backend does not yet
-    # support autodiff.
-    #
-    # ``output_arch=None`` routes tile-LTO builtins (e.g., ``tile_cholesky``)
-    # to their CPU/no-MathDx dispatch so they emit plain function calls
-    # rather than CUDA cuBLASDx LTO IR. ``block_dim`` is required by some
-    # of those dispatch funcs even on the no-MathDx path.
-    if not getattr(adj, "blocks", None):
-        # ``block_dim=1`` forces the cooperative-tile builtins (``wp.tile``,
-        # ``wp.tile_reduce``, etc.) to compile-time-shape themselves as
-        # single-element tiles. The Metal backend currently runs every
-        # cooperative-tile kernel serially (1 thread per threadgroup) — see
-        # ``launch_metal_kernel`` for the matching launcher policy. Once
-        # we implement real threadgroup-cooperative tiles this can climb
-        # back to a real value.
-        adj.build(
-            builder=None,
-            default_builder_options={
-                "enable_backward": False,
-                "output_arch": None,
-                "block_dim": 1,
-                # Tells no-MathDx lto_dispatch funcs (e.g. ``tile_fft``) to
-                # emit their operands into the generated source so the MSL
-                # translators can rewrite the call — the plain CPU path
-                # emits a bare no-op macro invocation instead.
-                "metal_backend": True,
-            },
-        )
+    def _has_reverse() -> bool:
+        # The IR always carries ``body_reverse`` lines; what a backward-
+        # enabled build changes is the option the tile/LTO value-funcs see,
+        # so track the flag we built with rather than the body's presence.
+        return bool(getattr(adj, "_metal_ir_ok", False)) and bool(getattr(adj, "_metal_built_backward", False))
+
+    want_coop = block_dim == _COOP_BLOCK_DIM and _coop_tiles_enabled()
+    coop_n = getattr(adj, "_metal_coop_block_n", 0)
+    if coop_n > 0:
+        # Already decided: the IR lives at the honest width. A backward
+        # request only needs the reverse bodies added at that same width.
+        if enable_backward and not _has_reverse():
+            _build(coop_n, True)
+            adj._metal_coop_plan = _coop_block_classify(adj, honest=True)
+        if enable_backward and (adj._metal_coop_plan is None or not adj._metal_coop_plan.reverse_ok):
+            raise MetalCodegenError(
+                f"Kernel {adj.fun_name!r}: its reverse pass uses a tile adjoint the distributed-lane "
+                "lowering does not support on Metal"
+            )
+    elif not getattr(adj, "_metal_ir_ok", False) or (enable_backward and not _has_reverse()):
+        # Reverse-mode codegen needs ``body_replay`` / ``body_reverse``,
+        # which only a backward-enabled build populates. ``Adjoint.build``
+        # fully resets IR state, so rebuilding a forward-only IR is safe
+        # (the forward artifact is cached separately and keyed off the same
+        # ``body_forward``, which a backward-enabled build produces
+        # identically).
+        try:
+            _build(1, enable_backward)
+        except Exception:
+            # The serial model can't shape some block-wide kernels at all
+            # (an explicit ``tile_broadcast(..., shape=(R, block_dim))``
+            # against a ``wp.tile()`` result). If this launch is at the coop
+            # width, try the honest build and see whether the distributed
+            # lowering covers it.
+            if not want_coop or getattr(adj, "_metal_coop_block_checked", False):
+                raise
+            adj._metal_coop_block_checked = True
+            _build(_COOP_BLOCK_DIM, enable_backward)
+            plan = _coop_block_classify(adj, honest=True)
+            if plan is None:
+                raise
+            if enable_backward and not plan.reverse_ok:
+                raise MetalCodegenError(
+                    f"Kernel {adj.fun_name!r}: its reverse pass uses a tile adjoint the distributed-lane "
+                    "lowering does not support on Metal"
+                ) from None
+            adj._metal_coop_block_n = _COOP_BLOCK_DIM
+            adj._metal_coop_plan = plan
     # Distributed-tile upgrade: launched at the coop width, eligible tile
     # pattern → rebuild once at the honest block_dim. ``Adjoint.build``
     # fully resets IR state, so a re-run is safe; the checked flag keeps
     # this a one-time decision per kernel object.
-    if block_dim == _COOP_BLOCK_DIM and not getattr(adj, "_metal_coop_block_checked", False) and _coop_tiles_enabled():
+    if want_coop and not getattr(adj, "_metal_coop_block_checked", False):
         adj._metal_coop_block_checked = True
-        if _coop_block_eligible(adj):
-            adj.build(
-                builder=None,
-                default_builder_options={
-                    "enable_backward": False,
-                    "output_arch": None,
-                    "block_dim": _COOP_BLOCK_DIM,
-                    "metal_backend": True,
-                },
-            )
-            adj._metal_coop_block_n = _COOP_BLOCK_DIM
+        if _coop_block_classify(adj) is not None:
+            _build(_COOP_BLOCK_DIM, _has_reverse())
+            plan = _coop_block_classify(adj, honest=True)
+            if plan is None:
+                # The honest IR disagrees with the serial pre-check (a shape
+                # only the real width exposes) — stay serial.
+                _build(1, _has_reverse())
+            else:
+                adj._metal_coop_block_n = _COOP_BLOCK_DIM
+                adj._metal_coop_plan = plan
+                if enable_backward and not plan.reverse_ok:
+                    raise MetalCodegenError(
+                        f"Kernel {adj.fun_name!r}: its reverse pass uses a tile adjoint the distributed-lane "
+                        "lowering does not support on Metal"
+                    )
     # When the kernel is part of a registered module (``module="unique"``),
     # ``adj.build`` sets ``adj.builder_options`` to the module's options
     # dict, which our default options dict can't reach. Backfill the keys
@@ -11125,6 +11618,8 @@ def _generate_msl_kernel_uncached(
     # first, so the splice below covers the mapped function too.
     _tile_elem_info: dict[str, tuple[str, int, int]] = {}
     _coop_n_early = getattr(adj, "_metal_coop_block_n", 0)
+    _coop_plan_early = getattr(adj, "_metal_coop_plan", None) if _coop_n_early > 0 else None
+    _coop_coldist_early: dict[str, int] = dict(_coop_plan_early.coldist) if _coop_plan_early is not None else {}
     for _v in adj.variables:
         _parsed = _parse_tile_ctype(_v.ctype())
         if _parsed is not None:
@@ -11133,8 +11628,14 @@ def _generate_msl_kernel_uncached(
             # so a mapped user function is called once per lane, not looped.
             if _coop_n_early > 0 and _rows == _coop_n_early and _cols == 1 and _elem in _SCALAR_CTYPE_TO_MSL:
                 _rows = 1
+            # Column-distributed tiles are one column per lane: the mapped
+            # function runs over the lane's R elements.
+            if _coop_n_early > 0 and _v.label in _coop_coldist_early:
+                _rows, _cols = _coop_coldist_early[_v.label], 1
             _tile_elem_info[_v.label] = (_elem, _rows, _cols)
     _ast_nodes, _tile_map_var_types = _expand_user_tile_map(_ast_nodes, adj, _tile_elem_info)
+    _ast_nodes, _tile_map_adj_var_types = _expand_user_tile_map_adj(_ast_nodes, adj, _tile_elem_info)
+    _tile_map_var_types = {**_tile_map_var_types, **_tile_map_adj_var_types}
     _ast_nodes, _inlined_const_ints, _inlined_struct_locals, _inlined_var_ctypes = _ast_inline(
         _ast_nodes, adj, extra_var_types=_tile_map_var_types
     )
@@ -11798,6 +12299,7 @@ def _generate_msl_kernel_uncached(
     # ``wp::tile<>()`` stays an identity assign. Maps label → element MSL
     # type; consumed by the declaration loop and ``tile_reduce`` lowering.
     distributed_tiles: dict[str, str] = {}
+    _coop_plan = getattr(adj, "_metal_coop_plan", None) if coop_block_n > 0 else None
     if coop_block_n > 0:
         _ctor_labels = set()
         for raw in forward_lines:
@@ -11811,12 +12313,31 @@ def _generate_msl_kernel_uncached(
             kind, dtype_ctype, rows, cols = parsed
             if rows != coop_block_n or cols != 1:
                 continue
+            # Column-distributed and replicated tiles were classified by
+            # dataflow (a 2-D ``(block_dim, 1)`` load is NOT per-lane).
+            if _coop_plan is not None and (label in _coop_plan.coldist or label in _coop_plan.full):
+                continue
             # ``wp.tile()`` results of any element type, plus every other
             # 1-D scalar tile of block_dim elements (``tile_load``,
             # ``tile_from_thread``, scans, maps ...) — see
             # ``_coop_block_eligible`` for the ops that keep them per-lane.
             if (label in _ctor_labels and kind == "register") or dtype_ctype in _SCALAR_CTYPE_TO_MSL:
                 distributed_tiles[label] = _msl_scalar_type(dtype_ctype)
+    # Column-distributed 2-D tiles (``(R, block_dim)``, column ``j`` on lane
+    # ``j``): label → (rows, element MSL scalar). Each lane owns an R-vector,
+    # declared and translated as an ``(R, 1)`` private tile struct. ``full``
+    # tiles are the replicated ``tile_load`` operands every lane holds
+    # whole. See ``_coop_block_classify``.
+    coldist_tiles: dict[str, tuple[int, str]] = {}
+    coop_full_tiles: set[str] = set()
+    if _coop_plan is not None:
+        _all_ctypes_cd: dict[str, str] = {str(v.label): v.ctype() for v in adj.variables}
+        _all_ctypes_cd.update(_inlined_var_ctypes)
+        for label, rows in _coop_plan.coldist.items():
+            parsed = _parse_tile_ctype(_all_ctypes_cd.get(label, ""))
+            if parsed is not None and parsed[1] in _SCALAR_CTYPE_TO_MSL:
+                coldist_tiles[label] = (rows, _SCALAR_CTYPE_TO_MSL[parsed[1]])
+        coop_full_tiles = set(_coop_plan.full)
 
     # --- Local variable declarations -----------------------------------
     body_lines: list[str] = []
@@ -11875,6 +12396,11 @@ def _generate_msl_kernel_uncached(
             # the bare element type (``_msl_var_type`` has no struct for
             # mat-element tiles and must not emit one here anyway).
             body_lines.append(f"    {distributed_tiles[str(var.label)]} var_{var.label};")
+            continue
+        if str(var.label) in coldist_tiles:
+            _cd_rows, _cd_scalar = coldist_tiles[str(var.label)]
+            _cd_ty = f"wp_tile_{_cd_rows}x1_{_cd_scalar}"
+            body_lines.append(f"    {_cd_ty} var_{var.label} = {_cd_ty}();")
             continue
         ctype = var.ctype()
         msl_type = _msl_var_type(ctype)
@@ -12085,6 +12611,10 @@ def _generate_msl_kernel_uncached(
         dims = tile_var_dims.get(label)
         if dims is not None:
             tile_var_dims[label] = (1, 1, dims[2])
+    # Column-distributed tiles: lane-local ``(R, 1)`` columns.
+    for label, (_cd_rows, _cd_scalar) in coldist_tiles.items():
+        tile_var_dims[label] = (_cd_rows, 1, _cd_scalar)
+        tile_var_vec_n[label] = 0
 
     # ``wp.tile_extract(t, wp.block_dim() - 1)`` — "the last lane's element" —
     # cannot be honoured by the serial model and must not be answered wrongly.
@@ -12418,6 +12948,8 @@ def _generate_msl_kernel_uncached(
             smem_tiles,
             distributed_tiles,
             arg_label_set,
+            coldist_tiles,
+            coop_block_n,
         )
         # Inline subscripts that the address-collapse produced.
         translated = _substitute_subscripts(translated)
@@ -12878,6 +13410,32 @@ def _generate_msl_kernel_uncached(
                         f"Kernel {adj.fun_name!r}: wp::adj_{op} has {ndim} index argument(s) but its "
                         f"{rows}x{cols} tile needs {n_off} (line: {raw.strip()})"
                     )
+                if (
+                    op == "tile_load"
+                    and coop_block_n > 0
+                    and tile_label in coop_full_tiles
+                    and rows * cols > 1
+                    and not tile_var_vec_n.get(tile_label, 0)
+                ):
+                    # Replicated tile: every lane holds the same dual, so
+                    # stride the scatter across lanes to add each element
+                    # once per block.
+                    _lead, _offs = index_args[: ndim - n_off], index_args[ndim - n_off :]
+                    _base = _build_flat_base_expr(arr_name, _lead, inner_dims=2 if cols > 1 else 1)
+                    if cols > 1:
+                        _rstride = f"{arr_name}_shape[{len(_lead) + 1}]"
+                        _roff, _coff = _offs[0], _offs[1]
+                    else:
+                        _rstride, _roff, _coff = "1", _offs[0], "0"
+                    body_lines.append(
+                        _finalize(
+                            f"{indent}for (int _al_e = {_COOP_LANE}; _al_e < {rows * cols}; _al_e += {coop_block_n}) {{ "
+                            f"const int _al_i = _al_e / {cols}; const int _al_j = _al_e - _al_i * {cols}; "
+                            f"wp_adj_accum(&{grad_name}[{_base} + (({_roff}) + _al_i) * ({_rstride}) + (({_coff}) + _al_j)], "
+                            f"{adj_tile}.c[_al_e]); }}"
+                        )
+                    )
+                    continue
                 slots = _tile_grad_slots(
                     arr_name,
                     index_args[: ndim - n_off],
@@ -14227,6 +14785,7 @@ def _generate_msl_kernel_uncached(
         needs_init_barrier=bool(seeded_outputs),
         coop_chol_n=coop_chol_n,
         coop_block_n=coop_block_n,
+        coop_tid1d=bool(_coop_plan is not None and _coop_plan.tid1d),
         init_shadow_packed_outputs=tuple(init_outputs) if use_packed_init_shadows else (),
         init_shadow_floats=tuple(init_shadow_floats),
         init_shadow_ints=tuple(init_shadow_ints),
@@ -16442,13 +17001,24 @@ def launch_metal_kernel_native(
         # Distributed-tile kernel: the IR was built at an honest
         # ``block_dim``, so the trailing launch dim is REAL lanes — one
         # threadgroup per launch-tiled block, ``tid() = (block, lane)``.
-        if len(dims) != 2 or dims[-1] != coop_block_n:
-            raise RuntimeError(
-                f"Kernel '{kernel.key}' was compiled for cooperative tiles with "
-                f"block_dim={coop_block_n} but launched with dim={dim}, block_dim={block_dim}"
-            )
-        grid = (dims[0], coop_block_n, 1)
-        tg = (1, coop_block_n, 1)
+        if getattr(artifact, "coop_tid1d", False):
+            # 1-D ``wp.tid()``: N real threads in 32-wide SIMD groups.
+            if len(dims) != 1 or dims[0] % coop_block_n != 0 or block_dim != coop_block_n:
+                raise RuntimeError(
+                    f"Kernel '{kernel.key}' was compiled for cooperative tiles with "
+                    f"block_dim={coop_block_n}: launch it 1-D with dim a multiple of {coop_block_n} "
+                    f"and block_dim={coop_block_n} (got dim={dim}, block_dim={block_dim})"
+                )
+            grid = (dims[0], 1, 1)
+            tg = (coop_block_n, 1, 1)
+        else:
+            if len(dims) != 2 or dims[-1] != coop_block_n:
+                raise RuntimeError(
+                    f"Kernel '{kernel.key}' was compiled for cooperative tiles with "
+                    f"block_dim={coop_block_n} but launched with dim={dim}, block_dim={block_dim}"
+                )
+            grid = (dims[0], coop_block_n, 1)
+            tg = (1, coop_block_n, 1)
     else:
         if getattr(artifact, "tile_block_fold", True) and len(dims) > 1 and dims[-1] == block_dim and block_dim > 1:
             dims = dims[:-1]
@@ -17105,12 +17675,21 @@ def launch_metal_kernel(
         # Distributed-tile kernel (see ``_coop_block_eligible``): the IR
         # was built at the honest ``block_dim``, so the trailing dim is
         # REAL lanes — one threadgroup per launch-tiled block.
-        if len(dims) != 2 or dims[-1] != coop_block_n:
+        if getattr(artifact, "coop_tid1d", False):
+            if len(dims) != 1 or dims[0] % coop_block_n != 0 or block_dim != coop_block_n:
+                raise RuntimeError(
+                    f"Kernel '{kernel.key}' was compiled for cooperative tiles with "
+                    f"block_dim={coop_block_n}: launch it 1-D with dim a multiple of {coop_block_n} "
+                    f"and block_dim={coop_block_n} (got dim={dim}, block_dim={block_dim})"
+                )
+            dims = (dims[0],)
+        elif len(dims) != 2 or dims[-1] != coop_block_n:
             raise RuntimeError(
                 f"Kernel '{kernel.key}' was compiled for cooperative tiles with "
                 f"block_dim={coop_block_n} but launched with dim={dim}, block_dim={block_dim}"
             )
-        dims = (dims[0], coop_block_n)
+        else:
+            dims = (dims[0], coop_block_n)
     elif getattr(artifact, "tile_block_fold", True) and len(dims) > 1 and dims[-1] == block_dim and block_dim > 1:
         dims = dims[:-1]
     grid_x = dims[0]
@@ -17125,7 +17704,7 @@ def launch_metal_kernel(
     # parameter is intentionally ignored here; distributed-tile kernels
     # (``coop_block_n > 0``) instead group each block's lanes on y.
     if coop_block_n > 0:
-        tg = (1, coop_block_n, 1)
+        tg = (coop_block_n, 1, 1) if getattr(artifact, "coop_tid1d", False) else (1, coop_block_n, 1)
     elif len(dims) == 1:
         tg = (min(256, grid_x), 1, 1)
     elif len(dims) == 2:

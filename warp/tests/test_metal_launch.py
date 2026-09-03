@@ -7518,6 +7518,119 @@ class TestMetalCoopTiles(unittest.TestCase):
 
 @unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
 @unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
+class TestMetalCoopColumnTiles(unittest.TestCase):
+    """Column-distributed 2-D tiles: ``wp.tile(vec)`` gives every lane its own
+    column of an ``(R, block_dim)`` tile, and ``tile_matmul`` with a loaded
+    weight tile, ``tile_broadcast`` of a loaded bias, element-wise ops,
+    ``tile_map`` and ``untile`` all stay lane-local — the
+    ``tile/example_tile_mlp`` layer shape. Kernels index with a 1-D
+    ``wp.tid()`` under ``wp.launch(dim=N, block_dim=32)``."""
+
+    _LAYER = """
+        import numpy as np
+
+        DIN, DHID, N = 8, 16, 64
+
+        def make(DT):
+            @wp.func
+            def relu(x: DT):
+                return wp.max(x, DT(0.0))
+
+            @wp.kernel
+            def layer(x: wp.array2d(dtype=DT), w: wp.array2d(dtype=DT), b: wp.array2d(dtype=DT),
+                      c: wp.array2d(dtype=float), out: wp.array2d(dtype=float), loss: wp.array(dtype=float)):
+                i = wp.tid()
+                local = wp.vector(dtype=DT, length=DIN)
+                for k in range(DIN):
+                    local[k] = x[k, i]
+                f = wp.tile(local)
+                wt = wp.tile_load(w, shape=(DHID, DIN))
+                bt = wp.tile_load(b, shape=(DHID, 1))
+                z = wp.tile_map(relu, wp.tile_matmul(wt, f) + wp.tile_broadcast(bt, shape=(DHID, 32)))
+                o = wp.untile(z)
+                acc = float(0.0)
+                for r in range(DHID):
+                    out[r, i] = float(o[r])
+                    acc += float(o[r]) * c[r, i]
+                wp.atomic_add(loss, 0, acc)
+
+            return layer
+
+        rng = np.random.default_rng(5)
+        x_np = rng.standard_normal((DIN, N)).astype(np.float32)
+        w_np = rng.standard_normal((DHID, DIN)).astype(np.float32) * 0.5
+        b_np = rng.standard_normal((DHID, 1)).astype(np.float32)
+        c_np = rng.standard_normal((DHID, N)).astype(np.float32)
+
+        def run(DT, tol):
+            dev = "metal:0"
+            layer = make(DT)
+            x = wp.array(x_np, dtype=DT, device=dev, requires_grad=True)
+            w = wp.array(w_np, dtype=DT, device=dev, requires_grad=True)
+            b = wp.array(b_np, dtype=DT, device=dev, requires_grad=True)
+            c = wp.array(c_np, dtype=float, device=dev)
+            out = wp.zeros((DHID, N), dtype=float, device=dev)
+            loss = wp.zeros(1, dtype=float, device=dev, requires_grad=True)
+            with wp.Tape() as tape:
+                wp.launch(layer, dim=[N], inputs=[x, w, b, c, out, loss], device=dev, block_dim=32)
+            tape.backward(loss)
+            wp.synchronize_device(dev)
+            art = layer._metal_artifact
+            assert art.coop_block_n == 32 and art.coop_tid1d, (art.coop_block_n, art.coop_tid1d)
+            assert "simd_sum" in next(iter(layer._metal_adj_cache.values()))[0].source
+            # Reference from the rounded values the GPU saw.
+            xr, wr, br = (a.numpy().astype(np.float32) for a in (x, w, b))
+            pre = wr @ xr + br
+            act = np.maximum(pre, 0)
+            G = c_np * (pre > 0)
+            np.testing.assert_allclose(out.numpy(), act, **tol)
+            np.testing.assert_allclose(loss.numpy()[0], (act * c_np).sum(), **tol)
+            np.testing.assert_allclose(w.grad.numpy().astype(np.float32), G @ xr.T, **tol)
+            np.testing.assert_allclose(b.grad.numpy().astype(np.float32), G.sum(1, keepdims=True), **tol)
+            np.testing.assert_allclose(x.grad.numpy().astype(np.float32), wr.T @ G, **tol)
+    """
+
+    def test_layer_forward_and_gradients_match_numpy_fp32(self):
+        snippet = textwrap.dedent(self._LAYER) + textwrap.dedent(
+            """
+            run(wp.float32, dict(rtol=1e-4, atol=1e-4))
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=180)
+
+    def test_layer_forward_and_gradients_match_numpy_fp16(self):
+        # fp16 storage and accumulation; gradients land through the
+        # compare-exchange half accumulator.
+        snippet = textwrap.dedent(self._LAYER) + textwrap.dedent(
+            """
+            run(wp.float16, dict(rtol=3e-2, atol=3e-1))
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=180)
+
+    def test_1d_launch_must_be_a_block_multiple(self):
+        snippet = textwrap.dedent(self._LAYER) + textwrap.dedent(
+            """
+            dev = "metal:0"
+            layer = make(wp.float32)
+            x = wp.zeros((DIN, N), dtype=float, device=dev)
+            w = wp.zeros((DHID, DIN), dtype=float, device=dev)
+            b = wp.zeros((DHID, 1), dtype=float, device=dev)
+            c = wp.zeros((DHID, N), dtype=float, device=dev)
+            out = wp.zeros((DHID, N), dtype=float, device=dev)
+            loss = wp.zeros(1, dtype=float, device=dev)
+            wp.launch(layer, dim=[N], inputs=[x, w, b, c, out, loss], device=dev, block_dim=32)
+            try:
+                wp.launch(layer, dim=[N - 2], inputs=[x, w, b, c, out, loss], device=dev, block_dim=32)
+            except RuntimeError as e:
+                assert "multiple of 32" in str(e), str(e)
+            else:
+                raise AssertionError("a non-multiple launch dim should be rejected")
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
+
 class TestMetalInplaceOutputs(unittest.TestCase):
     """MLX-path partial-writer kernels (top-level early return) write
     their outputs in place through const-cast input aliases; unwritten
