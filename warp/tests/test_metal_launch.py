@@ -8789,6 +8789,51 @@ class TestMetalHashGrid(unittest.TestCase):
 
 @unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
 @unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
+class TestMetalBufferLifetime(unittest.TestCase):
+    def test_freed_arrays_release_gpu_memory(self):
+        # Regression: PyObjC retained ``newBufferWithLength:options:`` results
+        # twice, so every freed wp.array leaked its MTLBuffer (see
+        # ``_register_pyobjc_ownership_metadata`` in metal_dispatch.py).
+        snippet = textwrap.dedent(
+            """
+            import gc
+            import numpy as np
+
+            if not wp.config.metal_native_dispatch:
+                raise SystemExit(0)
+            from warp._src.metal_dispatch import get_dispatcher
+
+            dev = get_dispatcher()._device
+
+            @wp.kernel
+            def fill(a: wp.array(dtype=float)):
+                i = wp.tid()
+                a[i] = float(i)
+
+            n = 16 * 1024 * 1024  # 64 MB per array
+            # Warm up (compiles the kernel, grows any caches once).
+            a = wp.zeros(n, dtype=float, device="metal:0")
+            wp.launch(fill, dim=n, inputs=[a], device="metal:0")
+            wp.synchronize_device("metal:0")
+            del a
+            gc.collect()
+            base = dev.currentAllocatedSize()
+            for _ in range(20):  # 1.3 GB of traffic
+                a = wp.zeros(n, dtype=float, device="metal:0")
+                wp.launch(fill, dim=n, inputs=[a], device="metal:0")
+                b = wp.clone(a)
+                del a, b
+            wp.synchronize_device("metal:0")
+            gc.collect()
+            grown = dev.currentAllocatedSize() - base
+            assert grown < 3 * 64 * 1024 * 1024, f"GPU allocation grew by {grown / 1e6:.0f} MB after freeing every array"
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=240)
+
+
+@unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
+@unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
 class TestMetalVolume(unittest.TestCase):
     """``wp.Volume`` on Metal: NanoVDB grids traversed through the MSL
     rewrite of PNanoVDB.h (native dispatch only; float/int32/vec3f grids)."""

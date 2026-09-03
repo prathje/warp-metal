@@ -136,6 +136,10 @@
   struct's per-field adjoints were zeroed once instead of on each iteration, so they accumulated across the
   loop; nested structs compounded the error, making it grow with the iteration count. This affected
   `wp.fem.lookup()`, and so the gradients of semi-Lagrangian advection in `warp.fem`.
+- Fix Metal device memory growing by the full per-step allocation traffic on long runs: PyObjC leaked the
+  argument tuple of `setBuffers:offsets:withRange:` and retained `newBufferWithLength:options:` results twice, so
+  every freed `wp.array` kept its `MTLBuffer` alive (`fem/example_kelvin_helmholtz` was killed by the OS after
+  ~170 frames).
 
 ### Changed
 
