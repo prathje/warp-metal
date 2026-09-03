@@ -8789,6 +8789,54 @@ class TestMetalHashGrid(unittest.TestCase):
 
 @unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
 @unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
+class TestMetalNoneArrayTruth(unittest.TestCase):
+    def test_if_array_with_none_argument(self):
+        # ``if arr:`` tests ``array_t::data != nullptr`` in C++; a ``None``
+        # argument is a null array. Metal binds a placeholder buffer for
+        # ``None`` so the pointer is never null — the branch has to test the
+        # (zeroed) packed shape instead, including the ``where`` phi-select
+        # Warp emits after the if/else. warp.fem's PicQuadrature relies on
+        # this (``if particle_fraction:``) and silently produced all-zero
+        # particle weights on Metal.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            @wp.kernel
+            def k(a: wp.array(dtype=float), b: wp.array(dtype=float), out: wp.array(dtype=float),
+                  flags: wp.array(dtype=int)):
+                i = wp.tid()
+                v = a[i]
+                if b:
+                    v = v * b[i]
+                else:
+                    v = v + 100.0
+                out[i] = v
+                if not b:
+                    flags[i] = 1
+
+            res = {}
+            for dev in ("cpu", "metal:0"):
+                with wp.ScopedDevice(dev):
+                    a = wp.array(np.arange(1, 5, dtype=np.float32))
+                    bb = wp.array(np.full(4, 2.0, np.float32))
+                    o1 = wp.zeros(4, dtype=float); f1 = wp.zeros(4, dtype=int)
+                    o2 = wp.zeros(4, dtype=float); f2 = wp.zeros(4, dtype=int)
+                    wp.launch(k, dim=4, inputs=[a, None, o1, f1])
+                    wp.launch(k, dim=4, inputs=[a, bb, o2, f2])
+                    wp.synchronize_device()
+                    res[dev] = (o1.numpy(), f1.numpy(), o2.numpy(), f2.numpy())
+            for x, y in zip(res["cpu"], res["metal:0"]):
+                np.testing.assert_array_equal(y, x)
+            np.testing.assert_array_equal(res["metal:0"][0], [101.0, 102.0, 103.0, 104.0])
+            np.testing.assert_array_equal(res["metal:0"][2], [2.0, 4.0, 6.0, 8.0])
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=240)
+
+
+@unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
+@unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
 class TestMetalBufferLifetime(unittest.TestCase):
     def test_freed_arrays_release_gpu_memory(self):
         # Regression: PyObjC retained ``newBufferWithLength:options:`` results

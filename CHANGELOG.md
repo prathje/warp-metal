@@ -165,6 +165,15 @@
   argument tuple of `setBuffers:offsets:withRange:` and retained `newBufferWithLength:options:` results twice, so
   every freed `wp.array` kept its `MTLBuffer` alive (`fem/example_kelvin_helmholtz` was killed by the OS after
   ~170 frames).
+- Fix Metal kernels that mix `wp.atomic_*` with plain stores into `int8`, `uint8`, `int16`, `uint16`, `float16`
+  or `bool` output arrays failing to compile (Metal has no 8- or 16-bit atomics); such outputs now keep ordinary
+  stores. Unblocks `warp.fem`'s adaptive grid refinement on Metal.
+- Fix `if arr:` on a `wp.array` kernel argument always taking the true branch on Metal when the argument is `None`
+  (Metal binds a placeholder buffer, so the null-pointer test C++ uses never fires). The test now reads the
+  zeroed shape. `warp.fem`'s `PicQuadrature` silently produced all-zero particle weights because of this, which
+  made `fem/example_apic_fluid` diverge to NaN on Metal.
+- Support `arr[i] |= v`, `arr[i] &= v` and `arr[i] ^= v` on Metal devices, including on outputs of kernels that
+  also use `wp.atomic_*` (lowered to the atomic fetch-op).
 
 ### Documentation
 

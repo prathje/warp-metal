@@ -10429,6 +10429,16 @@ def _expand_user_tile_map(nodes: list, adj, tile_info: dict[str, tuple[str, int,
 # them and they would reach the Metal compiler as undeclared identifiers.
 _UNTRANSLATED_TILE_ADJ_PAT = re.compile(r"\badj_(tile_\w+)\s*\(")
 
+# Compound in-place stores on ``device atomic<T>*`` outputs: MSL forbids
+# ``a[i] op= v`` on atomics, but these have a fetch-op equivalent.
+_ATOMIC_COMPOUND_FETCH: dict[str, str] = {
+    "+=": "atomic_fetch_add_explicit",
+    "-=": "atomic_fetch_sub_explicit",
+    "|=": "atomic_fetch_or_explicit",
+    "&=": "atomic_fetch_and_explicit",
+    "^=": "atomic_fetch_xor_explicit",
+}
+
 
 def _check_no_unsupported_intrinsics(line: str) -> None:
     """After translation, any remaining ``wp::`` or ``builtin_`` is unsupported."""
@@ -11973,8 +11983,17 @@ def _generate_msl_kernel_uncached(
     # atomic pointer cast) and reads/zeroes them non-atomically, which
     # ``device atomic<T>*`` would not allow.
     grad_label_set = {v.label for v in grad_array_vars}
+    # MSL has no 8- or 16-bit atomics, so outputs of such element types
+    # (``int8`` refinement flags, ``uint8`` levels, ``float16`` ...) stay
+    # plain ``device T*`` with ordinary stores even in an atomic kernel.
+    narrow_output_labels = {
+        a.label
+        for a in output_args
+        if _array_scalar_type_name(a) in ("int8", "uint8", "int16", "uint16", "float16", "bool")
+    }
+    nonatomic_label_set = grad_label_set | narrow_output_labels
     atomic_output_names: set[str] = (
-        {a.label for a in output_args if a.label not in grad_label_set} if has_atomic else set()
+        {a.label for a in output_args if a.label not in nonatomic_label_set} if has_atomic else set()
     )
 
     # ``tile_view`` materialisation registry: view local label →
@@ -12371,9 +12390,45 @@ def _generate_msl_kernel_uncached(
     # itself once we know the local is aliased away.
     inlined_decl_pat = re.compile(r"^\s*[\w<>:*\s]+?\s+var_(\w+)\s*;\s*$")
 
+    # ``if arr:`` on an array argument. C++ tests ``array_t::data != nullptr``
+    # (a ``None`` argument is a null array). On Metal every argument slot is
+    # bound — ``None`` gets a placeholder buffer — so the pointer test is
+    # always true and the body would read zeros from the placeholder. Test
+    # the packed shape instead: the launcher zeroes it for ``None``.
+    array_truth_if_pat = re.compile(
+        r"^(?P<indent>\s*)if\s*\(\s*(?P<neg>!?)\s*(?:\(\s*var_(?P<n1>\w+)\s*\)|var_(?P<n2>\w+))\s*\)\s*\{\s*$"
+    )
+    array_arg_labels_local = {a.label for a in adj.args if _is_array_arg(a)}
+    array_truth_unot_pat = re.compile(r"wp::unot\(\s*var_(?P<name>\w+)\s*\)")
+    array_truth_where_pat = re.compile(
+        r"wp::where\(\s*var_(?P<name>\w+)\s*,\s*(?P<x>[^,()]+?)\s*,\s*(?P<y>[^,()]+?)\s*\)"
+    )
+
     for raw in forward_lines:
         line = _strip_comments_and_directives(raw)
         if line is None:
+            continue
+        # The phi-select Warp emits after an ``if arr:`` / ``else`` pair keeps
+        # the array as the ``wp::where`` condition; give it the same test.
+        if "wp::where(" in line and "var_" in line:
+            line = array_truth_where_pat.sub(
+                lambda m: f"(({m.group('name')}_shape[0] != 0) ? ({m.group('x')}) : ({m.group('y')}))"
+                if m.group("name") in array_arg_labels_local
+                else m.group(0),
+                line,
+            )
+        if "wp::unot(" in line and "var_" in line:  # ``if not arr:``
+            line = array_truth_unot_pat.sub(
+                lambda m: f"(!({m.group('name')}_shape[0] != 0))"
+                if m.group("name") in array_arg_labels_local
+                else m.group(0),
+                line,
+            )
+        m_arr_if = array_truth_if_pat.match(line)
+        if m_arr_if and (m_arr_if.group("n1") or m_arr_if.group("n2")) in array_arg_labels_local:
+            arr_name = m_arr_if.group("n1") or m_arr_if.group("n2")
+            neg = "!" if m_arr_if.group("neg") else ""
+            body_lines.append(_finalize(f"{m_arr_if.group('indent')}if ({neg}({arr_name}_shape[0] != 0)) {{"))
             continue
         # ``arr.shape[k]`` reverses to ``wp::adj_extract(<shape>, k, ...)``
         # feeding the dual of the shape struct. An array's shape is an integer
@@ -13004,6 +13059,9 @@ def _generate_msl_kernel_uncached(
             "sub_inplace": "-=",
             "mul_inplace": "*=",
             "div_inplace": "/=",
+            "bit_or_inplace": "|=",
+            "bit_and_inplace": "&=",
+            "bit_xor_inplace": "^=",
         }
         # 3-arg form: ``wp::*_inplace(vec, idx, val)`` — element-wise
         # assignment to a vec local (``vec[idx] op= val``). MSL natively
@@ -13022,7 +13080,7 @@ def _generate_msl_kernel_uncached(
         # read-modify-write through ``wp_mat_extract``.
         mat_elem_inplace_pat = re.compile(
             r"^(?P<indent>\s*)wp::(?P<op>assign_inplace|add_inplace|sub_inplace|"
-            r"mul_inplace|div_inplace)\s*\(\s*var_(?P<mat>\w+)\s*,\s*var_(?P<row>\w+)\s*,\s*"
+            r"mul_inplace|div_inplace|bit_or_inplace|bit_and_inplace|bit_xor_inplace)\s*\(\s*var_(?P<mat>\w+)\s*,\s*var_(?P<row>\w+)\s*,\s*"
             r"var_(?P<col>\w+)\s*,\s*(?P<val>[^(),]+?)\s*\)\s*;\s*$"
         )
         m_mat_elem = mat_elem_inplace_pat.match(raw)
@@ -13043,7 +13101,7 @@ def _generate_msl_kernel_uncached(
             continue
         elem_inplace_pat = re.compile(
             r"^(?P<indent>\s*)wp::(?P<op>assign_inplace|add_inplace|sub_inplace|"
-            r"mul_inplace|div_inplace)\s*\(\s*var_(?P<vec>\w+)\s*,\s*var_(?P<idx>\w+)\s*,\s*"
+            r"mul_inplace|div_inplace|bit_or_inplace|bit_and_inplace|bit_xor_inplace)\s*\(\s*var_(?P<vec>\w+)\s*,\s*var_(?P<idx>\w+)\s*,\s*"
             r"(?P<val>[^(),]+?)\s*\)\s*;\s*$"
         )
         m_elem = elem_inplace_pat.match(raw)
@@ -13068,7 +13126,7 @@ def _generate_msl_kernel_uncached(
             continue
         store_pat = re.compile(
             r"^(?P<indent>\s*)wp::(?P<op>store|assign_inplace|add_inplace|sub_inplace|"
-            r"mul_inplace|div_inplace)\s*\(\s*var_(?P<addr>\w+)\s*,\s*(?P<val>[^()]+?)\s*\)\s*;\s*$"
+            r"mul_inplace|div_inplace|bit_or_inplace|bit_and_inplace|bit_xor_inplace)\s*\(\s*var_(?P<addr>\w+)\s*,\s*(?P<val>[^()]+?)\s*\)\s*;\s*$"
         )
         m_store = store_pat.match(raw)
         if m_store:
@@ -13199,7 +13257,8 @@ def _generate_msl_kernel_uncached(
         # a plain scalar subscript write (or atomic store under atomic mode).
         scalar_store_match = re.match(
             r"^(?P<indent>\s*)wp::__metal_scalar_store__\s*\(\s*var_(?P<arr>\w+)\s*,\s*"
-            r"(?P<op>store|assign_inplace|add_inplace|sub_inplace|mul_inplace|div_inplace)\s*,\s*"
+            r"(?P<op>store|assign_inplace|add_inplace|sub_inplace|mul_inplace|div_inplace|"
+            r"bit_or_inplace|bit_and_inplace|bit_xor_inplace)\s*,\s*"
             r"(?P<idx>[^,]+(?:,[^,]+)*?)\s*,\s*(?P<val>[^()]+?)\s*\)\s*;\s*$",
             raw,
         )
@@ -13217,6 +13276,9 @@ def _generate_msl_kernel_uncached(
                 "sub_inplace": "-=",
                 "mul_inplace": "*=",
                 "div_inplace": "/=",
+                "bit_or_inplace": "|=",
+                "bit_and_inplace": "&=",
+                "bit_xor_inplace": "^=",
             }[op_name]
             if arr in f64_arr_names:
                 slot = f"{arr}[{idx}]"
@@ -13224,8 +13286,11 @@ def _generate_msl_kernel_uncached(
                     line_out = f"{indent}{slot} = wp_f32_to_f64({val});"
                 else:
                     line_out = f"{indent}{slot} = wp_f32_to_f64(wp_f64_to_f32({slot}) {op_sym[0]} ({val}));"
-            elif has_atomic and arr in output_arg_names and op_sym == "=":
+            elif arr in atomic_output_names and op_sym == "=":
                 line_out = f"{indent}atomic_store_explicit(&{arr}[{idx}], {val}, memory_order_relaxed);"
+            elif arr in atomic_output_names and op_sym in _ATOMIC_COMPOUND_FETCH:
+                fetch = _ATOMIC_COMPOUND_FETCH[op_sym]
+                line_out = f"{indent}{fetch}(&{arr}[{idx}], {val}, memory_order_relaxed);"
             else:
                 line_out = f"{indent}{arr}[{idx}] {op_sym} {val};"
             body_lines.append(_finalize(line_out))
@@ -13245,8 +13310,7 @@ def _generate_msl_kernel_uncached(
                 # makes ALL outputs ``device atomic<T>*`` and a plain
                 # ``arr[idx] = val`` won't compile — wrap each scalar
                 # write in ``atomic_store_explicit`` instead.
-                output_arg_names = {a.label for a in output_args}
-                use_atomic_store = has_atomic and arr in output_arg_names
+                use_atomic_store = arr in atomic_output_names
 
                 def _emit_scalar_write(
                     idx_expr: str,
@@ -13999,7 +14063,7 @@ def _generate_msl_kernel_uncached(
         input_args=input_args,
         output_args=output_args,
         atomic_outputs=has_atomic,
-        nonatomic_outputs=tuple(sorted(grad_label_set)),
+        nonatomic_outputs=tuple(sorted(nonatomic_label_set)),
         output_shape_inputs=[],
         shape_packed_arrs=tuple(_shape_arrs_seen),
         shape_packed_slot=_SHAPE_SLOT,
