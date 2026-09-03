@@ -9036,54 +9036,6 @@ class TestMetalVolume(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet, timeout=300)
 
-
-@unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
-@unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
-class TestMetalLaunchDimAndParams(unittest.TestCase):
-    """Regressions surfaced by mujoco_warp's BVH raycast kernel."""
-
-    def test_atomic_outputs_accumulate_across_kernels(self):
-        # Regression: the native launcher used to pre-zero every output of
-        # atomic kernels outside the artifact's seeded set "for MLX
-        # init_value=0 parity". Kernels with a ``*_worldid_in`` array arg
-        # (mujoco_warp's narrowphase family) deliberately have an empty
-        # seeded set, so each such launch silently ERASED the counters and
-        # contact slots written by sibling kernels — hfield GJK contacts
-        # vanished whenever another pair type launched afterwards. CUDA
-        # semantics: outputs bind in place, callers zero explicitly.
-        snippet = textwrap.dedent(
-            """
-            import numpy as np
-
-            # In-place cross-kernel accumulation is a native-dispatch
-            # guarantee; the MLX eager path materialises fresh output
-            # buffers per launch and keeps the legacy shadow semantics.
-            if not wp.config.metal_native_dispatch:
-                raise SystemExit(0)
-
-            @wp.kernel
-            def add_a(count: wp.array(dtype=int), slots: wp.array(dtype=float)):
-                i = wp.tid()
-                cid = wp.atomic_add(count, 0, 1)
-                slots[cid] = 1.0
-
-            @wp.kernel
-            def add_b(collision_worldid_in: wp.array(dtype=int),
-                      count: wp.array(dtype=int), slots: wp.array(dtype=float)):
-                i = wp.tid()
-                wid = collision_worldid_in[i]
-                cid = wp.atomic_add(count, 0, 1)
-                slots[cid] = 2.0 + float(wid) * 0.0
-
-            for dev in ('cpu', 'metal:0'):
-                count = wp.zeros(1, dtype=int, device=dev)
-                slots = wp.zeros(16, dtype=float, device=dev)
-                worldids = wp.zeros(4, dtype=int, device=dev)
-                wp.launch(add_a, dim=3, inputs=[], outputs=[count, slots], device=dev)
-                wp.launch(add_b, dim=4, inputs=[worldids], outputs=[count, slots], device=dev)
-                total = count.numpy()[0]
-                written = slots.numpy()
-                assert total == 7, f'{dev}: count {total} != 7 (second launch wiped the first?)'
     def test_allocate_by_voxels_matches_cpu(self):
         # ``Volume.allocate_by_voxels`` has no native builder outside CUDA; the
         # NumPy NanoVDB builder (warp/_src/nanovdb_builder.py) must give the
@@ -9138,6 +9090,54 @@ class TestMetalLaunchDimAndParams(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet, timeout=300)
 
+
+@unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
+@unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
+class TestMetalLaunchDimAndParams(unittest.TestCase):
+    """Regressions surfaced by mujoco_warp's BVH raycast kernel."""
+
+    def test_atomic_outputs_accumulate_across_kernels(self):
+        # Regression: the native launcher used to pre-zero every output of
+        # atomic kernels outside the artifact's seeded set "for MLX
+        # init_value=0 parity". Kernels with a ``*_worldid_in`` array arg
+        # (mujoco_warp's narrowphase family) deliberately have an empty
+        # seeded set, so each such launch silently ERASED the counters and
+        # contact slots written by sibling kernels — hfield GJK contacts
+        # vanished whenever another pair type launched afterwards. CUDA
+        # semantics: outputs bind in place, callers zero explicitly.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            # In-place cross-kernel accumulation is a native-dispatch
+            # guarantee; the MLX eager path materialises fresh output
+            # buffers per launch and keeps the legacy shadow semantics.
+            if not wp.config.metal_native_dispatch:
+                raise SystemExit(0)
+
+            @wp.kernel
+            def add_a(count: wp.array(dtype=int), slots: wp.array(dtype=float)):
+                i = wp.tid()
+                cid = wp.atomic_add(count, 0, 1)
+                slots[cid] = 1.0
+
+            @wp.kernel
+            def add_b(collision_worldid_in: wp.array(dtype=int),
+                      count: wp.array(dtype=int), slots: wp.array(dtype=float)):
+                i = wp.tid()
+                wid = collision_worldid_in[i]
+                cid = wp.atomic_add(count, 0, 1)
+                slots[cid] = 2.0 + float(wid) * 0.0
+
+            for dev in ('cpu', 'metal:0'):
+                count = wp.zeros(1, dtype=int, device=dev)
+                slots = wp.zeros(16, dtype=float, device=dev)
+                worldids = wp.zeros(4, dtype=int, device=dev)
+                wp.launch(add_a, dim=3, inputs=[], outputs=[count, slots], device=dev)
+                wp.launch(add_b, dim=4, inputs=[worldids], outputs=[count, slots], device=dev)
+                total = count.numpy()[0]
+                written = slots.numpy()
+                assert total == 7, f'{dev}: count {total} != 7 (second launch wiped the first?)'
                 np.testing.assert_array_equal(np.sort(written[:7]), np.array([1, 1, 1, 2, 2, 2, 2], np.float32))
             """
         )
