@@ -6808,6 +6808,20 @@ def _coop_reduce_expr(val: str, elem_msl: str, simd_fn: str) -> str:
     raise MetalCodegenError(f"distributed tile_reduce: unsupported element type {elem_msl!r}")
 
 
+# One MSL lane index for the distributed-tile lowerings. The launcher runs a
+# coop-block kernel as one ``(1, 32, 1)`` threadgroup per launch-tiled block,
+# i.e. exactly one SIMD group, so the SIMD lane is the block-local thread
+# index ``wp.tid()`` returns as ``j`` and the index ``simd_shuffle`` expects.
+_COOP_LANE = "(int)thread_index_in_simdgroup"
+
+# ``wp::tile_<op><tpl>(args)`` — every tile intrinsic call in the IR. ``<``
+# never follows ``wp::tile`` itself (the ``wp.tile()`` constructor), so the
+# constructor is excluded by construction.
+_COOP_TILE_CALL_PAT = re.compile(r"\bwp::tile_(\w+)\s*(<[^()]*>)?\s*\(([^)]*)\)")
+# ``tile_load`` template: ``<dtype, layout, flag, R>`` (1-D) vs ``<..., R, C>``.
+_COOP_LOAD_TPL_1D_PAT = re.compile(r"^<\s*[^,]+,\s*\w+\s*,\s*\w+\s*,\s*(\d+)\s*>$")
+
+
 def _coop_block_eligible(adj) -> bool:
     """Decide whether a kernel can be rebuilt with an honest ``block_dim``
     and dispatched as one 32-lane threadgroup per launch-tiled block.
@@ -6815,50 +6829,111 @@ def _coop_block_eligible(adj) -> bool:
     The scan runs on the serial (``block_dim=1``) IR. Semantics of the
     honest build match CUDA thread-for-thread, so the checks below are
     about whether every tile intrinsic present has a distributed-lane
-    lowering — anything else keeps the serial model:
+    lowering — anything else keeps the serial model.
 
-    - only 2-D ``wp.tid()`` (launch dims are ``(D, block_dim)``);
-    - register tiles come only from ``wp.tile()`` (one element per lane);
-    - ``tile_reduce`` uses add/min/max over those tiles (→ ``simd_*``);
-    - ``tile_extract`` reads only reduce results (1-element tiles) —
-      extracting lane ``i`` of a distributed tile would need a shuffle;
-    - the kernel actually uses block-cooperative features (``wp.tile``,
-      ``wp.block_dim()`` or ``WP_TILE_SYNC``), so plain kernels are
-      untouched.
+    A *distributed* tile holds one element per lane: the result of
+    ``wp.tile()`` (CUDA's register-tile model), any 1-D tile of exactly
+    ``block_dim`` scalars (``tile_load(arr, 32, ...)``,
+    ``tile_from_thread(shape=32, ...)``), and whatever a supported op
+    derives from those. Supported on distributed tiles:
+
+    - ``tile_reduce`` with add/min/max (→ ``simd_sum`` / ``simd_min`` /
+      ``simd_max``), ``tile_scan_inclusive`` / ``_exclusive`` (→
+      ``simd_prefix_*_sum``);
+    - ``tile_extract(t, i)`` on a distributed tile (→ ``simd_shuffle``) or
+      on a reduce result (a broadcast value);
+    - ``tile_from_thread`` (→ ``simd_shuffle`` of the named lane's value);
+    - ``tile_load`` / ``tile_store`` of a 1-D tile (each lane moves its own
+      element, zero-filling out-of-range loads like CUDA);
+    - ``tile_store_indexed`` and ``tile_map`` / ``tile_binary_map`` over
+      distributed tiles (per-lane element ops);
+    - ``tile_zeros`` / ``tile_ones`` / ``tile_full`` / ``tile_arange``.
+
+    Other requirements: only 2-D ``wp.tid()`` (launch dims are
+    ``(D, block_dim)``), no tile-typed local produced any other way, and
+    the kernel actually uses block-cooperative features so plain kernels
+    are untouched.
     """
     try:
-        text = "\n".join(adj.blocks[0].body_forward)
+        lines = list(adj.blocks[0].body_forward)
     except Exception:
         return False
+    text = "\n".join(lines)
     if "builtin_tid2d(" not in text:
         return False
     if re.search(r"builtin_tid1d\s*\(|builtin_tid3d\s*\(|builtin_tid4d\s*\(", text):
         return False
-    ctor_labels = set(_COOP_TILE_CTOR_PAT.findall(text))
-    if not ctor_labels and "builtin_block_dim" not in text and "WP_TILE_SYNC" not in text:
-        return False
-    reduce_labels: set[str] = set()
-    for m in _COOP_TILE_REDUCE_PAT.finditer(text):
-        if m.group(2) not in _COOP_REDUCE_OPS or m.group(3) not in ctor_labels:
-            return False
-        reduce_labels.add(m.group(1))
-    for m in _COOP_TILE_OTHER_PAT.finditer(text):
-        op = m.group(1)
-        if op == "reduce":
-            continue
-        if op == "extract":
-            continue  # sources validated below
-        return False
-    for m in re.finditer(r"wp::tile_extract\s*\(\s*var_(\w+)", text):
-        if m.group(1) not in reduce_labels:
-            return False
-    # Tile-typed locals produced any other way (e.g. returned from a
-    # ``@wp.func``) have no distributed lowering.
+
+    def _label(tok: str) -> str:
+        tok = tok.strip()
+        return tok[len("var_") :] if tok.startswith("var_") else tok
+
+    tile_vars: dict[str, tuple[str, str, int, int]] = {}
     for v in adj.variables:
         parsed = _parse_tile_ctype(v.ctype())
-        if parsed is None:
-            continue
-        if str(v.label) not in ctor_labels and str(v.label) not in reduce_labels:
+        if parsed is not None:
+            tile_vars[str(v.label)] = parsed
+    ctor_labels = set(_COOP_TILE_CTOR_PAT.findall(text))
+    distributed: set[str] = set(ctor_labels)
+    for label, (_kind, dtype_ctype, rows, cols) in tile_vars.items():
+        if rows == _COOP_BLOCK_DIM and cols == 1 and dtype_ctype in _SCALAR_CTYPE_TO_MSL:
+            distributed.add(label)
+    if not distributed and "builtin_block_dim" not in text and "WP_TILE_SYNC" not in text:
+        return False
+
+    reduce_labels: set[str] = set()
+    for raw in lines:
+        lhs_m = re.match(r"\s*var_(\w+)\s*=", raw)
+        lhs = lhs_m.group(1) if lhs_m else None
+        for m in _COOP_TILE_CALL_PAT.finditer(raw):
+            op, tpl, arg_str = m.group(1), m.group(2) or "", m.group(3)
+            args = [a.strip() for a in arg_str.split(",") if a.strip()]
+            if op == "reduce":
+                if len(args) != 2 or args[0] not in _COOP_REDUCE_OPS or _label(args[1]) not in distributed:
+                    return False
+                if lhs is not None:
+                    reduce_labels.add(lhs)
+            elif op in ("scan_inclusive", "scan_exclusive"):
+                if len(args) != 1 or _label(args[0]) not in distributed or lhs is None:
+                    return False
+                distributed.add(lhs)
+            elif op == "extract":
+                if len(args) != 2:
+                    return False
+                src = _label(args[0])
+                if src not in distributed and src not in reduce_labels:
+                    return False
+            elif op == "from_thread":
+                if len(args) != 2 or lhs not in distributed:
+                    return False
+            elif op == "load":
+                if lhs not in distributed or len(args) < 2 or _COOP_LOAD_TPL_1D_PAT.match(tpl) is None:
+                    return False
+            elif op == "store":
+                if len(args) < 3 or _label(args[-1]) not in distributed:
+                    return False
+            elif op == "store_indexed":
+                if len(args) != 5 or _label(args[1]) not in distributed or _label(args[4]) not in distributed:
+                    return False
+            elif op in ("map", "binary_map"):
+                if lhs is None or len(args) < 2:
+                    return False
+                # ``tile_map<fn>(tiles...)`` or ``tile_map(fn, tiles...)`` —
+                # the op name is never a tile local, so scan every arg.
+                for a in args:
+                    la = _label(a)
+                    if la in tile_vars and la not in distributed:
+                        return False
+                distributed.add(lhs)
+            elif op in ("zeros", "ones", "full", "arange"):
+                if lhs not in distributed:
+                    return False
+            else:
+                return False
+    # Tile-typed locals produced any other way (e.g. returned from a
+    # ``@wp.func``) have no distributed lowering.
+    for label in tile_vars:
+        if label not in distributed and label not in reduce_labels:
             return False
     return True
 
@@ -8875,6 +8950,18 @@ def _translate_tile_intrinsics(
             # Treat the 1-D tile load as a degenerate ``Rx1`` load with
             # ``col_off=0`` so the same helper signature works.
             row_off, col_off = offsets[0], "0"
+        if lhs in distributed_tiles:
+            # Distributed 1-D tile: each lane loads its own element and
+            # zero-fills out-of-range positions (CUDA's bounds-checked load).
+            if cols > 1 or vec_n_elem > 0 or not tile_is_1d:
+                raise MetalCodegenError(
+                    f"MSL codegen: distributed tile_load supports 1-D scalar tiles only (statement: {m.group(0)!r})"
+                )
+            return (
+                f"{{ const int _dl_i = ({row_off}) + {_COOP_LANE}; "
+                f"var_{lhs} = (_dl_i >= 0 && _dl_i < (int){arr_name}_shape[{len(lead_idx_args)}]) "
+                f"? {arr}[{base_expr} + _dl_i] : ({msl_scalar})0; }}"
+            )
         # Shape (1,1) collapses to a scalar local (see ``_msl_var_type``);
         # there's no wp_tile_1x1 struct/helper, so emit a direct subscript.
         if rows == 1 and cols == 1:
@@ -8986,6 +9073,23 @@ def _translate_tile_intrinsics(
         else:
             row_stride = "1"
             row_off, col_off = offsets[0], "0"
+        if tile_label in distributed_tiles:
+            # Distributed 1-D tile: each lane stores its own element,
+            # skipping positions past the array's end.
+            if vec_n_elem > 0:
+                raise MetalCodegenError(
+                    f"MSL codegen: distributed tile_store supports scalar tiles only (statement: {m.group(0)!r})"
+                )
+            target = f"{arr}[{base_expr} + _ds_i]"
+            write = (
+                f"atomic_store_explicit(&{target}, {tile_var}, memory_order_relaxed);"
+                if arr_name in atomic_output_names
+                else f"{target} = {tile_var};"
+            )
+            return (
+                f"{{ const int _ds_i = ({row_off}) + {_COOP_LANE}; "
+                f"if (_ds_i >= 0 && _ds_i < (int){arr_name}_shape[{len(lead_idx_args)}]) {{ {write} }} }}"
+            )
         # Shape (1,1) tile is a scalar local — store with a direct subscript.
         if rows == 1 and cols == 1:
             return f"{arr}[{base_expr} + ({row_off}) * ({row_stride}) + ({col_off})] = {tile_var}"
@@ -9374,6 +9478,9 @@ def _translate_tile_intrinsics(
 
     def repl_tile_scan(m: re.Match[str]) -> str:
         lhs, kind, in_label = m.group(1), m.group(2), m.group(3)
+        if in_label in distributed_tiles:
+            # One element per lane: a cross-lane SIMD prefix sum.
+            return f"var_{lhs} = simd_prefix_{kind}_sum(var_{in_label})"
         dims = tile_var_dims.get(in_label)
         n = dims[0] * dims[1] if dims is not None else 1
         if tile_var_vec_n.get(in_label, 0) > 0:
@@ -9428,13 +9535,23 @@ def _translate_tile_intrinsics(
         args = [a.strip() for a in _split_top_level_args(m.group(3))]
         if len(args) != 2 or not args[0]:
             return m.group(0)
+        if m.group(1) in distributed_tiles:
+            # Distributed tile: every lane takes lane ``thread_idx``'s value.
+            msl = distributed_tiles[m.group(1)]
+            return f"var_{m.group(1)} = simd_shuffle(({msl})({args[0]}), (ushort)({args[1]}))"
         return _emit_tile_const_fill(m.group(1), m.group(2), f"({args[0]})")
 
     line = _TILE_ZEROS_PAT.sub(repl_zeros, line)
     line = _TILE_ONES_PAT.sub(repl_ones, line)
     line = _TILE_FULL_PAT.sub(repl_full, line)
     line = _TILE_FROM_THREAD_PAT.sub(repl_from_thread, line)
-    line = _TILE_ARANGE_PAT.sub(r"var_\1 = 0", line)
+
+    def repl_tile_arange_1(m: re.Match[str]) -> str:
+        if m.group(1) in distributed_tiles:
+            return f"var_{m.group(1)} = ({distributed_tiles[m.group(1)]}){_COOP_LANE}"
+        return f"var_{m.group(1)} = 0"
+
+    line = _TILE_ARANGE_PAT.sub(repl_tile_arange_1, line)
 
     def repl_tile_arange_3(m: re.Match[str]) -> str:
         # ``var_X = wp::tile_arange<dtype, N>(start, stop, step)``.
@@ -9445,6 +9562,8 @@ def _translate_tile_intrinsics(
             # 1-arg form already handled above.
             return m.group(0)
         start, _stop, step = args
+        if lhs in distributed_tiles:
+            return f"var_{lhs} = ({start}) + {_COOP_LANE} * ({step})"
         dims = tile_var_dims.get(lhs)
         if dims is None:
             return m.group(0)
@@ -9956,6 +10075,14 @@ def _translate_tile_intrinsics(
         # from its consecutive scalar components (same accessor shape as
         # the tile_map lowering above).
         lhs, t_label, idx = m.group(1), m.group(2), m.group(3).strip()
+        if t_label in distributed_tiles:
+            # One element per lane: read lane ``idx``'s value. (Reduce
+            # results are broadcast scalars and are not in this map.)
+            if "," in idx:
+                raise MetalCodegenError(
+                    f"MSL codegen: distributed tile_extract takes a single index (statement: {m.group(0)!r})"
+                )
+            return f"var_{lhs} = simd_shuffle(var_{t_label}, (ushort)({idx}))"
         dims = tile_var_dims.get(t_label)
         if dims is None:
             return f"var_{lhs} = var_{t_label}"
@@ -10997,10 +11124,16 @@ def _generate_msl_kernel_uncached(
     # cannot see — expand it into an element loop holding a direct call
     # first, so the splice below covers the mapped function too.
     _tile_elem_info: dict[str, tuple[str, int, int]] = {}
+    _coop_n_early = getattr(adj, "_metal_coop_block_n", 0)
     for _v in adj.variables:
         _parsed = _parse_tile_ctype(_v.ctype())
         if _parsed is not None:
-            _tile_elem_info[_v.label] = (_parsed[1], _parsed[2], _parsed[3])
+            _elem, _rows, _cols = _parsed[1], _parsed[2], _parsed[3]
+            # Distributed tiles (coop-block mode) are one element per lane,
+            # so a mapped user function is called once per lane, not looped.
+            if _coop_n_early > 0 and _rows == _coop_n_early and _cols == 1 and _elem in _SCALAR_CTYPE_TO_MSL:
+                _rows = 1
+            _tile_elem_info[_v.label] = (_elem, _rows, _cols)
     _ast_nodes, _tile_map_var_types = _expand_user_tile_map(_ast_nodes, adj, _tile_elem_info)
     _ast_nodes, _inlined_const_ints, _inlined_struct_locals, _inlined_var_ctypes = _ast_inline(
         _ast_nodes, adj, extra_var_types=_tile_map_var_types
@@ -11671,15 +11804,18 @@ def _generate_msl_kernel_uncached(
             _ctor_labels.update(_COOP_TILE_CTOR_PAT.findall(raw))
         _all_ctypes: dict[str, str] = {str(v.label): v.ctype() for v in adj.variables}
         _all_ctypes.update(_inlined_var_ctypes)
-        for label in _ctor_labels:
-            ctype = _all_ctypes.get(label)
-            if ctype is None:
-                continue
+        for label, ctype in _all_ctypes.items():
             parsed = _parse_tile_ctype(ctype)
             if parsed is None:
                 continue
             kind, dtype_ctype, rows, cols = parsed
-            if kind == "register" and rows == coop_block_n and cols == 1:
+            if rows != coop_block_n or cols != 1:
+                continue
+            # ``wp.tile()`` results of any element type, plus every other
+            # 1-D scalar tile of block_dim elements (``tile_load``,
+            # ``tile_from_thread``, scans, maps ...) — see
+            # ``_coop_block_eligible`` for the ops that keep them per-lane.
+            if (label in _ctor_labels and kind == "register") or dtype_ctype in _SCALAR_CTYPE_TO_MSL:
                 distributed_tiles[label] = _msl_scalar_type(dtype_ctype)
 
     # --- Local variable declarations -----------------------------------
@@ -11939,6 +12075,16 @@ def _generate_msl_kernel_uncached(
             continue
         _kind, dtype_ctype, rows, cols = parsed
         _record_tile(label, dtype_ctype, rows, cols)
+    # Distributed tiles are one element per lane. Present them to the
+    # translators as single-element tiles so the scalar collapses apply
+    # (``tile_map`` → direct call, ``tile_store_indexed`` → one guarded
+    # store, ``tile_zeros`` → a scalar). The ops whose per-lane form is NOT
+    # the scalar one (load/store/scan/extract/from_thread/arange) check
+    # ``distributed_tiles`` first.
+    for label in distributed_tiles:
+        dims = tile_var_dims.get(label)
+        if dims is not None:
+            tile_var_dims[label] = (1, 1, dims[2])
 
     # ``wp.tile_extract(t, wp.block_dim() - 1)`` — "the last lane's element" —
     # cannot be honoured by the serial model and must not be answered wrongly.
@@ -12412,16 +12558,18 @@ def _generate_msl_kernel_uncached(
         # the array as the ``wp::where`` condition; give it the same test.
         if "wp::where(" in line and "var_" in line:
             line = array_truth_where_pat.sub(
-                lambda m: f"(({m.group('name')}_shape[0] != 0) ? ({m.group('x')}) : ({m.group('y')}))"
-                if m.group("name") in array_arg_labels_local
-                else m.group(0),
+                lambda m: (
+                    f"(({m.group('name')}_shape[0] != 0) ? ({m.group('x')}) : ({m.group('y')}))"
+                    if m.group("name") in array_arg_labels_local
+                    else m.group(0)
+                ),
                 line,
             )
         if "wp::unot(" in line and "var_" in line:  # ``if not arr:``
             line = array_truth_unot_pat.sub(
-                lambda m: f"(!({m.group('name')}_shape[0] != 0))"
-                if m.group("name") in array_arg_labels_local
-                else m.group(0),
+                lambda m: (
+                    f"(!({m.group('name')}_shape[0] != 0))" if m.group("name") in array_arg_labels_local else m.group(0)
+                ),
                 line,
             )
         m_arr_if = array_truth_if_pat.match(line)
