@@ -4352,6 +4352,517 @@ inline int wp_mesh_get_index(ulong id, int face_vertex_index) {
 # ("<4Q6i2f", 64 bytes): 8-byte-aligned ulongs first, then six ints (one is
 # padding), then the two cell-width floats. An unbuilt grid has
 # ``point_cells == 0`` and queries return no results, matching native.
+# ---------------------------------------------------------------------------
+# wp.Volume (NanoVDB) support
+# ---------------------------------------------------------------------------
+#
+# Warp's own volume builtins (warp/native/volume.h) are a thin layer over
+# PNanoVDB.h, the portable C99 rendition of the NanoVDB tree traversal that
+# is written to be included from shader languages. MSL is close enough to
+# C++14 that the header compiles as-is once a handful of platform macros are
+# rewritten: pointer parameters need the ``thread`` address space, program
+# scope constants need ``constant``, and the CPU bit-casts through memcpy
+# become ``as_type``. ``_volume_helpers()`` performs that rewrite on the
+# checked-in header at codegen time and appends ``_VOLUME_LAYER_MSL``, a
+# port of volume.h's builtins on top of it. Only float, int32 and vec3f
+# grids (plus index grids) are supported; there is no fp64 on Apple GPUs.
+#
+# A volume ``id`` is the gpuAddress of the Metal buffer holding the NanoVDB
+# grid (see ``Volume._init_metal`` in warp/_src/types.py); kernels that use
+# volume builtins dispatch with ``reads_resident=True`` like BVH kernels.
+
+_PNANOVDB_MSL_PATCHES: tuple[tuple[str, str], ...] = (
+    ("#define PNANOVDB_INOUT(X) X*", "#define PNANOVDB_INOUT(X) thread X*"),
+    ("#define PNANOVDB_IN(X) const X*", "#define PNANOVDB_IN(X) const thread X*"),
+    ("#define PNANOVDB_STATIC_CONST static const", "#define PNANOVDB_STATIC_CONST constant"),
+    (
+        "PNANOVDB_FORCE_INLINE float pnanovdb_uint32_as_float(pnanovdb_uint32_t v) "
+        "{ float vf; pnanovdb_memcpy(&vf, &v, sizeof(vf)); return vf; }",
+        "PNANOVDB_FORCE_INLINE float pnanovdb_uint32_as_float(pnanovdb_uint32_t v) { return as_type<float>(v); }",
+    ),
+    (
+        "PNANOVDB_FORCE_INLINE pnanovdb_uint32_t pnanovdb_float_as_uint32(float v) "
+        "{ return *((pnanovdb_uint32_t*)(&v)); }",
+        "PNANOVDB_FORCE_INLINE pnanovdb_uint32_t pnanovdb_float_as_uint32(float v) "
+        "{ return as_type<pnanovdb_uint32_t>(v); }",
+    ),
+    # No fp64 on Metal: the double accessors must still compile (they are
+    # instantiated by the generic read paths) but are never reached for the
+    # supported grid types.
+    (
+        "PNANOVDB_FORCE_INLINE double pnanovdb_uint64_as_double(pnanovdb_uint64_t v) "
+        "{ double vf; pnanovdb_memcpy(&vf, &v, sizeof(vf)); return vf; }",
+        "PNANOVDB_FORCE_INLINE double pnanovdb_uint64_as_double(pnanovdb_uint64_t v) { return 0.0f; }",
+    ),
+    (
+        "PNANOVDB_FORCE_INLINE pnanovdb_uint64_t pnanovdb_double_as_uint64(double v) "
+        "{ return *((pnanovdb_uint64_t*)(&v)); }",
+        "PNANOVDB_FORCE_INLINE pnanovdb_uint64_t pnanovdb_double_as_uint64(double v) { return 0ul; }",
+    ),
+    (
+        "PNANOVDB_FORCE_INLINE float pnanovdb_floor(float v) { return floorf(v); }",
+        "PNANOVDB_FORCE_INLINE float pnanovdb_floor(float v) { return metal::floor(v); }",
+    ),
+)
+
+_PNANOVDB_MSL_PREAMBLE = """\
+// ---- PNanoVDB.h (warp/native/nanovdb) rewritten for MSL by codegen_metal ----
+#define double float
+#define __CUDACC_RTC__
+#define PNANOVDB_C
+#define PNANOVDB_MEMCPY_CUSTOM
+#define PNANOVDB_BUF_CUSTOM
+typedef struct pnanovdb_buf_t { device uint32_t* data; } pnanovdb_buf_t;
+static inline pnanovdb_buf_t pnanovdb_make_buf(device uint32_t* data, uint64_t size_in_words) {
+    pnanovdb_buf_t b; b.data = data; return b;
+}
+static inline uint32_t pnanovdb_buf_read_uint32(pnanovdb_buf_t buf, uint64_t byte_offset) {
+    return buf.data[byte_offset >> 2u];
+}
+static inline uint64_t pnanovdb_buf_read_uint64(pnanovdb_buf_t buf, uint64_t byte_offset) {
+    return reinterpret_cast<device uint64_t*>(buf.data)[byte_offset >> 3u];
+}
+static inline void pnanovdb_buf_write_uint32(pnanovdb_buf_t buf, uint64_t byte_offset, uint32_t value) {
+    buf.data[byte_offset >> 2u] = value;
+}
+static inline void pnanovdb_buf_write_uint64(pnanovdb_buf_t buf, uint64_t byte_offset, uint64_t value) {
+    reinterpret_cast<device uint64_t*>(buf.data)[byte_offset >> 3u] = value;
+}
+typedef uint32_t pnanovdb_grid_type_t;
+#define PNANOVDB_GRID_TYPE_GET(grid_typeIn, nameIn) pnanovdb_grid_type_constants[grid_typeIn].nameIn
+"""
+
+_PNANOVDB_MSL_POSTAMBLE = """\
+#undef double
+#undef __CUDACC_RTC__
+"""
+
+_VOLUME_LAYER_MSL = """\
+// ---- wp.Volume builtins: port of warp/native/volume.h over PNanoVDB ----
+#define WP_VOLUME_CLOSEST 0
+#define WP_VOLUME_LINEAR 1
+
+inline pnanovdb_buf_t wp_volume_buf(ulong id) {
+    pnanovdb_buf_t buf;
+    buf.data = reinterpret_cast<device uint32_t*>(id);
+    return buf;
+}
+inline pnanovdb_grid_handle_t wp_volume_grid() {
+    pnanovdb_grid_handle_t grid;
+    grid.address.byte_offset = 0u;
+    return grid;
+}
+inline uint32_t wp_volume_grid_type(pnanovdb_buf_t buf) {
+    return pnanovdb_grid_get_grid_type(buf, wp_volume_grid());
+}
+inline pnanovdb_root_handle_t wp_volume_root(pnanovdb_buf_t buf) {
+    return pnanovdb_tree_get_root(buf, pnanovdb_grid_get_tree(buf, wp_volume_grid()));
+}
+inline pnanovdb_coord_t wp_pn_coord(int i, int j, int k) {
+    pnanovdb_coord_t c;
+    c.x = i;
+    c.y = j;
+    c.z = k;
+    return c;
+}
+inline pnanovdb_vec3_t wp_pn_vec3(float3 v) {
+    pnanovdb_vec3_t r;
+    r.x = v.x;
+    r.y = v.y;
+    r.z = v.z;
+    return r;
+}
+inline float3 wp_pn_float3(pnanovdb_vec3_t v) { return float3(v.x, v.y, v.z); }
+// roundf(): halves away from zero, as in volume.h's vec3_round_to_coord.
+inline pnanovdb_coord_t wp_pn_round_coord(float3 p) {
+    return wp_pn_coord(int(metal::round(p.x)), int(metal::round(p.y)), int(metal::round(p.z)));
+}
+
+// Per-element-type traits (pnano_traits + pnano_read/pnano_write in volume.h).
+// ``load`` reads element ``i`` of a Warp array bound as scalar storage
+// (vec3 arrays are ``device float*`` with 3 floats per element).
+template <typename T> struct wp_pn_traits;
+template <> struct wp_pn_traits<float> {
+    static uint32_t grid_type() { return PNANOVDB_GRID_TYPE_FLOAT; }
+    static float zero() { return 0.0f; }
+    static float read(pnanovdb_buf_t buf, pnanovdb_address_t a) { return pnanovdb_read_float(buf, a); }
+    static void write(pnanovdb_buf_t buf, pnanovdb_address_t a, float v) { pnanovdb_write_float(buf, a, v); }
+    template <typename PtrT> static float load(PtrT p, ulong i) { return float(p[i]); }
+    static float dot(float a, float b) { return a * b; }
+};
+template <> struct wp_pn_traits<int> {
+    static uint32_t grid_type() { return PNANOVDB_GRID_TYPE_INT32; }
+    static int zero() { return 0; }
+    static int read(pnanovdb_buf_t buf, pnanovdb_address_t a) { return pnanovdb_read_int32(buf, a); }
+    static void write(pnanovdb_buf_t buf, pnanovdb_address_t a, int v) { pnanovdb_write_int32(buf, a, v); }
+    template <typename PtrT> static int load(PtrT p, ulong i) { return int(p[i]); }
+    static float dot(int a, int b) { return float(a * b); }
+};
+template <> struct wp_pn_traits<float3> {
+    static uint32_t grid_type() { return PNANOVDB_GRID_TYPE_VEC3F; }
+    static float3 zero() { return float3(0.0f); }
+    static float3 read(pnanovdb_buf_t buf, pnanovdb_address_t a) { return wp_pn_float3(pnanovdb_read_vec3(buf, a)); }
+    static void write(pnanovdb_buf_t buf, pnanovdb_address_t a, float3 v) {
+        pnanovdb_write_float(buf, a, v.x);
+        pnanovdb_write_float(buf, pnanovdb_address_offset(a, 4u), v.y);
+        pnanovdb_write_float(buf, pnanovdb_address_offset(a, 8u), v.z);
+    }
+    template <typename PtrT> static float3 load(PtrT p, ulong i) {
+        return float3(p[3ul * i], p[3ul * i + 1ul], p[3ul * i + 2ul]);
+    }
+    static float dot(float3 a, float3 b) { return metal::dot(a, b); }
+};
+
+// Voxel index of a leaf value address (volume.h leaf_regular_get_voxel_index /
+// get_grid_voxel_index): 1-based, 0 = not a leaf voxel.
+inline ulong wp_volume_leaf_regular_voxel_index(pnanovdb_buf_t buf, pnanovdb_address_t value_address,
+                                                pnanovdb_coord_t ijk) {
+    const uint32_t grid_type = wp_volume_grid_type(buf);
+    const uint32_t n = pnanovdb_leaf_coord_to_offset(PNANOVDB_REF(ijk));
+    const uint32_t byte_offset = PNANOVDB_GRID_TYPE_GET(grid_type, leaf_off_table)
+        + ((PNANOVDB_GRID_TYPE_GET(grid_type, value_stride_bits) * n) >> 3u);
+    const pnanovdb_address_t leaf_address = pnanovdb_address_offset_neg(value_address, byte_offset);
+    const ulong first_leaf_offset = pnanovdb_tree_get_node_offset_leaf(buf, pnanovdb_grid_get_tree(buf, wp_volume_grid()));
+    const uint32_t leaf_size = PNANOVDB_GRID_TYPE_GET(grid_type, leaf_size);
+    const ulong leaf_index = (leaf_address.byte_offset - first_leaf_offset) / leaf_size;
+    return leaf_index * PNANOVDB_LEAF_TABLE_COUNT + n + 1ul;
+}
+inline ulong wp_volume_voxel_index(uint32_t grid_type, pnanovdb_buf_t buf, pnanovdb_address_t value_address,
+                                   pnanovdb_coord_t ijk) {
+    switch (grid_type) {
+    case PNANOVDB_GRID_TYPE_INDEX:
+        return pnanovdb_leaf_index_get_value_index(buf, value_address, PNANOVDB_REF(ijk));
+    case PNANOVDB_GRID_TYPE_ONINDEX:
+        return pnanovdb_leaf_onindex_get_value_index(buf, value_address, PNANOVDB_REF(ijk));
+    case PNANOVDB_GRID_TYPE_INDEXMASK:
+        return pnanovdb_leaf_indexmask_get_value_index(buf, value_address, PNANOVDB_REF(ijk));
+    case PNANOVDB_GRID_TYPE_ONINDEXMASK:
+        return pnanovdb_leaf_onindexmask_get_value_index(buf, value_address, PNANOVDB_REF(ijk));
+    default:
+        return wp_volume_leaf_regular_voxel_index(buf, value_address, ijk);
+    }
+}
+
+// Regular grid accessor: values stored in the leaves.
+template <typename T> struct wp_volume_leaf_accessor {
+    pnanovdb_buf_t buf;
+    pnanovdb_root_handle_t root;
+    pnanovdb_readaccessor_t acc;
+    wp_volume_leaf_accessor(pnanovdb_buf_t b) : buf(b), root(wp_volume_root(b)) {}
+    bool is_valid() { return wp_volume_grid_type(buf) == wp_pn_traits<T>::grid_type(); }
+    void init_cache() { pnanovdb_readaccessor_init(PNANOVDB_REF(acc), root); }
+    T read_single(pnanovdb_coord_t ijk) {
+        const pnanovdb_address_t a = pnanovdb_root_get_value_address(wp_pn_traits<T>::grid_type(), buf, root, PNANOVDB_REF(ijk));
+        return wp_pn_traits<T>::read(buf, a);
+    }
+    T read_cache(pnanovdb_coord_t ijk) {
+        uint32_t level;
+        const pnanovdb_address_t a = pnanovdb_readaccessor_get_value_address_and_level(
+            wp_pn_traits<T>::grid_type(), buf, PNANOVDB_REF(acc), PNANOVDB_REF(ijk), PNANOVDB_REF(level));
+        return wp_pn_traits<T>::read(buf, a);
+    }
+};
+
+// Index grid accessor: values live in a user array indexed by voxel index.
+template <typename T, typename PtrT> struct wp_volume_index_accessor {
+    pnanovdb_buf_t buf;
+    pnanovdb_root_handle_t root;
+    pnanovdb_readaccessor_t acc;
+    uint32_t grid_type;
+    PtrT data;
+    T background;
+    wp_volume_index_accessor(pnanovdb_buf_t b, PtrT d, T bg)
+        : buf(b), root(wp_volume_root(b)), grid_type(wp_volume_grid_type(b)), data(d), background(bg) {}
+    bool is_valid() { return true; }
+    void init_cache() { pnanovdb_readaccessor_init(PNANOVDB_REF(acc), root); }
+    T read_at(uint32_t level, pnanovdb_address_t a, pnanovdb_coord_t ijk) {
+        if (level == 0u) {
+            const ulong voxel_index = wp_volume_voxel_index(grid_type, buf, a, ijk);
+            if (voxel_index > 0ul) { return wp_pn_traits<T>::load(data, voxel_index - 1ul); }
+        }
+        return background;
+    }
+    T read_single(pnanovdb_coord_t ijk) {
+        uint32_t level;
+        const pnanovdb_address_t a = pnanovdb_root_get_value_address_and_level(
+            grid_type, buf, root, PNANOVDB_REF(ijk), PNANOVDB_REF(level));
+        return read_at(level, a, ijk);
+    }
+    T read_cache(pnanovdb_coord_t ijk) {
+        uint32_t level;
+        const pnanovdb_address_t a = pnanovdb_readaccessor_get_value_address_and_level(
+            grid_type, buf, PNANOVDB_REF(acc), PNANOVDB_REF(ijk), PNANOVDB_REF(level));
+        return read_at(level, a, ijk);
+    }
+};
+
+// Trilinear corner ``idx`` in volume.h's OFFSETS order: x = idx>>2, y = idx>>1, z = idx.
+#define WP_VOLUME_CORNER(idx, ox, oy, oz) \\
+    const int ox = ((idx) >> 2) & 1; const int oy = ((idx) >> 1) & 1; const int oz = (idx) & 1;
+
+template <typename T, typename Acc>
+inline T wp_volume_sample_impl(thread Acc& accessor, float3 uvw, int mode) {
+    if (!accessor.is_valid()) { return wp_pn_traits<T>::zero(); }
+    if (mode == WP_VOLUME_CLOSEST) { return accessor.read_single(wp_pn_round_coord(uvw)); }
+    if (mode != WP_VOLUME_LINEAR) { return wp_pn_traits<T>::zero(); }
+    const float3 base = metal::floor(uvw);
+    const float3 frac = uvw - base;
+    const pnanovdb_coord_t ijk = wp_pn_coord(int(base.x), int(base.y), int(base.z));
+    accessor.init_cache();
+    T val = wp_pn_traits<T>::zero();
+    const float wx[2] = {1.0f - frac.x, frac.x};
+    const float wy[2] = {1.0f - frac.y, frac.y};
+    const float wz[2] = {1.0f - frac.z, frac.z};
+    for (int idx = 0; idx < 8; ++idx) {
+        WP_VOLUME_CORNER(idx, ox, oy, oz)
+        const T v = accessor.read_cache(wp_pn_coord(ijk.x + ox, ijk.y + oy, ijk.z + oz));
+        const float w = wx[ox] * wy[oy] * wz[oz];
+        val = T(val + w * v);
+    }
+    return val;
+}
+
+template <typename Acc>
+inline float wp_volume_sample_grad_impl(thread Acc& accessor, float3 uvw, int mode, thread float3& grad) {
+    grad = float3(0.0f);
+    if (!accessor.is_valid()) { return 0.0f; }
+    if (mode == WP_VOLUME_CLOSEST) { return accessor.read_single(wp_pn_round_coord(uvw)); }
+    if (mode != WP_VOLUME_LINEAR) { return 0.0f; }
+    const float3 base = metal::floor(uvw);
+    const float3 frac = uvw - base;
+    const pnanovdb_coord_t ijk = wp_pn_coord(int(base.x), int(base.y), int(base.z));
+    accessor.init_cache();
+    float val = 0.0f;
+    const float wx[2] = {1.0f - frac.x, frac.x};
+    const float wy[2] = {1.0f - frac.y, frac.y};
+    const float wz[2] = {1.0f - frac.z, frac.z};
+    for (int idx = 0; idx < 8; ++idx) {
+        WP_VOLUME_CORNER(idx, ox, oy, oz)
+        const float v = accessor.read_cache(wp_pn_coord(ijk.x + ox, ijk.y + oy, ijk.z + oz));
+        const float3 signs = float3(float(ox * 2 - 1), float(oy * 2 - 1), float(oz * 2 - 1));
+        const float w = wx[ox] * wy[oy] * wz[oz];
+        const float3 grad_w = float3(signs.x * wy[oy] * wz[oz], signs.y * wx[ox] * wz[oz], signs.z * wx[ox] * wy[oy]);
+        val = val + w * v;
+        grad += v * grad_w;
+    }
+    return val;
+}
+
+template <typename T, typename Acc>
+inline void wp_adj_volume_sample_impl(thread Acc& accessor, float3 uvw, int mode, thread float3& adj_uvw, T adj_ret) {
+    // Grid-value adjoints are not propagated (matches volume.h's TODO).
+    if (!accessor.is_valid() || mode != WP_VOLUME_LINEAR) { return; }
+    const float3 base = metal::floor(uvw);
+    const float3 frac = uvw - base;
+    const pnanovdb_coord_t ijk = wp_pn_coord(int(base.x), int(base.y), int(base.z));
+    accessor.init_cache();
+    const float wx[2] = {1.0f - frac.x, frac.x};
+    const float wy[2] = {1.0f - frac.y, frac.y};
+    const float wz[2] = {1.0f - frac.z, frac.z};
+    for (int idx = 0; idx < 8; ++idx) {
+        WP_VOLUME_CORNER(idx, ox, oy, oz)
+        const T v = accessor.read_cache(wp_pn_coord(ijk.x + ox, ijk.y + oy, ijk.z + oz));
+        const float3 signs = float3(float(ox * 2 - 1), float(oy * 2 - 1), float(oz * 2 - 1));
+        const float3 grad_w = float3(signs.x * wy[oy] * wz[oz], signs.y * wx[ox] * wz[oz], signs.z * wx[ox] * wy[oy]);
+        adj_uvw += wp_pn_traits<T>::dot(v, adj_ret) * grad_w;
+    }
+}
+
+template <typename Acc>
+inline void wp_adj_volume_sample_grad_impl(thread Acc& accessor, float3 uvw, int mode, thread float3& adj_uvw,
+                                           float3 adj_grad, float adj_ret) {
+    if (!accessor.is_valid() || mode != WP_VOLUME_LINEAR) { return; }
+    const float3 base = metal::floor(uvw);
+    const float3 frac = uvw - base;
+    const pnanovdb_coord_t ijk = wp_pn_coord(int(base.x), int(base.y), int(base.z));
+    accessor.init_cache();
+    const float wx[2] = {1.0f - frac.x, frac.x};
+    const float wy[2] = {1.0f - frac.y, frac.y};
+    const float wz[2] = {1.0f - frac.z, frac.z};
+    for (int idx = 0; idx < 8; ++idx) {
+        WP_VOLUME_CORNER(idx, ox, oy, oz)
+        const float v = accessor.read_cache(wp_pn_coord(ijk.x + ox, ijk.y + oy, ijk.z + oz));
+        const float3 s = float3(float(ox * 2 - 1), float(oy * 2 - 1), float(oz * 2 - 1));
+        const float3 grad_w = float3(s.x * wy[oy] * wz[oz], s.y * wx[ox] * wz[oz], s.z * wx[ox] * wy[oy]);
+        adj_uvw += (v * adj_ret) * grad_w;
+        // (v * adj_grad) as a row vector times the (zero-diagonal, symmetric)
+        // Hessian of the trilinear weight, as in volume.h.
+        const float3 a = v * adj_grad;
+        adj_uvw += float3(a.y * s.x * s.y * wz[oz] + a.z * s.x * s.z * wy[oy],
+                          a.x * s.x * s.y * wz[oz] + a.z * s.y * s.z * wx[ox],
+                          a.x * s.x * s.z * wy[oy] + a.y * s.y * s.z * wx[ox]);
+    }
+}
+
+// -- exposed builtins ------------------------------------------------------
+
+template <typename T>
+inline T wp_volume_sample(ulong id, float3 uvw, int mode) {
+    wp_volume_leaf_accessor<T> acc(wp_volume_buf(id));
+    return wp_volume_sample_impl<T>(acc, uvw, mode);
+}
+inline float wp_volume_sample_f(ulong id, float3 uvw, int mode) { return wp_volume_sample<float>(id, uvw, mode); }
+inline float3 wp_volume_sample_v(ulong id, float3 uvw, int mode) { return wp_volume_sample<float3>(id, uvw, mode); }
+inline int wp_volume_sample_i(ulong id, float3 uvw) { return wp_volume_sample<int>(id, uvw, WP_VOLUME_CLOSEST); }
+inline float wp_volume_sample_grad_f(ulong id, float3 uvw, int mode, thread float3& grad) {
+    wp_volume_leaf_accessor<float> acc(wp_volume_buf(id));
+    return wp_volume_sample_grad_impl(acc, uvw, mode, grad);
+}
+template <typename T, typename PtrT>
+inline T wp_volume_sample_index(ulong id, float3 uvw, int mode, PtrT data, T background) {
+    wp_volume_index_accessor<T, PtrT> acc(wp_volume_buf(id), data, background);
+    return wp_volume_sample_impl<T>(acc, uvw, mode);
+}
+template <typename PtrT>
+inline float wp_volume_sample_grad_index(ulong id, float3 uvw, int mode, PtrT data, float background,
+                                         thread float3& grad) {
+    wp_volume_index_accessor<float, PtrT> acc(wp_volume_buf(id), data, background);
+    return wp_volume_sample_grad_impl(acc, uvw, mode, grad);
+}
+template <typename T>
+inline T wp_volume_lookup(ulong id, int i, int j, int k) {
+    wp_volume_leaf_accessor<T> acc(wp_volume_buf(id));
+    if (!acc.is_valid()) { return wp_pn_traits<T>::zero(); }
+    return acc.read_single(wp_pn_coord(i, j, k));
+}
+inline float wp_volume_lookup_f(ulong id, int i, int j, int k) { return wp_volume_lookup<float>(id, i, j, k); }
+inline float3 wp_volume_lookup_v(ulong id, int i, int j, int k) { return wp_volume_lookup<float3>(id, i, j, k); }
+inline int wp_volume_lookup_i(ulong id, int i, int j, int k) { return wp_volume_lookup<int>(id, i, j, k); }
+inline int wp_volume_lookup_index(ulong id, int i, int j, int k) {
+    const pnanovdb_buf_t buf = wp_volume_buf(id);
+    const pnanovdb_root_handle_t root = wp_volume_root(buf);
+    const uint32_t grid_type = wp_volume_grid_type(buf);
+    pnanovdb_coord_t ijk = wp_pn_coord(i, j, k);
+    uint32_t level;
+    const pnanovdb_address_t a = pnanovdb_root_get_value_address_and_level(
+        grid_type, buf, root, PNANOVDB_REF(ijk), PNANOVDB_REF(level));
+    if (level == 0u) { return int(wp_volume_voxel_index(grid_type, buf, a, ijk)) - 1; }
+    return -1;
+}
+template <typename T>
+inline void wp_volume_store(ulong id, int i, int j, int k, T value) {
+    const pnanovdb_buf_t buf = wp_volume_buf(id);
+    if (wp_volume_grid_type(buf) != wp_pn_traits<T>::grid_type()) { return; }
+    const pnanovdb_root_handle_t root = wp_volume_root(buf);
+    pnanovdb_coord_t ijk = wp_pn_coord(i, j, k);
+    uint32_t level;
+    const pnanovdb_address_t a = pnanovdb_root_get_value_address_and_level(
+        wp_pn_traits<T>::grid_type(), buf, root, PNANOVDB_REF(ijk), PNANOVDB_REF(level));
+    // Leaf level only, so the background value is never modified.
+    if (level == 0u) { wp_pn_traits<T>::write(buf, a, value); }
+}
+inline void wp_volume_store_f(ulong id, int i, int j, int k, float value) { wp_volume_store<float>(id, i, j, k, value); }
+inline void wp_volume_store_v(ulong id, int i, int j, int k, float3 value) { wp_volume_store<float3>(id, i, j, k, value); }
+inline void wp_volume_store_i(ulong id, int i, int j, int k, int value) { wp_volume_store<int>(id, i, j, k, value); }
+
+inline float3 wp_volume_index_to_world(ulong id, float3 uvw) {
+    pnanovdb_vec3_t p = wp_pn_vec3(uvw);
+    return wp_pn_float3(pnanovdb_grid_index_to_worldf(wp_volume_buf(id), wp_volume_grid(), PNANOVDB_REF(p)));
+}
+inline float3 wp_volume_world_to_index(ulong id, float3 xyz) {
+    pnanovdb_vec3_t p = wp_pn_vec3(xyz);
+    return wp_pn_float3(pnanovdb_grid_world_to_indexf(wp_volume_buf(id), wp_volume_grid(), PNANOVDB_REF(p)));
+}
+inline float3 wp_volume_index_to_world_dir(ulong id, float3 uvw) {
+    pnanovdb_vec3_t p = wp_pn_vec3(uvw);
+    return wp_pn_float3(pnanovdb_grid_index_to_world_dirf(wp_volume_buf(id), wp_volume_grid(), PNANOVDB_REF(p)));
+}
+inline float3 wp_volume_world_to_index_dir(ulong id, float3 xyz) {
+    pnanovdb_vec3_t p = wp_pn_vec3(xyz);
+    return wp_pn_float3(pnanovdb_grid_world_to_index_dirf(wp_volume_buf(id), wp_volume_grid(), PNANOVDB_REF(p)));
+}
+
+// -- adjoints (same conventions as volume.h; ids and modes carry no gradient) --
+
+template <typename T>
+inline void wp_adj_volume_sample(ulong id, float3 uvw, int mode, ulong adj_id, thread float3& adj_uvw,
+                                 thread int& adj_mode, T adj_ret) {
+    wp_volume_leaf_accessor<T> acc(wp_volume_buf(id));
+    wp_adj_volume_sample_impl<T>(acc, uvw, mode, adj_uvw, adj_ret);
+}
+inline void wp_adj_volume_sample_f(ulong id, float3 uvw, int mode, ulong adj_id, thread float3& adj_uvw,
+                                   thread int& adj_mode, float adj_ret) {
+    wp_adj_volume_sample<float>(id, uvw, mode, adj_id, adj_uvw, adj_mode, adj_ret);
+}
+inline void wp_adj_volume_sample_v(ulong id, float3 uvw, int mode, ulong adj_id, thread float3& adj_uvw,
+                                   thread int& adj_mode, float3 adj_ret) {
+    wp_adj_volume_sample<float3>(id, uvw, mode, adj_id, adj_uvw, adj_mode, adj_ret);
+}
+inline void wp_adj_volume_sample_i(ulong id, float3 uvw, ulong adj_id, thread float3& adj_uvw, int adj_ret) {}
+inline void wp_adj_volume_sample_grad_f(ulong id, float3 uvw, int mode, thread float3& grad, ulong adj_id,
+                                        thread float3& adj_uvw, thread int& adj_mode, thread float3& adj_grad,
+                                        float adj_ret) {
+    wp_volume_leaf_accessor<float> acc(wp_volume_buf(id));
+    wp_adj_volume_sample_grad_impl(acc, uvw, mode, adj_uvw, adj_grad, adj_ret);
+}
+template <typename T>
+inline void wp_adj_volume_lookup(ulong id, int i, int j, int k, ulong adj_id, thread int& adj_i, thread int& adj_j,
+                                 thread int& adj_k, T adj_ret) {}
+template <typename T>
+inline void wp_adj_volume_store(ulong id, int i, int j, int k, T value, ulong adj_id, thread int& adj_i,
+                                thread int& adj_j, thread int& adj_k, thread T& adj_value) {}
+template <typename T>
+inline void wp_adj_volume_lookup_index(ulong id, int i, int j, int k, ulong adj_id, thread int& adj_i,
+                                       thread int& adj_j, thread int& adj_k, T adj_ret) {}
+inline void wp_adj_volume_index_to_world(ulong id, float3 uvw, ulong adj_id, thread float3& adj_uvw, float3 adj_ret) {
+    adj_uvw += wp_volume_index_to_world_dir(id, adj_ret);
+}
+inline void wp_adj_volume_world_to_index(ulong id, float3 xyz, ulong adj_id, thread float3& adj_xyz, float3 adj_ret) {
+    adj_xyz += wp_volume_world_to_index_dir(id, adj_ret);
+}
+inline void wp_adj_volume_index_to_world_dir(ulong id, float3 uvw, ulong adj_id, thread float3& adj_uvw, float3 adj_ret) {
+    wp_adj_volume_index_to_world(id, uvw, adj_id, adj_uvw, adj_ret);
+}
+inline void wp_adj_volume_world_to_index_dir(ulong id, float3 xyz, ulong adj_id, thread float3& adj_xyz, float3 adj_ret) {
+    wp_adj_volume_world_to_index(id, xyz, adj_id, adj_xyz, adj_ret);
+}
+"""
+
+_VOLUME_HELPERS_CACHE: str | None = None
+
+
+def _volume_helpers() -> str:
+    """PNanoVDB.h rewritten for MSL plus the ``wp_volume_*`` layer (cached)."""
+    global _VOLUME_HELPERS_CACHE
+    if _VOLUME_HELPERS_CACHE is None:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "native", "nanovdb", "PNanoVDB.h")
+        with open(path, encoding="utf-8") as f:
+            src = f.read()
+        for old, new in _PNANOVDB_MSL_PATCHES:
+            if old not in src:
+                raise MetalCodegenError(f"PNanoVDB.h no longer contains the expected line for the MSL rewrite: {old!r}")
+            # ``PNANOVDB_STATIC_CONST`` is defined once per platform block; the
+            # C block comes first and is the only one compiled here.
+            src = src.replace(old, new, 1)
+        _VOLUME_HELPERS_CACHE = _PNANOVDB_MSL_PREAMBLE + src + _PNANOVDB_MSL_POSTAMBLE + _VOLUME_LAYER_MSL
+    return _VOLUME_HELPERS_CACHE
+
+
+_VOLUME_MSL_ELEM_TYPES = {"float": "float", "int": "int", "float3": "float3"}
+
+
+def _volume_template_repl(base: str, allow: tuple[str, ...] = ("float", "int", "float3")):
+    """``re.sub`` callback mapping ``wp::volume_x<wp::T>`` to ``wp_volume_x<msl T>``."""
+
+    def repl(m: re.Match) -> str:
+        ctype = m.group(1).strip()
+        try:
+            msl = _msl_scalar_type(ctype)
+        except MetalCodegenError:
+            msl = ctype  # already translated by an earlier fixpoint round
+        if msl not in allow:
+            raise MetalCodegenError(
+                f"MSL codegen: {base.replace('wp_', 'wp.')}() with element type {ctype!r} is not supported on "
+                "Metal (float32, int32 and vec3f grids only)"
+            )
+        return f"{base}<{msl}>"
+
+    return repl
+
+
+_VOLUME_TEMPLATE_ARG = r"\s*<\s*([^<>]*(?:<[^<>]*>)?[^<>]*)\s*>"
+
+
 _HASHGRID_HELPERS = """\
 struct wp_hash_grid_desc_t {
     ulong point_cells;
@@ -6691,6 +7202,8 @@ def _build_kernel_header(source: str) -> str:
         parts.append(_BVH_HELPERS)
     if "wp_hash_grid_" in source:
         parts.append(_HASHGRID_HELPERS)
+    if "wp_volume_" in source or "wp_adj_volume_" in source:
+        parts.append(_volume_helpers())
     misc_math = _emit_misc_math_helpers(source)
     if misc_math:
         parts.append(misc_math)
@@ -7697,6 +8210,54 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bwp::hash_grid_query_next\b"), "wp_hash_grid_query_next"),
     (re.compile(r"\bwp::hash_grid_point_id\b"), "wp_hash_grid_point_id"),
     (re.compile(r"\bwp::hash_grid_query\b"), "wp_hash_grid_query"),
+    # wp.Volume builtins — PNanoVDB port of warp/native/volume.h (see
+    # ``_volume_helpers``). Ids are gpuAddresses of the grid buffers
+    # (``Volume._init_metal`` in warp/_src/types.py). Suffixed forms first;
+    # the generic ``wp.volume_sample(..., dtype=T)`` family carries a
+    # template argument that selects the MSL element type.
+    (re.compile(r"\bwp::volume_sample_grad_f\b"), "wp_volume_sample_grad_f"),
+    (re.compile(r"\bwp::volume_sample_f\b"), "wp_volume_sample_f"),
+    (re.compile(r"\bwp::volume_sample_v\b"), "wp_volume_sample_v"),
+    (re.compile(r"\bwp::volume_sample_i\b"), "wp_volume_sample_i"),
+    (re.compile(r"\bwp::volume_lookup_f\b"), "wp_volume_lookup_f"),
+    (re.compile(r"\bwp::volume_lookup_v\b"), "wp_volume_lookup_v"),
+    (re.compile(r"\bwp::volume_lookup_i\b"), "wp_volume_lookup_i"),
+    (re.compile(r"\bwp::volume_store_f\b"), "wp_volume_store_f"),
+    (re.compile(r"\bwp::volume_store_v\b"), "wp_volume_store_v"),
+    (re.compile(r"\bwp::volume_store_i\b"), "wp_volume_store_i"),
+    (re.compile(r"\bwp::volume_sample" + _VOLUME_TEMPLATE_ARG), _volume_template_repl("wp_volume_sample")),
+    (re.compile(r"\bwp::volume_lookup" + _VOLUME_TEMPLATE_ARG), _volume_template_repl("wp_volume_lookup")),
+    (re.compile(r"\bwp::volume_store" + _VOLUME_TEMPLATE_ARG), _volume_template_repl("wp_volume_store")),
+    # Only scalar grids have a vec3 gradient; vec3 grids would need a mat33.
+    (
+        re.compile(r"\bwp::volume_sample_grad" + _VOLUME_TEMPLATE_ARG),
+        lambda m: _volume_template_repl("wp_volume_sample_grad", ("float",))(m).replace("<float>", "_f"),
+    ),
+    (re.compile(r"\bwp::volume_sample_grad_index\b(?:" + _VOLUME_TEMPLATE_ARG + ")?"), "wp_volume_sample_grad_index"),
+    (re.compile(r"\bwp::volume_sample_index\b(?:" + _VOLUME_TEMPLATE_ARG + ")?"), "wp_volume_sample_index"),
+    (re.compile(r"\bwp::volume_lookup_index\b"), "wp_volume_lookup_index"),
+    (re.compile(r"\bwp::volume_index_to_world_dir\b"), "wp_volume_index_to_world_dir"),
+    (re.compile(r"\bwp::volume_world_to_index_dir\b"), "wp_volume_world_to_index_dir"),
+    (re.compile(r"\bwp::volume_index_to_world\b"), "wp_volume_index_to_world"),
+    (re.compile(r"\bwp::volume_world_to_index\b"), "wp_volume_world_to_index"),
+    (re.compile(r"\bwp::adj_volume_sample_grad_f\b"), "wp_adj_volume_sample_grad_f"),
+    (re.compile(r"\bwp::adj_volume_sample_f\b"), "wp_adj_volume_sample_f"),
+    (re.compile(r"\bwp::adj_volume_sample_v\b"), "wp_adj_volume_sample_v"),
+    (re.compile(r"\bwp::adj_volume_sample_i\b"), "wp_adj_volume_sample_i"),
+    (re.compile(r"\bwp::adj_volume_lookup_[fvi]\b"), "wp_adj_volume_lookup"),
+    (re.compile(r"\bwp::adj_volume_store_[fvi]\b"), "wp_adj_volume_store"),
+    (re.compile(r"\bwp::adj_volume_sample" + _VOLUME_TEMPLATE_ARG), _volume_template_repl("wp_adj_volume_sample")),
+    (re.compile(r"\bwp::adj_volume_lookup" + _VOLUME_TEMPLATE_ARG), "wp_adj_volume_lookup"),
+    (re.compile(r"\bwp::adj_volume_store" + _VOLUME_TEMPLATE_ARG), "wp_adj_volume_store"),
+    (
+        re.compile(r"\bwp::adj_volume_sample_grad" + _VOLUME_TEMPLATE_ARG),
+        lambda m: _volume_template_repl("wp_adj_volume_sample_grad", ("float",))(m).replace("<float>", "_f"),
+    ),
+    (re.compile(r"\bwp::adj_volume_lookup_index\b"), "wp_adj_volume_lookup_index"),
+    (re.compile(r"\bwp::adj_volume_index_to_world_dir\b"), "wp_adj_volume_index_to_world_dir"),
+    (re.compile(r"\bwp::adj_volume_world_to_index_dir\b"), "wp_adj_volume_world_to_index_dir"),
+    (re.compile(r"\bwp::adj_volume_index_to_world\b"), "wp_adj_volume_index_to_world"),
+    (re.compile(r"\bwp::adj_volume_world_to_index\b"), "wp_adj_volume_world_to_index"),
     # NOTE: ``wp::lower_bound`` is intentionally NOT handled here — its
     # 2-arg form references the array's ``<argname>_shape`` input, which
     # requires the *final* parameter name. It's rewritten inside
@@ -10686,7 +11247,9 @@ def _generate_msl_kernel_uncached(
             grad_arg_of[syn_var.label] = gname
             output_args.append(gvar)
 
-    if not output_args:
+    if not output_args and not any("volume_store" in ln for ln in forward_lines):
+        # (A kernel whose only writes go through ``wp.volume_store`` into a
+        # resident NanoVDB buffer legitimately has no output array.)
         raise MetalCodegenError(
             f"Kernel {adj.fun_name!r} has no output array; MSL kernels must write through at least one output buffer"
         )
@@ -13253,7 +13816,7 @@ def _generate_msl_kernel_uncached(
     input_args = [a for a in input_args if a.label in _used_names]
     output_args = [a for a in output_args if a.label in _used_names]
 
-    if not output_args:
+    if not output_args and "volume_store" not in source:
         # Every declared output arg is unreferenced in the body — for
         # this specialisation the kernel is truly write-free (e.g.
         # ``primitive_narrowphase`` with sphere-only collisions and no
@@ -13457,7 +14020,7 @@ def _generate_msl_kernel_uncached(
         init_shadow_ints=tuple(init_shadow_ints),
         inplace_arrays=tuple(mlx_inplace_arrays),
         seeded_outputs=seeded_outputs,
-        uses_bvh=("wp_bvh_" in source or "wp_mesh_" in source or "wp_hash_grid_" in source),
+        uses_bvh=("wp_bvh_" in source or "wp_mesh_" in source or "wp_hash_grid_" in source or "wp_volume_" in source),
         # NB: ``builtin_block_dim`` is checked on the kernel's own IR — a
         # ``wp.block_dim()`` buried in a non-inlined wp.func would be
         # missed, but tile/block kernels call it at kernel scope.

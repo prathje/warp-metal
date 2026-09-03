@@ -6798,13 +6798,19 @@ class TestMetalUnsupportedFeaturesRaise(unittest.TestCase):
                 else:
                     raise AssertionError('float64 HashGrid creation should have raised on Metal')
 
+            # Volumes are supported on the native-dispatch path (see
+            # TestMetalVolume); the MLX path raises cleanly, and bytes that
+            # are not a NanoVDB grid are rejected like on the CPU.
             data = wp.array(np.zeros(1024, np.uint8), device=dev)
             try:
                 wp.Volume(data)
             except RuntimeError as e:
-                assert 'Metal' in str(e), str(e)
+                if wp.config.metal_native_dispatch:
+                    assert 'Failed to create volume' in str(e), str(e)
+                else:
+                    assert 'native dispatch' in str(e), str(e)
             else:
-                raise AssertionError('Volume creation should have raised on Metal')
+                raise AssertionError('Volume creation from non-grid bytes should have raised')
             """
         )
         _run_with_metal_enabled(self, snippet)
@@ -8776,6 +8782,163 @@ class TestMetalHashGrid(unittest.TestCase):
                     np.testing.assert_array_equal(c1, c0, err_msg=f"{name} build {k}: neighbor counts")
                     np.testing.assert_array_equal(p1, p0, err_msg=f"{name} build {k}: point ids")
                 assert outs["cpu"][0][0].sum() > 0
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=300)
+
+
+@unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
+@unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
+class TestMetalVolume(unittest.TestCase):
+    """``wp.Volume`` on Metal: NanoVDB grids traversed through the MSL
+    rewrite of PNanoVDB.h (native dispatch only; float/int32/vec3f grids)."""
+
+    def test_volume_builtins_match_cpu(self):
+        snippet = textwrap.dedent(
+            """
+            import os
+            import numpy as np
+            import warp.tests
+
+            if not wp.config.metal_native_dispatch:
+                raise SystemExit(0)  # Volume is native-dispatch-only on Metal
+
+            A = os.path.join(os.path.dirname(warp.tests.__file__), "assets")
+            grids = {k: open(os.path.join(A, f), "rb").read() for k, f in (
+                ("float", "test_grid.nvdb"), ("vec", "test_vec_grid.nvdb"), ("int", "test_int32_grid.nvdb"),
+                ("index", "test_index_grid.nvdb"), ("torus", "torus.nvdb"))}
+
+            @wp.kernel
+            def k_float(vol: wp.uint64, pts: wp.array(dtype=wp.vec3), lookup: wp.array(dtype=float),
+                        closest: wp.array(dtype=float), linear: wp.array(dtype=float),
+                        grad: wp.array(dtype=wp.vec3), xform: wp.array(dtype=wp.vec3), generic: wp.array(dtype=float)):
+                i = wp.tid()
+                p = pts[i]
+                lookup[i] = wp.volume_lookup_f(vol, int(p[0]), int(p[1]), int(p[2]))
+                closest[i] = wp.volume_sample_f(vol, p, wp.Volume.CLOSEST)
+                g = wp.vec3()
+                linear[i] = wp.volume_sample_grad_f(vol, p, wp.Volume.LINEAR, g)
+                grad[i] = g
+                q = wp.volume_index_to_world(vol, p)
+                xform[i] = (wp.volume_world_to_index(vol, q) + wp.volume_index_to_world_dir(vol, p)
+                            + wp.volume_world_to_index_dir(vol, p))
+                generic[i] = (wp.volume_sample(vol, p, wp.Volume.LINEAR, dtype=wp.float32)
+                              + wp.volume_lookup(vol, int(p[0]), int(p[1]), int(p[2]), dtype=wp.float32))
+
+            @wp.kernel
+            def k_vec(vol: wp.uint64, pts: wp.array(dtype=wp.vec3), lookup: wp.array(dtype=wp.vec3),
+                      closest: wp.array(dtype=wp.vec3), linear: wp.array(dtype=wp.vec3)):
+                i = wp.tid()
+                p = pts[i]
+                lookup[i] = wp.volume_lookup_v(vol, int(p[0]), int(p[1]), int(p[2]))
+                closest[i] = wp.volume_sample_v(vol, p, wp.Volume.CLOSEST)
+                linear[i] = wp.volume_sample_v(vol, p, wp.Volume.LINEAR) + wp.volume_sample(vol, p, wp.Volume.LINEAR, dtype=wp.vec3)
+
+            @wp.kernel
+            def k_int(vol: wp.uint64, pts: wp.array(dtype=wp.vec3), lookup: wp.array(dtype=int), sample: wp.array(dtype=int)):
+                i = wp.tid()
+                p = pts[i]
+                lookup[i] = wp.volume_lookup_i(vol, int(p[0]), int(p[1]), int(p[2]))
+                sample[i] = wp.volume_sample_i(vol, p) + wp.volume_lookup(vol, int(p[0]), int(p[1]), int(p[2]), dtype=wp.int32)
+
+            @wp.kernel
+            def k_index(vol: wp.uint64, pts: wp.array(dtype=wp.vec3), data: wp.array(dtype=float),
+                        vdata: wp.array(dtype=wp.vec3), idx: wp.array(dtype=int), s: wp.array(dtype=float),
+                        v: wp.array(dtype=wp.vec3), g_out: wp.array(dtype=wp.vec3)):
+                i = wp.tid()
+                p = pts[i]
+                idx[i] = wp.volume_lookup_index(vol, int(p[0]), int(p[1]), int(p[2]))
+                g = wp.vec3()
+                s[i] = (wp.volume_sample_index(vol, p, wp.Volume.LINEAR, data, -1.0)
+                        + wp.volume_sample_grad_index(vol, p, wp.Volume.LINEAR, data, -1.0, g)
+                        + wp.volume_sample_index(vol, p, wp.Volume.CLOSEST, data, -1.0))
+                g_out[i] = g
+                v[i] = wp.volume_sample_index(vol, p, wp.Volume.LINEAR, vdata, wp.vec3(-1.0, -2.0, -3.0))
+
+            @wp.kernel
+            def k_store(vol: wp.uint64, pts: wp.array(dtype=wp.vec3)):
+                # Writes only through the volume: no output array at all.
+                i = wp.tid()
+                p = pts[i]
+                wp.volume_store_f(vol, int(p[0]), int(p[1]), int(p[2]), p[0] * 100.0 + p[1] * 10.0 + p[2])
+
+            @wp.kernel
+            def k_readback(vol: wp.uint64, pts: wp.array(dtype=wp.vec3), out: wp.array(dtype=float)):
+                i = wp.tid()
+                p = pts[i]
+                out[i] = wp.volume_lookup_f(vol, int(p[0]), int(p[1]), int(p[2]))
+
+            @wp.kernel
+            def k_loss(vol: wp.uint64, pts: wp.array(dtype=wp.vec3), loss: wp.array(dtype=float)):
+                i = wp.tid()
+                p = pts[i]
+                g = wp.vec3()
+                v = wp.volume_sample_f(vol, p, wp.Volume.LINEAR) + 0.5 * wp.volume_sample_grad_f(vol, p, wp.Volume.LINEAR, g)
+                w = wp.volume_index_to_world(vol, p)
+                wp.atomic_add(loss, 0, v * v + g[0] + w[1])
+
+            rng = np.random.default_rng(1)
+            N = 1500
+            pts_np = rng.uniform(-12.0, 12.0, size=(N, 3)).astype(np.float32)  # straddles the [-10, 10]^3 active region
+            ipts_np = np.floor(rng.uniform(-11, 11, size=(N, 3))).astype(np.float32)
+            res = {}
+            for dev in ("cpu", "metal:0"):
+                with wp.ScopedDevice(dev):
+                    out = {}
+                    pts = wp.array(pts_np, dtype=wp.vec3)
+                    ipts = wp.array(ipts_np, dtype=wp.vec3)
+                    vols = {k: wp.Volume.load_from_nvdb(g) for k, g in grids.items()}
+                    vf, vx, vt = vols["float"], vols["index"], vols["torus"]
+                    out["info"] = (vf.get_grid_info(), vf.get_voxel_count(), vf.get_tile_count(),
+                                   vx.get_voxel_count(), vt.get_voxel_size(), vf.array().shape,
+                                   vt.get_grid_info().transform_matrix)
+                    out["tiles"] = vf.get_tiles().numpy()
+                    out["voxels"] = vx.get_voxels().numpy()
+                    for name, vol in (("float", vf), ("torus", vt)):
+                        a = [wp.zeros(N, dtype=float) for _ in range(3)] + [wp.zeros(N, dtype=wp.vec3) for _ in range(2)] + [wp.zeros(N, dtype=float)]
+                        wp.launch(k_float, dim=N, inputs=[vol.id, pts, *a])
+                        out[name] = [x.numpy() for x in a]
+                    a = [wp.zeros(N, dtype=wp.vec3) for _ in range(3)]
+                    wp.launch(k_vec, dim=N, inputs=[vols["vec"].id, pts, *a])
+                    out["vec"] = [x.numpy() for x in a]
+                    a = [wp.zeros(N, dtype=int) for _ in range(2)]
+                    wp.launch(k_int, dim=N, inputs=[vols["int"].id, pts, *a])
+                    out["int"] = [x.numpy() for x in a]
+                    nvox = vx.get_voxel_count()
+                    data = wp.array(np.arange(nvox, dtype=np.float32) * 0.5, dtype=float)
+                    vdata = wp.array(np.stack([np.arange(nvox)] * 3, axis=1).astype(np.float32) * np.array([1, 2, 3], dtype=np.float32), dtype=wp.vec3)
+                    a = [wp.zeros(N, dtype=int), wp.zeros(N, dtype=float), wp.zeros(N, dtype=wp.vec3), wp.zeros(N, dtype=wp.vec3)]
+                    wp.launch(k_index, dim=N, inputs=[vx.id, pts, data, vdata, *a])
+                    out["index"] = [x.numpy() for x in a]
+                    vf2 = wp.Volume.load_from_nvdb(grids["float"])
+                    wp.launch(k_store, dim=N, inputs=[vf2.id, ipts])
+                    rb = wp.zeros(N, dtype=float)
+                    wp.launch(k_readback, dim=N, inputs=[vf2.id, ipts, rb])
+                    out["store"] = rb.numpy()
+                    ptsg = wp.array(pts_np, dtype=wp.vec3, requires_grad=True)
+                    loss = wp.zeros(1, dtype=float, requires_grad=True)
+                    with wp.Tape() as tape:
+                        wp.launch(k_loss, dim=N, inputs=[vf.id, ptsg, loss])
+                    tape.backward(loss)
+                    out["grad"] = ptsg.grad.numpy()
+                    wp.synchronize_device()
+                    res[dev] = out
+
+            c, m = res["cpu"], res["metal:0"]
+            assert c["info"][:6] == m["info"][:6], (c["info"], m["info"])
+            np.testing.assert_array_equal(np.array(c["info"][6]), np.array(m["info"][6]))
+            for k in ("tiles", "voxels", "store"):
+                np.testing.assert_array_equal(m[k], c[k], err_msg=k)
+            exact = {"float": (0, 1, 4), "torus": (0, 1, 4), "vec": (0, 1), "int": (0, 1), "index": (0, 1)}
+            for k in ("float", "torus", "vec", "int", "index"):
+                for j, (a, b) in enumerate(zip(c[k], m[k])):
+                    assert np.count_nonzero(a) > 0, (k, j)  # the probe actually hit the grid
+                    if j in exact[k]:
+                        np.testing.assert_array_equal(b, a, err_msg=f"{k}[{j}]")
+                    else:
+                        np.testing.assert_allclose(b, a, rtol=1e-5, atol=1e-4, err_msg=f"{k}[{j}]")
+            assert np.abs(c["store"]).max() > 100.0  # the store kernel ran (background is 10)
+            np.testing.assert_allclose(m["grad"], c["grad"], rtol=1e-5, atol=1e-3)
             """
         )
         _run_with_metal_enabled(self, snippet, timeout=300)

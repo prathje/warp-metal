@@ -6509,10 +6509,8 @@ class Volume:
         self.device = data.device
 
         if getattr(self.device, "is_metal", False):
-            raise RuntimeError(
-                "wp.Volume is not supported on Metal devices yet. "
-                "Create the volume on the 'cpu' device to sample it with CPU kernels."
-            )
+            self._init_metal(data, copy)
+            return
 
         owner = False
         if self.device.is_cpu:
@@ -6527,8 +6525,53 @@ class Volume:
         if self.id == 0:
             raise RuntimeError("Failed to create volume from input array")
 
+    def _init_metal(self, data: array, copy: builtins.bool) -> None:
+        """Metal: the grid lives in a Metal buffer whose gpuAddress is the kernel-side ``id``.
+
+        Metal buffers are host-visible, so the SAME bytes are also registered
+        with the native host volume API (``_host_id``) and every host-side
+        query (grid info, tiles, voxels, feature arrays) goes through that.
+        The buffer is made resident so kernels can dereference the address.
+        """
+        from warp._src.metal_bvh import _gpu_address, _require_native_dispatch  # noqa: PLC0415
+        from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
+
+        _require_native_dispatch("wp.Volume")
+        if not data.is_contiguous:
+            data = data.contiguous()
+        if copy:
+            data = warp.clone(data)
+        # The header is parsed on the host below; the copy (or the upload
+        # that produced ``data``) may still be in flight on the GPU queue.
+        warp.synchronize_device(self.device)
+        self._metal_data = data  # keeps the grid storage alive
+        nbytes = data.size * type_size_in_bytes(data.dtype)
+        self._host_id = self.runtime.core.wp_volume_create_host(
+            ctypes.cast(data.ptr, ctypes.c_void_p), nbytes, False, False
+        )
+        if self._host_id == 0:
+            raise RuntimeError("Failed to create volume from input array")
+        gpu_address, mtl_buffer = _gpu_address(data)
+        self._metal_buffer = mtl_buffer
+        self._dispatcher = get_dispatcher()
+        self._dispatcher.add_resident_resource(mtl_buffer)
+        self.id = gpu_address
+
+    @property
+    def _native_id(self) -> int:
+        """Id understood by the native host/device volume API (differs from ``id`` on Metal)."""
+        return getattr(self, "_host_id", None) or self.id
+
     def __del__(self):
         if not self.id:
+            return
+
+        if getattr(self, "_host_id", None):
+            try:
+                self.runtime.core.wp_volume_destroy_host(self._host_id)
+                self._dispatcher.remove_resident_resource(self._metal_buffer)
+            except (TypeError, AttributeError):
+                pass  # interpreter shutdown
             return
 
         try:
@@ -6547,7 +6590,7 @@ class Volume:
 
         buf = ctypes.c_void_p(0)
         size = ctypes.c_uint64(0)
-        self.runtime.core.wp_volume_get_buffer_info(self.id, ctypes.byref(buf), ctypes.byref(size))
+        self.runtime.core.wp_volume_get_buffer_info(self._native_id, ctypes.byref(buf), ctypes.byref(size))
         return array(ptr=buf.value, dtype=uint8, shape=size.value, device=self.device)
 
     def get_tile_count(self) -> int:
@@ -6558,7 +6601,7 @@ class Volume:
             ctypes.c_uint32(0),
         )
         self.runtime.core.wp_volume_get_tile_and_voxel_count(
-            self.id, ctypes.byref(tile_count), ctypes.byref(voxel_count)
+            self._native_id, ctypes.byref(tile_count), ctypes.byref(voxel_count)
         )
         return tile_count.value
 
@@ -6585,10 +6628,12 @@ class Volume:
                 "'out' must be a contiguous 1D array with type vec3i or a 2D array of type int32 with shape (N, 3) "
             )
 
-        if self.device.is_cpu:
-            self.runtime.core.wp_volume_get_tiles_host(self.id, out.ptr)
+        if not self.device.is_cuda:  # Metal buffers are host-visible
+            if getattr(self, "_host_id", None):
+                warp.synchronize_device(self.device)  # kernels may have written the grid
+            self.runtime.core.wp_volume_get_tiles_host(self._native_id, out.ptr)
         else:
-            self.runtime.core.wp_volume_get_tiles_device(self.id, out.ptr)
+            self.runtime.core.wp_volume_get_tiles_device(self._native_id, out.ptr)
 
         return out
 
@@ -6600,7 +6645,7 @@ class Volume:
             ctypes.c_uint32(0),
         )
         self.runtime.core.wp_volume_get_tile_and_voxel_count(
-            self.id, ctypes.byref(tile_count), ctypes.byref(voxel_count)
+            self._native_id, ctypes.byref(tile_count), ctypes.byref(voxel_count)
         )
         return voxel_count.value
 
@@ -6651,10 +6696,12 @@ class Volume:
                 "'out' must be a contiguous 1D array with type vec3i or a 2D array of type int32 with shape (N, 3) "
             )
 
-        if self.device.is_cpu:
-            self.runtime.core.wp_volume_get_voxels_host(self.id, out.ptr)
+        if not self.device.is_cuda:  # Metal buffers are host-visible
+            if getattr(self, "_host_id", None):
+                warp.synchronize_device(self.device)  # kernels may have written the grid
+            self.runtime.core.wp_volume_get_voxels_host(self._native_id, out.ptr)
         else:
-            self.runtime.core.wp_volume_get_voxels_device(self.id, out.ptr)
+            self.runtime.core.wp_volume_get_voxels_device(self._native_id, out.ptr)
 
         return out
 
@@ -6665,7 +6712,9 @@ class Volume:
             raise RuntimeError("Invalid Volume")
 
         dx, dy, dz = ctypes.c_float(0), ctypes.c_float(0), ctypes.c_float(0)
-        self.runtime.core.wp_volume_get_voxel_size(self.id, ctypes.byref(dx), ctypes.byref(dy), ctypes.byref(dz))
+        self.runtime.core.wp_volume_get_voxel_size(
+            self._native_id, ctypes.byref(dx), ctypes.byref(dy), ctypes.byref(dz)
+        )
         return (dx.value, dy.value, dz.value)
 
     class GridInfo(NamedTuple):
@@ -6708,7 +6757,7 @@ class Volume:
         type_str_buffer = (ctypes.c_char * 16)()
 
         name = self.runtime.core.wp_volume_get_grid_info(
-            self.id,
+            self._native_id,
             ctypes.byref(grid_size),
             ctypes.byref(grid_index),
             ctypes.byref(grid_count),
@@ -6789,7 +6838,7 @@ class Volume:
     def get_feature_array_count(self) -> int:
         """Return the number of supplemental data arrays stored alongside the grid"""
 
-        return self.runtime.core.wp_volume_get_blind_data_count(self.id)
+        return self.runtime.core.wp_volume_get_blind_data_count(self._native_id)
 
     class FeatureArrayInfo(NamedTuple):
         """Metadata for a supplemental data array"""
@@ -6815,7 +6864,7 @@ class Volume:
         type_str_buffer = (ctypes.c_char * 16)()
 
         name = self.runtime.core.wp_volume_get_blind_data_info(
-            self.id,
+            self._native_id,
             feature_index,
             ctypes.byref(buf),
             ctypes.byref(value_count),
