@@ -124,6 +124,11 @@ def build_onindex_grid(ijk: np.ndarray, transform: np.ndarray, translation: np.n
 
     n_vox = ijk.shape[0]
     n_upper, n_lower, n_leaf = len(upper_start), len(lower_start), len(leaf_start)
+    if n_upper * _UPPER_SIZE + n_lower * _LOWER_SIZE + n_leaf * _LEAF_SIZE > (1 << 31):
+        raise ValueError(
+            f"NanoVDB grid with {n_vox} voxels spanning {n_upper} upper nodes would exceed 2 GB "
+            "(coordinates range over " + str(ijk.min(axis=0).tolist()) + " to " + str(ijk.max(axis=0).tolist()) + ")"
+        )
     root_off = _TREE_SIZE
     upper_off = root_off + _ROOT_SIZE + n_upper * _ROOT_TILE_SIZE
     lower_off = upper_off + n_upper * _UPPER_SIZE
@@ -186,7 +191,7 @@ def build_onindex_grid(ijk: np.ndarray, transform: np.ndarray, translation: np.n
     h["invmatd"] = inv.reshape(-1)
     h["vecd"] = translation
     h["taperd"] = 1.0
-    ijk_min, ijk_max = ijk.min(axis=0), ijk.max(axis=0)
+    ijk_min, ijk_max = ijk.min(axis=0).astype(np.int64), ijk.max(axis=0).astype(np.int64)
     corners = np.array(
         [
             [x, y, z]
