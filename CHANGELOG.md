@@ -149,6 +149,10 @@
   made `fem/example_apic_fluid` diverge to NaN on Metal.
 - Support `arr[i] |= v`, `arr[i] &= v` and `arr[i] ^= v` on Metal devices, including on outputs of kernels that
   also use `wp.atomic_*` (lowered to the atomic fetch-op).
+- Speed up the Metal launch path: `wp.copy()` between two Metal arrays now runs as a GPU dispatch instead of
+  draining the queue for a host memcpy, and binding an array view no longer scans every live buffer. A `warp.fem`
+  conjugate-residual iteration went from ~44 ms to ~2 ms of host time (`fem/example_apic_fluid` 23 s to ~1 s per
+  frame).
 
 ### Changed
 

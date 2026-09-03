@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ast
+import bisect
 import collections
 import ctypes
 import enum
@@ -5451,9 +5452,40 @@ _metal_buffer_registry: dict[int, Any] = {}
 _metal_buffer_lock = threading.Lock()
 
 
+# Sorted allocation bases + byte lengths, kept in step with the registry so
+# interior-pointer lookups (array views) are a bisect instead of a linear scan
+# with a PyObjC ``length()`` call per entry (~1 ms per lookup at a few hundred
+# live buffers; a CG iteration does dozens).
+_metal_buffer_bases: list[int] = []
+_metal_buffer_nbytes: dict[int, int] = {}
+
+
+def _metal_buffer_length(buf) -> int | None:
+    length = getattr(buf, "length", None)
+    return length() if callable(length) else getattr(buf, "nbytes", None)
+
+
+def _metal_index_buffer(ptr: int, buf) -> None:
+    """Record ``buf``'s extent for :func:`_metal_find_buffer` (lock held by caller)."""
+    nbytes = _metal_buffer_length(buf)
+    if nbytes is None:
+        return
+    if ptr not in _metal_buffer_nbytes:
+        bisect.insort(_metal_buffer_bases, ptr)
+    _metal_buffer_nbytes[ptr] = int(nbytes)
+
+
+def _metal_unindex_buffer(ptr: int) -> None:
+    if _metal_buffer_nbytes.pop(ptr, None) is not None:
+        i = bisect.bisect_left(_metal_buffer_bases, ptr)
+        if i < len(_metal_buffer_bases) and _metal_buffer_bases[i] == ptr:
+            del _metal_buffer_bases[i]
+
+
 def _metal_register_buffer(ptr: int, mx_array) -> None:
     with _metal_buffer_lock:
         _metal_buffer_registry[ptr] = mx_array
+        _metal_index_buffer(ptr, mx_array)
 
 
 def _metal_get_buffer(ptr: int):
@@ -5471,6 +5503,7 @@ def _metal_get_buffer(ptr: int):
 def _metal_release_buffer(ptr: int) -> None:
     with _metal_buffer_lock:
         _metal_buffer_registry.pop(ptr, None)
+        _metal_unindex_buffer(ptr)
 
 
 # Foreign (externally owned) Metal buffers — e.g. a Torch MPS tensor's
@@ -5492,6 +5525,7 @@ def _metal_register_foreign_buffer(ptr: int, owner) -> None:
         _metal_foreign_refcounts[ptr] = n + 1
         if n == 0:
             _metal_buffer_registry[ptr] = owner
+            _metal_index_buffer(ptr, owner)
 
 
 def _metal_release_foreign_buffer(ptr: int) -> None:
@@ -5505,6 +5539,13 @@ def _metal_release_foreign_buffer(ptr: int) -> None:
             return
         _metal_foreign_refcounts.pop(ptr, None)
         _metal_buffer_registry.pop(ptr, None)
+        _metal_unindex_buffer(ptr)
+
+
+def _metal_host_copy_forced() -> bool:
+    """``WARP_METAL_HOST_COPY=1`` routes Metal-to-Metal ``wp.copy`` through the
+    synchronous host memcpy instead of a GPU dispatch (A/B kill switch)."""
+    return os.environ.get("WARP_METAL_HOST_COPY", "").strip().lower() in ("1", "true", "on")
 
 
 def _metal_find_buffer(ptr: int):
@@ -5512,27 +5553,20 @@ def _metal_find_buffer(ptr: int):
     containing ``ptr``, or ``(None, 0)`` if no allocation covers it.
 
     Exact-base lookups are O(1); interior pointers (contiguous views into a
-    larger array) fall back to a linear scan over the registry. Callers on
-    the launch path (binding a sub-view of a larger allocation) only reach
-    the scan when the exact lookup misses.
-
-    Works in both dispatch modes: native mode registers ``MTLBuffer``
-    (byte length via ``length()``), MLX mode registers a flat ``uint8``
-    ``mx.array`` (``nbytes``).
+    larger array) bisect the sorted base table kept by
+    :func:`_metal_index_buffer`. Works in both dispatch modes: native mode
+    registers ``MTLBuffer`` (byte length via ``length()``), MLX mode a flat
+    ``uint8`` ``mx.array`` (``nbytes``).
     """
     with _metal_buffer_lock:
         buf = _metal_buffer_registry.get(ptr)
         if buf is not None:
             return buf, 0
-        for base, b in _metal_buffer_registry.items():
-            if not isinstance(base, int):
-                continue
-            length = getattr(b, "length", None)
-            nbytes = length() if callable(length) else getattr(b, "nbytes", None)
-            if nbytes is None:
-                continue
-            if base < ptr < base + nbytes:
-                return b, ptr - base
+        i = bisect.bisect_right(_metal_buffer_bases, ptr) - 1
+        if i >= 0:
+            base = _metal_buffer_bases[i]
+            if base < ptr < base + _metal_buffer_nbytes[base]:
+                return _metal_buffer_registry[base], ptr - base
     return None, 0
 
 
@@ -14981,6 +15015,24 @@ def copy(
                                 "buffers to be registered with the Metal allocator."
                             )
                         dispatcher.device_copy(dst_buf, src_buf, bytes_to_copy, dst_off, src_off)
+                        result = True
+                    elif (
+                        getattr(src.device, "is_metal", False)
+                        and getattr(dest.device, "is_metal", False)
+                        and not _metal_host_copy_forced()
+                    ):
+                        # Both sides on the GPU: copy with a compute dispatch on
+                        # the same queue, so it orders after pending kernels
+                        # without draining them (a host memcpy would have to
+                        # ``sync()`` first, ~5-10 ms of stall per ``wp.copy``
+                        # inside solver loops).
+                        src_buf, src_off = _metal_find_buffer(src_ptr)
+                        dst_buf, dst_off = _metal_find_buffer(dst_ptr)
+                        if src_buf is not None and dst_buf is not None:
+                            dispatcher.device_copy(dst_buf, src_buf, bytes_to_copy, dst_off, src_off)
+                        else:
+                            dispatcher.sync()
+                            runtime.core.wp_memcpy_h2h(dst_ptr, src_ptr, bytes_to_copy)
                         result = True
                     else:
                         dispatcher.sync()
