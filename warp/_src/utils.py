@@ -90,7 +90,7 @@ def quat_between_vectors(a: wp.vec3, b: wp.vec3) -> wp.quat:
     return wp.normalize(q)
 
 
-def _use_host_native_op(device) -> bool:
+def _use_host_native_op(device, *arrays) -> bool:
     """Return ``True`` if arrays on ``device`` should use the ``_host`` native ops.
 
     True for CPU arrays, and for Metal arrays: Apple unified memory makes
@@ -109,6 +109,13 @@ def _use_host_native_op(device) -> bool:
                 "capture — they run on the host and would not be replayed. Move the call "
                 "outside the capture region."
             )
+        for arr in arrays:
+            if arr is not None and warp._src.context._metal_is_private_ptr(arr.ptr):
+                raise RuntimeError(
+                    "wp.utils host ops are not supported on arrays wrapping a private-storage "
+                    "Metal buffer (e.g. a Torch MPS tensor) — they run on the host and the "
+                    "buffer has no host address. Copy the array into a Warp-allocated one first."
+                )
         wp.synchronize_device(device)
         return True
     return False
@@ -146,7 +153,7 @@ def array_scan(in_array: wp.array, out_array: wp.array, inclusive: bool = True) 
 
     from warp._src.context import runtime  # noqa: PLC0415
 
-    if _use_host_native_op(in_array.device):
+    if _use_host_native_op(in_array.device, in_array, out_array):
         if in_array.dtype == wp.int32:
             runtime.core.wp_array_scan_int_host(in_array.ptr, out_array.ptr, in_array.size, inclusive)
         elif in_array.dtype == wp.float32:
@@ -190,7 +197,7 @@ def radix_sort_pairs(keys: wp.array, values: wp.array, count: int) -> None:
 
     from warp._src.context import runtime  # noqa: PLC0415
 
-    if _use_host_native_op(keys.device):
+    if _use_host_native_op(keys.device, keys, values):
         if keys.dtype == wp.int32 and values.dtype == wp.int32:
             runtime.core.wp_radix_sort_pairs_int_host(keys.ptr, values.ptr, count)
         elif keys.dtype == wp.float32 and values.dtype == wp.int32:
@@ -275,7 +282,7 @@ def segmented_sort_pairs(
         segment_end_indices_ptr = segment_end_indices.ptr
         segment_start_indices_ptr = segment_start_indices.ptr
 
-    if _use_host_native_op(keys.device):
+    if _use_host_native_op(keys.device, keys, values):
         if keys.dtype == wp.int32 and values.dtype == wp.int32:
             runtime.core.wp_segmented_sort_pairs_int_host(
                 keys.ptr,
@@ -384,7 +391,7 @@ def runlength_encode(
 
     from warp._src.context import runtime  # noqa: PLC0415
 
-    if _use_host_native_op(values.device):
+    if _use_host_native_op(values.device, values):
         if values.dtype == wp.int32:
             runtime.core.wp_runlength_encode_int_host(
                 values.ptr, run_values.ptr, run_lengths.ptr, run_count.ptr, value_count
@@ -467,7 +474,7 @@ def array_sum(
 
     from warp._src.context import runtime  # noqa: PLC0415
 
-    if _use_host_native_op(values.device):
+    if _use_host_native_op(values.device, values):
         if scalar_type == wp.float32:
             native_func = runtime.core.wp_array_sum_float_host
         elif scalar_type == wp.float64:
@@ -579,7 +586,7 @@ def array_inner(
 
     from warp._src.context import runtime  # noqa: PLC0415
 
-    if _use_host_native_op(a.device):
+    if _use_host_native_op(a.device, a):
         if scalar_type == wp.float32:
             native_func = runtime.core.wp_array_inner_float_host
         elif scalar_type == wp.float64:

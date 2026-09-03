@@ -4103,6 +4103,12 @@ class array(Array[DType, NDim]):
                             "fill_ on a non-contiguous Metal array is not supported inside a "
                             "Metal graph capture — move it outside the capture region."
                         )
+                    if warp._src.context._metal_is_private_ptr(self.ptr):
+                        raise RuntimeError(
+                            "fill_ on a non-contiguous view of a private-storage Metal buffer "
+                            "(e.g. a wrapped Torch MPS tensor) is not supported — the strided "
+                            "fill runs on the host and the buffer has no host address."
+                        )
                     dispatcher.sync()
                 warp._src.context.runtime.core.wp_array_fill_host(carr_ptr, ARRAY_TYPE_REGULAR, cvalue_ptr, cvalue_size)
 
