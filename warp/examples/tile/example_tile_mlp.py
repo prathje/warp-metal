@@ -365,6 +365,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument("--device", type=str, default=None, help="Override the default Warp device.")
     parser.add_argument("--train-iters", type=int, default=20000, help="Total number of training iterations.")
     parser.add_argument(
         "--headless",
@@ -374,7 +375,7 @@ if __name__ == "__main__":
 
     args = parser.parse_known_args()[0]
 
-    with wp.ScopedDevice("cuda:0"):
+    with wp.ScopedDevice(args.device):
         example = Example(args.train_iters)
         example.train_warp()
         # example.train_torch()
