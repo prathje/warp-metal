@@ -8720,6 +8720,66 @@ class TestMetalHashGrid(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet, timeout=240)
 
+    def test_hash_grid_build_tables_match_cpu(self):
+        # The Metal build is a GPU counting sort (atomic histogram + scan +
+        # atomic scatter + per-cell id sort). Exercise the shapes that could
+        # break it: thousands of points in ONE cell (long per-cell sort),
+        # exact duplicates, points on cell boundaries, negative coordinates,
+        # a grid with more cells than the scan handles in one block, and
+        # shrinking then regrowing the point count on the same grid (table
+        # reallocation + descriptor rewrite). Ids must match the native
+        # stable sort exactly, not just the neighbor counts.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            if not wp.config.metal_native_dispatch:
+                raise SystemExit(0)  # HashGrid is native-dispatch-only on Metal
+
+            @wp.kernel
+            def dump(grid: wp.uint64, pts: wp.array(dtype=wp.vec3), radius: float,
+                     counts: wp.array(dtype=wp.int32), pid: wp.array(dtype=wp.int32)):
+                i = wp.tid()
+                p = pts[i]
+                n = int(0)
+                for j in wp.hash_grid_query(grid, p, radius):
+                    if wp.length(pts[j] - p) <= radius:
+                        n += 1
+                counts[i] = n
+                pid[i] = wp.hash_grid_point_id(grid, i)
+
+            rng = np.random.default_rng(0)
+            cases = {
+                "uniform_neg": (rng.uniform(-40.0, 40.0, size=(6000, 3)), 1.0, (16, 16, 16)),
+                "one_cell": (rng.uniform(0.0, 0.9, size=(1500, 3)), 1.0, (8, 8, 8)),
+                "duplicates": (np.repeat(rng.uniform(-3, 3, size=(50, 3)), 40, axis=0), 0.5, (10, 10, 10)),
+                "boundaries": (np.round(rng.uniform(-8, 8, size=(3000, 3)) * 2) / 2, 0.5, (32, 32, 32)),
+                "big_grid": (rng.uniform(-100, 100, size=(6000, 3)), 1.0, (64, 64, 64)),
+            }
+            for name, (pts_np, radius, dims) in cases.items():
+                pts_np = pts_np.astype(np.float32)
+                outs = {}
+                for dev in ("cpu", "metal:0"):
+                    with wp.ScopedDevice(dev):
+                        grid = wp.HashGrid(*dims)
+                        res = []
+                        for n in (len(pts_np), len(pts_np) // 3, len(pts_np)):
+                            pts = wp.array(pts_np[:n], dtype=wp.vec3)
+                            grid.build(pts, radius)
+                            counts = wp.zeros(n, dtype=wp.int32)
+                            pid = wp.zeros(n, dtype=wp.int32)
+                            wp.launch(dump, dim=n, inputs=[grid.id, pts, radius], outputs=[counts, pid])
+                            wp.synchronize_device()
+                            res.append((counts.numpy().copy(), pid.numpy().copy()))
+                        outs[dev] = res
+                for k, ((c0, p0), (c1, p1)) in enumerate(zip(outs["cpu"], outs["metal:0"])):
+                    np.testing.assert_array_equal(c1, c0, err_msg=f"{name} build {k}: neighbor counts")
+                    np.testing.assert_array_equal(p1, p0, err_msg=f"{name} build {k}: point ids")
+                assert outs["cpu"][0][0].sum() > 0
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=300)
+
 
 @unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
 @unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")

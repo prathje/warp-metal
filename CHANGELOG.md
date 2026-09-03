@@ -141,6 +141,9 @@
 
 - Support `wp.tile_map()` with a user `@wp.func` on Metal devices, for scalar- and vector-element tiles. The
   mapped function may itself call other `@wp.func`s, loop, and `return` from inside a loop.
+- Build `wp.HashGrid` cell tables on the GPU on Metal devices instead of sorting on the host. `HashGrid.build()`
+  no longer synchronizes the device, and the tables list each cell's points in the same order as the native
+  stable sort (`core/example_sph` steps ~20x faster).
 
 ## [1.18.0] - 2026-10-05
 
