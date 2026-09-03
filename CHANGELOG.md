@@ -78,6 +78,11 @@
   (including `storage_offset()` views) and stages `numpy()`, `fill_()`, and host copies through the GPU.
   `requires_grad=True` follows the CUDA path, attaching a Warp-allocated gradient to the tensor as `t.grad`.
   `core/example_torch` runs on Metal.
+- Run launch-tiled kernels over 1-D tiles of `block_dim` elements with real lanes on Metal devices when
+  `block_dim=32`: `wp.tile_load()`, `wp.tile_store()`, `wp.tile_scan_inclusive()` / `_exclusive()`,
+  `wp.tile_extract()`, `wp.tile_from_thread()`, `wp.tile_arange()`, `wp.tile_map()`, and `wp.tile_store_indexed()`
+  lower to per-lane SIMD operations, so `wp.tid()` and `wp.block_dim()` mean the same as on CUDA.
+  `tile/example_tile_stream_compaction` runs on Metal.
 
 ### Fixed
 

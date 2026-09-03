@@ -7380,6 +7380,141 @@ class TestMetalCoopTiles(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet, timeout=120)
 
+    def test_stream_compaction_pattern(self):
+        """The ``tile/example_tile_stream_compaction`` shape: 1-D
+        ``tile_load``, ``tile_scan_inclusive``, ``tile_extract`` at
+        ``wp.block_dim() - 1`` inside a one-lane branch, an atomic
+        reservation broadcast with ``tile_from_thread``, a user-function
+        ``tile_map``, and ``tile_store_indexed`` — all one element per lane."""
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            TILE = 32
+            NB = 5
+
+            @wp.func
+            def compute_index(valid: int, scan_inclusive: int, offset: int) -> int:
+                if valid == 1:
+                    return scan_inclusive + offset - 1
+                else:
+                    return -1
+
+            @wp.kernel
+            def compact(is_valid: wp.array(dtype=int), data: wp.array(dtype=float),
+                        num_output: wp.array(dtype=int), output: wp.array(dtype=float)):
+                i, j = wp.tid()
+                data_tile = wp.tile_load(data, TILE, offset=i * TILE)
+                valid_tile = wp.tile_load(is_valid, TILE, offset=i * TILE)
+                scan_inclusive = wp.tile_scan_inclusive(valid_tile)
+                offset = 0
+                if j == wp.block_dim() - 1:
+                    block_count = wp.tile_extract(scan_inclusive, wp.block_dim() - 1)
+                    offset = wp.atomic_add(num_output, 0, block_count)
+                offset_tile = wp.tile_from_thread(shape=TILE, value=offset,
+                                                  thread_idx=wp.block_dim() - 1, storage="shared")
+                index_tile = wp.tile_map(compute_index, valid_tile, scan_inclusive, offset_tile)
+                wp.tile_store_indexed(output, index_tile, data_tile, axis=0)
+
+            dev = 'metal:0'
+            n = NB * TILE
+            rng = np.random.default_rng(11)
+            valid_np = (rng.random(n) < 0.4).astype(np.int32)
+            data_np = np.arange(n, dtype=np.float32) * 10.0
+            is_valid = wp.array(valid_np, dtype=int, device=dev)
+            data = wp.array(data_np, dtype=float, device=dev)
+            num_output = wp.zeros(1, dtype=int, device=dev)
+            output = wp.full(n, -1.0, dtype=float, device=dev)
+            wp.launch_tiled(compact, dim=[NB], inputs=[is_valid, data, num_output, output],
+                            block_dim=TILE, device=dev)
+            wp.synchronize_device(dev)
+            count = int(num_output.numpy()[0])
+            expected = data_np[valid_np == 1]
+            assert count == len(expected), (count, len(expected))
+            result = output.numpy()[:count]
+            np.testing.assert_allclose(np.sort(result), np.sort(expected))
+            assert not (output.numpy()[count:] != -1.0).any(), 'wrote past the compacted range'
+            # Each block's valid elements land contiguously, in order, at the
+            # offset it reserved — so the output is piecewise increasing with
+            # exactly one run per block that had any valid element.
+            runs = 1 + int((np.diff(result) < 0).sum())
+            nonempty = int(sum(valid_np[b * TILE:(b + 1) * TILE].any() for b in range(NB)))
+            assert runs <= nonempty, (runs, nonempty)
+            art = compact._metal_artifact
+            assert art.coop_block_n == 32, art.coop_block_n
+            for token in ('simd_prefix_inclusive_sum', 'simd_shuffle'):
+                assert token in art.source, token
+            """
+        )
+        _run_with_metal_native(self, snippet, timeout=120)
+
+    def test_distributed_lane_ops_match_cpu(self):
+        """Per-lane lowerings of the 1-D tile ops against the CPU backend:
+        a partially out-of-range ``tile_load`` (zero-filled), inclusive and
+        exclusive scans, ``tile_reduce``, ``tile_extract`` at a runtime
+        lane, ``tile_from_thread`` from a middle lane, ``tile_arange``,
+        ``tile_map`` with a builtin, and bounds-checked ``tile_store``."""
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            TILE = 32
+
+            @wp.kernel
+            def lane_ops(a: wp.array(dtype=float), pick: wp.array(dtype=int),
+                         out_inc: wp.array(dtype=float), out_exc: wp.array(dtype=float),
+                         out_combo: wp.array(dtype=float), out_ar: wp.array(dtype=float),
+                         out_sum: wp.array(dtype=float), out_last: wp.array(dtype=float),
+                         out_pick: wp.array(dtype=float)):
+                i, j = wp.tid()
+                t = wp.tile_load(a, TILE, offset=i * TILE)
+                inc = wp.tile_scan_inclusive(t)
+                exc = wp.tile_scan_exclusive(t)
+                total = wp.tile_reduce(wp.add, t)
+                last = wp.tile_extract(inc, TILE - 1)
+                picked = wp.tile_extract(t, pick[i])
+                bc = wp.tile_from_thread(shape=TILE, value=float(j) * 2.0, thread_idx=5)
+                ar = wp.tile_arange(TILE, dtype=float)
+                combo = wp.tile_map(wp.add, exc, bc)
+                wp.tile_store(out_inc, inc, offset=i * TILE)
+                wp.tile_store(out_exc, exc, offset=i * TILE)
+                wp.tile_store(out_combo, combo, offset=i * TILE)
+                wp.tile_store(out_ar, ar, offset=i * TILE)
+                if j == 0:
+                    out_sum[i] = total[0]
+                    out_last[i] = last
+                    out_pick[i] = picked
+
+            def run(dev):
+                n, nb = 100, 4  # the last block covers only 4 real elements
+                rng = np.random.default_rng(5)
+                a = wp.array(rng.integers(-5, 6, n).astype(np.float32), dtype=float, device=dev)
+                pick = wp.array(np.array([3, 31, 0, 2], np.int32), dtype=int, device=dev)
+                outs = [wp.full(n, 99.0, dtype=float, device=dev) for _ in range(4)]
+                per_block = [wp.zeros(nb, dtype=float, device=dev) for _ in range(3)]
+                wp.launch_tiled(lane_ops, dim=[nb], inputs=[a, pick, *outs, *per_block],
+                                block_dim=TILE, device=dev)
+                wp.synchronize_device(dev)
+                return [o.numpy() for o in outs + per_block]
+
+            ref = run('cpu')
+            got = run('metal:0')
+            names = ('inc', 'exc', 'combo', 'arange', 'sum', 'last', 'pick')
+            for name, r, g in zip(names, ref, got):
+                if name == 'combo':
+                    # The CPU backend runs a launch-tiled block as ONE thread,
+                    # so ``tile_from_thread(thread_idx=5)`` has no lane 5
+                    # there; the CUDA semantics are lane 5's value, 10.0.
+                    np.testing.assert_allclose(g, ref[1] + 10.0, rtol=1e-6, atol=1e-6, err_msg=name)
+                    continue
+                np.testing.assert_allclose(g, r, rtol=1e-6, atol=1e-6, err_msg=name)
+            art = lane_ops._metal_artifact
+            assert art.coop_block_n == 32, art.coop_block_n
+            assert 'simd_prefix_exclusive_sum' in art.source
+            """
+        )
+        _run_with_metal_native(self, snippet, timeout=120)
+
 
 @unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
 @unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
