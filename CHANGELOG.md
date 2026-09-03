@@ -90,6 +90,11 @@
 - Build `wp.HashGrid` cell tables on the GPU on Metal devices instead of sorting on the host. `HashGrid.build()`
   no longer synchronizes the device, and the tables list each cell's points in the same order as the native
   stable sort (`core/example_sph` steps ~20x faster).
+- Support `wp.Volume` on Metal devices: `Volume.load_from_nvdb()` and `wp.Volume(data)`, the host-side
+  introspection API, and the `wp.volume_*` sampling, lookup, store, index-grid and transform builtins for
+  `float32`, `int32` and `vec3f` grids, including reverse mode through the sampling and transform functions.
+  Volumes are read through the same NanoVDB traversal code as the CPU and CUDA backends (`core/example_nvdb`
+  runs on Metal). `Volume.allocate*()` remains CUDA-only.
 
 ### Fixed
 
