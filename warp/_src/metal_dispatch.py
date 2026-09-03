@@ -253,6 +253,44 @@ def _binding_buffer(entry):
     return entry
 
 
+# Metal object-creation selectors the backend calls. Cocoa's naming rule says
+# a ``new*`` method hands the caller a +1 reference, and PyObjC normally adopts
+# that reference instead of retaining again. For the Metal device's private
+# ``AGX*`` classes the rule is NOT applied (PyObjC 12.1, macOS 26): a fresh
+# ``MTLBuffer`` reports ``retainCount() == 2``, so when the Python proxy dies
+# the buffer keeps one reference forever. Every freed ``wp.array`` leaked its
+# storage — ``fem/example_kelvin_helmholtz`` grew by ~700 MB per frame until
+# the OS killed it. Declaring the return values ``already_retained`` restores
+# the +1 adoption; ``MTLDevice.currentAllocatedSize`` then drops on free.
+_PYOBJC_NEW_SELECTORS: tuple[bytes, ...] = (
+    # Only selectors WITHOUT an ``error:`` out-parameter: registering retval
+    # metadata replaces the selector's argument metadata, which would break
+    # the ``(result, error)`` tuple unpacking of ``newLibraryWithSource:...``
+    # and friends. Those objects are cached for the process lifetime anyway.
+    b"newCommandQueue",
+    b"newBufferWithLength:options:",
+    b"newBufferWithBytes:length:options:",
+    b"newFunctionWithName:",
+    b"newIndirectCommandBufferWithDescriptor:maxCommandCount:options:",
+    b"newFence",
+    b"newHeapWithDescriptor:",
+    b"newEvent",
+    b"newSharedEvent",
+)
+_pyobjc_metadata_registered = False
+
+
+def _register_pyobjc_ownership_metadata() -> None:
+    global _pyobjc_metadata_registered
+    if _pyobjc_metadata_registered:
+        return
+    import objc  # noqa: PLC0415
+
+    for sel in _PYOBJC_NEW_SELECTORS:
+        objc.registerMetaDataForSelector(b"NSObject", sel, {"retval": {"already_retained": True}})
+    _pyobjc_metadata_registered = True
+
+
 class MetalDispatcher:
     """Encapsulates the Apple Metal API state Warp needs for direct dispatch.
 
@@ -267,6 +305,7 @@ class MetalDispatcher:
         # module load when this file is imported through the package.
         import Metal  # noqa: PLC0415
 
+        _register_pyobjc_ownership_metadata()
         self._Metal = Metal
         device = Metal.MTLCreateSystemDefaultDevice()
         if device is None:
@@ -1128,38 +1167,28 @@ class MetalDispatcher:
                 # transient allocations alive while the GPU reads them.
                 self._inflight_refs.append(buf)
         encoder.setComputePipelineState_(pso)
-        # Batch-bind buffers. ``setBytes`` entries are passed one at a
-        # time (each pushes a separate small allocation into the
-        # encoder's command stream) but consecutive MTLBuffer entries
-        # collapse into a single ``setBuffers:offsets:withRange:`` call
-        # — fewer PyObjC bridge crossings = lower per-launch overhead.
-        run_start = 0
-        run_buffers: list = []
-        run_offsets: list = []
-
-        def _flush_run(end_exclusive: int) -> None:
-            if not run_buffers:
-                return
-            count = len(run_buffers)
-            encoder.setBuffers_offsets_withRange_(
-                run_buffers, run_offsets, self._NSMakeRange(end_exclusive - count, count)
-            )
-            self._inflight_refs.extend(run_buffers)
-            run_buffers.clear()
-            run_offsets.clear()
-
+        # Bind buffers ONE slot at a time. The batched
+        # ``setBuffers:offsets:withRange:`` form is fewer bridge crossings,
+        # but PyObjC (12.1) leaks the tuple it builds for the ``id[]``
+        # argument, which pinned every buffer ever bound: a freed
+        # ``wp.array`` kept its MTLBuffer alive forever and long runs grew
+        # by the full per-step allocation traffic (~700 MB/frame in
+        # ``fem/example_kelvin_helmholtz``) until the OS killed them.
+        # ``setBuffer:offset:atIndex:`` takes no array and does not leak
+        # (see TestMetalBufferLifetime).
+        set_buffer = encoder.setBuffer_offset_atIndex_
+        set_bytes = encoder.setBytes_length_atIndex_
+        inflight = self._inflight_refs
         for idx, entry in enumerate(bindings):
             if isinstance(entry, tuple) and len(entry) == 2:
-                _flush_run(idx)
                 data, length = entry
-                encoder.setBytes_length_atIndex_(data, length, idx)
+                set_bytes(data, length, idx)
             elif isinstance(entry, BufferSlice):
-                run_buffers.append(entry.buffer)
-                run_offsets.append(entry.offset)
+                set_buffer(entry.buffer, entry.offset, idx)
+                inflight.append(entry.buffer)
             else:
-                run_buffers.append(entry)
-                run_offsets.append(0)
-        _flush_run(len(bindings))
+                set_buffer(entry, 0, idx)
+                inflight.append(entry)
 
         gx, gy, gz = grid
         tx, ty, tz = threadgroup

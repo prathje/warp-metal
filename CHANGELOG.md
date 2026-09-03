@@ -158,6 +158,10 @@
   composing the two transforms. A transform lowers to a struct that has an `operator*`, so the generic multiply
   lowering compiled and produced a plausible-looking wrong answer with no diagnostic.
   `wp.transform_multiply()` was unaffected.
+- Fix Metal device memory growing by the full per-step allocation traffic on long runs: PyObjC leaked the
+  argument tuple of `setBuffers:offsets:withRange:` and retained `newBufferWithLength:options:` results twice, so
+  every freed `wp.array` kept its `MTLBuffer` alive (`fem/example_kelvin_helmholtz` was killed by the OS after
+  ~170 frames).
 
 ### Documentation
 
