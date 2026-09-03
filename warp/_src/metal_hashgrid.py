@@ -19,11 +19,14 @@ The CUDA/CPU backends pass a host or device ``HashGrid_t*`` as the
 ``uint64`` id a kernel dereferences. Metal kernels can't chase host
 pointers, so — exactly like ``metal_bvh.py`` — the Metal model is:
 
-* Build the cell tables ON THE HOST. The build is a direct NumPy
-  transcription of ``hash_grid_update_host_impl`` (warp/native/hashgrid.cpp):
-  per-point cell index (same ``floor(p * cell_width_inv)`` + origin-offset +
-  modulo math, in float32), a stable sort of (cell, point-id) pairs, then a
-  cell start/end scan over the sorted cells.
+* Build the cell tables ON THE GPU with ordinary Warp kernels (a counting
+  sort): per-point cell index (same ``floor(p * cell_width_inv)`` +
+  origin-offset + modulo math as ``hash_grid_index()``), a per-cell
+  histogram via ``atomic_add``, a two-level exclusive scan over the cells,
+  an atomic scatter of point ids into their cell ranges, and finally a
+  per-cell sort of the ids so every cell lists its points in ascending
+  index order — the same order the native stable radix sort produces.
+  Nothing syncs the device; ``build()`` is a fixed sequence of launches.
 * Store ``point_cells`` / ``point_ids`` / ``cell_starts`` / ``cell_ends`` as
   Metal-side ``wp.array`` storage and pack a descriptor buffer whose fields
   are the arrays' ``gpuAddress``es (see ``wp_hash_grid_desc_t`` in
@@ -33,10 +36,11 @@ pointers, so — exactly like ``metal_bvh.py`` — the Metal model is:
   kernels using hash-grid builtins dispatch with ``reads_resident=True``
   (the ``uses_bvh`` artifact flag covers hash grids too).
 
-``build()`` re-sorts on the host every call (it syncs to read the points),
-so unlike CUDA it is NOT graph-capturable. Before the first ``build()`` the
-descriptor's ``point_cells`` address is 0 and queries return no results,
-matching the native unbuilt-grid behavior.
+The point tables are reallocated only when a build sees more points than
+the tables hold; the descriptor is rewritten (after draining the queue)
+only when an address, the point count, or the cell width changes. Before
+the first ``build()`` the descriptor's ``point_cells`` address is 0 and
+queries return no results, matching the native unbuilt-grid behavior.
 """
 
 from __future__ import annotations
@@ -56,6 +60,114 @@ __all__ = ["MetalHashGrid"]
 _HASH_GRID_DESC_FMT = "<4Q6i2f"
 _HASH_GRID_DESC_NBYTES = struct.calcsize(_HASH_GRID_DESC_FMT)
 
+# Cells per thread in the two-level exclusive scan.
+_SCAN_BLOCK = 1024
+
+
+@warp.kernel(enable_backward=False)
+def _hg_count_cells(
+    points: warp.array(dtype=warp.vec3),
+    cell_width_inv: warp.float32,
+    dim_x: int,
+    dim_y: int,
+    dim_z: int,
+    point_cell: warp.array(dtype=warp.int32),
+    counts: warp.array(dtype=warp.int32),
+):
+    # Mirrors hash_grid_index() in warp/native/hashgrid.h: floor toward -inf,
+    # +2^20 origin offset, clamp at 0, modulo the grid dims.
+    i = warp.tid()
+    p = points[i]
+    x = warp.max(0, int(warp.floor(p[0] * cell_width_inv)) + 1048576)
+    y = warp.max(0, int(warp.floor(p[1] * cell_width_inv)) + 1048576)
+    z = warp.max(0, int(warp.floor(p[2] * cell_width_inv)) + 1048576)
+    cell = (z % dim_z) * (dim_x * dim_y) + (y % dim_y) * dim_x + (x % dim_x)
+    point_cell[i] = cell
+    warp.atomic_add(counts, cell, 1)
+
+
+@warp.kernel(enable_backward=False)
+def _hg_block_sums(
+    counts: warp.array(dtype=warp.int32),
+    num_cells: int,
+    block_sums: warp.array(dtype=warp.int32),
+):
+    b = warp.tid()
+    start = b * 1024
+    end = warp.min(start + 1024, num_cells)
+    s = int(0)
+    for k in range(start, end):
+        s += counts[k]
+    block_sums[b] = s
+
+
+@warp.kernel(enable_backward=False)
+def _hg_scan_block_sums(block_sums: warp.array(dtype=warp.int32), num_blocks: int):
+    # Single thread: in-place exclusive scan of the (few) block totals.
+    s = int(0)
+    for b in range(num_blocks):
+        v = block_sums[b]
+        block_sums[b] = s
+        s += v
+
+
+@warp.kernel(enable_backward=False)
+def _hg_scan_within_block(
+    counts: warp.array(dtype=warp.int32),
+    num_cells: int,
+    block_offsets: warp.array(dtype=warp.int32),
+    cell_starts: warp.array(dtype=warp.int32),
+    cell_ends: warp.array(dtype=warp.int32),
+    cursor: warp.array(dtype=warp.int32),
+):
+    b = warp.tid()
+    start = b * 1024
+    end = warp.min(start + 1024, num_cells)
+    s = block_offsets[b]
+    for k in range(start, end):
+        c = counts[k]
+        counts[k] = 0  # leave the histogram zeroed for the next build
+        cell_starts[k] = s
+        cursor[k] = s
+        s += c
+        cell_ends[k] = s
+
+
+@warp.kernel(enable_backward=False)
+def _hg_scatter(
+    point_cell: warp.array(dtype=warp.int32),
+    cursor: warp.array(dtype=warp.int32),
+    point_ids: warp.array(dtype=warp.int32),
+    sorted_cells: warp.array(dtype=warp.int32),
+):
+    i = warp.tid()
+    c = point_cell[i]
+    pos = warp.atomic_add(cursor, c, 1)
+    point_ids[pos] = i
+    sorted_cells[pos] = c
+
+
+@warp.kernel(enable_backward=False)
+def _hg_sort_cell_ids(
+    cell_starts: warp.array(dtype=warp.int32),
+    cell_ends: warp.array(dtype=warp.int32),
+    point_ids: warp.array(dtype=warp.int32),
+):
+    # The atomic scatter places a cell's points in arbitrary order; sort each
+    # cell's range ascending so the tables equal a stable sort by cell.
+    c = warp.tid()
+    lo = cell_starts[c]
+    hi = cell_ends[c]
+    for k in range(lo + 1, hi):
+        v = point_ids[k]
+        j = k - 1
+        while j >= lo:
+            if point_ids[j] <= v:
+                break
+            point_ids[j + 1] = point_ids[j]
+            j -= 1
+        point_ids[j + 1] = v
+
 
 class MetalHashGrid:
     """Metal-side cell tables + descriptor for one ``wp.HashGrid``.
@@ -72,6 +184,7 @@ class MetalHashGrid:
         if self.dim_x <= 0 or self.dim_y <= 0 or self.dim_z <= 0:
             raise ValueError(f"Hash grid dimensions must be positive, got ({dim_x}, {dim_y}, {dim_z})")
         self.num_cells = self.dim_x * self.dim_y * self.dim_z
+        self._num_blocks = (self.num_cells + _SCAN_BLOCK - 1) // _SCAN_BLOCK
         self._dispatcher = get_dispatcher()
         self._resident: list = []
         self._resident_ids: set[int] = set()
@@ -82,12 +195,21 @@ class MetalHashGrid:
         self._register(self._desc_buf)
         self.id = int(self._desc_buf.gpuAddress())
 
+        # Per-cell tables are sized once; per-point tables grow on demand.
+        with warp.ScopedDevice(self.device):
+            self.cell_starts = warp.zeros(self.num_cells, dtype=warp.int32)
+            self.cell_ends = warp.zeros(self.num_cells, dtype=warp.int32)
+            self._counts = warp.zeros(self.num_cells, dtype=warp.int32)
+            self._cursor = warp.zeros(self.num_cells, dtype=warp.int32)
+            self._block_sums = warp.zeros(self._num_blocks, dtype=warp.int32)
         self.point_cells = None
         self.point_ids = None
-        self.cell_starts = None
-        self.cell_ends = None
+        self._point_cell = None
+        self._capacity = 0
         self.num_points = 0
         self.cell_width = 0.0
+        self._desc_data = None
+        self._retired: list = []
         self._write_descriptor()
 
     # -- residency ------------------------------------------------------
@@ -116,54 +238,88 @@ class MetalHashGrid:
 
     # -- build ----------------------------------------------------------
 
+    def _reserve_points(self, num_points: int) -> None:
+        if num_points <= self._capacity:
+            return
+        # A previous build's tables may still be read by in-flight queries;
+        # keep the old arrays alive until the descriptor rewrite drains the
+        # queue (``_write_descriptor`` clears ``_retired`` after its sync).
+        self._retired = [self.point_ids, self.point_cells, self._point_cell]
+        with warp.ScopedDevice(self.device):
+            self.point_ids = warp.zeros(num_points, dtype=warp.int32)
+            self.point_cells = warp.zeros(num_points, dtype=warp.int32)
+            self._point_cell = warp.zeros(num_points, dtype=warp.int32)
+        self._capacity = num_points
+
     def build(self, points, radius: float) -> None:
-        """Host-side rebuild of the cell tables (see module docstring)."""
-        pts = points.numpy().reshape(-1, 3).astype(np.float32, copy=False)  # syncs the device
-        num_points = pts.shape[0]
+        """GPU rebuild of the cell tables (see module docstring)."""
+        num_points = points.shape[0]
+        self._reserve_points(num_points)
         self.num_points = num_points
         self.cell_width = float(radius)
+        self._write_descriptor()  # no-op unless an address / count / width changed
 
-        # Per-point cell index — float32 math matching hash_grid_index():
-        # floor toward -inf, +2^20 origin offset, clamp, modulo dims.
-        cell_width_inv = np.float32(1.0) / np.float32(radius)
-        ijk = np.floor(pts * cell_width_inv).astype(np.int64) + (1 << 20)
-        np.maximum(ijk, 0, out=ijk)
-        cx = ijk[:, 0] % self.dim_x
-        cy = ijk[:, 1] % self.dim_y
-        cz = ijk[:, 2] % self.dim_z
-        cells = (cz * (self.dim_x * self.dim_y) + cy * self.dim_x + cx).astype(np.int32)
-
-        # Sort (cell, point-id) pairs; stable matches the native radix sort.
-        order = np.argsort(cells, kind="stable").astype(np.int32)
-        sorted_cells = cells[order]
-
-        # Cell start/end scan. Unvisited cells keep start == end == 0
-        # (an empty range), matching the native memset.
-        starts = np.zeros(self.num_cells, dtype=np.int32)
-        ends = np.zeros(self.num_cells, dtype=np.int32)
-        if num_points:
-            vals, first_idx, counts = np.unique(sorted_cells, return_index=True, return_counts=True)
-            starts[vals] = first_idx
-            ends[vals] = first_idx + counts
-
-        with warp.ScopedDevice(self.device):
-            self.point_cells = warp.array(sorted_cells, dtype=warp.int32)
-            self.point_ids = warp.array(order, dtype=warp.int32)
-            self.cell_starts = warp.array(starts, dtype=warp.int32)
-            self.cell_ends = warp.array(ends, dtype=warp.int32)
-
-        self._write_descriptor()
-        self._dispatcher.sync()
+        if num_points == 0:
+            return
+        dev = self.device
+        cell_width_inv = float(np.float32(1.0) / np.float32(radius))
+        # Leading-slice views keep the launch dims honest when the tables are
+        # larger than the current point count.
+        point_ids = self.point_ids[:num_points]
+        point_cells = self.point_cells[:num_points]
+        point_cell = self._point_cell[:num_points]
+        warp.launch(
+            _hg_count_cells,
+            dim=num_points,
+            inputs=[points, cell_width_inv, self.dim_x, self.dim_y, self.dim_z],
+            outputs=[point_cell, self._counts],
+            device=dev,
+        )
+        warp.launch(
+            _hg_block_sums,
+            dim=self._num_blocks,
+            inputs=[self._counts, self.num_cells],
+            outputs=[self._block_sums],
+            device=dev,
+        )
+        warp.launch(
+            _hg_scan_block_sums,
+            dim=1,
+            inputs=[self._block_sums, self._num_blocks],
+            device=dev,
+        )
+        warp.launch(
+            _hg_scan_within_block,
+            dim=self._num_blocks,
+            inputs=[self._counts, self.num_cells, self._block_sums],
+            outputs=[self.cell_starts, self.cell_ends, self._cursor],
+            device=dev,
+        )
+        warp.launch(
+            _hg_scatter,
+            dim=num_points,
+            inputs=[point_cell, self._cursor],
+            outputs=[point_ids, point_cells],
+            device=dev,
+        )
+        warp.launch(
+            _hg_sort_cell_ids,
+            dim=self.num_cells,
+            inputs=[self.cell_starts, self.cell_ends],
+            outputs=[point_ids],
+            device=dev,
+        )
 
     def _write_descriptor(self) -> None:
         addrs = []
+        bufs = []
         for arr in (self.point_cells, self.point_ids, self.cell_starts, self.cell_ends):
             if arr is None:
                 addrs.append(0)
                 continue
             ga, buf = _gpu_address(arr)
             addrs.append(ga)
-            self._register(buf)
+            bufs.append(buf)
         cell_width = float(self.cell_width)
         cell_width_inv = float(np.float32(1.0) / np.float32(cell_width)) if cell_width > 0.0 else 0.0
         data = struct.pack(
@@ -178,4 +334,15 @@ class MetalHashGrid:
             cell_width,
             cell_width_inv,
         )
+        if data == self._desc_data:
+            return
+        for buf in bufs:
+            self._register(buf)
+        if self._desc_data is not None:
+            # Kernels from earlier launches may still read the old descriptor
+            # (and, after a regrow, the old tables); the host write below is
+            # immediate, so drain the queue first.
+            self._dispatcher.sync()
+        self._retired = []
         ctypes.memmove(self._desc_ptr, data, len(data))
+        self._desc_data = data
