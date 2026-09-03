@@ -238,6 +238,15 @@ class MetalBvh:
 
         # The host builder reads the item bounds through their unified-memory
         # pointers — drain any queued GPU writes first.
+        from warp._src.context import _metal_is_private_ptr  # noqa: PLC0415
+
+        for arr in (self.lowers, self.uppers, self.groups):
+            if arr is not None and _metal_is_private_ptr(arr.ptr):
+                raise RuntimeError(
+                    "wp.Bvh on Metal builds its tree on the host, which is not possible for bounds "
+                    "arrays wrapping a private-storage Metal buffer (e.g. a Torch MPS tensor) — "
+                    "copy them into Warp-allocated arrays first."
+                )
         self._dispatcher.sync()
 
         groups_ptr = ctypes.c_void_p(self.groups.ptr) if self.groups is not None else ctypes.c_void_p(0)

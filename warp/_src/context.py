@@ -5540,6 +5540,96 @@ def _metal_release_foreign_buffer(ptr: int) -> None:
         _metal_foreign_refcounts.pop(ptr, None)
         _metal_buffer_registry.pop(ptr, None)
         _metal_unindex_buffer(ptr)
+        objc_id = _metal_private_owners.pop(ptr, None)
+        if objc_id is not None:
+            _metal_private_keys.pop(objc_id, None)
+            _metal_private_free.append((ptr, _metal_private_spans.pop(ptr)))
+
+
+# Private-storage foreign buffers (what Torch's MPS allocator hands out) have
+# no host address: ``contents()`` is nil. They are registered under a
+# synthetic key drawn from a range no user-space mapping can occupy (above the
+# 47-bit arm64 user VA), so the wrapping wp.array's pointer is non-zero
+# (truthiness), interior views bisect to the right buffer + offset, and an
+# accidental host dereference faults loudly instead of reading garbage.
+# Kernel launches bind the MTLBuffer exactly like a Warp-owned one; the
+# host-side paths (``wp.copy`` to/from host memory, ``numpy()``, ``fill_`` /
+# ``zero_``) consult :func:`_metal_is_private_ptr` and stage through the GPU.
+_METAL_PRIVATE_PTR_BASE = 0x0000_F000_0000_0000
+_METAL_PRIVATE_PTR_LIMIT = 0x0000_FFFF_0000_0000
+_metal_private_next_ptr = _METAL_PRIVATE_PTR_BASE
+_metal_private_keys: dict[int, int] = {}  # ObjC id<MTLBuffer> -> synthetic base key
+_metal_private_owners: dict[int, int] = {}  # synthetic base key -> ObjC id
+_metal_private_spans: dict[int, int] = {}  # synthetic base key -> reserved key span
+_metal_private_free: list[tuple[int, int]] = []  # released (key, span) pairs for reuse
+
+
+def _metal_is_private_ptr(ptr) -> bool:
+    """``True`` if ``ptr`` is a synthetic key for a private-storage Metal buffer
+    (see :func:`_metal_register_private_buffer`) rather than a host address."""
+    return bool(ptr) and _METAL_PRIVATE_PTR_BASE <= ptr < _METAL_PRIVATE_PTR_LIMIT
+
+
+def _metal_register_private_buffer(objc_id: int, mtl_buf) -> int:
+    """Register a private-storage ``MTLBuffer`` and return its synthetic base key.
+
+    Refcounted per buffer like :func:`_metal_register_foreign_buffer` (release
+    with :func:`_metal_release_foreign_buffer`); wrapping the same buffer twice
+    yields the same key so refcounts and views stay consistent.
+    """
+    global _metal_private_next_ptr
+    with _metal_buffer_lock:
+        ptr = _metal_private_keys.get(objc_id)
+        if ptr is None:
+            nbytes = int(_metal_buffer_length(mtl_buf) or 0)
+            # Page-round and leave a guard page so neighbouring keys never
+            # bisect into each other's extent.
+            span = ((nbytes + 4095) & ~4095) + 4096
+            for i, (free_ptr, free_span) in enumerate(_metal_private_free):
+                if free_span >= span:
+                    ptr, span = free_ptr, free_span
+                    del _metal_private_free[i]
+                    break
+            if ptr is None:
+                ptr = _metal_private_next_ptr
+                if ptr + span >= _METAL_PRIVATE_PTR_LIMIT:
+                    raise RuntimeError("Exhausted the synthetic key space for private-storage Metal buffers")
+                _metal_private_next_ptr = ptr + span
+            _metal_private_keys[objc_id] = ptr
+            _metal_private_owners[ptr] = objc_id
+            _metal_private_spans[ptr] = span
+        n = _metal_foreign_refcounts.get(ptr, 0)
+        _metal_foreign_refcounts[ptr] = n + 1
+        if n == 0:
+            _metal_buffer_registry[ptr] = mtl_buf
+            _metal_index_buffer(ptr, mtl_buf)
+    return ptr
+
+
+def _metal_private_copy(dispatcher, dst_ptr: int, src_ptr: int, nbytes: int) -> None:
+    """``wp.copy`` where at least one side is a private-storage Metal buffer.
+
+    Both sides registered: a GPU dispatch (orders after queued kernels). One
+    side host memory: stage through a transient shared-storage buffer, since
+    the private side has no host address.
+    """
+    src_buf, src_off = _metal_find_buffer(src_ptr)
+    dst_buf, dst_off = _metal_find_buffer(dst_ptr)
+    if src_buf is not None and dst_buf is not None:
+        dispatcher.device_copy(dst_buf, src_buf, nbytes, dst_off, src_off)
+        return
+    if (src_buf is None and _metal_is_private_ptr(src_ptr)) or (dst_buf is None and _metal_is_private_ptr(dst_ptr)):
+        raise RuntimeError("wp.copy: private-storage Metal buffer is no longer registered (its owner was released)")
+    stage, stage_ptr = dispatcher.alloc(nbytes)
+    if src_buf is None:
+        # host -> private: the dispatch retains ``stage`` until the GPU is done.
+        ctypes.memmove(stage_ptr, src_ptr, nbytes)
+        dispatcher.device_copy(dst_buf, stage, nbytes, dst_off, 0)
+    else:
+        # private -> host
+        dispatcher.device_copy(stage, src_buf, nbytes, 0, src_off)
+        dispatcher.sync()
+        ctypes.memmove(dst_ptr, stage_ptr, nbytes)
 
 
 def _metal_host_copy_forced() -> bool:
@@ -5579,7 +5669,7 @@ def _metal_host_memset(ptr, value, nbytes):
         from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
 
         disp = get_dispatcher()
-        if disp._record_state is not None:
+        if disp._record_state is not None or _metal_is_private_ptr(ptr):
             if not ptr or nbytes <= 0:
                 return True
             buf, off = _metal_find_buffer(ptr)
@@ -5601,7 +5691,7 @@ def _metal_host_memtile(ptr, src_ptr, srcsize, reps):
         from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
 
         disp = get_dispatcher()
-        if disp._record_state is not None:
+        if disp._record_state is not None or _metal_is_private_ptr(ptr):
             if not ptr or srcsize <= 0 or reps <= 0:
                 return None
             buf, off = _metal_find_buffer(ptr)
@@ -15016,6 +15106,12 @@ def copy(
                             )
                         dispatcher.device_copy(dst_buf, src_buf, bytes_to_copy, dst_off, src_off)
                         result = True
+                    elif _metal_is_private_ptr(src_ptr) or _metal_is_private_ptr(dst_ptr):
+                        # A wrapped private-storage buffer (Torch MPS tensor)
+                        # has no host address: copy on the GPU, staging
+                        # through shared memory when the other side is host.
+                        _metal_private_copy(dispatcher, dst_ptr, src_ptr, bytes_to_copy)
+                        result = True
                     elif (
                         getattr(src.device, "is_metal", False)
                         and getattr(dest.device, "is_metal", False)
@@ -15157,6 +15253,13 @@ def copy(
                         "wp.copy of a non-contiguous Metal array is not supported inside a "
                         "Metal graph capture — the strided transfer runs on the host and would "
                         "not be replayed. Move it outside the capture region."
+                    )
+                if _metal_is_private_ptr(getattr(src, "ptr", 0)) or _metal_is_private_ptr(getattr(dest, "ptr", 0)):
+                    raise RuntimeError(
+                        "wp.copy of a non-contiguous view of a private-storage Metal buffer "
+                        "(e.g. a wrapped Torch MPS tensor) is not supported — the strided copy "
+                        "runs on the host and the buffer has no host address. Copy a contiguous "
+                        "view instead, or .contiguous() the tensor before wrapping it."
                     )
                 dispatcher.sync()
             result = runtime.core.wp_array_copy_host(dst_ptr, src_ptr, dst_type, src_type, src_elem_size)

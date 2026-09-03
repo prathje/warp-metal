@@ -7697,12 +7697,10 @@ class TestMetalTorchInterop(unittest.TestCase):
                 wp.synchronize_device(dev)
                 np.testing.assert_allclose(a.numpy(), src * 4)
 
-                # Torch-owned MPS tensors use private storage -> clear error
-                try:
-                    wp.from_torch(torch.zeros(8, device='mps'))
-                    raise AssertionError('expected RuntimeError')
-                except RuntimeError as e:
-                    assert 'private storage' in str(e), e
+                # Torch-owned MPS tensors (private storage) wrap under a
+                # synthetic key -- see test_from_torch_private_storage
+                pw = wp.from_torch(torch.zeros(8, device='mps'))
+                assert ctx._metal_is_private_ptr(pw.ptr), hex(pw.ptr)
 
                 # torch consumes Warp's kDLMetal capsule directly too
                 t2 = torch.from_dlpack(wp.to_dlpack(a))
@@ -7721,6 +7719,189 @@ class TestMetalTorchInterop(unittest.TestCase):
             """
         )
         _run_with_metal_enabled(self, snippet, timeout=120)
+
+    def test_from_torch_private_storage(self):
+        """Torch-owned MPS tensors live in private-storage MTLBuffers with no
+        host address. They wrap under a synthetic pointer key: kernels bind
+        them in place (reads and writes visible on both sides after a sync),
+        while ``numpy()``, ``fill_``, and host copies stage through the GPU.
+        Non-host-capable paths (strided copies, wp.utils host ops, BVH
+        builds) refuse with a clear error instead of dereferencing the key."""
+        snippet = textwrap.dedent(
+            """
+            import gc
+            import numpy as np
+            import torch
+            import warp._src.context as ctx
+
+            dev = 'metal:0'
+            if not wp.config.metal_native_dispatch:
+                raise SystemExit(0)
+
+            @wp.kernel
+            def scale_into(a: wp.array(dtype=wp.float32), b: wp.array(dtype=wp.float32)):
+                i = wp.tid()
+                b[i] = a[i] * 3.0
+
+            @wp.kernel
+            def add_one(a: wp.array(dtype=wp.float32)):
+                i = wp.tid()
+                a[i] = a[i] + 1.0
+
+            src = np.arange(64, dtype=np.float32)
+            t = torch.tensor(src, device='mps')  # Torch-owned -> private storage
+            a = wp.from_torch(t)
+            assert ctx._metal_is_private_ptr(a.ptr), hex(a.ptr)
+            assert a.ptr > 0x7FFFFFFFFFFF, hex(a.ptr)
+
+            # kernel reads the private buffer
+            out = wp.zeros(64, dtype=wp.float32, device=dev)
+            wp.launch(scale_into, dim=64, inputs=[a, out], device=dev)
+            np.testing.assert_allclose(out.numpy(), src * 3)
+            # numpy() stages private -> host through the GPU
+            np.testing.assert_allclose(a.numpy(), src)
+            # kernel writes land in the tensor (zero-copy) ...
+            wp.launch(add_one, dim=64, inputs=[a], device=dev)
+            wp.synchronize_device(dev)
+            np.testing.assert_allclose(t.cpu().numpy(), src + 1)
+            # ... and Torch writes are visible to Warp
+            t.add_(10.0)
+            torch.mps.synchronize()
+            np.testing.assert_allclose(a.numpy(), src + 11)
+
+            # fill_/zero_ and host -> private copies go through the GPU
+            a.fill_(2.0)
+            wp.synchronize_device(dev)
+            np.testing.assert_allclose(t.cpu().numpy(), 2.0)
+            a.assign(np.full(64, 7.0, dtype=np.float32))
+            wp.synchronize_device(dev)
+            np.testing.assert_allclose(t.cpu().numpy(), 7.0)
+            a.zero_()
+            wp.synchronize_device(dev)
+            assert not t.cpu().numpy().any()
+
+            # Metal <-> private copies are plain GPU copies
+            w = wp.array(src * 5, dtype=wp.float32, device=dev)
+            wp.copy(a, w)
+            wp.synchronize_device(dev)
+            np.testing.assert_allclose(t.cpu().numpy(), src * 5)
+            w2 = wp.zeros(64, dtype=wp.float32, device=dev)
+            wp.copy(w2, a)
+            np.testing.assert_allclose(w2.numpy(), src * 5)
+
+            # storage_offset views bind at a byte offset into the same buffer
+            av = wp.from_torch(t[16:48])
+            assert av.ptr == a.ptr + 64 and av.shape == (32,), (hex(av.ptr), av.shape)
+            np.testing.assert_allclose(av.numpy(), src[16:48] * 5)
+            wp.launch(add_one, dim=32, inputs=[av], device=dev)
+            wp.synchronize_device(dev)
+            expect = src * 5
+            expect[16:48] += 1
+            np.testing.assert_allclose(t.cpu().numpy(), expect)
+
+            # to_torch of the wrapper is a live MPS view of the same buffer
+            tt = wp.to_torch(a)
+            assert tt.device.type == 'mps'
+            np.testing.assert_allclose(tt.cpu().numpy(), expect)
+
+            # vector dtypes, 2-D tensors, and the DLPack import path
+            t2 = torch.randn(10, 3, device='mps')
+            v = wp.from_torch(t2, dtype=wp.vec3)
+            assert v.shape == (10,)
+            np.testing.assert_allclose(v.numpy(), t2.cpu().numpy())
+            d = wp.from_dlpack(t2)
+            assert d.shape == (10, 3) and ctx._metal_is_private_ptr(d.ptr)
+            np.testing.assert_allclose(d.numpy(), t2.cpu().numpy())
+
+            # the same tensor re-wraps to the same key; the registration
+            # survives until the LAST wrapper dies, then the key is released
+            a2 = wp.from_torch(t)
+            assert a2.ptr == a.ptr
+            del a2
+            gc.collect()
+            assert ctx._metal_get_buffer(a.ptr) is not None
+            key = a.ptr
+            del a, av, tt
+            gc.collect()
+            assert ctx._metal_get_buffer(key) is None, 'private key still registered'
+            t3 = torch.zeros(64, device='mps')
+            a3 = wp.from_torch(t3)
+            assert ctx._metal_is_private_ptr(a3.ptr)
+
+            # paths that must run on the host refuse clearly
+            t4 = torch.zeros(8, 8, device='mps')
+            a4 = wp.from_torch(t4)
+            try:
+                wp.copy(a4[:, 1:3], wp.zeros((8, 2), dtype=wp.float32, device=dev))
+                raise AssertionError('expected RuntimeError')
+            except RuntimeError as e:
+                assert 'private-storage' in str(e), e
+            try:
+                wp.utils.array_sum(a3)
+                raise AssertionError('expected RuntimeError')
+            except RuntimeError as e:
+                assert 'private-storage' in str(e), e
+            print('private-storage interop OK')
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=180)
+
+    def test_from_torch_private_storage_gradients(self):
+        """``requires_grad`` on a private-storage tensor: an absent ``.grad``
+        is allocated in Warp and attached to the tensor as a zero-copy view;
+        an existing ``.grad`` (private) is wrapped. Adjoint launches then
+        write gradients Torch can read."""
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+            import torch
+            import warp._src.context as ctx
+
+            dev = 'metal:0'
+            if not wp.config.metal_native_dispatch:
+                raise SystemExit(0)
+
+            @wp.func
+            def rosenbrock(x: float, y: float):
+                return (1.0 - x) ** 2.0 + 100.0 * (y - x**2.0) ** 2.0
+
+            @wp.kernel
+            def eval_rosenbrock(xs: wp.array(dtype=wp.vec2), z: wp.array(dtype=float)):
+                i = wp.tid()
+                x = xs[i]
+                z[i] = rosenbrock(x[0], x[1])
+
+            N = 256
+            rng = np.random.default_rng(3)
+            xy_np = rng.normal(size=(N, 2)).astype(np.float32)
+            x, y = xy_np[:, 0], xy_np[:, 1]
+            ref = np.stack([-2.0 * (1.0 - x) - 400.0 * x * (y - x * x), 200.0 * (y - x * x)], axis=1)
+
+            def run(preset_grad):
+                xy = torch.tensor(xy_np, device='mps', requires_grad=True)
+                if preset_grad:
+                    xy.grad = torch.zeros_like(xy)
+                a = wp.from_torch(xy, dtype=wp.vec2, requires_grad=True)
+                assert ctx._metal_is_private_ptr(a.ptr)
+                assert a.grad is not None and xy.grad is not None
+                assert xy.grad.device.type == 'mps' and xy.grad.shape == xy.shape
+                z = wp.zeros(N, dtype=float, requires_grad=True, device=dev)
+                tape = wp.Tape()
+                with tape:
+                    wp.launch(eval_rosenbrock, dim=N, inputs=[a], outputs=[z], device=dev)
+                z.grad.fill_(1.0)
+                tape.backward()
+                wp.synchronize_device(dev)
+                np.testing.assert_allclose(a.grad.numpy(), ref, rtol=1e-4, atol=1e-3)
+                # Torch sees the same gradient through its own .grad tensor
+                np.testing.assert_allclose(xy.grad.cpu().numpy(), ref, rtol=1e-4, atol=1e-3)
+
+            run(preset_grad=False)  # Warp-allocated grad attached as xy.grad
+            run(preset_grad=True)   # existing private-storage grad wrapped
+            print('private-storage gradients OK')
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=180)
 
 
 @unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")

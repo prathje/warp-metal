@@ -73,6 +73,11 @@
 - Raise a `MetalCodegenError` for `wp.tile_extract(t, wp.block_dim() - 1)` on Metal devices instead of returning
   the wrong element. A launch-tiled kernel runs as one thread per tile there, so `wp.block_dim()` is 1 and the
   index reads the first element of the tile rather than the last. Index with the tile's own extent instead.
+- Support wrapping Torch-owned MPS tensors with `wp.from_torch()` and `wp.from_dlpack()` on Metal devices. Torch's
+  MPS allocator uses private-storage `MTLBuffer`s with no host address; Warp now binds them to kernels in place
+  (including `storage_offset()` views) and stages `numpy()`, `fill_()`, and host copies through the GPU.
+  `requires_grad=True` follows the CUDA path, attaching a Warp-allocated gradient to the tensor as `t.grad`.
+  `core/example_torch` runs on Metal.
 
 ### Fixed
 

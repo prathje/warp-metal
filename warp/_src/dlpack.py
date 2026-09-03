@@ -411,15 +411,17 @@ def _dtype_name(dl_dtype: DLDataType) -> str:
     return name
 
 
-def _map_metal_dltensor(dlt: DLTensor) -> int:
-    """Resolve a ``kDLMetal`` DLTensor to a host address and register its buffer.
+def _map_metal_dltensor(dlt: DLTensor) -> tuple[int, int]:
+    """Resolve a ``kDLMetal`` DLTensor to ``(array_ptr, base_key)`` and register its buffer.
 
     Per the ``kDLMetal`` convention (shared with Torch MPS), ``dlt.data`` is an
     ObjC ``id<MTLBuffer>``. Shared-storage buffers are host-addressable on Apple
-    unified memory; the returned address doubles as the Warp array pointer and
-    the key under which the buffer is registered for native-dispatch launches.
+    unified memory and are keyed by that address; private-storage buffers
+    (Torch's own MPS allocations) are keyed by a synthetic pointer (see
+    ``_metal_register_private_buffer``) and only reachable from kernels and
+    GPU-staged host operations. ``array_ptr`` is ``base_key + byte_offset``.
     The caller must pair the registration with
-    ``_metal_release_foreign_buffer`` when the wrapping array dies.
+    ``_metal_release_foreign_buffer(base_key)`` when the wrapping array dies.
     """
     import numpy as np  # noqa: PLC0415
 
@@ -430,28 +432,26 @@ def _map_metal_dltensor(dlt: DLTensor) -> int:
         )
     import objc  # noqa: PLC0415
 
-    mtl_buf = objc.objc_object(c_void_p=dlt.data)
+    objc_id = int(dlt.data)
+    mtl_buf = objc.objc_object(c_void_p=objc_id)
     try:
         storage_mode = int(mtl_buf.storageMode())
         buf_nbytes = int(mtl_buf.length())
     except Exception as e:
         raise RuntimeError("Metal DLPack tensor's data field could not be interpreted as an MTLBuffer") from e
-    if storage_mode != 0:  # MTLStorageModeShared
+    byte_offset = int(dlt.byte_offset)
+    if byte_offset >= buf_nbytes:
         raise RuntimeError(
-            "Cannot import this Metal DLPack tensor: its MTLBuffer does not use shared "
-            "storage, so its bytes are not host-addressable. (Torch MPS tensors allocate "
-            "private storage — allocate in Warp instead and view the array in Torch via "
-            "wp.to_torch, which is zero-copy on the native Metal dispatch path.)"
+            f"Cannot import this Metal DLPack tensor: byte_offset {byte_offset} lies beyond its "
+            f"{buf_nbytes}-byte MTLBuffer."
         )
-    if dlt.byte_offset != 0:
-        raise RuntimeError(
-            "Cannot import a Metal DLPack tensor with a non-zero byte_offset — Metal "
-            "kernel launches bind whole MTLBuffers. Import the base tensor instead."
-        )
-    mv = mtl_buf.contents().as_buffer(buf_nbytes)
-    addr = int(np.frombuffer(mv, dtype=np.uint8).__array_interface__["data"][0])
-    warp._src.context._metal_register_foreign_buffer(addr, mtl_buf)
-    return addr
+    if storage_mode == 0:  # MTLStorageModeShared
+        mv = mtl_buf.contents().as_buffer(buf_nbytes)
+        base = int(np.frombuffer(mv, dtype=np.uint8).__array_interface__["data"][0])
+        warp._src.context._metal_register_foreign_buffer(base, mtl_buf)
+    else:
+        base = warp._src.context._metal_register_private_buffer(objc_id, mtl_buf)
+    return base + byte_offset, base
 
 
 def _unpack_array(dlt: DLTensor, dtype=None):
@@ -513,8 +513,7 @@ def _unpack_array(dlt: DLTensor, dtype=None):
     data_ptr = dlt.data
     metal_foreign_ptr = None
     if dlt.device.device_type.value == DLDeviceType.kDLMetal:
-        data_ptr = _map_metal_dltensor(dlt)
-        metal_foreign_ptr = data_ptr
+        data_ptr, metal_foreign_ptr = _map_metal_dltensor(dlt)
 
     a = warp._src.types.array(
         ptr=data_ptr, dtype=dtype, shape=shape, strides=strides, copy=False, device=device, pinned=pinned
