@@ -7718,6 +7718,40 @@ class Volume:
             raise RuntimeError(
                 "voxel_points must be contiguous and either a 1D Warp array of vec3f or vec3i or a 2D n-by-3 array of int32 or float32."
             )
+        if getattr(device, "is_metal", False):
+            # No native NanoVDB builder for Metal: assemble the grid with NumPy
+            # (see warp/_src/nanovdb_builder.py) and upload it to ``device``.
+            if (
+                rebuildable
+                or max_active_voxels is not None
+                or max_leaf_nodes is not None
+                or max_lower_nodes is not None
+                or max_upper_nodes is not None
+                or status is not None
+                or point_mask is not None
+            ):
+                raise NotImplementedError(
+                    "Volume.allocate_by_voxels() on Metal devices does not support rebuildable volumes, "
+                    "rebuild capacities, status, or point_mask yet."
+                )
+            from warp._src.nanovdb_builder import build_onindex_grid  # noqa: PLC0415
+
+            in_world_space = type_scalar_type(voxel_points.dtype) is float32
+            transform_buf, translation_buf = Volume._fill_transform_buffers(voxel_size, translation, transform)
+            pts = voxel_points.numpy().reshape(-1, 3)
+            mat = np.frombuffer(transform_buf, dtype=np.float32).reshape(3, 3).astype(np.float64)
+            trans = np.frombuffer(translation_buf, dtype=np.float32).astype(np.float64)
+            if in_world_space:
+                # Same as the CUDA path: apply the inverse map in float32, then floor.
+                inv = np.linalg.inv(mat).astype(np.float32)
+                ijk = np.floor((pts.astype(np.float32) - trans.astype(np.float32)) @ inv.T).astype(np.int32)
+            else:
+                ijk = pts.astype(np.int32)
+            grid = array(build_onindex_grid(ijk, mat, trans), dtype=uint8, device=device)
+            volume = cls(grid, copy=False)
+            volume._grid_array = grid  # aliased, so keep the storage alive with the volume
+            return volume
+
         if voxel_points.device != device:
             voxel_points = voxel_points.to(device)
 
