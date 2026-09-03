@@ -7742,9 +7742,11 @@ class Volume:
             mat = np.frombuffer(transform_buf, dtype=np.float32).reshape(3, 3).astype(np.float64)
             trans = np.frombuffer(translation_buf, dtype=np.float32).astype(np.float64)
             if in_world_space:
-                # Same as the CUDA path: apply the inverse map in float32, then floor.
+                # Same as NanoVDB's PointsToGrid: apply the inverse map in float32,
+                # then round to the NEAREST voxel (``Vec3::round`` = floor(x + 0.5)).
                 inv = np.linalg.inv(mat).astype(np.float32)
-                ijk = np.floor((pts.astype(np.float32) - trans.astype(np.float32)) @ inv.T).astype(np.int32)
+                uvw = (pts.astype(np.float32) - trans.astype(np.float32)) @ inv.T
+                ijk = np.floor(uvw + np.float32(0.5)).astype(np.int32)
             else:
                 ijk = pts.astype(np.int32)
             grid = array(build_onindex_grid(ijk, mat, trans), dtype=uint8, device=device)

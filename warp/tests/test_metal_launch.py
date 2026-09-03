@@ -9054,14 +9054,15 @@ class TestMetalVolume(unittest.TestCase):
                 i = wp.tid()
                 p = pts[i]
                 u = wp.volume_world_to_index(vol, p)
-                idx[i] = wp.volume_lookup_index(vol, int(wp.floor(u[0])), int(wp.floor(u[1])), int(wp.floor(u[2])))
+                idx[i] = wp.volume_lookup_index(vol, int(wp.round(u[0])), int(wp.round(u[1])), int(wp.round(u[2])))
                 s[i] = wp.volume_sample_index(vol, u, wp.Volume.LINEAR, data, -1.0)
                 w[i] = wp.volume_index_to_world(vol, u)
 
             rng = np.random.default_rng(0)
             world = rng.uniform(-3.0, 3.0, size=(4000, 3)).astype(np.float32)
             vs, tr = 0.1, (0.5, -0.25, 1.0)
-            ijk = np.floor((world - np.float32(tr)) / np.float32(vs)).astype(np.int32)
+            # World-space points map to the NEAREST voxel (NanoVDB PointsToGrid semantics).
+            ijk = np.floor((world - np.float32(tr)) / np.float32(vs) + np.float32(0.5)).astype(np.int32)
             res = {}
             for dev in ("cpu", "metal:0"):
                 with wp.ScopedDevice(dev):
