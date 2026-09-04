@@ -264,6 +264,11 @@ still *stored* as 8-byte IEEE-754 doubles — host-side ``numpy()`` round-trips
 are unchanged — but every value is converted to ``float32`` when a kernel reads
 it and back when a kernel writes it, so all arithmetic happens at single
 precision. Warp emits a warning the first time a kernel is generated this way.
+``float64`` kernel parameters, tiles, and vector/matrix values demote the same
+way. With native dispatch (the default), ``wp.atomic_add``/``sub``/``min``/``max``
+on a demoted array element are emulated with a per-element lock, since Metal
+has no 64-bit atomics; they are exact in ``float32`` but much slower than a
+native atomic, and the MLX dispatch path still rejects them.
 
 Enable this only when reduced precision is acceptable: it silently changes
 results relative to a CUDA or CPU run. Algorithms that chose ``float64`` for

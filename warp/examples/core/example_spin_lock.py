@@ -75,5 +75,12 @@ def test_spinlock(device):
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument("--device", type=str, default=None, help="Override the default Warp device.")
+
+    args = parser.parse_known_args()[0]
+
     wp.clear_kernel_cache()
-    test_spinlock(device="cuda")
+    test_spinlock(device=args.device)
