@@ -125,6 +125,15 @@ def get_cuda_test_devices(mode=None):
     return [d for d in devices if d.is_cuda]
 
 
+def get_metal_test_devices():
+    """Returns the Metal device when the Metal backend is enabled, else an empty list.
+
+    Metal is opt-in (``WARP_ENABLE_METAL=1``) and never part of :func:`get_test_devices`,
+    so test modules that support it add it explicitly.
+    """
+    return [d for d in wp.get_devices() if d.is_metal]
+
+
 class StreamCapture:
     def __init__(self, stream_name):
         self.stream_name = stream_name  # 'stdout' or 'stderr'

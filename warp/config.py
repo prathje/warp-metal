@@ -19,8 +19,11 @@ _wp_module_name_ = "warp.config"
 import os as _os  # noqa: E402
 
 
-def _env_flag(name: str) -> bool:
-    return _os.environ.get(name, "").strip().lower() not in ("", "0", "false", "off")
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = _os.environ.get(name, "").strip().lower()
+    if value == "":
+        return default
+    return value not in ("0", "false", "off")
 
 
 version: str = "1.14.0.dev0"
@@ -236,14 +239,16 @@ enable_metal: bool = _env_flag("WARP_ENABLE_METAL")
 Defaults to the ``WARP_ENABLE_METAL`` environment variable (unset → ``False``),
 so applications that never touch ``warp.config`` can opt in from the shell.
 
-When ``True``, Warp registers a ``"metal:0"`` device backed by Apple's Metal API
-via the `MLX <https://github.com/ml-explore/mlx>`_ runtime. Requires ``mlx`` to
-be importable; raises ``RuntimeError`` at :func:`warp.init` time if it is not.
+When ``True``, Warp registers a ``"metal:0"`` device. Requires ``mlx`` to be
+importable; raises ``RuntimeError`` at :func:`warp.init` time if it is not.
+Kernels are dispatched through Apple's Metal API directly when
+``pyobjc-framework-metal`` is installed (see :data:`metal_native_dispatch`),
+and through the `MLX <https://github.com/ml-explore/mlx>`_ runtime otherwise.
 
 This setting must be assigned before :func:`warp.init` is called (or before the
-first import-driven device enumeration). The Metal backend is incomplete and
-intended for inference-only workloads — autograd, graph capture, and most of
-the kernel-builtin surface are not yet wired up.
+first import-driven device enumeration). The Metal backend is incomplete:
+Apple GPUs have no ``float64`` hardware (see :data:`metal_demote_fp64`), and
+some builtins and tile operations are not yet supported.
 """
 
 metal_demote_fp64: bool = _env_flag("WARP_METAL_DEMOTE_FP64")
@@ -265,21 +270,23 @@ results relative to a CUDA or CPU run. Algorithms that chose ``float64`` for
 conditioning reasons may converge differently or not at all.
 """
 
-metal_native_dispatch: bool = _env_flag("WARP_METAL_NATIVE_DISPATCH")
+metal_native_dispatch: bool = _env_flag("WARP_METAL_NATIVE_DISPATCH", default=True)
 """Route Metal launches through Apple's Metal API directly instead of MLX.
 
-Defaults to the ``WARP_METAL_NATIVE_DISPATCH`` environment variable (unset →
-``False``), so applications that never touch ``warp.config`` can opt in from
-the shell.
+Defaults to ``True``; set the ``WARP_METAL_NATIVE_DISPATCH`` environment
+variable to ``0`` to fall back to MLX dispatch (an A/B kill switch).
 
-Experimental. When ``True`` (and :data:`enable_metal` is also true), Warp's
-Metal backend bypasses ``mlx.core.fast.metal_kernel`` for dispatch — kernels
-write in-place into Warp-owned ``MTLBuffer``s the same way CUDA kernels
-write into ``cudaMalloc``-allocated memory. This eliminates the per-launch
-``mx.eval`` + host memcpy that the MLX path requires (≈660 µs/launch on M3)
-and is ≈30× faster on dispatch-bound workloads.
+When ``True`` (and :data:`enable_metal` is also true), Warp's Metal backend
+bypasses ``mlx.core.fast.metal_kernel`` for dispatch — kernels write in-place
+into Warp-owned ``MTLBuffer``s the same way CUDA kernels write into
+``cudaMalloc``-allocated memory. This eliminates the per-launch ``mx.eval`` +
+host memcpy that the MLX path requires (≈660 µs/launch on M3) and is ≈30x
+faster on dispatch-bound workloads. Graph capture, :class:`warp.Mesh`,
+:class:`warp.HashGrid`, :class:`warp.Volume`, and Torch/DLPack interop on
+Metal are only available on this path.
 
-Set before :func:`warp.init`. Requires ``pyobjc-framework-metal``.
+Requires ``pyobjc-framework-metal``. If it is not importable Warp warns at
+:func:`warp.init` and falls back to MLX dispatch. Set before :func:`warp.init`.
 """
 
 metal_threadgroup_tiles: bool = _os.environ.get("WARP_METAL_THREADGROUP_TILES", "").strip().lower() not in (

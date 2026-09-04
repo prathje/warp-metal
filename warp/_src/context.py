@@ -3737,12 +3737,12 @@ class MetalDefaultAllocator:
 
     Two backends, controlled by :data:`warp.config.metal_native_dispatch`:
 
-    * **MLX (default).** ``allocate`` calls ``mx.zeros`` and registers the
+    * **MLX (fallback).** ``allocate`` calls ``mx.zeros`` and registers the
       resulting ``mx.array``. The CPU-addressable pointer goes through
       ``np.array(buf, copy=False)``. The launch path uses ``mx.fast.metal_kernel``
       which always allocates fresh outputs + does a per-launch host memcpy.
 
-    * **Native.** ``allocate`` calls
+    * **Native (default).** ``allocate`` calls
       :meth:`warp._src.metal_dispatch.MetalDispatcher.alloc` which goes
       straight to ``MTLDevice newBufferWithLength`` with shared storage.
       The registered entry is the ``MTLBuffer`` itself — the launch path
@@ -4252,8 +4252,7 @@ class Device:
             )
 
         elif self.kind == "metal":
-            # Metal device (experimental — discovery only at this stage; no allocator
-            # or kernel launch wired up yet). The MLX runtime substrate is imported
+            # Metal device (experimental). The MLX runtime substrate is imported
             # lazily so that builds without ``mlx`` installed still succeed.
             try:
                 import mlx.core as mx  # noqa: PLC0415
@@ -4266,6 +4265,23 @@ class Device:
 
             if not mx.metal.is_available():
                 raise RuntimeError("Metal is not available on this system. The MLX runtime reports no Metal device.")
+
+            if warp.config.metal_native_dispatch:
+                # Native dispatch (the default) needs PyObjC's Metal bindings.
+                # Fall back to the MLX launch path rather than failing init so
+                # that ``WARP_ENABLE_METAL=1`` alone still yields a usable device.
+                try:
+                    import Metal  # noqa: PLC0415,F401
+                except ImportError:
+                    from warp._src.utils import warn  # noqa: PLC0415
+
+                    warn(
+                        "wp.config.metal_native_dispatch is enabled but 'pyobjc-framework-metal' is not "
+                        "importable; falling back to MLX dispatch. Graph capture, wp.Mesh, wp.HashGrid, "
+                        "wp.Volume, and Torch interop on Metal require native dispatch — install it with "
+                        "`uv pip install pyobjc-framework-metal`."
+                    )
+                    warp.config.metal_native_dispatch = False
 
             self.name = f"Apple Metal GPU {ordinal}"
             self.arch = 0  # MSL/Metal version not yet exposed

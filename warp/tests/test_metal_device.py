@@ -63,6 +63,7 @@ def _run_assertion_subprocess(test_case, snippet: str, timeout: int = 30):
 @unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
 @unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
 class TestMetalDevice(unittest.TestCase):
+    @unittest.skipIf(wp.config.enable_metal, "Metal backend enabled for this process (WARP_ENABLE_METAL)")
     def test_metal_not_registered_by_default(self):
         # In-process: enable_metal defaults to False, so 'metal:0' should not resolve.
         with self.assertRaises(ValueError):

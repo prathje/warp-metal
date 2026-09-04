@@ -40,6 +40,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument("--device", type=str, default=None, help="Override the default Warp device.")
     parser.add_argument(
         "--headless",
         action="store_true",
@@ -48,7 +49,7 @@ if __name__ == "__main__":
 
     args = parser.parse_known_args()[0]
 
-    with wp.ScopedDevice("cuda:0"):
+    with wp.ScopedDevice(args.device):
         rng = np.random.default_rng(42)
 
         x_h = rng.standard_normal((TILE_M, TILE_N, 2), dtype=np.float64)
