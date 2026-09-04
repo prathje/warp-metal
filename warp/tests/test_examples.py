@@ -8,6 +8,8 @@ dictionaries can be provided: test_options, test_options_cuda, and
 test_options_cpu. These are added to the command line arguments in-order, so
 if a parameter is specified in both test_options and test_options_cuda, the
 one in test_options_cuda will take precedence due to how argparse works.
+test_options_cuda applies to every GPU device, including Metal when the Metal
+backend is enabled (WARP_ENABLE_METAL=1).
 
 Generally the test_options[_cpu,_cuda] dictionaries should be used to prevent
 graphical windows from being open by the example {"headless": True} and to
@@ -36,6 +38,7 @@ import warp.tests.unittest_utils
 from warp.tests.unittest_utils import (
     USD_AVAILABLE,
     add_function_test,
+    get_metal_test_devices,
     get_selected_cuda_test_devices,
     get_selected_cuda_test_devices_with_mempool,
     get_test_devices,
@@ -75,10 +78,10 @@ def add_example_test(
         test_options_cuda = {}
 
     def run(test, device):
-        if wp.get_device(device).is_cuda:
-            options = test_options | test_options_cuda
-        else:
+        if wp.get_device(device).is_cpu:
             options = test_options | test_options_cpu
+        else:
+            options = test_options | test_options_cuda
 
         # Mark the test as skipped if Torch is not installed but required
         torch_required = options.pop("torch_required", False)
@@ -89,6 +92,8 @@ def add_example_test(
                 if wp.get_device(device).is_cuda and not torch.cuda.is_available():
                     # Ensure torch has CUDA support
                     test.skipTest("Torch not compiled with CUDA support")
+                if wp.get_device(device).is_metal and not torch.backends.mps.is_available():
+                    test.skipTest("Torch not compiled with MPS support")
 
             except Exception as e:
                 test.skipTest(f"{e}")
@@ -184,7 +189,11 @@ def add_example_test(
 
 cuda_test_devices = get_selected_cuda_test_devices(mode="basic")  # Don't test on multiple GPUs to save time
 cuda_test_devices_with_mempool = get_selected_cuda_test_devices_with_mempool(mode="basic")
-test_devices = get_test_devices(mode="basic")
+metal_test_devices = get_metal_test_devices()  # Empty unless the Metal backend is enabled
+gpu_test_devices = cuda_test_devices + metal_test_devices
+test_devices = get_test_devices(mode="basic") + metal_test_devices
+# Apple GPUs have no float64 hardware, so examples that depend on it never run on Metal
+fp64_test_devices = [d for d in test_devices if not d.is_metal]
 
 # NOTE: To give the parallel test runner more opportunities to parallelize test cases,
 # we break up the tests into multiple TestCase classes
@@ -260,7 +269,7 @@ add_example_test(TestCoreExamples, name="core.example_wave", devices=test_device
 add_example_test(
     TestCoreExamples,
     name="core.example_fft_poisson_navier_stokes_2d",
-    devices=cuda_test_devices,
+    devices=gpu_test_devices,
     test_options={"headless": True, "num_steps": 100, "sim_substeps": 10},
 )
 add_example_test(
@@ -305,7 +314,7 @@ add_example_test(
 add_example_test(
     TestOptimExamples,
     name="optim.example_fluid_checkpoint",
-    devices=cuda_test_devices_with_mempool,
+    devices=cuda_test_devices_with_mempool + metal_test_devices,
     test_options={"headless": True, "train_iters": 5, "num_frames": 301, "pillow_required": True},
 )
 add_example_test(
@@ -325,13 +334,13 @@ add_example_test(
 add_example_test(
     TestOptimExamples,
     name="optim.example_particle_repulsion",
-    devices=cuda_test_devices,
+    devices=gpu_test_devices,
     test_options={"headless": True, "num_frames": 100},
 )
 add_example_test(
     TestOptimExamples,
     name="optim.example_navier_stokes_perturbation",
-    devices=cuda_test_devices_with_mempool,
+    devices=cuda_test_devices_with_mempool + metal_test_devices,
     test_options={"headless": True, "train_iters": 5, "lead_steps": 5, "spin_up_steps": 10},
 )
 
@@ -349,7 +358,7 @@ add_example_test(
 add_example_test(
     TestTileExamples,
     name="tile.example_tile_cholesky",
-    devices=test_devices,
+    devices=fp64_test_devices,
     test_options={"headless": True},
 )
 add_example_test(
@@ -373,7 +382,7 @@ add_example_test(
 add_example_test(
     TestTileExamples,
     name="tile.example_tile_matmul",
-    devices=test_devices,
+    devices=fp64_test_devices,
     test_options={"headless": True},
 )
 add_example_test(
@@ -387,7 +396,7 @@ add_example_test(
 add_example_test(
     TestTileExamples,
     name="tile.example_tile_mlp",
-    devices=cuda_test_devices,
+    devices=gpu_test_devices,
     test_options_cuda={"train_iters": 10, "headless": True},
 )
 add_example_test(
@@ -399,7 +408,7 @@ add_example_test(
 add_example_test(
     TestTileExamples,
     name="tile.example_tile_stream_compaction",
-    devices=cuda_test_devices,
+    devices=gpu_test_devices,
 )
 
 

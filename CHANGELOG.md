@@ -186,6 +186,13 @@
   NumPy, so `warp.fem`'s `Nanogrid` and `AdaptiveNanogrid` geometries work there. Rebuildable volumes, rebuild
   capacities, `status` and `point_mask` are not supported on Metal; `Volume.allocate()` and
   `Volume.allocate_by_tiles()` remain unsupported on Metal.
+- Dispatch Metal kernels through Apple's Metal API by default: `wp.config.metal_native_dispatch` now defaults to
+  `True` (set `WARP_METAL_NATIVE_DISPATCH=0` to keep MLX dispatch), so `WARP_ENABLE_METAL=1` alone enables graph
+  capture, `wp.Mesh`, `wp.HashGrid`, `wp.Volume` and Torch interop. Warp warns and falls back to MLX dispatch when
+  `pyobjc-framework-metal` is not installed.
+- Run the example test suites (`warp.tests.test_examples` and `warp.tests.fem.test_fem_examples`) on the Metal
+  device when the Metal backend is enabled, skipping the examples that depend on `float64`. `tile/example_tile_fft`,
+  `tile/example_tile_convolution` and `tile/example_tile_filtering` accept `--device` instead of assuming `cuda:0`.
 
 ## [1.18.0] - 2026-10-05
 

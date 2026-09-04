@@ -4,8 +4,9 @@
 """Test warp.fem examples with unittest.
 
 Registers FEM examples as test cases that run each example as a subprocess.
-Currently all examples are restricted to CUDA devices only; CPU device
-testing might be phased in later.
+Currently all examples are restricted to GPU devices (CUDA, plus Metal when the
+Metal backend is enabled with WARP_ENABLE_METAL=1); CPU device testing might be
+phased in later.
 """
 
 import os
@@ -21,6 +22,7 @@ from warp._src.utils import check_p2p
 from warp.tests.unittest_utils import (
     USD_AVAILABLE,
     add_function_test,
+    get_metal_test_devices,
     get_selected_cuda_test_devices,
     get_selected_cuda_test_devices_with_mempool,
     sanitize_identifier,
@@ -55,10 +57,10 @@ def add_fem_example_test(
         test_options_cuda = {}
 
     def run(test, device):
-        if wp.get_device(device).is_cuda:
-            options = test_options | test_options_cuda
-        else:
+        if wp.get_device(device).is_cpu:
             options = test_options | test_options_cpu
+        else:
+            options = test_options | test_options_cuda
 
         # Mark the test as skipped if NLopt is not installed but required
         nlopt_required = options.pop("nlopt_required", False)
@@ -148,6 +150,8 @@ def add_fem_example_test(
 
 cuda_devices = get_selected_cuda_test_devices(mode="basic")
 cuda_devices_with_mempool = get_selected_cuda_test_devices_with_mempool(mode="basic")
+metal_devices = get_metal_test_devices()  # Metal is only present when the backend is enabled
+gpu_devices = cuda_devices + metal_devices
 
 
 class TestFemExamples(unittest.TestCase):
@@ -170,7 +174,7 @@ if check_p2p():
 add_fem_example_test(
     TestFemExamples,
     name="fem.example_apic_fluid",
-    devices=cuda_devices_with_mempool,
+    devices=cuda_devices_with_mempool + metal_devices,
     test_options={"num_frames": 5, "voxel_size": 2.0, "stage_path": None},
 )
 add_fem_example_test(
@@ -182,57 +186,58 @@ add_fem_example_test(
 add_fem_example_test(
     TestFemExamples,
     name="fem.example_adaptive_grid",
-    devices=cuda_devices,
+    devices=gpu_devices,
     test_options={"headless": True, "div_conforming": True},
 )
 add_fem_example_test(
     TestFemDiffusionExamples,
     name="fem.example_diffusion",
-    devices=cuda_devices,
+    devices=gpu_devices,
     test_options={"resolution": 10, "mesh": "tri", "headless": True},
 )
 add_fem_example_test(
     TestFemDiffusionExamples,
     name="fem.example_diffusion_3d",
-    devices=cuda_devices,
+    devices=gpu_devices,
     test_options={"headless": True},
 )
 add_fem_example_test(
     TestFemExamples,
     name="fem.example_deformed_geometry",
-    devices=cuda_devices,
+    devices=gpu_devices,
     test_options={"resolution": 10, "mesh": "tri", "headless": True},
 )
 add_fem_example_test(
     TestFemExamples,
     name="fem.example_convection_diffusion",
-    devices=cuda_devices,
+    devices=gpu_devices,
     test_options={"resolution": 20, "headless": True},
 )
 add_fem_example_test(
     TestFemExamples,
     name="fem.example_burgers",
-    devices=cuda_devices,
+    devices=gpu_devices,
     test_options={"resolution": 20, "num_frames": 25, "degree": 1, "headless": True},
 )
 add_fem_example_test(
     TestFemExamples,
     name="fem.example_convection_diffusion_dg",
-    devices=cuda_devices,
+    devices=gpu_devices,
     test_options={"resolution": 20, "num_frames": 25, "headless": True},
 )
 add_fem_example_test(
     TestFemExamples,
     name="fem.example_mixed_elasticity",
-    devices=cuda_devices,
+    devices=gpu_devices,
     test_options={"nonconforming_stresses": True, "mesh": "quad", "headless": True},
 )
 add_fem_example_test(
     TestFemExamples,
     name="fem.example_stokes_transfer",
-    devices=cuda_devices,
+    devices=gpu_devices,
     test_options={"headless": True},
 )
+# The Stokes, Navier-Stokes and Taylor-Green examples assemble in float64, which Apple GPUs lack
 add_fem_example_test(
     TestFemExamples,
     name="fem.example_stokes",
@@ -248,37 +253,37 @@ add_fem_example_test(
 add_fem_example_test(
     TestFemExamples,
     name="fem.example_streamlines",
-    devices=cuda_devices,
+    devices=gpu_devices,
     test_options={"headless": True},
 )
 add_fem_example_test(
     TestFemExamples,
     name="fem.example_distortion_energy",
-    devices=cuda_devices,
+    devices=gpu_devices,
     test_options={"headless": True, "resolution": 16},
 )
 add_fem_example_test(
     TestFemExamples,
     name="fem.example_magnetostatics",
-    devices=cuda_devices,
+    devices=gpu_devices,
     test_options={"headless": True, "resolution": 16},
 )
 add_fem_example_test(
     TestFemExamples,
     name="fem.example_nonconforming_contact",
-    devices=cuda_devices,
+    devices=gpu_devices,
     test_options={"headless": True, "resolution": 16, "num_steps": 2},
 )
 add_fem_example_test(
     TestFemExamples,
     name="fem.example_elastic_shape_optimization",
-    devices=cuda_devices,
+    devices=gpu_devices,
     test_options={"num_iters": 5, "headless": True},
 )
 add_fem_example_test(
     TestFemExamples,
     name="fem.example_darcy_ls_optimization",
-    devices=cuda_devices,
+    devices=gpu_devices,
     test_options={"num_iters": 5, "resolution": 25, "headless": True},
 )
 add_fem_example_test(
@@ -297,19 +302,19 @@ add_fem_example_test(
 add_fem_example_test(
     TestFemExamples,
     name="fem.example_taylor_green",
-    devices=cuda_devices_with_mempool,
+    devices=cuda_devices_with_mempool + metal_devices,
     test_options={"num_frames": 10, "resolution": 10, "headless": True},
 )
 add_fem_example_test(
     TestFemExamples,
     name="fem.example_shallow_water",
-    devices=cuda_devices_with_mempool,
+    devices=cuda_devices_with_mempool + metal_devices,
     test_options={"num_frames": 10, "resolution": 10, "headless": True},
 )
 add_fem_example_test(
     TestFemExamples,
     name="fem.example_kelvin_helmholtz",
-    devices=cuda_devices_with_mempool,
+    devices=cuda_devices_with_mempool + metal_devices,
     test_options={"num_frames": 25, "resolution": 20, "headless": True},
 )
 

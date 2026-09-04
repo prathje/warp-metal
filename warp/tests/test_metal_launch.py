@@ -42,9 +42,10 @@ def _run_with_metal_enabled(test_case, snippet: str, timeout: int = 30):
     ``@wp.kernel``-decorated functions, which fails for code passed via
     ``python -c``.
     """
-    # Allow the whole suite to be re-run under native dispatch by setting
-    # ``WARP_METAL_NATIVE_DISPATCH=1`` in the environment. The flag must
-    # be set before ``wp.init()`` so the allocator picks the right backend.
+    # Native dispatch is the default; the subprocess inherits the environment,
+    # so ``WARP_METAL_NATIVE_DISPATCH=0`` re-runs the whole suite on the MLX
+    # path. The flag must be set before ``wp.init()`` so the allocator picks
+    # the right backend.
     prefix = "import warp as wp\nwp.config.enable_metal = True\n"
     if os.environ.get("WARP_METAL_NATIVE_DISPATCH") == "1":
         prefix += "wp.config.metal_native_dispatch = True\n"
