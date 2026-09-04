@@ -152,6 +152,9 @@ cuda_devices = get_selected_cuda_test_devices(mode="basic")
 cuda_devices_with_mempool = get_selected_cuda_test_devices_with_mempool(mode="basic")
 metal_devices = get_metal_test_devices()  # Metal is only present when the backend is enabled
 gpu_devices = cuda_devices + metal_devices
+# Apple GPUs have no float64 hardware; the float64 examples run there only under the opt-in fp32 demotion
+fp64_metal_devices = [d for d in metal_devices if wp.config.metal_demote_fp64]
+fp64_gpu_devices = cuda_devices + fp64_metal_devices
 
 
 class TestFemExamples(unittest.TestCase):
@@ -237,17 +240,17 @@ add_fem_example_test(
     devices=gpu_devices,
     test_options={"headless": True},
 )
-# The Stokes, Navier-Stokes and Taylor-Green examples assemble in float64, which Apple GPUs lack
+# The Stokes, Navier-Stokes and Taylor-Green examples assemble in float64 (see ``fp64_gpu_devices``)
 add_fem_example_test(
     TestFemExamples,
     name="fem.example_stokes",
-    devices=cuda_devices,
+    devices=fp64_gpu_devices,
     test_options={"resolution": 10, "nonconforming_pressures": True, "headless": True},
 )
 add_fem_example_test(
     TestFemExamples,
     name="fem.example_navier_stokes",
-    devices=cuda_devices,
+    devices=fp64_gpu_devices,
     test_options={"num_frames": 101, "resolution": 10, "tri_mesh": True, "headless": True},
 )
 add_fem_example_test(
@@ -302,7 +305,7 @@ add_fem_example_test(
 add_fem_example_test(
     TestFemExamples,
     name="fem.example_taylor_green",
-    devices=cuda_devices_with_mempool + metal_devices,
+    devices=cuda_devices_with_mempool + fp64_metal_devices,
     test_options={"num_frames": 10, "resolution": 10, "headless": True},
 )
 add_fem_example_test(

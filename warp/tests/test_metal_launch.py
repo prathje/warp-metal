@@ -10277,15 +10277,17 @@ class TestMetalDemoteFp64(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet, timeout=120)
 
-    def test_atomic_add_into_float64_array_raises(self):
-        # Metal has no 64-bit atomics, so an 8-byte element cannot be updated
-        # atomically even under demotion. Must be a clear error, not a
-        # miscompile or a silent race.
+    def test_atomic_add_into_float64_array_raises_on_mlx_path(self):
+        # The MLX dispatch path types every output of an atomic kernel
+        # ``device atomic<T>*``, which the lock-emulated 64-bit update cannot
+        # work on, so it must stay a clear error there (native dispatch is
+        # covered by ``test_float64_atomics_match_numpy``).
         snippet = textwrap.dedent(
             """
             import numpy as np
             from warp._src.codegen_metal import MetalCodegenError
             wp.config.metal_demote_fp64 = True
+            wp.config.metal_native_dispatch = False
 
             @wp.kernel
             def k(x: wp.array(dtype=wp.float64), acc: wp.array(dtype=wp.float64)):
@@ -10300,10 +10302,197 @@ class TestMetalDemoteFp64(unittest.TestCase):
             except (MetalCodegenError, RuntimeError) as e:
                 assert '64-bit atomics' in str(e), str(e)
             else:
-                raise AssertionError('expected wp.atomic_add into a float64 array to raise')
+                raise AssertionError('expected wp.atomic_add into a float64 array to raise on the MLX path')
             """
         )
         _run_with_metal_enabled(self, snippet, timeout=120)
+
+    def test_float64_atomics_match_numpy(self):
+        # Metal has no 64-bit atomics; under native dispatch a demoted
+        # element is updated under a lock carried in its own high word
+        # (``wp_f64_atomic_*``). Heavy contention (4096 threads into 4
+        # slots) exercises the retry loop; the values are multiples of 1/8 so
+        # every fp32 partial sum is exact and the comparison can be tight.
+        # Covers scalar add/sub/min/max, vec2d and mat22d elements (expanded
+        # per component), a struct-held array, and ``wp.tile_atomic_add``.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+            wp.config.metal_demote_fp64 = True
+
+            @wp.struct
+            class Holder:
+                vals: wp.array(dtype=wp.float64)
+
+            @wp.kernel
+            def k_scalar(a: wp.array(dtype=wp.float64), v: wp.array(dtype=wp.float64)):
+                i = wp.tid()
+                wp.atomic_add(a, i % 4, v[i])
+                wp.atomic_sub(a, 4 + i % 4, v[i])
+                wp.atomic_min(a, 8 + i % 4, -v[i])
+                wp.atomic_max(a, 12 + i % 4, v[i])
+
+            @wp.kernel
+            def k_vec(a: wp.array(dtype=wp.vec2d), v: wp.array(dtype=wp.vec2d)):
+                i = wp.tid()
+                wp.atomic_add(a, i % 4, v[i])
+
+            @wp.kernel
+            def k_mat(a: wp.array(dtype=wp.mat22d), v: wp.array(dtype=wp.mat22d)):
+                i = wp.tid()
+                wp.atomic_add(a, i % 4, v[i])
+
+            @wp.kernel
+            def k_struct(h: Holder, v: wp.array(dtype=wp.float64)):
+                i = wp.tid()
+                wp.atomic_add(h.vals, i % 4, v[i])
+
+            @wp.kernel
+            def k_tile(a: wp.array(dtype=wp.float64), v: wp.array(dtype=wp.float64)):
+                t = wp.tile_load(v, shape=8, offset=0)
+                wp.tile_atomic_add(a, t, offset=0)
+
+            dev = 'metal:0'
+            n = 4096
+            vn = (np.arange(n) % 64 + 1).astype(np.float64) / 8.0
+            v = wp.array(vn, dtype=wp.float64, device=dev)
+
+            a = wp.zeros(16, dtype=wp.float64, device=dev)
+            wp.launch(k_scalar, dim=n, inputs=[a, v], device=dev)
+            got = a.numpy()
+            assert got.dtype == np.float64
+            ref = np.zeros(16)
+            for j in range(4):
+                ref[j] = vn[j::4].sum()
+                ref[4 + j] = -vn[j::4].sum()
+                ref[8 + j] = min(0.0, (-vn[j::4]).min())
+                ref[12 + j] = max(0.0, vn[j::4].max())
+            np.testing.assert_allclose(got, ref, rtol=0, atol=0)
+
+            v2 = wp.array(np.stack([vn, 2.0 * vn], 1), dtype=wp.vec2d, device=dev)
+            a2 = wp.zeros(4, dtype=wp.vec2d, device=dev)
+            wp.launch(k_vec, dim=n, inputs=[a2, v2], device=dev)
+            ref2 = np.stack([np.stack([vn[j::4].sum(), 2.0 * vn[j::4].sum()]) for j in range(4)])
+            np.testing.assert_allclose(a2.numpy(), ref2, rtol=0, atol=0)
+
+            mn = np.stack([vn, 2.0 * vn, 3.0 * vn, 4.0 * vn], 1).reshape(n, 2, 2)
+            v3 = wp.array(mn, dtype=wp.mat22d, device=dev)
+            a3 = wp.zeros(4, dtype=wp.mat22d, device=dev)
+            wp.launch(k_mat, dim=n, inputs=[a3, v3], device=dev)
+            ref3 = np.stack([mn[j::4].sum(0) for j in range(4)])
+            np.testing.assert_allclose(a3.numpy(), ref3, rtol=0, atol=0)
+
+            a4 = wp.zeros(4, dtype=wp.float64, device=dev)
+            h = Holder()
+            h.vals = a4
+            wp.launch(k_struct, dim=n, inputs=[h, v], device=dev)
+            np.testing.assert_allclose(a4.numpy(), ref[:4], rtol=0, atol=0)
+
+            a5 = wp.zeros(8, dtype=wp.float64, device=dev)
+            v5 = wp.array(np.arange(1, 9, dtype=np.float64) / 8.0, dtype=wp.float64, device=dev)
+            wp.launch_tiled(k_tile, dim=[16], inputs=[a5, v5], block_dim=1, device=dev)
+            np.testing.assert_allclose(a5.numpy(), 16.0 * v5.numpy(), rtol=0, atol=0)
+            """
+        )
+        _run_with_metal_native(self, snippet, timeout=240)
+
+    def test_float64_tiles_load_store_and_mixed_matmul(self):
+        # Float64 *tiles* are float32 tiles under demotion; only the boundary
+        # with a demoted array converts the double bits. Mirrors
+        # ``example_tile_matmul`` (float32 x float16 -> float64 accumulator,
+        # a mixed-precision ``tile_matmul``), then a vec2d tile round trip
+        # and a scalar 2-D load whose trailing block runs past the array
+        # (must zero-fill, not read the neighbouring row).
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+            wp.config.metal_demote_fp64 = True
+
+            TILE_M, TILE_N, TILE_K = 8, 4, 8
+
+            @wp.kernel
+            def gemm(A: wp.array2d(dtype=float), B: wp.array2d(dtype=wp.float16), C: wp.array2d(dtype=wp.float64)):
+                i, j = wp.tid()
+                acc = wp.tile_zeros(shape=(TILE_M, TILE_N), dtype=wp.float64)
+                for k in range(A.shape[1] // TILE_K):
+                    a = wp.tile_load(A, shape=(TILE_M, TILE_K), offset=(i * TILE_M, k * TILE_K))
+                    b = wp.tile_load(B, shape=(TILE_K, TILE_N), offset=(k * TILE_K, j * TILE_N))
+                    wp.tile_matmul(a, b, acc)
+                wp.tile_store(C, acc, offset=(i * TILE_M, j * TILE_N))
+
+            @wp.kernel
+            def vec_round_trip(x: wp.array2d(dtype=wp.vec2d), y: wp.array2d(dtype=wp.vec2d)):
+                i = wp.tid()
+                t = wp.tile_load(x, shape=(1, 8), offset=(i, 0))
+                wp.tile_store(y, t, offset=(i, 0))
+
+            @wp.kernel
+            def partial_load(x: wp.array2d(dtype=wp.float64), y: wp.array2d(dtype=wp.float64)):
+                t = wp.tile_load(x, shape=(4, 4), offset=(0, 4))
+                wp.tile_store(y, t, offset=(0, 0))
+
+            dev = 'metal:0'
+            rng = np.random.default_rng(42)
+            M, N, K = 32, 16, 64
+            A = rng.random((M, K), dtype=np.float32)
+            B = rng.random((K, N), dtype=np.float32).astype(np.float16)
+            A_wp = wp.array2d(A, dtype=float, device=dev)
+            B_wp = wp.array2d(B, dtype=wp.float16, device=dev)
+            C_wp = wp.zeros((M, N), dtype=wp.float64, device=dev)
+            wp.launch_tiled(gemm, dim=(M // TILE_M, N // TILE_N), inputs=[A_wp, B_wp, C_wp], block_dim=64, device=dev)
+            assert C_wp.numpy().dtype == np.float64
+            np.testing.assert_allclose(C_wp.numpy(), A.astype(np.float64) @ B.astype(np.float64), atol=1e-4)
+
+            # Multiples of 1/8: exact in fp32, so the truncating double->float conversion is bit-exact.
+            x = rng.integers(-64, 64, (4, 8, 2)).astype(np.float64) / 8.0
+            x_wp = wp.array2d(x, dtype=wp.vec2d, device=dev)
+            y_wp = wp.zeros((4, 8), dtype=wp.vec2d, device=dev)
+            wp.launch_tiled(vec_round_trip, dim=[4], inputs=[x_wp, y_wp], block_dim=1, device=dev)
+            np.testing.assert_allclose(y_wp.numpy(), x, rtol=0, atol=0)
+
+            p = np.arange(24, dtype=np.float64).reshape(4, 6) + 1.0
+            p_wp = wp.array2d(p, dtype=wp.float64, device=dev)
+            q_wp = wp.zeros((4, 4), dtype=wp.float64, device=dev)
+            wp.launch_tiled(partial_load, dim=[1], inputs=[p_wp, q_wp], block_dim=1, device=dev)
+            expected = np.zeros((4, 4))
+            expected[:, :2] = p[:, 4:6]
+            np.testing.assert_allclose(q_wp.numpy(), expected, rtol=0, atol=0)
+            """
+        )
+        _run_with_metal_native(self, snippet, timeout=240)
+
+    def test_float64_scalar_param_and_value_types(self):
+        # A ``wp.float64`` *kernel parameter* binds its 8 packed bytes as
+        # ``ulong`` and converts in the prologue; value-level float64 types
+        # (``wp.identity`` of doubles, ``wp.mat22d`` / ``wp.vec2d``
+        # temporaries, including inside an inlined ``@wp.func``) compute in
+        # fp32. ``warp.sparse.bsr_axpy`` on a float64 matrix takes exactly
+        # these shapes.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+            wp.config.metal_demote_fp64 = True
+
+            @wp.func
+            def scaled_identity(s: wp.float64):
+                return wp.identity(n=2, dtype=wp.float64) * s
+
+            @wp.kernel
+            def k(alpha: wp.float64, x: wp.array(dtype=wp.float64), out: wp.array(dtype=wp.vec2d)):
+                i = wp.tid()
+                m = scaled_identity(alpha)
+                v = wp.vec2d(x[i], wp.float64(2.0) * x[i])
+                out[i] = m * v
+
+            dev = 'metal:0'
+            xn = np.arange(1, 9, dtype=np.float64) / 4.0
+            x = wp.array(xn, dtype=wp.float64, device=dev)
+            out = wp.zeros(8, dtype=wp.vec2d, device=dev)
+            wp.launch(k, dim=8, inputs=[1.5, x, out], device=dev)
+            np.testing.assert_allclose(out.numpy(), 1.5 * np.stack([xn, 2.0 * xn], 1), rtol=0, atol=0)
+            """
+        )
+        _run_with_metal_native(self, snippet, timeout=180)
 
 
 @unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")

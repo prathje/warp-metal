@@ -1227,6 +1227,57 @@ inline ulong wp_f32_to_f64(float f) {
 """
 
 
+# Atomic read-modify-write on an fp32-demoted float64 element. Metal has no
+# 64-bit atomics at all (``atomic<ulong>`` has no load / CAS overload on any
+# MSL version — probed), so the 8-byte element is updated under a per-element
+# lock carried *inside the element itself*: the high word is compare-exchanged
+# from its current value to ``0x7ff7dead`` — a signalling-NaN bit pattern that
+# ``wp_f32_to_f64`` never produces (it canonicalises NaN to the quiet
+# ``0x7ff8...``) — the holder rewrites both words from a full-precision fp32
+# sum, and the final store of the real high word releases the lock. Fences
+# order the low-word traffic against the lock word (MSL atomics are relaxed
+# only). The critical section sits *inside* the retry loop, so lanes of one
+# SIMD group serialise iteration by iteration instead of deadlocking the way
+# a lock taken by a spin loop *before* its critical section does on Apple
+# GPUs (no independent forward progress — see ``example_spin_lock``).
+# Consequences worth knowing: the update is exact fp32 (no further precision
+# loss beyond the demotion itself); a plain, racing read of an element that
+# is mid-update sees the sentinel NaN for a few instructions (such a read is
+# a data race in the source program too); and ``wp.atomic_*`` on a demoted
+# element costs one CAS loop plus two fences, so it is far slower than a
+# native ``atomic_float`` fetch-add.
+_F64_ATOMIC_HELPERS = """\
+#define WP_F64_ATOMIC_LOCK 0x7ff7deadu
+#define WP_F64_ATOMIC_OP(NAME, EXPR) \\
+inline float wp_f64_atomic_##NAME(device ulong* p, float v) { \\
+    device metal::atomic_uint* hi = ((device metal::atomic_uint*)p) + 1; \\
+    device metal::atomic_uint* lo = (device metal::atomic_uint*)p; \\
+    while (true) { \\
+        uint old_hi = metal::atomic_load_explicit(hi, metal::memory_order_relaxed); \\
+        if (old_hi == WP_F64_ATOMIC_LOCK) continue; \\
+        if (metal::atomic_compare_exchange_weak_explicit(hi, &old_hi, WP_F64_ATOMIC_LOCK, \\
+                                                         metal::memory_order_relaxed, metal::memory_order_relaxed)) { \\
+            metal::atomic_thread_fence(metal::mem_flags::mem_device, metal::memory_order_seq_cst, \\
+                                       metal::thread_scope::thread_scope_device); \\
+            uint old_lo = metal::atomic_load_explicit(lo, metal::memory_order_relaxed); \\
+            float cur = wp_f64_to_f32((ulong(old_hi) << 32) | ulong(old_lo)); \\
+            ulong nb = wp_f32_to_f64((EXPR)); \\
+            metal::atomic_store_explicit(lo, uint(nb), metal::memory_order_relaxed); \\
+            metal::atomic_thread_fence(metal::mem_flags::mem_device, metal::memory_order_seq_cst, \\
+                                       metal::thread_scope::thread_scope_device); \\
+            metal::atomic_store_explicit(hi, uint(nb >> 32), metal::memory_order_relaxed); \\
+            return cur; \\
+        } \\
+    } \\
+}
+WP_F64_ATOMIC_OP(add, cur + v)
+WP_F64_ATOMIC_OP(sub, cur - v)
+WP_F64_ATOMIC_OP(min, metal::min(cur, v))
+WP_F64_ATOMIC_OP(max, metal::max(cur, v))
+#undef WP_F64_ATOMIC_OP
+"""
+
+
 # ---------------------------------------------------------------------------
 # Reverse-mode (adjoint) helpers
 #
@@ -1977,6 +2028,84 @@ def _reject_f64_atomics(text: str, arr_names: set[str], kernel_name: str) -> Non
                         f"float32 array for atomically accumulated output."
                     )
                 pos = text.find(pat, pos + 1)
+
+
+_F64_ATOMIC_NEEDLES: tuple[tuple[str, str], ...] = (
+    ("atomic_fetch_add_explicit(&", "add"),
+    ("atomic_fetch_sub_explicit(&", "sub"),
+    ("wp_atomic_min(&", "min"),
+    ("wp_atomic_max(&", "max"),
+)
+
+
+def _split_f64_atomic_call_args(text: str, start: int) -> tuple[list[str], int]:
+    """Split ``text`` from ``start`` (just past an opening paren) into the
+    call's top-level comma-separated arguments.
+
+    Returns ``(args, end)`` where ``end`` indexes the matching close paren.
+    Nested ``()``/``[]``/``<>`` are skipped so an argument such as
+    ``arr[i * shape[k] + j]`` or ``metal::min(a, b)`` stays whole.
+    """
+    args: list[str] = []
+    depth = 0
+    i = start
+    tok_start = start
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch in "([<":
+            depth += 1
+        elif ch in ")]>":
+            if depth == 0:
+                args.append(text[tok_start:i])
+                return args, i
+            depth -= 1
+        elif ch == "," and depth == 0:
+            args.append(text[tok_start:i])
+            tok_start = i + 1
+        i += 1
+    raise MetalCodegenError("MSL codegen: unbalanced parentheses while rewriting a float64 atomic")
+
+
+def _rewrite_f64_atomics(text: str, arr_names: set[str]) -> str:
+    """Route atomics on fp32-demoted float64 arrays through the lock-emulated
+    ``wp_f64_atomic_<op>`` helpers (see ``_F64_ATOMIC_HELPERS``).
+
+    Every atomic the translators emit on an array element has one of the
+    shapes in ``_F64_ATOMIC_NEEDLES`` — vector- and matrix-typed elements have
+    already been expanded to one call per scalar component, and struct-held
+    arrays carry their synthesized ``<struct>__<field>`` name — so rewriting
+    ``<needle>NAME[IDX], VAL[, memory_order_relaxed])`` to
+    ``wp_f64_atomic_<op>(&NAME[IDX], VAL)`` covers them all. The demoted
+    buffer is bound as plain ``device ulong*`` (never ``atomic<ulong>*``, see
+    the ``nonatomic_outputs`` plumbing), which is exactly the pointer type
+    the helpers take.
+    """
+    if not arr_names:
+        return text
+    for needle, op in _F64_ATOMIC_NEEDLES:
+        pos = 0
+        while True:
+            pos = text.find(needle, pos)
+            if pos < 0:
+                break
+            name_start = pos + len(needle)
+            bracket = text.find("[", name_start)
+            name = text[name_start:bracket].strip() if bracket > 0 else ""
+            if name not in arr_names:
+                pos = name_start
+                continue
+            args, end = _split_f64_atomic_call_args(text, pos + len(needle) - 1)
+            if len(args) < 2:
+                raise MetalCodegenError(
+                    f"MSL codegen: cannot rewrite float64 atomic {text[pos : end + 1]!r} (expected a target and a value)"
+                )
+            target = args[0].strip()  # ``&NAME[IDX]``
+            value = args[1].strip()
+            replacement = f"wp_f64_atomic_{op}({target}, {value})"
+            text = text[:pos] + replacement + text[end + 1 :]
+            pos += len(replacement)
+    return text
 
 
 # ``wp.normalize`` must match ``warp/native/vec.h``/``quat.h`` exactly:
@@ -7405,8 +7534,10 @@ def _build_kernel_header(source: str) -> str:
         parts.append(extract_helpers)
     if "wp_diag_float3" in source:
         parts.append(_DIAG_HELPERS)
-    if "wp_f64_to_f32" in source or "wp_f32_to_f64" in source:
+    if "wp_f64_to_f32" in source or "wp_f32_to_f64" in source or "wp_f64_atomic_" in source:
         parts.append(_F64_HELPERS)
+    if "wp_f64_atomic_" in source:
+        parts.append(_F64_ATOMIC_HELPERS)
     if "wp_adj_" in source:
         parts.append(_ADJ_HELPERS)
         for _n in _ADJ_VEC_HELPER_LENGTHS:
@@ -7910,13 +8041,111 @@ def _parse_tile_ctype(ctype: str) -> tuple[str, str, int, int] | None:
         return None
     rows = int(shape_match.group(1))
     cols = int(shape_match.group(2)) if shape_match.group(2) else 1
-    return kind, dtype_ctype, rows, cols
+    return kind, _demote_f64_ctype(dtype_ctype), rows, cols
+
+
+def _demote_f64_ctype(ctype: str) -> str:
+    """Under ``metal_demote_fp64``, a tile *element* ctype of ``wp::float64``
+    (bare or inside ``wp::vec_t<N, wp::float64>``) becomes ``wp::float32``.
+    See ``_demote_tile_f64_tokens`` for why tiles may drop the double type."""
+    if "wp::float64" not in ctype:
+        return ctype
+    import warp.config as _wp_cfg  # noqa: PLC0415
+
+    if not _wp_cfg.metal_demote_fp64:
+        return ctype
+    return ctype.replace("wp::float64", "wp::float32")
+
+
+_F64_VALUE_TOKEN_PAT = re.compile(r"wp::float64(?!\s*\*)")
+
+
+def _demote_f64_value_tokens(text: str) -> str:
+    """Under ``metal_demote_fp64``, rewrite every *value-level* ``wp::float64``
+    in a piece of IR to ``wp::float32``.
+
+    Values (scalars, ``vec_t``/``mat_t``/``quat_t`` of double, casts,
+    ``wp::identity<N, wp::float64>()`` ...) live in registers, where there is
+    nothing to preserve about the 8-byte type on a GPU without fp64: they
+    simply compute in fp32, which is what this opt-in promises. Two spellings
+    are left alone because they *are* storage: ``wp::float64*`` pointers and
+    ``wp::array_t<wp::float64>`` element types — those keep their ``ulong``
+    bit-pattern binding and convert on access (``_f64_read`` and friends).
+    """
+    if "wp::float64" not in text:
+        return text
+    import warp.config as _wp_cfg  # noqa: PLC0415
+
+    if not _wp_cfg.metal_demote_fp64:
+        return text
+
+    def _sub(m: re.Match[str]) -> str:
+        head = text[: m.start()].rstrip()
+        if head.endswith("array_t<"):
+            return m.group(0)
+        return "wp::float32"
+
+    return _F64_VALUE_TOKEN_PAT.sub(_sub, text)
+
+
+def _demote_tile_f64_tokens(text: str) -> str:
+    """Under ``metal_demote_fp64``, make float64 *tiles* float32 tiles.
+
+    A tile lives in registers / threadgroup memory, never in user-visible
+    storage, so a ``wp.float64`` tile has no 8-byte layout to preserve — it
+    is simply an fp32 tile on Apple GPUs. Rewriting the element type inside
+    every ``wp::tile_*<...>`` template argument list (the tile type itself,
+    ``tile_load``/``tile_store``/``tile_zeros``/``tile_atomic_add``/...) lets
+    the existing float translators handle it; only the boundary with a
+    demoted *array* (whose elements are IEEE-754 double bits) needs the
+    ``wp_f64_to_f32``/``wp_f32_to_f64`` conversions, emitted by the
+    load/store translators. Plain ``wp::float64`` locals and casts outside a
+    tile template are untouched — they have their own demotion path.
+    """
+    if "wp::float64" not in text or "wp::tile_" not in text:
+        return text
+    import warp.config as _wp_cfg  # noqa: PLC0415
+
+    if not _wp_cfg.metal_demote_fp64:
+        return text
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    while True:
+        j = text.find("wp::tile_", i)
+        if j < 0:
+            out.append(text[i:])
+            break
+        name_end = j + len("wp::tile_")
+        while name_end < n and (text[name_end].isalnum() or text[name_end] == "_"):
+            name_end += 1
+        if name_end >= n or text[name_end] != "<":
+            out.append(text[i:name_end])
+            i = name_end
+            continue
+        depth = 0
+        k = name_end
+        while k < n:
+            if text[k] == "<":
+                depth += 1
+            elif text[k] == ">":
+                depth -= 1
+                if depth == 0:
+                    break
+            k += 1
+        out.append(text[i:name_end])
+        out.append(text[name_end : k + 1].replace("wp::float64", "wp::float32"))
+        i = k + 1
+    return "".join(out)
 
 
 def _msl_var_type(ctype: str) -> str:
     """Translate a local variable's ctype to MSL."""
     if ctype.endswith("*"):
         return _msl_pointer_type(ctype)
+    # Composite float64 VALUES (``vec_t<2, wp::float64>``, ``mat_t<1, 1,
+    # wp::float64>`` ...) demote to their fp32 counterparts under the opt-in.
+    ctype = _demote_f64_value_tokens(ctype)
     # Scalar float64 VALUES demote to fp32 — Apple GPUs have no fp64, and
     # warp.fem integrands routinely take ``wp.float64`` parameters that are
     # immediately cast down to the space's scalar type. Only bare value
@@ -9061,6 +9290,11 @@ def _emit_tile_writeback(
     return "\n".join(parts)
 
 
+def _f64_elem_read(elem: str) -> str:
+    """Wrap a demoted float64 array element access in its bit conversion."""
+    return f"wp_f64_to_f32({elem})"
+
+
 def _translate_tile_intrinsics(
     line: str,
     tile_var_dims: dict[str, tuple[int, int, str]],
@@ -9075,9 +9309,14 @@ def _translate_tile_intrinsics(
     shaped_array_names: set[str] | None = None,
     coldist_tiles: dict[str, tuple[int, str]] | None = None,
     coop_block_n: int = 0,
+    f64_arr_names: set[str] | None = None,
 ) -> str:
     if shaped_array_names is None:
         shaped_array_names = set()
+    if f64_arr_names is None:
+        f64_arr_names = set()
+    # Float64 tiles are float32 tiles under demotion (see the helper).
+    line = _demote_tile_f64_tokens(line)
     if coldist_tiles is None:
         coldist_tiles = {}
     if tile_var_vec_n is None:
@@ -9150,6 +9389,12 @@ def _translate_tile_intrinsics(
             # Treat the 1-D tile load as a degenerate ``Rx1`` load with
             # ``col_off=0`` so the same helper signature works.
             row_off, col_off = offsets[0], "0"
+        is_f64_src = arr_name in f64_arr_names
+        if is_f64_src and (lhs in distributed_tiles or lhs in smem_tiles):
+            raise MetalCodegenError(
+                f"MSL codegen: tile_load from a demoted float64 array into a lane-distributed or "
+                f"threadgroup-resident tile is not supported (statement: {m.group(0)!r})"
+            )
         if lhs in distributed_tiles:
             # Distributed 1-D tile: each lane loads its own element and
             # zero-fills out-of-range positions (CUDA's bounds-checked load).
@@ -9165,12 +9410,25 @@ def _translate_tile_intrinsics(
         # Shape (1,1) collapses to a scalar local (see ``_msl_var_type``);
         # there's no wp_tile_1x1 struct/helper, so emit a direct subscript.
         if rows == 1 and cols == 1:
-            return f"var_{lhs} = {arr}[{base_expr} + ({row_off}) * ({row_stride}) + ({col_off})]"
+            elem = f"{arr}[{base_expr} + ({row_off}) * ({row_stride}) + ({col_off})]"
+            return f"var_{lhs} = {_f64_elem_read(elem) if is_f64_src else elem}"
         # Vec-element tile: route to the vec-element helper. The
         # helper folds the ``n_elem`` scaling into its inner index, so
         # ``row_stride`` here is in ELEMENTS (1 for a 1-D tile of
         # ``vec_t<n_elem, scalar>`` over a 1-D backing array).
         if vec_n_elem > 0:
+            if is_f64_src:
+                # Demoted source: the ``_load`` helper would assign the raw
+                # ``ulong`` bits into a float slot (a silent integer->float
+                # conversion), so emit the helper's loop inline with the
+                # bit-pattern conversion on every element.
+                return (
+                    f"{{ for (int _tl_i = 0; _tl_i < {rows}; ++_tl_i) for (int _tl_j = 0; _tl_j < {cols}; ++_tl_j) {{ "
+                    f"const int _tl_e = ((({row_off}) + _tl_i) * ({row_stride}) + (({col_off}) + _tl_j)) * {vec_n_elem}; "
+                    f"for (int _tl_k = 0; _tl_k < {vec_n_elem}; ++_tl_k) "
+                    f"var_{lhs}.c[(_tl_i * {cols} + _tl_j) * {vec_n_elem} + _tl_k] = "
+                    f"wp_f64_to_f32({arr}[{base_expr} + _tl_e + _tl_k]); }} }}"
+                )
             helper = f"wp_tile_{rows}x{cols}_vec{vec_n_elem}_{msl_scalar}_load"
             return f"var_{lhs} = {helper}({arr}, {base_expr}, {row_stride}, {row_off}, {col_off})"
         # Threadgroup-resident destination: load device → smem directly,
@@ -9220,6 +9478,21 @@ def _translate_tile_intrinsics(
                 # actually walks is one further out.
                 n_rows_expr = f"(int){arr_name}_shape[{n_lead - 1}]"
                 n_cols_expr = f"(int){arr_name}_shape[{n_lead}]"
+        if is_f64_src:
+            # Same loop as the ``_load`` helper (bounds-checked zero-fill when
+            # the extents are known), converting each element's double bits.
+            guard = (
+                f"(_tl_r >= 0 && _tl_r < {n_rows_expr} && _tl_c >= 0 && _tl_c < {n_cols_expr}) ? "
+                if n_rows_expr is not None
+                else ""
+            )
+            tail = " : 0.0f" if n_rows_expr is not None else ""
+            return (
+                f"{{ for (int _tl_i = 0; _tl_i < {rows}; ++_tl_i) for (int _tl_j = 0; _tl_j < {cols}; ++_tl_j) {{ "
+                f"const int _tl_r = ({row_off}) + _tl_i; const int _tl_c = ({col_off}) + _tl_j; "
+                f"var_{lhs}.c[_tl_i * {cols} + _tl_j] = {guard}"
+                f"wp_f64_to_f32({arr}[{base_expr} + _tl_r * ({row_stride}) + _tl_c]){tail}; }} }}"
+            )
         if n_rows_expr is None:
             return f"var_{lhs} = {helper}({arr}, {base_expr}, {row_stride}, {row_off}, {col_off})"
         return (
@@ -9273,6 +9546,12 @@ def _translate_tile_intrinsics(
         else:
             row_stride = "1"
             row_off, col_off = offsets[0], "0"
+        is_f64_dst = arr_name in f64_arr_names
+        if is_f64_dst and (tile_label in distributed_tiles or tile_label in smem_tiles):
+            raise MetalCodegenError(
+                f"MSL codegen: tile_store into a demoted float64 array from a lane-distributed or "
+                f"threadgroup-resident tile is not supported (statement: {m.group(0)!r})"
+            )
         if tile_label in distributed_tiles:
             # Distributed 1-D tile: each lane stores its own element,
             # skipping positions past the array's end.
@@ -9292,8 +9571,19 @@ def _translate_tile_intrinsics(
             )
         # Shape (1,1) tile is a scalar local — store with a direct subscript.
         if rows == 1 and cols == 1:
-            return f"{arr}[{base_expr} + ({row_off}) * ({row_stride}) + ({col_off})] = {tile_var}"
+            value = f"wp_f32_to_f64({tile_var})" if is_f64_dst else tile_var
+            return f"{arr}[{base_expr} + ({row_off}) * ({row_stride}) + ({col_off})] = {value}"
         if vec_n_elem > 0:
+            if is_f64_dst:
+                # Demoted destination: write each component's double bits
+                # (the ``_store`` helper takes ``device float*``).
+                return (
+                    f"{{ for (int _ts_i = 0; _ts_i < {rows}; ++_ts_i) for (int _ts_j = 0; _ts_j < {cols}; ++_ts_j) {{ "
+                    f"const int _ts_e = ((({row_off}) + _ts_i) * ({row_stride}) + (({col_off}) + _ts_j)) * {vec_n_elem}; "
+                    f"for (int _ts_k = 0; _ts_k < {vec_n_elem}; ++_ts_k) "
+                    f"{arr}[{base_expr} + _ts_e + _ts_k] = "
+                    f"wp_f32_to_f64({tile_var}.c[(_ts_i * {cols} + _ts_j) * {vec_n_elem} + _ts_k]); }} }}"
+                )
             helper = f"wp_tile_{rows}x{cols}_vec{vec_n_elem}_{msl_scalar}_store"
             return f"{helper}({arr}, {base_expr}, {row_stride}, {row_off}, {col_off}, {tile_var})"
         # If the target output is atomic-typed (the kernel uses
@@ -9340,6 +9630,12 @@ def _translate_tile_intrinsics(
         # 32 redundant identical writes into one transaction, so it added
         # latency for no bandwidth saving. The smem-resident path above is
         # different: there is no private struct to broadcast from.
+        if is_f64_dst:
+            return (
+                f"{{ for (int _ts_i = 0; _ts_i < {rows}; ++_ts_i) for (int _ts_j = 0; _ts_j < {cols}; ++_ts_j) "
+                f"{arr}[{base_expr} + (({row_off}) + _ts_i) * ({row_stride}) + (({col_off}) + _ts_j)] = "
+                f"wp_f32_to_f64({tile_var}.c[_ts_i * {cols} + _ts_j]); }}"
+            )
         helper = f"wp_tile_{rows}x{cols}_{msl_scalar}_store"
         return f"{helper}({arr}, {base_expr}, {row_stride}, {row_off}, {col_off}, {tile_var})"
 
@@ -9383,9 +9679,21 @@ def _translate_tile_intrinsics(
         def _elem(i: str, j: str) -> str:
             return f"{arr}[{base_expr} + (({row_off}) + {i}) * ({row_stride}) + (({col_off}) + {j})]"
 
+        # A demoted float64 destination is plain ``device ulong*`` and goes
+        # through the lock-emulated helper (see ``_F64_ATOMIC_HELPERS``).
+        if arr_name in f64_arr_names:
+
+            def _fetch_add(elem: str, value: str) -> str:
+                return f"wp_f64_atomic_add(&{elem}, {value})"
+
+        else:
+
+            def _fetch_add(elem: str, value: str) -> str:
+                return f"atomic_fetch_add_explicit(&{elem}, {value}, memory_order_relaxed)"
+
         # Single-element tile is a plain scalar local on both sides.
         if rows == 1 and cols == 1:
-            return f"var_{lhs} = atomic_fetch_add_explicit(&{_elem('0', '0')}, {tile_var}, memory_order_relaxed)"
+            return f"var_{lhs} = {_fetch_add(_elem('0', '0'), tile_var)}"
         # Multi-element: the result tile local is already declared by the
         # generic local-decl pass, so only fill it — one pre-add value per
         # element. (Re-declaring here is a redefinition error in MSL.)
@@ -9393,8 +9701,8 @@ def _translate_tile_intrinsics(
             "do { "
             f"for (int _ta_i = 0; _ta_i < {rows}; ++_ta_i) "
             f"for (int _ta_j = 0; _ta_j < {cols}; ++_ta_j) "
-            f"var_{lhs}.c[_ta_i * {cols} + _ta_j] = atomic_fetch_add_explicit("
-            f"&{_elem('_ta_i', '_ta_j')}, {tile_var}.c[_ta_i * {cols} + _ta_j], memory_order_relaxed); "
+            f"var_{lhs}.c[_ta_i * {cols} + _ta_j] = "
+            f"{_fetch_add(_elem('_ta_i', '_ta_j'), f'{tile_var}.c[_ta_i * {cols} + _ta_j]')}; "
             "} while (0)"
         )
 
@@ -10195,13 +10503,33 @@ def _translate_tile_intrinsics(
         c_dims = tile_var_dims.get(c_label)
         if a_dims is None or b_dims is None or c_dims is None:
             return m.group(0)
-        rA, kA, scalar = a_dims
-        kB, nB, _ = b_dims
-        rC, nC, _ = c_dims
+        rA, kA, a_scalar = a_dims
+        kB, nB, b_scalar = b_dims
+        rC, nC, scalar = c_dims
         if kA != kB or rA != rC or nB != nC:
             return m.group(0)
         helper = f"wp_tile_matmul_{rA}x{kA}x{nB}_{scalar}"
+        # Mixed operand precisions (``tile_matmul(float, half, double)`` in
+        # ``example_tile_matmul``): the helper is typed on the accumulator's
+        # scalar, so widen the differing operand(s) into temporaries first.
+        # ``half``/``float`` -> ``float`` is exact, matching cuBLASDx's
+        # accumulate-in-C-type semantics.
+        widen: list[str] = []
+        if a_scalar != scalar:
+            widen.append(
+                f"wp_tile_{rA}x{kA}_{scalar} _mm_a; for (int _mm_i = 0; _mm_i < {rA * kA}; ++_mm_i) "
+                f"_mm_a.c[_mm_i] = ({scalar}){a_arg}.c[_mm_i];"
+            )
+            a_arg = "_mm_a"
+        if b_scalar != scalar:
+            widen.append(
+                f"wp_tile_{kB}x{nB}_{scalar} _mm_b; for (int _mm_i = 0; _mm_i < {kB * nB}; ++_mm_i) "
+                f"_mm_b.c[_mm_i] = ({scalar}){b_arg}.c[_mm_i];"
+            )
+            b_arg = "_mm_b"
         call = f"{helper}({a_arg}, {b_arg}, {c_arg}, {alpha_arg}, {beta_arg})"
+        if widen:
+            call = "{ " + " ".join(widen) + f" {call}; }}"
         # If C is a view, write its mutated contents back to the parent.
         if view_aliases is not None and c_label in view_aliases:
             parent_label, prows, pcols, vrows, vcols, vscalar, row_off, col_off = view_aliases[c_label]
@@ -11562,6 +11890,9 @@ def _generate_msl_kernel_uncached(
     # the CPU/CUDA backends emit.
     _replay_lines = list(adj.blocks[0].body_replay) if adjoint else []
     _ir_lines = list(reversed(adj.blocks[0].body_reverse)) if adjoint else list(adj.blocks[0].body_forward)
+    # fp32 demotion: value-level float64 becomes float32 before any pass
+    # looks at the text (see ``_demote_f64_value_tokens``).
+    _ir_lines = [_demote_f64_value_tokens(ln) for ln in _ir_lines]
     # Warp resets a dual var with C++ aggregate init (``adj_15 = {};``), which
     # MSL has no equivalent for. Rewrite to the typed zero the declaration
     # used; the type comes from the variable's value type. Forward bodies need
@@ -12667,7 +12998,11 @@ def _generate_msl_kernel_uncached(
         for a in output_args
         if _array_scalar_type_name(a) in ("int8", "uint8", "int16", "uint16", "float16", "bool")
     }
-    nonatomic_label_set = grad_label_set | narrow_output_labels
+    # fp32-demoted float64 outputs bind as ``ulong`` bits; there is no
+    # ``atomic<ulong>`` worth the name in MSL, so they stay plain and their
+    # ``wp.atomic_*`` calls go through ``wp_f64_atomic_*`` (see
+    # ``_rewrite_f64_atomics``).
+    nonatomic_label_set = grad_label_set | narrow_output_labels | f64_arr_names
     atomic_output_names: set[str] = (
         {a.label for a in output_args if a.label not in nonatomic_label_set} if has_atomic else set()
     )
@@ -12950,6 +13285,7 @@ def _generate_msl_kernel_uncached(
             arg_label_set,
             coldist_tiles,
             coop_block_n,
+            f64_arr_names=f64_arr_names,
         )
         # Inline subscripts that the address-collapse produced.
         translated = _substitute_subscripts(translated)
@@ -13052,10 +13388,19 @@ def _generate_msl_kernel_uncached(
         if has_atomic:
             for out_name in atomic_output_names:
                 translated = _wrap_atomic_load_reads(translated, out_name)
-        # Atomic accumulate on a demoted float64 element would need a 64-bit
-        # compare-exchange, which Metal does not have. Fail with a precise
-        # message rather than emit code that cannot compile.
-        _reject_f64_atomics(translated, f64_arr_names, adj.fun_name)
+        # Atomic accumulate on a demoted float64 element: Metal has no 64-bit
+        # compare-exchange, so under native dispatch (where the demoted
+        # buffer stays a plain ``device ulong*``) the op is routed through
+        # the lock-emulated ``wp_f64_atomic_*`` helpers. The MLX path types
+        # *every* output ``atomic<T>*`` for an atomic kernel, which the
+        # emulation cannot work on, so it keeps failing with a precise message.
+        if f64_arr_names:
+            import warp.config as _wp_cfg  # noqa: PLC0415
+
+            if _wp_cfg.metal_native_dispatch:
+                translated = _rewrite_f64_atomics(translated, f64_arr_names)
+            else:
+                _reject_f64_atomics(translated, f64_arr_names, adj.fun_name)
         _check_no_unsupported_intrinsics(translated)
         return translated
 
@@ -16072,6 +16417,23 @@ def _wrap_msl_for_native_dispatch(artifact) -> str:
                 # so the body's ``name`` references read as the scalar
                 # value directly. The bound bytes (via ``setBytes``)
                 # carry exactly one T.
+                if getattr(arg_var.type, "__name__", None) == "float64":
+                    # fp32-demoted float64 scalar: the launch packs the
+                    # Python float as a ``c_double`` (8 bytes), so bind
+                    # those bits as a ``ulong`` and convert once in the
+                    # prologue. The body's ``wp::float64`` locals already
+                    # lower to ``float`` (see ``_msl_var_type``).
+                    import warp.config as _wp_cfg  # noqa: PLC0415
+
+                    if not _wp_cfg.metal_demote_fp64:
+                        raise MetalCodegenError(
+                            f"Native dispatch: float64 kernel param {name!r} — MSL has no fp64; set "
+                            f"warp.config.metal_demote_fp64 (WARP_METAL_DEMOTE_FP64=1) to compute on it "
+                            f"at single precision"
+                        )
+                    add_buffer(f"const constant ulong& {name}__f64bits")
+                    value_prologue.append(f"    const float {name} = wp_f64_to_f32({name}__f64bits);")
+                    continue
                 msl = _native_scalar_param_msl(arg_var)
                 add_buffer(f"const constant {msl}& {name}")
 
@@ -16174,11 +16536,17 @@ def _wrap_msl_for_native_dispatch(artifact) -> str:
     # ``test_pendula_multi_step_warmstart_drift`` failure).
     body = _strip_init_prologue(artifact.source)
     prologue = ("\n".join(value_prologue) + "\n") if value_prologue else ""
+    header = artifact.header
+    # A demoted float64 scalar param converts in the prologue; the body's
+    # own helper scan only sees the body, so add the converter if it did
+    # not already pull it in.
+    if "wp_f64_to_f32(" in prologue and "wp_f64_to_f32(ulong b)" not in header:
+        header = _F64_HELPERS + "\n" + header
     return (
         "#include <metal_stdlib>\n"
         "#include <metal_atomic>\n"
         "using namespace metal;\n"
-        f"{artifact.header}\n"
+        f"{header}\n"
         f"{signature} {{\n"
         f"{prologue}{body}\n"
         "}\n"

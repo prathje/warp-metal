@@ -193,6 +193,15 @@
 - Run the example test suites (`warp.tests.test_examples` and `warp.tests.fem.test_fem_examples`) on the Metal
   device when the Metal backend is enabled, skipping the examples that depend on `float64`. `tile/example_tile_fft`,
   `tile/example_tile_convolution` and `tile/example_tile_filtering` accept `--device` instead of assuming `cuda:0`.
+- Extend `wp.config.metal_demote_fp64` (`WARP_METAL_DEMOTE_FP64=1`) so that `float64` kernel parameters, tiles,
+  vector/matrix values, and `wp.atomic_add()`/`sub()`/`min()`/`max()` into `float64` arrays also work on Metal
+  devices, all computing in `float32`. Atomics on a demoted element are emulated with a per-element lock (Metal has
+  no 64-bit atomics), so they are exact in `float32` but slower than native atomics, and the MLX dispatch path still
+  rejects them. `wp.tile_matmul()` on Metal now accepts operands of different precisions and widens them to the
+  accumulator's type. With the flag set, `fem/example_stokes`, `fem/example_navier_stokes`,
+  `fem/example_taylor_green`, `tile/example_tile_matmul` and `tile/example_tile_fft` run on Metal, and the example
+  test suites include them there.
+- `core/example_spin_lock` and `core/example_work_queue` accept `--device` instead of assuming CUDA.
 
 ## [1.18.0] - 2026-10-05
 

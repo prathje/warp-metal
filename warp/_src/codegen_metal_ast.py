@@ -1684,7 +1684,11 @@ def _inline_one_call(
             },
         )
 
-    fn_lines = fn_overload.adj.blocks[0].body_forward
+    from warp._src.codegen_metal import _demote_f64_value_tokens  # noqa: PLC0415
+
+    # Same value-level fp32 demotion the kernel body received (no-op unless
+    # ``metal_demote_fp64`` is set).
+    fn_lines = [_demote_f64_value_tokens(ln) for ln in fn_overload.adj.blocks[0].body_forward]
 
     # Build the substitution map.
     inline_id = _next_inline_id()
