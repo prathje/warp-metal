@@ -1849,7 +1849,7 @@ def _inline_one_call(
         if var.constant is None:
             decls.append(_RawLine(raw=f"    {msl_type} {mangled}{_msl_local_init(msl_type)};"))
         else:
-            decls.append(_RawLine(raw=f"    const {msl_type} {mangled} = {_msl_constant_str(var.constant)};"))
+            decls.append(_RawLine(raw=f"    const {msl_type} {mangled} = {_msl_constant_str(var.constant, msl_type)};"))
             # Record int constants so downstream passes (notably
             # fold_views' slice-step check) can recognise inlined
             # const-zeros the same as kernel-level ones.
@@ -2382,7 +2382,9 @@ def _inline_one_adj_call(
             if var.constant is None:
                 decls.append(_RawLine(raw=f"    {msl_type} {mangled}{_msl_local_init(msl_type)};"))
             else:
-                decls.append(_RawLine(raw=f"    const {msl_type} {mangled} = {_msl_constant_str(var.constant)};"))
+                decls.append(
+                    _RawLine(raw=f"    const {msl_type} {mangled} = {_msl_constant_str(var.constant, msl_type)};")
+                )
                 if isinstance(var.constant, int) and not isinstance(var.constant, bool):
                     const_ints_out[f"{inline_id}__{var.label}"] = var.constant
         decls.append(_RawLine(raw=f"    {dual_type} adj_{inline_id}__{var.label} = {_msl_zero_init(dual_type)};"))

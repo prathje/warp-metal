@@ -247,32 +247,56 @@ and through the `MLX <https://github.com/ml-explore/mlx>`_ runtime otherwise.
 
 This setting must be assigned before :func:`warp.init` is called (or before the
 first import-driven device enumeration). The Metal backend is incomplete:
-Apple GPUs have no ``float64`` hardware (see :data:`metal_demote_fp64`), and
+Apple GPUs have no ``float64`` hardware (see :data:`metal_fp64`), and
 some builtins and tile operations are not yet supported.
 """
 
-metal_demote_fp64: bool = _env_flag("WARP_METAL_DEMOTE_FP64")
-"""Allow ``float64`` arrays on Metal devices by computing on them in ``float32``.
+metal_fp64: str = _os.environ.get("WARP_METAL_FP64", "").strip().lower() or (
+    "demote" if _env_flag("WARP_METAL_DEMOTE_FP64") else "error"
+)
+"""How the Metal backend handles ``float64`` (Apple GPUs have no fp64 hardware).
 
-Defaults to the ``WARP_METAL_DEMOTE_FP64`` environment variable (unset →
-``False``), so applications that never touch ``warp.config`` can opt in from
-the shell.
+Defaults to the ``WARP_METAL_FP64`` environment variable (unset → ``"error"``,
+or ``"demote"`` when the older ``WARP_METAL_DEMOTE_FP64=1`` is set), so
+applications that never touch ``warp.config`` can choose from the shell.
 
-Apple Silicon GPUs have no double-precision hardware, so ``float64`` arrays are
-rejected at code-generation time by default. When ``True``, such arrays are
-still *stored* as 8-byte IEEE-754 doubles — host-side ``numpy()`` round-trips
-are unchanged — but every value is converted to ``float32`` when a kernel reads
-it and back when a kernel writes it, so all arithmetic happens at single
-precision. Warp emits a warning the first time a kernel is generated this way.
-``float64`` kernel parameters, tiles, and vector/matrix values demote the same
-way. With native dispatch (the default), ``wp.atomic_add``/``sub``/``min``/``max``
-on a demoted array element are emulated with a per-element lock, since Metal
-has no 64-bit atomics; they are exact in ``float32`` but much slower than a
-native atomic, and the MLX dispatch path still rejects them.
+* ``"error"``: ``float64`` arrays, parameters, and values are rejected at
+  code-generation time. Use ``float32`` on Metal.
+* ``"demote"``: compute on ``float64`` data in ``float32``. Arrays are still
+  *stored* as 8-byte IEEE-754 doubles — host-side ``numpy()`` round-trips are
+  unchanged — but every value is converted to ``float32`` when a kernel reads
+  it and back when it writes, so all arithmetic happens at single precision.
+  Warp warns the first time a kernel is generated this way. ``float64``
+  kernel parameters, tiles, and vector/matrix values demote the same way. This
+  is the fast option; it silently changes results relative to a CUDA or CPU
+  run, and algorithms that chose ``float64`` for conditioning reasons may
+  converge differently or not at all.
+* ``"emulate"``: compute in real IEEE-754 binary64 using integer arithmetic
+  (the bundled `metal-softfloat <https://github.com/guyfischman/metal-softfloat>`_
+  routines). Addition, subtraction, multiplication, division, square root,
+  ``fma``, comparisons, conversions, and ``floor``/``ceil``/``trunc``/``round``
+  are correctly rounded and bit-exact with a CPU run. Transcendental functions
+  (``exp``, ``log``, ``sin``, ``cos``, ``pow``, ...) are evaluated in ``float32``
+  and widened, so they carry single-precision error. Roughly 30x slower than
+  ``float32`` on the same GPU. Requires native dispatch
+  (:data:`metal_native_dispatch`); reverse-mode (adjoint) kernels over
+  ``float64`` values are not supported in this mode.
 
-Enable this only when reduced precision is acceptable: it silently changes
-results relative to a CUDA or CPU run. Algorithms that chose ``float64`` for
-conditioning reasons may converge differently or not at all.
+In both non-default modes ``wp.atomic_add``/``sub``/``min``/``max`` on a
+``float64`` array element are emulated with a per-element lock (Metal has no
+64-bit atomics); they are exact but much slower than a native atomic, and the
+MLX dispatch path rejects them.
+
+Setting :data:`metal_demote_fp64` to ``True`` is equivalent to ``"demote"``
+and is kept for backward compatibility.
+"""
+
+metal_demote_fp64: bool = False
+"""Deprecated alias for ``metal_fp64 = "demote"`` (see :data:`metal_fp64`).
+
+Setting this to ``True`` selects the ``"demote"`` mode whenever
+:data:`metal_fp64` is still ``"error"``. Reading it does not reflect a
+``metal_fp64`` assignment; prefer the string setting.
 """
 
 metal_native_dispatch: bool = _env_flag("WARP_METAL_NATIVE_DISPATCH", default=True)

@@ -11,10 +11,11 @@
   cooperating lane, up to ~23x faster for a 35x35 factorize-and-solve. Add `warp.config.metal_threadgroup_tiles`
   (environment variable `WARP_METAL_THREADGROUP_TILES`) to disable it.
 - Support `wp.tile_fft()` / `wp.tile_ifft()` on `vec2f` tiles and `wp.tile_transpose()` on vector-element tiles
-  on the Metal backend (`vec2d` remains unsupported — Apple GPUs have no double precision).
+  on the Metal backend (`vec2d` tiles require `warp.config.metal_fp64 = "emulate"`).
 - Support `warp.sparse`, `warp.optim.linear`, and `warp.fem` on Metal devices, including `wp.tile_sum()`,
   `wp.launch(..., record_cmd=True)`, arrays that are interior views of a larger allocation, and `wp.array`
-  fields of struct kernel arguments. `wp.fem.integrate()` falls back to `wp.float32` accumulation on Metal.
+  fields of struct kernel arguments. `wp.fem.integrate()` falls back to `wp.float32` accumulation on Metal
+  unless `warp.config.metal_fp64 = "emulate"`.
 - Support writing through `wp.array` fields of struct kernel arguments on Metal (previously read-only), the
   single-argument `wp.min()` / `wp.max()` component reductions, `wp.length()` on vectors of unsupported-by-MSL
   widths, and non-square matrices (`wp.transpose()`, `wp.matrix_from_cols()`, `wp.matrix_from_rows()`, and
@@ -90,6 +91,15 @@
   Kernels indexed with a 1-D `wp.tid()` may be launched with `wp.launch(dim=N, block_dim=32)`.
   `tile/example_tile_mlp` runs on Metal and accepts `--device`.
 
+- Add `warp.config.metal_fp64` (`WARP_METAL_FP64`) to choose how the Metal backend handles `float64`:
+  `"error"` (default), `"demote"` (compute in `float32`, the former `metal_demote_fp64`, which is kept as an
+  alias), or `"emulate"`, which computes in software IEEE-754 binary64 using the bundled
+  [metal-softfloat](https://github.com/guyfischman/metal-softfloat) routines. Emulated arithmetic, `sqrt`, `fma`,
+  comparisons, conversions, and rounding are correctly rounded and bit-exact with a CPU run; transcendental
+  functions are evaluated in `float32`. It covers `float64` arrays, kernel parameters, struct fields, vectors and
+  matrices, tiles (including `wp.tile_cholesky()`, `wp.tile_matmul()`, and `vec2d` `wp.tile_fft()`), and the
+  atomic operations, at roughly 30x the cost of `float32`; it requires native dispatch. `example_tile_cholesky`,
+  `example_tile_convolution`, and `example_tile_filtering` now run on Metal in this mode.
 ### Removed
 
 ### Deprecated

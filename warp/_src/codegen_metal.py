@@ -178,37 +178,70 @@ class MetalCodegenError(NotImplementedError):
 # Type mapping
 # ---------------------------------------------------------------------------
 
+
 # C++ ctype string (as returned by ``Var.ctype()``) -> MSL type string.
 # The values intentionally match Apple's MSL spec:
 #   https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf
-_SCALAR_CTYPE_TO_MSL: dict[str, str] = {
-    "wp::float16": "half",
-    "wp::float32": "float",
-    "wp::int32": "int",
-    "wp::uint32": "uint",
-    "wp::int64": "long",
-    "wp::uint64": "ulong",
-    "wp::int8": "char",
-    "wp::uint8": "uchar",
-    "wp::int16": "short",
-    "wp::uint16": "ushort",
-    # Bool is the one IR ctype without a ``wp::`` prefix — Warp emits plain
-    # ``bool`` for boolean locals (e.g. the result of a comparison op).
-    "wp::bool": "bool",
-    "bool": "bool",
-    # ``wp::slice_t`` is a 3-int struct (start, stop, step) used by
-    # matrix slicing builtins (``mat[:, c]`` / ``mat[r, :]``). The MSL
-    # equivalent ``wp_slice_t`` struct is emitted in the kernel header.
-    "wp::slice_t": "wp_slice_t",
-    # BVH traversal state — the MSL struct is emitted with ``_BVH_HELPERS``.
-    "wp::bvh_query_t": "wp_bvh_query_t",
-    "wp::mesh_query_aabb_t": "wp_mesh_query_aabb_t",
-    "wp::mesh_query_point_t": "wp_mesh_query_point_t",
-    "wp::mesh_query_ray_t": "wp_mesh_query_ray_t",
-    # Hash-grid traversal state (float32 grids only) — the MSL struct is
-    # emitted with ``_HASHGRID_HELPERS``.
-    "wp::hash_grid_query_f": "wp_hash_grid_query_t",
-}
+class _ScalarMslMap(dict):
+    """``ctype -> MSL scalar`` map in which ``wp::float64`` resolves (to the
+    emulated ``wp_f64``) only under ``warp.config.metal_fp64 = "emulate"``.
+
+    Every other mode must keep seeing the key as *absent*: the ``"demote"``
+    translators rewrite float64 tokens to float32 before they look anything
+    up and rely on the miss for the paths they do not rewrite (e.g. the
+    element scalar of a demoted array bound as ``ulong``), and ``"error"``
+    relies on it to raise cleanly.
+    """
+
+    def __contains__(self, key) -> bool:
+        if key == "wp::float64":
+            return _fp64_mode() == "emulate"
+        return dict.__contains__(self, key)
+
+    def __getitem__(self, key):
+        if key == "wp::float64" and _fp64_mode() != "emulate":
+            raise KeyError(key)
+        return dict.__getitem__(self, key)
+
+    def get(self, key, default=None):
+        return self[key] if key in self else default
+
+
+_SCALAR_CTYPE_TO_MSL: dict[str, str] = _ScalarMslMap(
+    {
+        "wp::float16": "half",
+        "wp::float32": "float",
+        "wp::int32": "int",
+        "wp::uint32": "uint",
+        "wp::int64": "long",
+        "wp::uint64": "ulong",
+        "wp::int8": "char",
+        "wp::uint8": "uchar",
+        "wp::int16": "short",
+        "wp::uint16": "ushort",
+        # Emulated double (``metal_fp64 = "emulate"``): a POD struct around the
+        # IEEE-754 bits, see ``_f64_emulate_helpers``. Present unconditionally so
+        # type-name lookups resolve; the mode gates live in ``_msl_scalar_type``
+        # / ``_msl_var_type`` and the array-argument check.
+        "wp::float64": "wp_f64",
+        # Bool is the one IR ctype without a ``wp::`` prefix — Warp emits plain
+        # ``bool`` for boolean locals (e.g. the result of a comparison op).
+        "wp::bool": "bool",
+        "bool": "bool",
+        # ``wp::slice_t`` is a 3-int struct (start, stop, step) used by
+        # matrix slicing builtins (``mat[:, c]`` / ``mat[r, :]``). The MSL
+        # equivalent ``wp_slice_t`` struct is emitted in the kernel header.
+        "wp::slice_t": "wp_slice_t",
+        # BVH traversal state — the MSL struct is emitted with ``_BVH_HELPERS``.
+        "wp::bvh_query_t": "wp_bvh_query_t",
+        "wp::mesh_query_aabb_t": "wp_mesh_query_aabb_t",
+        "wp::mesh_query_point_t": "wp_mesh_query_point_t",
+        "wp::mesh_query_ray_t": "wp_mesh_query_ray_t",
+        # Hash-grid traversal state (float32 grids only) — the MSL struct is
+        # emitted with ``_HASHGRID_HELPERS``.
+        "wp::hash_grid_query_f": "wp_hash_grid_query_t",
+    }
+)
 
 # Builtin result structs whose fields kernels read directly (``q.result``,
 # ``q.face``, ...). Locals of these ctypes are materialised as real MSL
@@ -219,17 +252,38 @@ _BUILTIN_FIELD_STRUCT_CTYPES = frozenset({"wp::mesh_query_point_t", "wp::mesh_qu
 # MSL has built-in vector types ``floatN`` / ``intN`` / ``uintN`` etc. for
 # N in {2, 3, 4}. Larger sizes (Warp's vec5, vec6, vec8) would need a custom
 # struct, which we defer until they actually show up in a target kernel.
-_MSL_VEC_SCALAR_PREFIX: dict[str, str] = {
-    "wp::float16": "half",
-    "wp::float32": "float",
-    "wp::int32": "int",
-    "wp::uint32": "uint",
-    "wp::int16": "short",
-    "wp::uint16": "ushort",
-    "wp::int8": "char",
-    "wp::uint8": "uchar",
-}
+_MSL_VEC_SCALAR_PREFIX: dict[str, str] = _ScalarMslMap(
+    {
+        "wp::float16": "half",
+        "wp::float32": "float",
+        # Emulated double: never a native ``floatN`` — see ``_vec_native``.
+        "wp::float64": "wp_f64",
+        "wp::int32": "int",
+        "wp::uint32": "uint",
+        "wp::int16": "short",
+        "wp::uint16": "ushort",
+        "wp::int8": "char",
+        "wp::uint8": "uchar",
+    }
+)
 _MSL_VEC_SUPPORTED_N = (2, 3, 4)
+
+# The emulated double's MSL type name. Vectors / matrices of it have no
+# native MSL counterpart (there is no ``wp_f642``), so every shape goes
+# through the custom ``wp_vecN_wp_f64`` / ``wp_matRxC_wp_f64`` structs.
+_F64_EMU_MSL = "wp_f64"
+
+
+def _vec_native(n: int, msl_scalar: str) -> bool:
+    """True when ``vec_t<n, scalar>`` lowers to a native MSL ``scalarN``."""
+    return n in _MSL_VEC_NATIVE_N and msl_scalar != _F64_EMU_MSL
+
+
+def _mat_native(rows: int, cols: int, msl_scalar: str) -> bool:
+    """True when ``mat_t<rows, cols, scalar>`` lowers to a native MSL matrix
+    (square 2-4; the emulated double always uses the row-major struct)."""
+    return rows == cols and rows in _MSL_VEC_NATIVE_N and msl_scalar != _F64_EMU_MSL
+
 
 # Pattern that matches ``wp::vec_t<N, wp::TYPE>`` — used both to translate
 # variable ctypes (declarations) and constructor expressions inside the body.
@@ -296,7 +350,7 @@ def _msl_vec_name(n: int, msl_scalar: str) -> str:
 
     Native ``floatN`` etc. for N in {2, 3, 4}; ``wp_vecN_<scalar>`` otherwise.
     """
-    if n in _MSL_VEC_NATIVE_N:
+    if _vec_native(n, msl_scalar):
         return f"{msl_scalar}{n}"
     return f"wp_vec{n}_{msl_scalar}"
 
@@ -308,7 +362,7 @@ def _msl_vec_ctor(n: int, msl_scalar: str) -> str:
     big sizes we use a free factory function ``wp_vecN_<scalar>_make`` —
     MSL doesn't let us declare a variadic struct constructor cleanly.
     """
-    if n in _MSL_VEC_NATIVE_N:
+    if _vec_native(n, msl_scalar):
         return f"{msl_scalar}{n}"
     return f"wp_vec{n}_{msl_scalar}_make"
 
@@ -324,16 +378,17 @@ def _vec_t_to_msl(n: int, scalar_ctype: str) -> str:
     if n < 1:
         raise MetalCodegenError(f"MSL codegen: vec_t<{n}, ...> not supported")
     full_ctype = f"wp::{scalar_ctype}"
-    # float64 VALUE locals demote to fp32, the same as bare ``wp::float64``
-    # scalars (see ``_msl_var_type``). Only float64 *pointers* — i.e. array
-    # storage, whose 8-byte stride is user-visible layout — are gated on
-    # ``warp.config.metal_demote_fp64``.
-    if full_ctype == "wp::float64":
+    # float64 VALUE locals: under ``"demote"`` they are fp32 vectors, the
+    # same as bare ``wp::float64`` scalars (see ``_msl_var_type``); under
+    # ``"emulate"`` they are ``wp_vecN_wp_f64`` structs for every N. Only
+    # float64 *pointers* — i.e. array storage, whose 8-byte stride is
+    # user-visible layout — are gated on the mode elsewhere.
+    if full_ctype == "wp::float64" and _fp64_mode() != "emulate":
         full_ctype = "wp::float32"
     if full_ctype not in _MSL_VEC_SCALAR_PREFIX:
         raise MetalCodegenError(f"MSL codegen does not yet support vec_t element type {full_ctype!r}")
     msl_scalar = _MSL_VEC_SCALAR_PREFIX[full_ctype]
-    if n in _MSL_VEC_NATIVE_N:
+    if _vec_native(n, msl_scalar):
         return f"{msl_scalar}{n}"
     return f"wp_vec{n}_{msl_scalar}"
 
@@ -360,7 +415,7 @@ def _msl_mat_name(rows: int, cols: int, msl_scalar: str) -> str:
     need the predicate should ask ``_is_native_mat_shape`` rather than
     re-deriving it.
     """
-    if rows == cols and rows in _MSL_VEC_NATIVE_N and msl_scalar in _MSL_NATIVE_MAT_SCALARS:
+    if _mat_native(rows, cols, msl_scalar) and msl_scalar in _MSL_NATIVE_MAT_SCALARS:
         return f"{msl_scalar}{rows}x{cols}"
     return f"wp_mat{rows}x{cols}_{msl_scalar}"
 
@@ -376,7 +431,7 @@ def _mat_t_to_msl(rows: int, cols: int, scalar_ctype: str) -> str:
     if rows < 1 or cols < 1:
         raise MetalCodegenError(f"MSL codegen: mat_t<{rows}, {cols}, ...> not supported")
     full_ctype = f"wp::{scalar_ctype}"
-    if full_ctype == "wp::float64":
+    if full_ctype == "wp::float64" and _fp64_mode() != "emulate":
         full_ctype = "wp::float32"  # value locals demote — see ``_vec_t_to_msl``
     if full_ctype not in _MSL_VEC_SCALAR_PREFIX:
         raise MetalCodegenError(f"MSL codegen does not yet support mat_t element type {full_ctype!r}")
@@ -430,7 +485,7 @@ def _translate_vec_t_in(text: str) -> str:
 # emission. The optional ``_make`` suffix lets the same regex match
 # both the bare struct name and the factory call.
 _BIG_VEC_NAME_PAT = re.compile(
-    r"\bwp_vec(\d+)_(half|float|double|int|uint|long|ulong|char|uchar|short|ushort|bool)"
+    r"\bwp_vec(\d+)_(wp_f64|half|float|double|int|uint|long|ulong|char|uchar|short|ushort|bool)"
     r"(?:_make)?\b"
 )
 # Stripped scalar -> MSL scalar prefix lookup. Goes from "float" / "int" etc.
@@ -452,6 +507,12 @@ def _emit_big_vec_struct(name: str, n: int, msl_scalar: str) -> str:
     body_lines.append(f"    {msl_scalar} c[{n}];")
     body_lines.append(f"    inline thread {msl_scalar}& operator[](int i) thread {{ return c[i]; }}")
     body_lines.append(f"    inline {msl_scalar} operator[](int i) const thread {{ return c[i]; }}")
+    if msl_scalar == _F64_EMU_MSL and n in _MSL_VEC_NATIVE_N:
+        # ``wp.vec2f(v_f64)`` lowers to the functional cast ``float2(v)``,
+        # which MSL only accepts through a conversion operator.
+        for nat in ("float", "half", "int", "uint"):
+            comps = ", ".join(f"{nat}(c[{i}])" for i in range(n))
+            body_lines.append(f"    inline explicit operator {nat}{n}() const thread {{ return {nat}{n}({comps}); }}")
     body_lines.append("};")
     # Variadic-arg constructor: ``wp_vec6_float(v0, v1, ..., v5)`` so the
     # existing IR ``wp::vec_t<6, ...>(...)`` (with the braces stripped) maps
@@ -480,6 +541,13 @@ def _emit_big_vec_struct(name: str, n: int, msl_scalar: str) -> str:
     # Copy overload: ``vec_t<N>(v)`` with a same-type operand (Warp's
     # explicit copy-construction, e.g. warp.fem's vec1 accumulators).
     body_lines.append(f"inline {name} {name}_make({name} v) {{ return v; }}")
+    # Emulated double <-> native vector conversions (``wp.vec2d(v_f32)`` and
+    # ``wp.vec2f(v_f64)``): the native ``floatN`` types always exist, so the
+    # overloads can be emitted unconditionally for N in 2..4.
+    if msl_scalar == _F64_EMU_MSL and n in _MSL_VEC_NATIVE_N:
+        for nat in ("float", "half", "int", "uint"):
+            comps = ", ".join(f"wp_f64_from(v[{i}])" for i in range(n))
+            body_lines.append(f"inline {name} {name}_make({nat}{n} v) {{ return {name}_make({comps}); }}")
     # Operator overloads. Component-wise unrolled for clarity and so MSL's
     # auto-vectoriser sees independent statements.
     for op in ("+", "-", "*", "/"):
@@ -549,14 +617,16 @@ def _emit_big_vec_struct(name: str, n: int, msl_scalar: str) -> str:
     # dof values, so even n == 1 reaches these.
     sum_sq = " + ".join(f"v.c[{i}] * v.c[{i}]" for i in range(n))
     body_lines.append(f"inline {msl_scalar} wp_length({name} v) {{")
-    body_lines.append(f"    return ({msl_scalar})metal::precise::sqrt(float({sum_sq}));")
+    if msl_scalar == _F64_EMU_MSL:
+        body_lines.append(f"    return metal::sqrt({sum_sq});")
+    else:
+        body_lines.append(f"    return ({msl_scalar})metal::precise::sqrt(float({sum_sq}));")
     body_lines.append("}")
     body_lines.append(f"inline {name} wp_normalize({name} v) {{")
     body_lines.append(f"    {msl_scalar} l = wp_length(v);")
     body_lines.append(f"    {name} r;")
-    body_lines.append(
-        f"    for (int i = 0; i < {n}; ++i) r.c[i] = (l > ({msl_scalar})0) ? (v.c[i] / l) : ({msl_scalar})0;"
-    )
+    _zero = _sc_zero(msl_scalar)
+    body_lines.append(f"    for (int i = 0; i < {n}; ++i) r.c[i] = (l > {_zero}) ? (v.c[i] / l) : {_zero};")
     body_lines.append("    return r;")
     body_lines.append("}")
     # Reverse-mode overloads for this struct shape. The generic templates in
@@ -581,6 +651,17 @@ def _emit_big_vec_struct(name: str, n: int, msl_scalar: str) -> str:
         )
     # Copy / element-cast constructor.
     body_lines.append(f"inline void wp_adj_vec_t({name} other, thread {name}& ao, {name} r) {{ ao += r; }}")
+    if msl_scalar == _F64_EMU_MSL and n in _MSL_VEC_NATIVE_N:
+        # Adjoints of the two conversion constructors (``vec2d(v_f32)`` and
+        # ``vec2f(v_f64)``): the gradient converts back the other way. Emitted
+        # here, after the struct's ``operator+=`` exists.
+        for nat in ("float", "half"):
+            body_lines.append(
+                f"inline void wp_adj_vec_t({nat}{n} other, thread {nat}{n}& ao, {name} r) {{ ao += {nat}{n}(r); }}"
+            )
+            body_lines.append(
+                f"inline void wp_adj_vec_t({name} other, thread {name}& ao, {nat}{n} r) {{ ao += {name}_make(r); }}"
+            )
     # ``wp.extract(v, i)`` — scatter the scalar adjoint into component i.
     # The index is non-differentiable but Warp still names its dual.
     body_lines.append(
@@ -617,15 +698,17 @@ def _emit_big_vec_struct(name: str, n: int, msl_scalar: str) -> str:
     body_lines.append(f"    for (int i = 0; i < {n}; ++i) {{ aa.c[i] += b.c[i] * r; ab.c[i] += a.c[i] * r; }}")
     body_lines.append("}")
     body_lines.append(f"inline void wp_adj_length({name} a, {msl_scalar} ret, thread {name}& aa, {msl_scalar} r) {{")
-    body_lines.append(f"    if (ret > ({msl_scalar})0) for (int i = 0; i < {n}; ++i) aa.c[i] += a.c[i] * (r / ret);")
+    body_lines.append(
+        f"    if (ret > {_sc_zero(msl_scalar)}) for (int i = 0; i < {n}; ++i) aa.c[i] += a.c[i] * (r / ret);"
+    )
     body_lines.append("}")
     body_lines.append(f"inline void wp_adj_length_sq({name} a, thread {name}& aa, {msl_scalar} r) {{")
-    body_lines.append(f"    for (int i = 0; i < {n}; ++i) aa.c[i] += a.c[i] * (({msl_scalar})2 * r);")
+    body_lines.append(f"    for (int i = 0; i < {n}; ++i) aa.c[i] += a.c[i] * ({_sc_lit(msl_scalar, 2)} * r);")
     body_lines.append("}")
     body_lines.append(f"inline void wp_adj_normalize({name} a, {name} ret, thread {name}& aa, {name} r) {{")
     body_lines.append(f"    {msl_scalar} d = wp_length(a);")
-    body_lines.append(f"    if (d <= ({msl_scalar})0) return;")
-    body_lines.append(f"    {msl_scalar} rd = ({msl_scalar})0;")
+    body_lines.append(f"    if (d <= {_sc_zero(msl_scalar)}) return;")
+    body_lines.append(f"    {msl_scalar} rd = {_sc_zero(msl_scalar)};")
     body_lines.append(f"    for (int i = 0; i < {n}; ++i) rd += ret.c[i] * r.c[i];")
     body_lines.append(f"    for (int i = 0; i < {n}; ++i) aa.c[i] += (r.c[i] - ret.c[i] * rd) / d;")
     body_lines.append("}")
@@ -687,6 +770,71 @@ def _emit_spatial_helpers() -> str:
 _BIG_MAT_NAME_PAT = re.compile(r"\bwp_mat(\d+)x(\d+)_(\w+)\b")
 
 
+def _emit_f64_square_mat_helpers(name: str, n: int) -> str:
+    """``metal::determinant`` / ``wp_trace`` / ``wp_inverse`` overloads for a
+    square emulated-double matrix struct (the native ``floatNxN`` versions
+    come from MSL and ``_MISC_MATH_HELPERS``). Row-major ``c[r * n + c]``."""
+
+    def e(r: int, c: int) -> str:
+        return f"m.c[{r * n + c}]"
+
+    L: list[str] = []
+    if n == 1:
+        det = e(0, 0)
+    elif n == 2:
+        det = f"({e(0, 0)} * {e(1, 1)} - {e(0, 1)} * {e(1, 0)})"
+    elif n == 3:
+        det = (
+            f"({e(0, 0)} * ({e(1, 1)} * {e(2, 2)} - {e(1, 2)} * {e(2, 1)}) "
+            f"- {e(0, 1)} * ({e(1, 0)} * {e(2, 2)} - {e(1, 2)} * {e(2, 0)}) "
+            f"+ {e(0, 2)} * ({e(1, 0)} * {e(2, 1)} - {e(1, 1)} * {e(2, 0)}))"
+        )
+    else:
+        # Laplace expansion along the first row over 3x3 minors.
+        def minor3(skip_c: int) -> str:
+            cols = [c for c in range(4) if c != skip_c]
+            a = [[f"m.c[{r * 4 + c}]" for c in cols] for r in (1, 2, 3)]
+            return (
+                f"({a[0][0]} * ({a[1][1]} * {a[2][2]} - {a[1][2]} * {a[2][1]}) "
+                f"- {a[0][1]} * ({a[1][0]} * {a[2][2]} - {a[1][2]} * {a[2][0]}) "
+                f"+ {a[0][2]} * ({a[1][0]} * {a[2][1]} - {a[1][1]} * {a[2][0]}))"
+            )
+
+        det = " ".join(f"{'+' if c % 2 == 0 else '-'} {e(0, c)} * {minor3(c)}" for c in range(4)).lstrip("+ ")
+        det = f"({det})"
+    L.append(f"namespace metal {{ inline wp_f64 determinant({name} m) {{ return {det}; }} }}")
+    trace = " + ".join(e(i, i) for i in range(n))
+    L.append(f"inline wp_f64 wp_trace({name} m) {{ return {trace}; }}")
+    if n == 1:
+        L.append(
+            f"inline {name} wp_inverse({name} m) {{ {name} r; r.c[0] = wp_f64{{0x3ff0000000000000UL}} / m.c[0]; return r; }}"
+        )
+    elif n == 2:
+        L.append(f"inline {name} wp_inverse({name} m) {{")
+        L.append("    wp_f64 inv = wp_f64{0x3ff0000000000000UL} / metal::determinant(m);")
+        L.append(f"    {name} r;")
+        L.append(
+            f"    r.c[0] = {e(1, 1)} * inv; r.c[1] = -{e(0, 1)} * inv; r.c[2] = -{e(1, 0)} * inv; r.c[3] = {e(0, 0)} * inv;"
+        )
+        L.append("    return r;")
+        L.append("}")
+    elif n == 3:
+        L.append(f"inline {name} wp_inverse({name} m) {{")
+        L.append("    wp_f64 inv = wp_f64{0x3ff0000000000000UL} / metal::determinant(m);")
+        L.append(f"    {name} r;")
+        for r in range(3):
+            for c in range(3):
+                # cofactor C(c, r) / det  (adjugate is the transposed cofactor matrix)
+                rr = [i for i in range(3) if i != c]
+                cc = [j for j in range(3) if j != r]
+                cof = f"({e(rr[0], cc[0])} * {e(rr[1], cc[1])} - {e(rr[0], cc[1])} * {e(rr[1], cc[0])})"
+                sign = "" if (r + c) % 2 == 0 else "-"
+                L.append(f"    r.c[{r * 3 + c}] = {sign}{cof} * inv;")
+        L.append("    return r;")
+        L.append("}")
+    return "\n".join(L)
+
+
 def _emit_big_mat_struct(name: str, rows: int, cols: int, msl_scalar: str) -> str:
     """Emit the MSL declaration for a custom big-mat struct.
 
@@ -706,7 +854,7 @@ def _emit_big_mat_struct(name: str, rows: int, cols: int, msl_scalar: str) -> st
     n = rows * cols
     # Row-vector type. Native ``floatN`` / ``intN`` for cols in 2..4 and
     # supported scalars; otherwise the custom ``wp_vecN_<scalar>`` struct.
-    if cols in (2, 3, 4) and msl_scalar in _MSL_PREFIX_TO_SAME:
+    if _vec_native(cols, msl_scalar) and msl_scalar in _MSL_PREFIX_TO_SAME:
         row_type = f"{msl_scalar}{cols}"
         row_make = f"{row_type}(" + ", ".join(f"c[i*{cols}+{j}]" for j in range(cols)) + ")"
         proxy_assign = "; ".join(f"p[{j}] = v[{j}]" for j in range(cols))
@@ -779,12 +927,21 @@ def _emit_big_mat_struct(name: str, rows: int, cols: int, msl_scalar: str) -> st
     # ``{msl_scalar}{n}`` for n in 2..4, custom ``wp_vecN_<scalar>`` struct
     # otherwise (whose components live in ``.c[]``).
     def _vec_ty(n: int) -> tuple[str, str]:
-        if n in (2, 3, 4) and msl_scalar in _MSL_PREFIX_TO_SAME:
+        if _vec_native(n, msl_scalar) and msl_scalar in _MSL_PREFIX_TO_SAME:
             return f"{msl_scalar}{n}", "[{k}]"
         return f"wp_vec{n}_{msl_scalar}", ".c[{k}]"
 
     col_vec_ty, col_at = _vec_ty(cols)  # operand of mat * vec
     row_vec_ty, row_at = _vec_ty(rows)  # result of mat * vec
+    if msl_scalar == _F64_EMU_MSL and rows == cols and rows in (1, 2, 3, 4):
+        body.append(_emit_f64_square_mat_helpers(name, rows))
+    # ``wp_get_diag`` for square big mats (the native sizes come from
+    # ``_MISC_MATH_HELPERS``, the float 1x1 one from the ``need_mat1x1`` block).
+    if rows == cols and (rows > 1 or msl_scalar == _F64_EMU_MSL):
+        diag = ", ".join(f"m.c[{i * cols + i}]" for i in range(rows))
+        body.append(
+            f"inline {row_vec_ty} wp_get_diag({name} m) {{ return {_msl_vec_ctor(rows, msl_scalar)}({diag}); }}"
+        )
     for op in ("+", "-"):
         body.append(f"inline {name} operator{op}({name} a, {name} b) {{")
         body.append(f"    {name} r;")
@@ -851,7 +1008,7 @@ def _emit_big_mat_struct(name: str, rows: int, cols: int, msl_scalar: str) -> st
     # operand (warp.fem's ``mat_t<2, 3>`` reference gradients) has no
     # viable candidate without this one.
     body.append(f"inline {msl_scalar} wp_ddot({name} a, {name} b) {{")
-    body.append(f"    {msl_scalar} s = ({msl_scalar})0;")
+    body.append(f"    {msl_scalar} s = {_sc_zero(msl_scalar)};")
     body.append(f"    for (int i = 0; i < {n}; ++i) s += a.c[i] * b.c[i];")
     body.append("    return s;")
     body.append("}")
@@ -861,7 +1018,7 @@ def _emit_big_mat_struct(name: str, rows: int, cols: int, msl_scalar: str) -> st
         body.append(f"    {name} r;")
         body.append(f"    for (int i = 0; i < {rows}; ++i)")
         body.append(f"    for (int j = 0; j < {cols}; ++j) {{")
-        body.append(f"        {msl_scalar} s = ({msl_scalar})0;")
+        body.append(f"        {msl_scalar} s = {_sc_zero(msl_scalar)};")
         body.append(f"        for (int k = 0; k < {cols}; ++k) s += a.c[i * {cols} + k] * b.c[k * {cols} + j];")
         body.append(f"        r.c[i * {cols} + j] = s;")
         body.append("    }")
@@ -934,7 +1091,7 @@ def _emit_big_mat_cross_overloads(
     body: list[str] = []
 
     def _vec_name(n: int, scalar: str) -> str:
-        return f"{scalar}{n}" if n in _MSL_VEC_NATIVE_N else f"wp_vec{n}_{scalar}"
+        return _msl_vec_name(n, scalar)
 
     for rows, cols, scalar in shapes:
         name = f"wp_mat{rows}x{cols}_{scalar}"
@@ -1155,7 +1312,7 @@ def _emit_wp_dot_overloads(source: str) -> str:
     for m in _BIG_VEC_NAME_PAT.finditer(source):
         n = int(m.group(1))
         scalar = m.group(2)
-        if n in _MSL_VEC_NATIVE_N or scalar not in _MSL_PREFIX_TO_SAME:
+        if scalar not in _MSL_PREFIX_TO_SAME or _vec_native(n, scalar):
             continue
         seen_big.add((n, scalar))
     for n, scalar in sorted(seen_big):
@@ -1190,7 +1347,304 @@ _DIAG_HELPERS = (
 # parameters ride in the ValueStruct) are read as their raw 64 bits and
 # converted here. Truncating (round-toward-zero) mantissa conversion;
 # handles inf/NaN, overflow to inf, and flushes underflow/denormals to 0.
-_F64_HELPERS = """\
+def _fp64_mode() -> str:
+    """Resolve :data:`warp.config.metal_fp64` (``"error"`` / ``"demote"`` /
+    ``"emulate"``), honouring the deprecated ``metal_demote_fp64`` alias."""
+    import warp.config as _wp_cfg  # noqa: PLC0415
+
+    mode = getattr(_wp_cfg, "metal_fp64", "error")
+    if mode == "error" and getattr(_wp_cfg, "metal_demote_fp64", False):
+        return "demote"
+    if mode not in ("error", "demote", "emulate"):
+        raise MetalCodegenError(f"warp.config.metal_fp64 must be one of 'error', 'demote', 'emulate' (got {mode!r})")
+    return mode
+
+
+def _f64_lit(value) -> str:
+    """MSL aggregate literal of an emulated double from a Python number."""
+    import struct as _struct  # noqa: PLC0415
+
+    bits = _struct.unpack("<Q", _struct.pack("<d", float(value)))[0]
+    return f"wp_f64{{0x{bits:016x}UL}}"
+
+
+def _sc_zero(msl_scalar: str) -> str:
+    """A zero of ``msl_scalar`` (the POD ``wp_f64`` has no converting ctor)."""
+    return "wp_f64{}" if msl_scalar == _F64_EMU_MSL else f"({msl_scalar})0"
+
+
+def _sc_lit(msl_scalar: str, value) -> str:
+    """A numeric literal of ``msl_scalar``."""
+    if msl_scalar == _F64_EMU_MSL:
+        return _f64_lit(value)
+    if msl_scalar in ("float", "half"):
+        return f"({msl_scalar}){float(value)!r}f"
+    return f"({msl_scalar}){value}"
+
+
+def _sc_cast(msl_scalar: str, expr: str) -> str:
+    """Convert ``expr`` (a native scalar expression) to ``msl_scalar``."""
+    if msl_scalar == _F64_EMU_MSL:
+        return f"wp_f64_from({expr})"
+    return f"({msl_scalar})({expr})"
+
+
+_F64_EMU_HELPERS_CACHE: str | None = None
+
+# Conversions between the emulated double and every native scalar. Each
+# entry is (MSL type, expression producing ``wp_f64`` from ``x``,
+# expression producing the native type from ``wp_f64 v``).
+_F64_EMU_SCALAR_CONVERSIONS: tuple[tuple[str, str, str], ...] = (
+    (
+        "float",
+        "wp_f64_bits(__softfloat64_cvt_f32_to_f64(as_type<uint>(x)))",
+        "as_type<float>(__softfloat64_cvt_f64_to_f32(v.bits, WP_F64_RM))",
+    ),
+    ("half", "wp_f64_from(float(x))", "half(float(v))"),
+    ("long", "wp_f64_bits(__softfloat64_cvt_i64_to_f64(x, WP_F64_RM))", "__softfloat64_cvt_f64_to_i64(v.bits, 3u)"),
+    ("ulong", "wp_f64_bits(__softfloat64_cvt_u64_to_f64(x, WP_F64_RM))", "ulong(long(v))"),
+    ("int", "wp_f64_from(long(x))", "int(long(v))"),
+    ("uint", "wp_f64_from(long(x))", "uint(long(v))"),
+    ("short", "wp_f64_from(long(x))", "short(long(v))"),
+    ("ushort", "wp_f64_from(long(x))", "ushort(long(v))"),
+    ("char", "wp_f64_from(long(x))", "char(long(v))"),
+    ("uchar", "wp_f64_from(long(x))", "uchar(long(v))"),
+    ("bool", "wp_f64_from(long(x ? 1 : 0))", "(v.bits & 0x7fffffffffffffffUL) != 0UL"),
+)
+
+# Transcendentals evaluated in fp32 and widened (see ``warp.config.metal_fp64``).
+_F64_EMU_FP32_UNARY = (
+    "exp",
+    "exp2",
+    "log",
+    "log2",
+    "log10",
+    "sin",
+    "cos",
+    "tan",
+    "asin",
+    "acos",
+    "atan",
+    "sinh",
+    "cosh",
+    "tanh",
+)
+_F64_EMU_FP32_BINARY = ("atan2", "pow")
+
+
+def _f64_emulate_helpers() -> str:
+    """The bundled metal-softfloat routines plus the ``wp_f64`` type (cached).
+
+    ``wp_f64`` is deliberately a POD struct with no constructors: MSL
+    refuses to place a type with a user-declared constructor in
+    ``threadgroup`` memory (smem tiles), so construction goes through
+    ``wp_f64{bits}`` aggregate literals and the ``wp_f64_from(x)`` overload
+    set, while ``float(x)`` / ``int(x)`` casts *out* of it use explicit
+    conversion operators (allowed on PODs). Arithmetic and comparison
+    operators, compound assignment in every address space, and overloads of
+    the ``metal::`` math functions the translators emit make the existing
+    scalar-templated helpers (big-vec / big-mat structs, tile helpers)
+    instantiate unchanged.
+    """
+    global _F64_EMU_HELPERS_CACHE
+    if _F64_EMU_HELPERS_CACHE is not None:
+        return _F64_EMU_HELPERS_CACHE
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "native", "metal", "softfloat64.metal")
+    with open(path, encoding="utf-8") as f:
+        soft = f.read()
+    L: list[str] = []
+    L.append("// ---- metal-softfloat (warp/native/metal/softfloat64.metal) ----")
+    L.append(soft)
+    L.append("// ---- wp_f64: emulated IEEE-754 binary64 (warp.config.metal_fp64 = 'emulate') ----")
+    L.append("#define WP_F64_RM 0u  // round-to-nearest-even, as CPU / CUDA")
+    L.append("struct wp_f64 {")
+    L.append("    ulong bits;")
+    for msl, _to, frm in _F64_EMU_SCALAR_CONVERSIONS:
+        for space in ("thread", "device", "constant", "threadgroup"):
+            L.append(f"    explicit operator {msl}() const {space} {{ wp_f64 v = *this; return {frm}; }}")
+    L.append("};")
+    L.append("inline wp_f64 wp_f64_bits(ulong b) { wp_f64 r; r.bits = b; return r; }")
+    L.append("inline wp_f64 wp_f64_from(wp_f64 x) { return x; }")
+    for msl, to, _frm in _F64_EMU_SCALAR_CONVERSIONS:
+        L.append(f"inline wp_f64 wp_f64_from({msl} x) {{ return {to}; }}")
+    for op, fn in (("+", "fadd"), ("-", "fsub"), ("*", "fmul"), ("/", "fdiv")):
+        L.append(
+            f"inline wp_f64 operator{op}(wp_f64 a, wp_f64 b) "
+            f"{{ return wp_f64_bits(__softfloat64_{fn}(a.bits, b.bits, WP_F64_RM)); }}"
+        )
+        for space in ("thread", "device", "threadgroup"):
+            L.append(f"inline {space} wp_f64& operator{op}=({space} wp_f64& a, wp_f64 b) {{ a = a {op} b; return a; }}")
+    L.append("inline wp_f64 operator-(wp_f64 a) { return wp_f64_bits(a.bits ^ 0x8000000000000000UL); }")
+    L.append("inline wp_f64 operator+(wp_f64 a) { return a; }")
+    for op, fn in (("<", "flt"), ("<=", "fle"), (">", "fgt"), (">=", "fge"), ("==", "feq")):
+        L.append(f"inline bool operator{op}(wp_f64 a, wp_f64 b) {{ return __softfloat64_{fn}(a.bits, b.bits); }}")
+    L.append("inline bool operator!=(wp_f64 a, wp_f64 b) { return !__softfloat64_feq(a.bits, b.bits); }")
+    # Exact bit-level helpers.
+    L.append("inline wp_f64 wp_f64_trunc(wp_f64 x) {")
+    L.append("    int e = int((x.bits >> 52) & 0x7ffUL) - 1023;")
+    L.append("    if (e >= 52) return x;  // already integral (or inf / nan)")
+    L.append("    if (e < 0) return wp_f64_bits(x.bits & 0x8000000000000000UL);  // |x| < 1 -> +-0")
+    L.append("    return wp_f64_bits(x.bits & ~((1UL << (52 - e)) - 1UL));")
+    L.append("}")
+    L.append("inline wp_f64 wp_f64_floor(wp_f64 x) {")
+    L.append("    wp_f64 t = wp_f64_trunc(x);")
+    L.append("    return (x < t) ? t - wp_f64{0x3ff0000000000000UL} : t;")
+    L.append("}")
+    L.append("inline wp_f64 wp_f64_ceil(wp_f64 x) {")
+    L.append("    wp_f64 t = wp_f64_trunc(x);")
+    L.append("    return (t < x) ? t + wp_f64{0x3ff0000000000000UL} : t;")
+    L.append("}")
+    L.append("inline wp_f64 wp_f64_copysign(wp_f64 a, wp_f64 b) {")
+    L.append("    return wp_f64_bits((a.bits & 0x7fffffffffffffffUL) | (b.bits & 0x8000000000000000UL));")
+    L.append("}")
+    L.append("inline wp_f64 wp_f64_abs(wp_f64 a) { return wp_f64_bits(a.bits & 0x7fffffffffffffffUL); }")
+    # round half away from zero (C ``round``); rint = ties-to-even.
+    L.append("inline wp_f64 wp_f64_round(wp_f64 x) {")
+    L.append("    wp_f64 t = wp_f64_trunc(x);")
+    L.append("    wp_f64 d = wp_f64_abs(x - t);  // exact: |x| < 2^52 here or t == x")
+    L.append("    if (!(d < wp_f64{0x3fe0000000000000UL})) t = t + wp_f64_copysign(wp_f64{0x3ff0000000000000UL}, x);")
+    L.append("    return t;")
+    L.append("}")
+    L.append("inline wp_f64 wp_f64_rint(wp_f64 x) {")
+    L.append("    wp_f64 t = wp_f64_trunc(x);")
+    L.append("    wp_f64 d = wp_f64_abs(x - t);")
+    L.append("    wp_f64 half_ = wp_f64{0x3fe0000000000000UL}, one = wp_f64{0x3ff0000000000000UL};")
+    L.append("    if (half_ < d) return t + wp_f64_copysign(one, x);")
+    L.append("    if (d == half_) {  // tie: pick the even neighbour")
+    L.append("        wp_f64 h = t * half_;")
+    L.append("        if (!(wp_f64_trunc(h) == h)) return t + wp_f64_copysign(one, x);")
+    L.append("    }")
+    L.append("    return t;")
+    L.append("}")
+    L.append("inline bool wp_f64_isnan(wp_f64 a) { return (a.bits & 0x7fffffffffffffffUL) > 0x7ff0000000000000UL; }")
+    L.append("inline bool wp_f64_isinf(wp_f64 a) { return (a.bits & 0x7fffffffffffffffUL) == 0x7ff0000000000000UL; }")
+    L.append(
+        "inline bool wp_f64_isfinite(wp_f64 a) { return (a.bits & 0x7ff0000000000000UL) != 0x7ff0000000000000UL; }"
+    )
+    L.append("namespace metal {")
+    L.append("inline wp_f64 sqrt(wp_f64 a) { return wp_f64_bits(__softfloat64_fsqrt(a.bits, WP_F64_RM)); }")
+    L.append("inline wp_f64 rsqrt(wp_f64 a) { return wp_f64{0x3ff0000000000000UL} / metal::sqrt(a); }")
+    L.append(
+        "inline wp_f64 fma(wp_f64 a, wp_f64 b, wp_f64 c) "
+        "{ return wp_f64_bits(__softfloat64_fma(a.bits, b.bits, c.bits, WP_F64_RM)); }"
+    )
+    L.append("inline wp_f64 abs(wp_f64 a) { return wp_f64_abs(a); }")
+    L.append("inline wp_f64 fabs(wp_f64 a) { return wp_f64_abs(a); }")
+    L.append("inline wp_f64 min(wp_f64 a, wp_f64 b) { return (b < a) ? b : a; }")
+    L.append("inline wp_f64 max(wp_f64 a, wp_f64 b) { return (a < b) ? b : a; }")
+    L.append("inline wp_f64 clamp(wp_f64 x, wp_f64 lo, wp_f64 hi) { return metal::min(metal::max(x, lo), hi); }")
+    L.append("inline wp_f64 floor(wp_f64 a) { return wp_f64_floor(a); }")
+    L.append("inline wp_f64 ceil(wp_f64 a) { return wp_f64_ceil(a); }")
+    L.append("inline wp_f64 trunc(wp_f64 a) { return wp_f64_trunc(a); }")
+    L.append("inline wp_f64 round(wp_f64 a) { return wp_f64_round(a); }")
+    L.append("inline wp_f64 rint(wp_f64 a) { return wp_f64_rint(a); }")
+    L.append("inline wp_f64 copysign(wp_f64 a, wp_f64 b) { return wp_f64_copysign(a, b); }")
+    L.append("inline wp_f64 fmod(wp_f64 a, wp_f64 b) { return a - wp_f64_trunc(a / b) * b; }")
+    L.append("inline bool isnan(wp_f64 a) { return wp_f64_isnan(a); }")
+    L.append("inline bool isinf(wp_f64 a) { return wp_f64_isinf(a); }")
+    L.append("inline bool isfinite(wp_f64 a) { return wp_f64_isfinite(a); }")
+    for fn in _F64_EMU_FP32_UNARY:
+        L.append(f"inline wp_f64 {fn}(wp_f64 a) {{ return wp_f64_from(metal::precise::{fn}(float(a))); }}")
+    for fn in _F64_EMU_FP32_BINARY:
+        L.append(
+            f"inline wp_f64 {fn}(wp_f64 a, wp_f64 b) "
+            f"{{ return wp_f64_from(metal::precise::{fn}(float(a), float(b))); }}"
+        )
+    # SIMD-group collectives: shuffle the two 32-bit halves. ``simd_sum``
+    # runs an xor butterfly (always in range) and then broadcasts lane 0's
+    # total so every lane holds the *same* correctly-rounded value — the
+    # cooperative Cholesky/solve helpers rely on lane-identical copies.
+    L.append("inline wp_f64 simd_shuffle(wp_f64 v, ushort lane) {")
+    L.append("    uint lo = metal::simd_shuffle(uint(v.bits & 0xffffffffUL), lane);")
+    L.append("    uint hi = metal::simd_shuffle(uint(v.bits >> 32), lane);")
+    L.append("    return wp_f64_bits((ulong(hi) << 32) | ulong(lo));")
+    L.append("}")
+    L.append("inline wp_f64 simd_shuffle_xor(wp_f64 v, ushort mask) {")
+    L.append("    uint lo = metal::simd_shuffle_xor(uint(v.bits & 0xffffffffUL), mask);")
+    L.append("    uint hi = metal::simd_shuffle_xor(uint(v.bits >> 32), mask);")
+    L.append("    return wp_f64_bits((ulong(hi) << 32) | ulong(lo));")
+    L.append("}")
+    L.append("inline wp_f64 simd_broadcast(wp_f64 v, ushort lane) { return metal::simd_shuffle(v, lane); }")
+    for fn, expr in (("simd_sum", "v + o"), ("simd_min", "metal::min(v, o)"), ("simd_max", "metal::max(v, o)")):
+        L.append(f"inline wp_f64 {fn}(wp_f64 v) {{")
+        L.append(
+            "    for (ushort m = 16; m > 0; m >>= 1) { wp_f64 o = metal::simd_shuffle_xor(v, m); v = " + expr + "; }"
+        )
+        L.append("    return metal::simd_shuffle(v, 0);")
+        L.append("}")
+    L.append("namespace precise {")
+    L.append("inline wp_f64 sqrt(wp_f64 a) { return metal::sqrt(a); }")
+    L.append("inline wp_f64 rsqrt(wp_f64 a) { return metal::rsqrt(a); }")
+    for fn in _F64_EMU_FP32_UNARY:
+        L.append(f"inline wp_f64 {fn}(wp_f64 a) {{ return metal::{fn}(a); }}")
+    for fn in _F64_EMU_FP32_BINARY:
+        L.append(f"inline wp_f64 {fn}(wp_f64 a, wp_f64 b) {{ return metal::{fn}(a, b); }}")
+    L.append("}  // namespace precise")
+    L.append("}  // namespace metal")
+    # Non-template overloads of the ``wp_*`` scalar helpers whose generic
+    # bodies spell literals as ``T(0)`` (impossible for a POD).
+    L.append(
+        "inline wp_f64 wp_sign(wp_f64 x) { return (x < wp_f64{}) ? wp_f64{0xbff0000000000000UL} : wp_f64{0x3ff0000000000000UL}; }"
+    )
+    L.append("inline wp_f64 wp_step(wp_f64 x) { return (x < wp_f64{}) ? wp_f64{0x3ff0000000000000UL} : wp_f64{}; }")
+    L.append("inline wp_f64 wp_nonzero(wp_f64 x) { return (x == wp_f64{}) ? wp_f64{} : wp_f64{0x3ff0000000000000UL}; }")
+    L.append("inline wp_f64 wp_mod(wp_f64 a, wp_f64 b) { return metal::fmod(a, b); }")
+    L.append("inline wp_f64 wp_frac(wp_f64 x) { return x - wp_f64_trunc(x); }")
+    L.append("inline wp_f64 wp_degrees(wp_f64 x) { return x * wp_f64{0x404ca5dc1a63c1f8UL}; }")
+    L.append("inline wp_f64 wp_radians(wp_f64 x) { return x * wp_f64{0x3f91df46a2529d39UL}; }")
+    L.append("inline bool wp_isfinite(wp_f64 x) { return wp_f64_isfinite(x); }")
+    # Reverse-mode cast adjoints: the generic ``wp_adj_cast`` template spells
+    # the widening as ``T(r)``, which a POD cannot provide.
+    L.append(
+        "template <typename U> inline void wp_adj_cast(wp_f64 x, thread wp_f64& ax, U r) { ax += wp_f64_from(r); }"
+    )
+    L.append("inline bool wp_isnan(wp_f64 x) { return wp_f64_isnan(x); }")
+    L.append("inline bool wp_isinf(wp_f64 x) { return wp_f64_isinf(x); }")
+    _F64_EMU_HELPERS_CACHE = "\n".join(L) + "\n"
+    return _F64_EMU_HELPERS_CACHE
+
+
+# Atomic read-modify-write on an emulated-double element (``"emulate"``
+# mode). Same per-element lock protocol as ``_F64_ATOMIC_HELPERS`` below —
+# the high word is compare-exchanged to the ``0x7ff7dead`` sentinel — but
+# the update itself is a correctly-rounded softfloat op, so the result is
+# bit-identical to a serial CPU accumulation in the same order.
+_F64_EMU_ATOMIC_HELPERS = """\
+#define WP_F64_ATOMIC_LOCK 0x7ff7deadu
+#define WP_F64E_ATOMIC_OP(NAME, EXPR) \\
+inline wp_f64 wp_f64_atomic_##NAME(device wp_f64* p, wp_f64 v) { \\
+    device metal::atomic_uint* hi = ((device metal::atomic_uint*)p) + 1; \\
+    device metal::atomic_uint* lo = (device metal::atomic_uint*)p; \\
+    while (true) { \\
+        uint old_hi = metal::atomic_load_explicit(hi, metal::memory_order_relaxed); \\
+        if (old_hi == WP_F64_ATOMIC_LOCK) continue; \\
+        if (metal::atomic_compare_exchange_weak_explicit(hi, &old_hi, WP_F64_ATOMIC_LOCK, \\
+                                                         metal::memory_order_relaxed, metal::memory_order_relaxed)) { \\
+            metal::atomic_thread_fence(metal::mem_flags::mem_device, metal::memory_order_seq_cst, \\
+                                       metal::thread_scope::thread_scope_device); \\
+            uint old_lo = metal::atomic_load_explicit(lo, metal::memory_order_relaxed); \\
+            wp_f64 cur = wp_f64_bits((ulong(old_hi) << 32) | ulong(old_lo)); \\
+            wp_f64 nb = (EXPR); \\
+            metal::atomic_store_explicit(lo, uint(nb.bits & 0xffffffffUL), metal::memory_order_relaxed); \\
+            metal::atomic_thread_fence(metal::mem_flags::mem_device, metal::memory_order_seq_cst, \\
+                                       metal::thread_scope::thread_scope_device); \\
+            metal::atomic_store_explicit(hi, uint(nb.bits >> 32), metal::memory_order_relaxed); \\
+            return cur; \\
+        } \\
+    } \\
+}
+WP_F64E_ATOMIC_OP(add, cur + v)
+WP_F64E_ATOMIC_OP(sub, cur - v)
+WP_F64E_ATOMIC_OP(min, metal::min(cur, v))
+WP_F64E_ATOMIC_OP(max, metal::max(cur, v))
+// Reverse-mode gradient accumulation into a float64 array (see the float
+// ``wp_adj_accum`` in ``_ADJ_HELPERS``): several lanes may hold the adjoint
+// of one element, so it goes through the lock-emulated atomic add.
+inline void wp_adj_accum(device wp_f64* p, wp_f64 v) { wp_f64_atomic_add(p, v); }
+"""
+
+
+_F64_HELPERS = """\\
 inline float wp_f64_to_f32(ulong b) {
     uint sign = uint(b >> 63) << 31;
     int exp = int((b >> 52) & 0x7ffull);
@@ -6082,7 +6536,9 @@ def _emit_tile_struct(rows: int, cols: int, msl_scalar: str) -> str:
     parts.append(f"        for (int j = 0; j < {cols}; ++j) {{")
     parts.append("            int c = col_off + j;")
     parts.append("            bool in_range = r >= 0 && r < n_rows && c >= 0 && c < n_cols;")
-    parts.append(f"            t.c[i * {cols} + j] = in_range ? arr[base + r * row_stride + c] : ({msl_scalar})0;")
+    parts.append(
+        f"            t.c[i * {cols} + j] = in_range ? arr[base + r * row_stride + c] : {_sc_zero(msl_scalar)};"
+    )
     parts.append("        }")
     parts.append("    }")
     parts.append("    return t;")
@@ -6165,6 +6621,26 @@ def _emit_tile_fft(rows: int, cols: int, msl_scalar: str) -> str:
     name = f"wp_tile_{rows}x{cols}_vec2_{msl_scalar}_fft"
     two_pi = "6.283185307179586f"
     parts: list[str] = []
+    emu = msl_scalar == _F64_EMU_MSL
+    if emu:
+        # No fp64 ``sin``/``cos`` on the GPU: tabulate the twiddles on the
+        # host in double precision. Stage ``len`` (half-length ``h``) uses
+        # entries ``h - 1 + k`` for ``k < h`` — the stages' half-lengths
+        # 1, 2, 4, ... pack contiguously since ``1 + 2 + ... + h/2 == h - 1``.
+        import math as _math  # noqa: PLC0415
+        import struct as _struct  # noqa: PLC0415
+
+        cos_bits: list[str] = []
+        sin_bits: list[str] = []
+        ln = 2
+        while ln <= cols:
+            for k in range(ln // 2):
+                ang = -2.0 * _math.pi * k / ln
+                cos_bits.append(f"0x{_struct.unpack('<Q', _struct.pack('<d', _math.cos(ang)))[0]:016x}UL")
+                sin_bits.append(f"0x{_struct.unpack('<Q', _struct.pack('<d', _math.sin(ang)))[0]:016x}UL")
+            ln <<= 1
+        parts.append(f"constant ulong {name}_twc[{len(cos_bits)}] = {{{', '.join(cos_bits)}}};")
+        parts.append(f"constant ulong {name}_tws[{len(sin_bits)}] = {{{', '.join(sin_bits)}}};")
     parts.append(f"inline void {name}(thread wp_tile_{rows}x{cols}_vec2_{msl_scalar}& t, bool inverse) {{")
     parts.append(f"    for (int b = 0; b < {rows}; ++b) {{")
     parts.append(f"        thread {msl_scalar}* d = t.c + b * {cols * 2};")
@@ -6183,13 +6659,19 @@ def _emit_tile_fft(rows: int, cols: int, msl_scalar: str) -> str:
     parts.append("            }")
     parts.append("        }")
     parts.append(f"        for (int len = 2; len <= {cols}; len <<= 1) {{")
-    parts.append(f"            {msl_scalar} ang = (inverse ? {two_pi} : -{two_pi}) / {msl_scalar}(len);")
+    if not emu:
+        parts.append(f"            {msl_scalar} ang = (inverse ? {two_pi} : -{two_pi}) / {msl_scalar}(len);")
     # ``half`` is an MSL type name — use ``hlen``.
     parts.append("            int hlen = len >> 1;")
     parts.append(f"            for (int i = 0; i < {cols}; i += len) {{")
     parts.append("                for (int k = 0; k < hlen; ++k) {")
-    parts.append(f"                    {msl_scalar} wr = metal::precise::cos(ang * {msl_scalar}(k));")
-    parts.append(f"                    {msl_scalar} wi = metal::precise::sin(ang * {msl_scalar}(k));")
+    if emu:
+        parts.append(f"                    wp_f64 wr = wp_f64_bits({name}_twc[hlen - 1 + k]);")
+        parts.append(f"                    wp_f64 wi = wp_f64_bits({name}_tws[hlen - 1 + k]);")
+        parts.append("                    if (inverse) wi = -wi;")
+    else:
+        parts.append(f"                    {msl_scalar} wr = metal::precise::cos(ang * {msl_scalar}(k));")
+        parts.append(f"                    {msl_scalar} wi = metal::precise::sin(ang * {msl_scalar}(k));")
     parts.append("                    int a = 2 * (i + k);")
     parts.append("                    int c = 2 * (i + k + hlen);")
     parts.append(f"                    {msl_scalar} vr = d[c] * wr - d[c + 1] * wi;")
@@ -6239,15 +6721,15 @@ def _emit_tile_cholesky(n: int, msl_scalar: str) -> str:
     # blows up the rest of the factorization to NaN.
     parts.append("            d = metal::fma(-ljk, ljk, d);")
     parts.append("        }")
-    parts.append(f"        d = metal::max(d, ({msl_scalar})1e-30);")
+    parts.append(f"        d = metal::max(d, {_sc_lit(msl_scalar, 1e-30)});")
     parts.append(f"        {msl_scalar} ljj = metal::precise::sqrt(d);")
     parts.append(f"        L.c[j*{n} + j] = ljj;")
-    parts.append(f"        {msl_scalar} inv = ({msl_scalar})1.0 / ljj;")
+    parts.append(f"        {msl_scalar} inv = {_sc_lit(msl_scalar, 1.0)} / ljj;")
     parts.append(f"        for (int i = j + 1; i < {n}; ++i) {{")
     parts.append(f"            {msl_scalar} s = L.c[i*{n} + j];")
     parts.append(f"            for (int k = 0; k < j; ++k) s = metal::fma(-L.c[i*{n} + k], L.c[j*{n} + k], s);")
     parts.append(f"            L.c[i*{n} + j] = s * inv;")
-    parts.append(f"            L.c[j*{n} + i] = ({msl_scalar})0.0;")
+    parts.append(f"            L.c[j*{n} + i] = {_sc_zero(msl_scalar)};")
     parts.append("        }")
     parts.append("    }")
     parts.append("    return L;")
@@ -6397,7 +6879,7 @@ def _emit_tile_cholesky_coop(n: int, msl_scalar: str) -> str:
     # Explicit fma — see ``_emit_tile_cholesky_inplace`` for rationale.
     parts.append("                d = metal::fma(-ljk, ljk, d);")
     parts.append("            }")
-    parts.append(f"            d = metal::max(d, ({msl_scalar})1e-30);")
+    parts.append(f"            d = metal::max(d, {_sc_lit(msl_scalar, 1e-30)});")
     parts.append(f"            smem[j*{n} + j] = metal::precise::sqrt(d);")
     parts.append("        }")
     parts.append("        threadgroup_barrier(metal::mem_flags::mem_threadgroup);")
@@ -6418,7 +6900,7 @@ def _emit_tile_cholesky_coop(n: int, msl_scalar: str) -> str:
     parts.append(f"    for (int idx = 0; idx < {n * n}; ++idx) {{")
     parts.append(f"        int i = idx / {n};")
     parts.append(f"        int j2 = idx - i * {n};")
-    parts.append(f"        L.c[idx] = (j2 > i) ? ({msl_scalar})0 : smem[idx];")
+    parts.append(f"        L.c[idx] = (j2 > i) ? {_sc_zero(msl_scalar)} : smem[idx];")
     parts.append("    }")
     parts.append("    return L;")
     parts.append("}")
@@ -6459,15 +6941,15 @@ def _emit_tile_cholesky_inplace(n: int, msl_scalar: str) -> str:
     # blows up the rest of the factorization to NaN.
     parts.append("            d = metal::fma(-ljk, ljk, d);")
     parts.append("        }")
-    parts.append(f"        d = metal::max(d, ({msl_scalar})1e-30);")
+    parts.append(f"        d = metal::max(d, {_sc_lit(msl_scalar, 1e-30)});")
     parts.append(f"        {msl_scalar} ljj = metal::precise::sqrt(d);")
     parts.append(f"        L.c[j*{n} + j] = ljj;")
-    parts.append(f"        {msl_scalar} inv = ({msl_scalar})1.0 / ljj;")
+    parts.append(f"        {msl_scalar} inv = {_sc_lit(msl_scalar, 1.0)} / ljj;")
     parts.append(f"        for (int i = j + 1; i < {n}; ++i) {{")
     parts.append(f"            {msl_scalar} s = L.c[i*{n} + j];")
     parts.append(f"            for (int k = 0; k < j; ++k) s = metal::fma(-L.c[i*{n} + k], L.c[j*{n} + k], s);")
     parts.append(f"            L.c[i*{n} + j] = s * inv;")
-    parts.append(f"            L.c[j*{n} + i] = ({msl_scalar})0.0;")
+    parts.append(f"            L.c[j*{n} + i] = {_sc_zero(msl_scalar)};")
     parts.append("        }")
     parts.append("    }")
     parts.append("}")
@@ -6602,7 +7084,7 @@ def _emit_tile_matmul(r: int, k: int, n: int, msl_scalar: str) -> str:
     ]
     parts.append(f"    for (int i = 0; i < {r}; ++i) {{")
     parts.append(f"        for (int j = 0; j < {n}; ++j) {{")
-    parts.append(f"            {msl_scalar} s = ({msl_scalar})0;")
+    parts.append(f"            {msl_scalar} s = {_sc_zero(msl_scalar)};")
     parts.append(f"            for (int kk = 0; kk < {k}; ++kk) {{")
     # Explicit ``fma`` accumulator: ``-ffast-math`` allows reassociation,
     # and on G1's H structure the rank-1 updates lose enough precision
@@ -6747,7 +7229,7 @@ def _emit_tile_cholesky_solve_coop(n: int, msl_scalar: str) -> str:
     # single-thread variant — keep the outer loop at runtime.
     parts.append("    #pragma clang loop unroll(disable)")
     parts.append(f"    for (int i = 0; i < {n}; ++i) {{")
-    parts.append(f"        {msl_scalar} s = ({msl_scalar})0;")
+    parts.append(f"        {msl_scalar} s = {_sc_zero(msl_scalar)};")
     parts.append(f"        for (int kk = (int)lane; kk < i; kk += 32) s = metal::fma(-L.c[i*{n} + kk], x.c[kk], s);")
     parts.append("        s = metal::simd_sum(s);")
     parts.append(f"        x.c[i] = (x.c[i] + s) / L.c[i*{n} + i];")
@@ -6755,7 +7237,7 @@ def _emit_tile_cholesky_solve_coop(n: int, msl_scalar: str) -> str:
     # Backward: L^T x = y.
     parts.append("    #pragma clang loop unroll(disable)")
     parts.append(f"    for (int i = {n} - 1; i >= 0; --i) {{")
-    parts.append(f"        {msl_scalar} s = ({msl_scalar})0;")
+    parts.append(f"        {msl_scalar} s = {_sc_zero(msl_scalar)};")
     parts.append(
         f"        for (int kk = i + 1 + (int)lane; kk < {n}; kk += 32) s = metal::fma(-L.c[kk*{n} + i], x.c[kk], s);"
     )
@@ -6816,7 +7298,7 @@ def _emit_tile_cholesky_smem(n: int, msl_scalar: str) -> str:
     parts.append(f"                {msl_scalar} ljk = smem[j*{n} + k];")
     parts.append("                d = metal::fma(-ljk, ljk, d);")
     parts.append("            }")
-    parts.append(f"            d = metal::max(d, ({msl_scalar})1e-30);")
+    parts.append(f"            d = metal::max(d, {_sc_lit(msl_scalar, 1e-30)});")
     parts.append(f"            smem[j*{n} + j] = metal::precise::sqrt(d);")
     parts.append("        }")
     parts.append("        threadgroup_barrier(metal::mem_flags::mem_threadgroup);")
@@ -6833,7 +7315,7 @@ def _emit_tile_cholesky_smem(n: int, msl_scalar: str) -> str:
     parts.append(f"    for (uint e = lane; e < {nn}u; e += 32u) {{")
     parts.append(f"        uint i = e / {n}u;")
     parts.append(f"        uint j = e - i * {n}u;")
-    parts.append(f"        if (j > i) smem[e] = ({msl_scalar})0;")
+    parts.append(f"        if (j > i) smem[e] = {_sc_zero(msl_scalar)};")
     parts.append("    }")
     parts.append("    threadgroup_barrier(metal::mem_flags::mem_threadgroup);")
     parts.append("}")
@@ -6859,14 +7341,14 @@ def _emit_tile_cholesky_solve_smem_1(n: int, msl_scalar: str) -> str:
     parts.append(f"    {B_name} x = b;")
     parts.append("    #pragma clang loop unroll(disable)")
     parts.append(f"    for (int i = 0; i < {n}; ++i) {{")
-    parts.append(f"        {msl_scalar} s = ({msl_scalar})0;")
+    parts.append(f"        {msl_scalar} s = {_sc_zero(msl_scalar)};")
     parts.append(f"        for (int kk = (int)lane; kk < i; kk += 32) s = metal::fma(-L[i*{n} + kk], x.c[kk], s);")
     parts.append("        s = metal::simd_sum(s);")
     parts.append(f"        x.c[i] = (x.c[i] + s) / L[i*{n} + i];")
     parts.append("    }")
     parts.append("    #pragma clang loop unroll(disable)")
     parts.append(f"    for (int i = {n} - 1; i >= 0; --i) {{")
-    parts.append(f"        {msl_scalar} s = ({msl_scalar})0;")
+    parts.append(f"        {msl_scalar} s = {_sc_zero(msl_scalar)};")
     parts.append(
         f"        for (int kk = i + 1 + (int)lane; kk < {n}; kk += 32) s = metal::fma(-L[kk*{n} + i], x.c[kk], s);"
     )
@@ -7427,7 +7909,7 @@ def _plan_smem_tiles(
 
 def _msl_vec_name(n: int, msl_scalar: str) -> str:
     """MSL type name for ``vec_t<N, T>`` — native ``floatN`` or our struct."""
-    return f"{msl_scalar}{n}" if n in _MSL_VEC_NATIVE_N else f"wp_vec{n}_{msl_scalar}"
+    return f"{msl_scalar}{n}" if _vec_native(n, msl_scalar) else f"wp_vec{n}_{msl_scalar}"
 
 
 def _emit_nonsquare_outer_overloads(shapes: set[tuple[int, int, str]]) -> str:
@@ -7443,7 +7925,9 @@ def _emit_nonsquare_outer_overloads(shapes: set[tuple[int, int, str]]) -> str:
     """
     parts: list[str] = []
     for rows, cols, scalar in sorted(shapes):
-        if rows == cols:
+        if _mat_native(rows, cols, scalar) or (rows, cols, scalar) == (1, 1, "float"):
+            # Native shapes come from ``_MISC_MATH_HELPERS``; the float 1x1
+            # overload from the ``need_mat1x1`` block in ``_build_kernel_header``.
             continue
         mat = _msl_mat_name(rows, cols, scalar)
         a_ty = _msl_vec_name(rows, scalar)
@@ -7464,7 +7948,7 @@ def _build_kernel_header(source: str) -> str:
         scalar = m.group(2)
         if scalar not in _MSL_PREFIX_TO_SAME:
             continue
-        if n in _MSL_VEC_NATIVE_N:
+        if _vec_native(n, scalar):
             continue
         seen_vec.add((n, scalar))
     # Transform helpers are built on the ``wp_vec7_float`` struct — a kernel
@@ -7510,11 +7994,30 @@ def _build_kernel_header(source: str) -> str:
     # emitted even when the kernel body never names them directly.
     for rows, cols, scalar in seen_mat:
         for n in (rows, cols):
-            if n not in _MSL_VEC_NATIVE_N:
+            if not _vec_native(n, scalar):
                 seen_vec.add((n, scalar))
     parts: list[str] = []
+    # Emulated doubles first: every struct below may carry ``wp_f64`` members.
+    if _F64_EMU_MSL in source:
+        parts.append(_f64_emulate_helpers())
     for n, scalar in sorted(seen_vec):
         parts.append(_emit_big_vec_struct(f"wp_vec{n}_{scalar}", n, scalar))
+    # ``wp.vec1d(v_f32)`` / ``wp.vec1f(v_f64)`` between two big-vec structs
+    # (warp.fem's scalar-space dofs): emitted after both structs exist.
+    for n, scalar in sorted(seen_vec):
+        if scalar != _F64_EMU_MSL or (n, "float") not in seen_vec:
+            continue
+        f64_ty, f32_ty = f"wp_vec{n}_{_F64_EMU_MSL}", f"wp_vec{n}_float"
+        to64 = ", ".join(f"wp_f64_from(v.c[{i}])" for i in range(n))
+        to32 = ", ".join(f"float(v.c[{i}])" for i in range(n))
+        parts.append(f"inline {f64_ty} {f64_ty}_make({f32_ty} v) {{ return {f64_ty}_make({to64}); }}")
+        parts.append(f"inline {f32_ty} {f32_ty}_make({f64_ty} v) {{ return {f32_ty}_make({to32}); }}")
+        parts.append(
+            f"inline void wp_adj_vec_t({f32_ty} o, thread {f32_ty}& ao, {f64_ty} r) {{ ao += {f32_ty}_make(r); }}"
+        )
+        parts.append(
+            f"inline void wp_adj_vec_t({f64_ty} o, thread {f64_ty}& ao, {f32_ty} r) {{ ao += {f64_ty}_make(r); }}"
+        )
     if (6, "float") in seen_vec:
         parts.append(_emit_spatial_helpers())
     for rows, cols, scalar in sorted(seen_mat):
@@ -7534,10 +8037,11 @@ def _build_kernel_header(source: str) -> str:
         parts.append(extract_helpers)
     if "wp_diag_float3" in source:
         parts.append(_DIAG_HELPERS)
-    if "wp_f64_to_f32" in source or "wp_f32_to_f64" in source or "wp_f64_atomic_" in source:
+    _emu = _F64_EMU_MSL in source and _fp64_mode() == "emulate"
+    if "wp_f64_to_f32" in source or "wp_f32_to_f64" in source or ("wp_f64_atomic_" in source and not _emu):
         parts.append(_F64_HELPERS)
-    if "wp_f64_atomic_" in source:
-        parts.append(_F64_ATOMIC_HELPERS)
+    if "wp_f64_atomic_" in source or (_emu and "wp_adj_accum" in source):
+        parts.append(_F64_EMU_ATOMIC_HELPERS if _emu else _F64_ATOMIC_HELPERS)
     if "wp_adj_" in source:
         parts.append(_ADJ_HELPERS)
         for _n in _ADJ_VEC_HELPER_LENGTHS:
@@ -7833,7 +8337,7 @@ def _rewrite_vec_t_brace_constructor(text: str) -> str:
         if full_ctype not in _MSL_VEC_SCALAR_PREFIX or n < 1:
             return m.group(0)
         msl_scalar = _MSL_VEC_SCALAR_PREFIX[full_ctype]
-        if n in _MSL_VEC_NATIVE_N:
+        if _vec_native(n, msl_scalar):
             return f"{msl_scalar}{n}({args_str})"
         # Zero-arg ``wp::vec_t<N, T>()`` is the default-construction
         # form Warp uses for ``vec_t = vec5()`` style local declarations.
@@ -7920,13 +8424,13 @@ def _rewrite_mat_t_constructor(text: str) -> str:
         # struct so the row-access proxy works; ``mat_t<2, 3>(args)``
         # routes to ``wp_mat2x3_float_make(args...)``.
         if not args:
-            if rows == cols and rows in _MSL_VEC_NATIVE_N:
+            if _mat_native(rows, cols, msl_scalar):
                 return f"{msl_scalar}{rows}x{cols}(0)"
             return f"wp_mat{rows}x{cols}_{msl_scalar}()"
         # Single-scalar broadcast: ``mat_t<R,C,T>(scalar)``.
         if len(args) == 1:
             scalar_arg = args[0]
-            if rows == cols and rows in _MSL_VEC_NATIVE_N:
+            if _mat_native(rows, cols, msl_scalar):
                 # MSL's single-scalar matrix constructor fills the DIAGONAL
                 # (GLSL semantics); Warp broadcasts to every element. Expand
                 # to an explicit all-columns broadcast — ``mat22(1.0)`` must
@@ -7938,7 +8442,7 @@ def _rewrite_mat_t_constructor(text: str) -> str:
             return f"wp_mat{rows}x{cols}_{msl_scalar}_make({scalar_arg})"
         if len(args) != rows * cols:
             return m.group(0)
-        if rows == cols and rows in _MSL_VEC_NATIVE_N:
+        if _mat_native(rows, cols, msl_scalar):
             msl_vec = f"{msl_scalar}{rows}"
             msl_mat = f"{msl_scalar}{rows}x{cols}"
             col_strs: list[str] = []
@@ -7964,7 +8468,12 @@ def _msl_scalar_type(ctype: str) -> str:
     floating point support).
     """
     if ctype == "wp::float64":
-        raise MetalCodegenError("MSL has no native float64; double-precision kernels cannot be lowered to Metal")
+        if _fp64_mode() == "emulate":
+            return _F64_EMU_MSL
+        raise MetalCodegenError(
+            "MSL has no native float64; double-precision kernels cannot be lowered to Metal "
+            "(see warp.config.metal_fp64)"
+        )
     stripped = ctype.strip()
     # ``wp::quat_t<wp::TYPE>`` is laid out as a 4-element vec_t; rewrite
     # so the vec_t/mat_t handling below covers it.
@@ -8050,9 +8559,7 @@ def _demote_f64_ctype(ctype: str) -> str:
     See ``_demote_tile_f64_tokens`` for why tiles may drop the double type."""
     if "wp::float64" not in ctype:
         return ctype
-    import warp.config as _wp_cfg  # noqa: PLC0415
-
-    if not _wp_cfg.metal_demote_fp64:
+    if _fp64_mode() != "demote":
         return ctype
     return ctype.replace("wp::float64", "wp::float32")
 
@@ -8074,9 +8581,7 @@ def _demote_f64_value_tokens(text: str) -> str:
     """
     if "wp::float64" not in text:
         return text
-    import warp.config as _wp_cfg  # noqa: PLC0415
-
-    if not _wp_cfg.metal_demote_fp64:
+    if _fp64_mode() != "demote":
         return text
 
     def _sub(m: re.Match[str]) -> str:
@@ -8104,9 +8609,7 @@ def _demote_tile_f64_tokens(text: str) -> str:
     """
     if "wp::float64" not in text or "wp::tile_" not in text:
         return text
-    import warp.config as _wp_cfg  # noqa: PLC0415
-
-    if not _wp_cfg.metal_demote_fp64:
+    if _fp64_mode() != "demote":
         return text
     out: list[str] = []
     i = 0
@@ -8153,7 +8656,11 @@ def _msl_var_type(ctype: str) -> str:
     # 8-byte element stride is user-visible memory layout) still raise via
     # ``_msl_pointer_type`` above.
     if ctype == "wp::float64":
-        return "float"
+        # Under "emulate" the value is a real double; otherwise (both "error"
+        # and "demote") it computes in fp32 — float64 *storage* is what the
+        # "error" mode rejects (see the array-argument check), value locals
+        # such as warp.fem's ``wp.float64`` integrand parameters always have.
+        return _F64_EMU_MSL if _fp64_mode() == "emulate" else "float"
     # Tile types translate two ways depending on element shape:
     #   * shape == (1,) or (1, 1) — a single-thread tile of one element.
     #     With ``block_dim=1`` (the Metal default) every register-tile
@@ -8192,10 +8699,17 @@ def _msl_var_type(ctype: str) -> str:
     return _msl_scalar_type(ctype)
 
 
-def _msl_constant_str(value) -> str:
-    """Format a Python scalar as an MSL literal."""
+def _msl_constant_str(value, msl_type: str | None = None) -> str:
+    """Format a Python scalar as an MSL literal.
+
+    ``msl_type`` is the declared type of the local being initialised, when
+    known: a plain Python number destined for an emulated-double local must
+    become a ``wp_f64{bits}`` aggregate literal rather than a float literal.
+    """
     if isinstance(value, bool):
         return "true" if value else "false"
+    if msl_type == _F64_EMU_MSL and isinstance(value, (int, float)):
+        return _f64_lit(value)
     # ``isinstance(True, int)`` is True, so ``bool`` must come first.
     if isinstance(value, int):
         return str(value)
@@ -8220,16 +8734,27 @@ def _msl_constant_str(value) -> str:
 
         scalar_t = getattr(type(value), "_wp_scalar_type_", None)
         scalar_name = scalar_t.__name__ if scalar_t is not None else "float32"
+        if scalar_name == "float64":
+            # ``wp.constant(wp.vec2d(...))``: follows the float64 value rule
+            # of the active mode (fp32 under "demote", ``wp_f64`` structs
+            # under "emulate").
+            _mode = _fp64_mode()
+            if _mode == "error":
+                raise MetalCodegenError(
+                    "MSL codegen: constant element type wp::float64 is not supported "
+                    "(set warp.config.metal_fp64 to 'demote' or 'emulate')"
+                )
+            scalar_name = "float32" if _mode == "demote" else "float64"
         msl_scalar = _MSL_VEC_SCALAR_PREFIX.get(f"wp::{scalar_name}")
         if msl_scalar is None:
             raise MetalCodegenError(f"MSL codegen: constant element type wp::{scalar_name} is not supported")
-        elems = [_msl_constant_str(x) for x in np.array(value).flatten().tolist()]
+        elems = [_msl_constant_str(x, msl_scalar) for x in np.array(value).flatten().tolist()]
         if len(shape) == 1:
             # Big vecs (5/6/8) use the free ``_make`` factory of the custom
             # struct; the preamble emitter picks the struct up from the name.
             return f"{_msl_vec_ctor(shape[0], msl_scalar)}({', '.join(elems)})"
         rows, cols = shape
-        if rows == cols and rows in _MSL_VEC_NATIVE_N:
+        if _mat_native(rows, cols, msl_scalar):
             # Native square matrix: MSL constructors take COLUMNS.
             msl_vec = f"{msl_scalar}{rows}"
             col_strs = [f"{msl_vec}({', '.join(elems[r * cols + c] for r in range(rows))})" for c in range(cols)]
@@ -8245,6 +8770,8 @@ def _msl_constant_str(value) -> str:
     from warp._src.types import float_types  # noqa: PLC0415
 
     if isinstance(value, float_types):
+        if type(value).__name__ == "float64" and _fp64_mode() == "emulate":
+            return _f64_lit(value.value)
         return _msl_constant_str(float(value.value))
     # Warp's ``uint32`` / ``int32`` etc. wrap into typed-int classes
     # whose ``int(...)`` works. mujoco_warp's solver passes these as
@@ -8318,6 +8845,90 @@ _MATH_BUILTIN_NAMES: tuple[str, ...] = (
 # ``builtin_tid2d/3d`` are handled inline in ``generate_msl_kernel`` (their
 # arity varies with the array's rank, which doesn't fit a single
 # ``re.sub``-style rule).
+
+_CAST_TARGET_MSL: dict[str, str] = {
+    "float": "float",
+    "float32": "float",
+    "float16": "half",
+    "int": "int",
+    "int32": "int",
+    "int8": "char",
+    "int16": "short",
+    "int64": "long",
+    "uint": "uint",
+    "uint32": "uint",
+    "uint8": "uchar",
+    "uint16": "ushort",
+    "uint64": "ulong",
+    "bool": "bool",
+}
+_C_NUM_LITERAL_PAT = re.compile(
+    r"^(?:[-+]?(?:\d+\.?\d*(?:[eE][-+]?\d+)?|\.\d+(?:[eE][-+]?\d+)?)(?:[fF]|u|ll|ull)?|-?INFINITY|NAN)$"
+)
+
+
+def _parse_c_literal(text: str) -> float:
+    """Numeric value of a C literal matched by ``_C_NUM_LITERAL_PAT``."""
+    t = text.strip()
+    if t.endswith("INFINITY"):
+        return float("-inf") if t.startswith("-") else float("inf")
+    if t == "NAN":
+        return float("nan")
+    for suf in ("ull", "ll", "u", "f", "F"):
+        if t.endswith(suf):
+            t = t[: -len(suf)]
+            break
+    return float(t)
+
+
+def _scalar_cast_repl(m: re.Match[str]) -> str:
+    """Lower ``wp::T(x)`` scalar casts.
+
+    Outside ``metal_fp64 = "emulate"`` the wrapper is simply stripped — MSL's
+    implicit scalar conversions do the rest. With emulated doubles the cast
+    must be explicit: ``wp::float64(x)`` becomes ``wp_f64_from(x)`` (or a
+    host-computed ``wp_f64{bits}`` literal, so ``wp.float64(0.1)`` keeps all
+    53 bits), and casts *out* of a ``wp_f64`` go through its explicit
+    conversion operators via a functional cast ``float(x)`` / ``int(x)``.
+    """
+    target, arg = m.group(1), m.group(2).strip()
+    if _fp64_mode() != "emulate":
+        return arg
+    if target == "float64":
+        if _C_NUM_LITERAL_PAT.match(arg):
+            return _f64_lit(_parse_c_literal(arg))
+        return f"wp_f64_from({arg})"
+    return f"{_CAST_TARGET_MSL[target]}({arg})"
+
+
+_F64_EMU_DECL_PAT = re.compile(r"\bwp_f64 var_(\w+)\s*[=;]")
+_F64_EMU_LIT_ASSIGN_PAT = re.compile(
+    r"^(\s*(?:const\s+wp_f64\s+)?var_(\w+)\s*=\s*)"
+    r"([-+]?(?:\d+\.?\d*(?:[eE][-+]?\d+)?|\.\d+(?:[eE][-+]?\d+)?)[fF]?|-?INFINITY|NAN)\s*;\s*$",
+    re.M,
+)
+
+
+def _emulate_f64_literal_assigns(source: str) -> str:
+    """Rewrite ``var_x = 0.1;`` into ``var_x = wp_f64{bits};`` for every
+    ``wp_f64``-typed local. Warp emits 64-bit literals as bare numbers (its
+    ``wp.float64(0.1)`` fast path assigns ``constant_str(float64(0.1))``
+    straight into the typed local), and a POD struct has no conversion from
+    a float literal. The bits are computed on the host so no precision is
+    lost to an fp32 literal."""
+    if "wp_f64" not in source:
+        return source
+    f64_vars = set(_F64_EMU_DECL_PAT.findall(source))
+    if not f64_vars:
+        return source
+
+    def _sub(m: re.Match[str]) -> str:
+        if m.group(2) not in f64_vars:
+            return m.group(0)
+        return f"{m.group(1)}{_f64_lit(_parse_c_literal(m.group(3)))};"
+
+    return _F64_EMU_LIT_ASSIGN_PAT.sub(_sub, source)
+
 
 # Patterns are applied in order. Each entry is (regex, replacement). Captures
 # can be back-referenced with \1, \2, etc.
@@ -8511,11 +9122,13 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
             if f"wp::{m.group(2)}" not in _MSL_VEC_SCALAR_PREFIX
             else (
                 f"{_MSL_VEC_SCALAR_PREFIX[f'wp::{m.group(2)}']}{m.group(1)}x{m.group(1)}(1.0f)"
-                if int(m.group(1)) in _MSL_VEC_NATIVE_N
+                if _mat_native(int(m.group(1)), int(m.group(1)), _MSL_VEC_SCALAR_PREFIX[f"wp::{m.group(2)}"])
                 else (
                     f"wp_mat{m.group(1)}x{m.group(1)}_{_MSL_VEC_SCALAR_PREFIX[f'wp::{m.group(2)}']}_make("
                     + ", ".join(
-                        "1.0f" if i == j else "0.0f" for i in range(int(m.group(1))) for j in range(int(m.group(1)))
+                        _sc_lit(_MSL_VEC_SCALAR_PREFIX[f"wp::{m.group(2)}"], 1.0 if i == j else 0.0)
+                        for i in range(int(m.group(1)))
+                        for j in range(int(m.group(1)))
                     )
                     + ")"
                 )
@@ -8766,7 +9379,7 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
             r"wp::(float|float16|float32|float64|int|int8|int16|int32|int64|"
             r"uint|uint8|uint16|uint32|uint64|bool)\s*\(\s*([^()]+?)\s*\)"
         ),
-        r"\2",
+        _scalar_cast_repl,
     ),
 ]
 
@@ -9405,7 +10018,7 @@ def _translate_tile_intrinsics(
             return (
                 f"{{ const int _dl_i = ({row_off}) + {_COOP_LANE}; "
                 f"var_{lhs} = (_dl_i >= 0 && _dl_i < (int){arr_name}_shape[{len(lead_idx_args)}]) "
-                f"? {arr}[{base_expr} + _dl_i] : ({msl_scalar})0; }}"
+                f"? {arr}[{base_expr} + _dl_i] : {_sc_zero(msl_scalar)}; }}"
             )
         # Shape (1,1) collapses to a scalar local (see ``_msl_var_type``);
         # there's no wp_tile_1x1 struct/helper, so emit a direct subscript.
@@ -9724,7 +10337,7 @@ def _translate_tile_intrinsics(
         # sqrt(max(a, eps)). The clamp matches the wp_tile_NxN cholesky
         # helper's near-singular guard.
         if rows == 1:
-            return f"var_{lhs} = metal::precise::sqrt(metal::max({in_arg}, ({msl_scalar})1e-30))"
+            return f"var_{lhs} = metal::precise::sqrt(metal::max({in_arg}, {_sc_lit(msl_scalar, 1e-30)}))"
         # Above the cooperative threshold (and within Apple Silicon's
         # threadgroup-memory cap), route through the SIMD-cooperative
         # variant: 32 lanes share one ``wp_tile_chol_smem`` scratch
@@ -10138,7 +10751,7 @@ def _translate_tile_intrinsics(
         n = rows * cols
         if n == 1:
             return f"var_{lhs} = ({msl}){value}"
-        return f"{{ for (int _tc_i = 0; _tc_i < {n}; ++_tc_i) var_{lhs}.c[_tc_i] = ({msl}){value}; }}"
+        return f"{{ for (int _tc_i = 0; _tc_i < {n}; ++_tc_i) var_{lhs}.c[_tc_i] = {_sc_cast(msl, value)}; }}"
 
     def repl_full(m: re.Match[str]) -> str:
         value = m.group(3).strip()
@@ -10269,7 +10882,7 @@ def _translate_tile_intrinsics(
                 # Vec-element tile: build vec from ``a_vec_n`` consecutive
                 # scalars at offset ``i * a_vec_n``.
                 comps = [f"{a}.c[_tm_i * {a_vec_n} + {k}]" for k in range(a_vec_n)]
-                if a_vec_n in _MSL_VEC_NATIVE_N:
+                if _vec_native(a_vec_n, a_scalar):
                     per_arg_access.append(f"{a_scalar}{a_vec_n}({', '.join(comps)})")
                 else:
                     per_arg_access.append(f"wp_vec{a_vec_n}_{a_scalar}_make({', '.join(comps)})")
@@ -10518,15 +11131,19 @@ def _translate_tile_intrinsics(
         if a_scalar != scalar:
             widen.append(
                 f"wp_tile_{rA}x{kA}_{scalar} _mm_a; for (int _mm_i = 0; _mm_i < {rA * kA}; ++_mm_i) "
-                f"_mm_a.c[_mm_i] = ({scalar}){a_arg}.c[_mm_i];"
+                f"_mm_a.c[_mm_i] = {_sc_cast(scalar, f'{a_arg}.c[_mm_i]')};"
             )
             a_arg = "_mm_a"
         if b_scalar != scalar:
             widen.append(
                 f"wp_tile_{kB}x{nB}_{scalar} _mm_b; for (int _mm_i = 0; _mm_i < {kB * nB}; ++_mm_i) "
-                f"_mm_b.c[_mm_i] = ({scalar}){b_arg}.c[_mm_i];"
+                f"_mm_b.c[_mm_i] = {_sc_cast(scalar, f'{b_arg}.c[_mm_i]')};"
             )
             b_arg = "_mm_b"
+        if scalar == _F64_EMU_MSL:
+            # ``alpha`` / ``beta`` are fp32 IR constants; the helper takes the accumulator scalar.
+            alpha_arg = _sc_cast(scalar, alpha_arg)
+            beta_arg = _sc_cast(scalar, beta_arg)
         call = f"{helper}({a_arg}, {b_arg}, {c_arg}, {alpha_arg}, {beta_arg})"
         if widen:
             call = "{ " + " ".join(widen) + f" {call}; }}"
@@ -10573,7 +11190,7 @@ def _translate_tile_intrinsics(
         if rows != cols:
             return m.group(0)
         if rows == 1:
-            return f"{tile_arg} = metal::precise::sqrt(metal::max({tile_arg}, ({scalar})1e-30))"
+            return f"{tile_arg} = metal::precise::sqrt(metal::max({tile_arg}, {_sc_lit(scalar, 1e-30)}))"
         helper = f"wp_tile_{rows}x{cols}_{scalar}_cholesky_inplace"
         return f"{helper}({tile_arg})"
 
@@ -10638,8 +11255,10 @@ def _translate_tile_intrinsics(
         if dims is None or vec_n != 2:
             raise MetalCodegenError(f"tile_fft on Metal requires a vec2f register tile; got tile local {tile_expr!r}")
         rows, cols, scalar = dims
-        if scalar != "float":
-            raise MetalCodegenError(f"tile_fft on Metal supports vec2f only, got vec2 of {scalar!r} (no fp64 on MSL)")
+        if scalar not in ("float", _F64_EMU_MSL):
+            raise MetalCodegenError(
+                f"tile_fft on Metal supports vec2f (and vec2d under metal_fp64='emulate') only, got vec2 of {scalar!r}"
+            )
         if cols != size or cols & (cols - 1) or cols < 2:
             raise MetalCodegenError(
                 f"tile_fft on Metal requires a power-of-two FFT size matching the tile's last dim, got {cols}"
@@ -10740,7 +11359,7 @@ def _translate_tile_intrinsics(
         vec_n = tile_var_vec_n.get(t_label, 0)
         if vec_n > 0:
             comps = [f"var_{t_label}.c[{elem} * {vec_n} + {k}]" for k in range(vec_n)]
-            if vec_n in _MSL_VEC_NATIVE_N:
+            if _vec_native(vec_n, scalar):
                 return f"var_{lhs} = {scalar}{vec_n}({', '.join(comps)})"
             return f"var_{lhs} = wp_vec{vec_n}_{scalar}_make({', '.join(comps)})"
         return f"var_{lhs} = var_{t_label}.c[{elem}]"
@@ -12134,12 +12753,11 @@ def _generate_msl_kernel_uncached(
         # produce — those already demote, so the array check is explicit.)
         _dtype = getattr(arg.type, "dtype", None)
         _scalar = getattr(_dtype, "_wp_scalar_type_", _dtype)
-        if getattr(_scalar, "__name__", None) == "float64" and not _is_demoted_f64_array(arg):
+        if getattr(_scalar, "__name__", None) == "float64" and _fp64_mode() == "error":
             raise MetalCodegenError(
                 f"Kernel {adj.fun_name!r}: array argument {arg.label!r} has float64 elements — "
-                f"MSL has no fp64; use float32 arrays on Metal, or set "
-                f"warp.config.metal_demote_fp64 (WARP_METAL_DEMOTE_FP64=1) to compute on them "
-                f"at single precision"
+                f"MSL has no fp64; use float32 arrays on Metal, or set warp.config.metal_fp64 "
+                f"(WARP_METAL_FP64) to 'demote' (compute in float32) or 'emulate' (software fp64)"
             )
         # Args whose names end in ``_out`` are conventionally outputs in
         # mujoco_warp (and most Warp kernels). Treat them as outputs even
@@ -12176,11 +12794,10 @@ def _generate_msl_kernel_uncached(
                 )
             _fdtype = getattr(ftype, "dtype", None)
             _fscalar = getattr(_fdtype, "_wp_scalar_type_", _fdtype)
-            if getattr(_fscalar, "__name__", None) == "float64" and not _is_demoted_f64_array(ftype):
+            if getattr(_fscalar, "__name__", None) == "float64" and _fp64_mode() == "error":
                 raise MetalCodegenError(
                     f"Kernel {adj.fun_name!r}: {field_desc} has float64 elements — MSL has no fp64; "
-                    f"set warp.config.metal_demote_fp64 (WARP_METAL_DEMOTE_FP64=1) to compute on "
-                    f"them at single precision"
+                    f"set warp.config.metal_fp64 (WARP_METAL_FP64) to 'demote' or 'emulate'"
                 )
             syn_var = _WpVar(syn_label, ftype)
             struct_field_array_vars.append(syn_var)
@@ -12268,6 +12885,16 @@ def _generate_msl_kernel_uncached(
             f64_arr_names.add(arg.label)
     if f64_arr_names:
         _warn_fp64_demoted(adj.fun_name, sorted(f64_arr_names))
+    # Arrays of emulated doubles (``"emulate"`` mode) bind as ``device
+    # wp_f64*`` and need no access conversion, but — like the demoted ones —
+    # there is no ``atomic<wp_f64>``, so they stay non-atomic outputs and
+    # their ``wp.atomic_*`` calls route through the lock-emulated
+    # ``wp_f64_atomic_*`` overloads for ``device wp_f64*``.
+    f64_emu_arr_names: set[str] = set()
+    if _fp64_mode() == "emulate":
+        for arg in (*adj.args, *struct_field_array_vars, *grad_array_vars):
+            if _is_array_arg(arg) and _array_scalar_type_name(arg) == "float64":
+                f64_emu_arr_names.add(arg.label)
 
     def _f64_read(slot: str, arr_name: str) -> str:
         """Wrap a raw element access in the fp64->fp32 conversion if needed."""
@@ -12385,7 +13012,7 @@ def _generate_msl_kernel_uncached(
                     elem_idx = index_var_names[0]
                 else:
                     elem_idx = f"({_flat_index_expr(arr_arg, index_var_names)})"
-                if rows == cols and rows in _MSL_VEC_NATIVE_N:
+                if _mat_native(rows, cols, msl_scalar):
                     msl_vec_type = f"{msl_scalar}{rows}"
                     msl_mat_type = f"{msl_scalar}{rows}x{cols}"
                     col_strs: list[str] = []
@@ -12741,7 +13368,7 @@ def _generate_msl_kernel_uncached(
             init = _msl_local_init(msl_type) if adjoint else ""
             body_lines.append(f"    {msl_type} var_{var.label}{init};")
         else:
-            body_lines.append(f"    const {msl_type} var_{var.label} = {_msl_constant_str(var.constant)};")
+            body_lines.append(f"    const {msl_type} var_{var.label} = {_msl_constant_str(var.constant, msl_type)};")
 
     # --- Adjoint (dual) locals -----------------------------------------
     # Mirrors ``codegen.codegen_func_reverse``'s "dual vars" section: one
@@ -13002,7 +13629,7 @@ def _generate_msl_kernel_uncached(
     # ``atomic<ulong>`` worth the name in MSL, so they stay plain and their
     # ``wp.atomic_*`` calls go through ``wp_f64_atomic_*`` (see
     # ``_rewrite_f64_atomics``).
-    nonatomic_label_set = grad_label_set | narrow_output_labels | f64_arr_names
+    nonatomic_label_set = grad_label_set | narrow_output_labels | f64_arr_names | f64_emu_arr_names
     atomic_output_names: set[str] = (
         {a.label for a in output_args if a.label not in nonatomic_label_set} if has_atomic else set()
     )
@@ -13039,6 +13666,7 @@ def _generate_msl_kernel_uncached(
     _chol_solve_pat_pre = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_cholesky_solve\s*<[^()]*>\s*\(([^)]*)\)")
     is_coop_kernel = False
     pre_coop_chol_n = 0
+    pre_coop_chol_scalar = "float"
     # Distributed-tile (coop-block) kernels have their own launch geometry
     # (one threadgroup per launch-tiled block, honest tid mapping) that is
     # incompatible with the coop-Cholesky rewrite below (which redundantly
@@ -13054,6 +13682,7 @@ def _generate_msl_kernel_uncached(
                 if dims and dims[0] == dims[1] and _COOP_CHOL_MIN_N <= dims[0] <= _COOP_CHOL_MAX_N:
                     is_coop_kernel = True
                     pre_coop_chol_n = max(pre_coop_chol_n, dims[0])
+                    pre_coop_chol_scalar = dims[2]
         for m in _chol_inplace_pat_pre.finditer(raw):
             args = [a.strip() for a in m.group(1).split(",")]
             if len(args) >= 2:
@@ -13063,6 +13692,7 @@ def _generate_msl_kernel_uncached(
                 if dims and dims[0] == dims[1] and _COOP_CHOL_MIN_N <= dims[0] <= _COOP_CHOL_MAX_N:
                     is_coop_kernel = True
                     pre_coop_chol_n = max(pre_coop_chol_n, dims[0])
+                    pre_coop_chol_scalar = dims[2]
         # Vector-RHS ``tile_cholesky_solve`` in the cooperative range also
         # marks the kernel cooperative — a kernel can solve from a cached
         # factor without ever factorizing (mujoco_warp's
@@ -13087,6 +13717,7 @@ def _generate_msl_kernel_uncached(
                 ):
                     is_coop_kernel = True
                     pre_coop_chol_n = max(pre_coop_chol_n, L_dims[0])
+                    pre_coop_chol_scalar = L_dims[2]
 
     # ---- Threadgroup-resident tiles -----------------------------------
     # Promote whole tiles into threadgroup memory so the cooperative
@@ -13394,13 +14025,13 @@ def _generate_msl_kernel_uncached(
         # the lock-emulated ``wp_f64_atomic_*`` helpers. The MLX path types
         # *every* output ``atomic<T>*`` for an atomic kernel, which the
         # emulation cannot work on, so it keeps failing with a precise message.
-        if f64_arr_names:
+        if f64_arr_names or f64_emu_arr_names:
             import warp.config as _wp_cfg  # noqa: PLC0415
 
             if _wp_cfg.metal_native_dispatch:
-                translated = _rewrite_f64_atomics(translated, f64_arr_names)
+                translated = _rewrite_f64_atomics(translated, f64_arr_names | f64_emu_arr_names)
             else:
-                _reject_f64_atomics(translated, f64_arr_names, adj.fun_name)
+                _reject_f64_atomics(translated, f64_arr_names | f64_emu_arr_names, adj.fun_name)
         _check_no_unsupported_intrinsics(translated)
         return translated
 
@@ -13684,9 +14315,9 @@ def _generate_msl_kernel_uncached(
                     # matrix is the row-major slot ``r * cols + c``, and lives
                     # at ``[c][r]`` in the column-major MSL dual (or at
                     # ``.c[i]`` in the row-major struct for other shapes).
-                    _rows, _cols, _ = mat_arr_info[arr]
+                    _rows, _cols, _mscalar = mat_arr_info[arr]
                     _stride = _rows * _cols
-                    if _rows == _cols and _rows in _MSL_VEC_NATIVE_N:
+                    if _mat_native(_rows, _cols, _mscalar):
                         slots = [
                             (f"({flat}) * {_stride} + {r * _cols + c}", f"[{c}][{r}]")
                             for r in range(_rows)
@@ -14222,8 +14853,9 @@ def _generate_msl_kernel_uncached(
                     if op != "=":
                         read = _struct_field_read_expr(buf, base_expr, finfo)
                         full = f"({read} {op[:-1]} ({value}))"
+                    _s64 = f"({full}).bits" if finfo.scalar_msl == _F64_EMU_MSL else f"ulong({full})"
                     writes.append(
-                        f"{indent}{{ ulong _wp_s64 = ulong({full}); "
+                        f"{indent}{{ ulong _wp_s64 = {_s64}; "
                         f"{buf}[{base_expr}] = as_type<float>(uint(_wp_s64 & 0xffffffffull)); "
                         f"{buf}[({base_expr}) + 1] = as_type<float>(uint(_wp_s64 >> 32)); }}"
                     )
@@ -14233,7 +14865,7 @@ def _generate_msl_kernel_uncached(
                         writes.append(f"{indent}{slot} = {_slot_rhs(slot, f'{value}[{k}]')};")
                 elif finfo.kind == _STRUCT_FIELD_KIND_MAT:
                     rows, cols = finfo.rows, finfo.cols
-                    native_mat = rows == cols and rows in _MSL_VEC_NATIVE_N
+                    native_mat = _mat_native(rows, cols, finfo.scalar_msl)
                     for r in range(rows):
                         for c in range(cols):
                             slot = f"{buf}[({base_expr}) + {r * cols + c}]"
@@ -14388,9 +15020,9 @@ def _generate_msl_kernel_uncached(
                         body_lines.append(_finalize(_emit_scalar_write(f"{elem_idx} * {vec_n} + {k}", f"{value}[{k}]")))
                     continue
                 if arr in mat_arr_info:
-                    rows, cols, _ = mat_arr_info[arr]
+                    rows, cols, _mscalar = mat_arr_info[arr]
                     stride = rows * cols
-                    native_mat = rows == cols and rows in _MSL_VEC_NATIVE_N
+                    native_mat = _mat_native(rows, cols, _mscalar)
                     if len(indices) == 1:
                         elem_idx = indices[0]
                     else:
@@ -14436,18 +15068,17 @@ def _generate_msl_kernel_uncached(
                                 _finalize(_emit_scalar_write(f"{base} + {off}", _struct_bitcast_write(src, cast)))
                             )
                         elif finfo.kind == _STRUCT_FIELD_KIND_SCALAR64:
+                            _s64 = f"({src}).bits" if finfo.scalar_msl == _F64_EMU_MSL else f"ulong({src})"
                             body_lines.append(
                                 _finalize(
                                     _emit_scalar_write(
-                                        f"{base} + {off}", f"as_type<float>(uint(ulong({src}) & 0xffffffffull))"
+                                        f"{base} + {off}", f"as_type<float>(uint({_s64} & 0xffffffffull))"
                                     )
                                 )
                             )
                             body_lines.append(
                                 _finalize(
-                                    _emit_scalar_write(
-                                        f"{base} + {off} + 1", f"as_type<float>(uint(ulong({src}) >> 32))"
-                                    )
+                                    _emit_scalar_write(f"{base} + {off} + 1", f"as_type<float>(uint({_s64} >> 32))")
                                 )
                             )
                         elif finfo.kind == _STRUCT_FIELD_KIND_VEC:
@@ -14460,7 +15091,7 @@ def _generate_msl_kernel_uncached(
                                     )
                                 )
                         elif finfo.kind == _STRUCT_FIELD_KIND_MAT:
-                            native = finfo.rows == finfo.cols and finfo.rows in _MSL_VEC_NATIVE_N
+                            native = _mat_native(finfo.rows, finfo.cols, finfo.scalar_msl)
                             for r in range(finfo.rows):
                                 for c in range(finfo.cols):
                                     rhs = f"{src}[{c}][{r}]" if native else f"{src}.c[{r * finfo.cols + c}]"
@@ -14859,7 +15490,9 @@ def _generate_msl_kernel_uncached(
         # anyway would waste N*N floats of the 32 KB threadgroup budget
         # (which is what limits occupancy and caps the resident tile size).
         if any("wp_tile_chol_smem" in ln for ln in body_lines):
-            coop_prelude.insert(0, f"    threadgroup float wp_tile_chol_smem[{coop_chol_n * coop_chol_n}];")
+            coop_prelude.insert(
+                0, f"    threadgroup {pre_coop_chol_scalar} wp_tile_chol_smem[{coop_chol_n * coop_chol_n}];"
+            )
         # Threadgroup-resident tiles live here for their whole lifetime
         # instead of being copied in and out of per-lane private structs.
         if smem_arena_floats > 0:
@@ -14912,6 +15545,17 @@ def _generate_msl_kernel_uncached(
 
     if _shape_arrs_seen:
         source = "\n".join(_shape_idx_pat.sub(_replace_shape_ref, line) for line in body_lines) + "\n"
+
+    if _fp64_mode() == "emulate":
+        source = _emulate_f64_literal_assigns(source)
+        if "wp_f64" in source:
+            import warp.config as _wp_cfg_emu  # noqa: PLC0415
+
+            if not _wp_cfg_emu.metal_native_dispatch:
+                raise MetalCodegenError(
+                    f"Kernel {adj.fun_name!r}: warp.config.metal_fp64 = 'emulate' requires native dispatch "
+                    f"(warp.config.metal_native_dispatch = True); the MLX path cannot bind emulated doubles"
+                )
 
     # ---- Drop unused kernel args ------------------------------------
     # Kernels can have many declared args that go unreferenced in the
@@ -15174,7 +15818,7 @@ def _generate_msl_kernel_uncached(
 # closure-kernel instantiations previously collided (same kernel.key,
 # args, and IR statements; different baked ``const`` declarations).
 # v11: native packed arrays go bindless (``ptr_table`` / ``__arg_ptrs``).
-_ARTIFACT_CACHE_VERSION = 15
+_ARTIFACT_CACHE_VERSION = 16
 _codegen_source_hash_cached: str | None = None
 
 
@@ -15293,6 +15937,10 @@ def _artifact_cache_key(kernel, adj) -> str | None:
         # so a cached artifact from the other setting must not be reused —
         # this knob is an A/B switch and gets toggled between runs.
         f"tgtiles={_threadgroup_tiles_enabled()}",
+        # The float64 mode changes the MSL types of every float64 local,
+        # array, and helper ("float" / "ulong" storage vs "wp_f64"); a body
+        # cached under one mode is unusable under another.
+        f"fp64={_fp64_mode()}",
         # Distributed-tile builds share neither IR nor launch geometry
         # with serial builds of the same kernel.
         f"coopblock={getattr(adj, '_metal_coop_block_n', 0)}",
@@ -15848,11 +16496,20 @@ def _classify_struct_field(fname: str, ftype) -> _StructFieldInfo:
     scalar_ctype = f"wp::{name}"
     if scalar_ctype == "wp::float64":
         # fp64 field: occupies two 4-byte slots in the flat float32 view;
-        # reads reassemble the IEEE-754 double bits and demote to fp32 via
-        # the ``wp_f64_to_f32`` helper (Apple GPUs have no fp64). Writes
-        # are rejected in the store branch. ``scalar_msl="double"`` is the
-        # demotion marker — MSL has no such type; it never appears in
-        # emitted code.
+        # reads reassemble the IEEE-754 double bits. Under "emulate" the
+        # field is a ``wp_f64`` (readable and writable); otherwise the bits
+        # demote to fp32 via ``wp_f64_to_f32`` and writes are rejected in
+        # the store branch. ``scalar_msl="double"`` is the demotion marker —
+        # MSL has no such type; it never appears in emitted code.
+        if _fp64_mode() == "emulate":
+            return _StructFieldInfo(
+                name=fname,
+                offset=0,
+                size=2,
+                kind=_STRUCT_FIELD_KIND_SCALAR64,
+                msl_type=_F64_EMU_MSL,
+                scalar_msl=_F64_EMU_MSL,
+            )
         return _StructFieldInfo(
             name=fname, offset=0, size=2, kind=_STRUCT_FIELD_KIND_SCALAR64, msl_type="float", scalar_msl="double"
         )
@@ -15963,14 +16620,16 @@ def _struct_field_read_expr(buf: str, base_expr: str, finfo: _StructFieldInfo) -
         if finfo.scalar_msl == "double":
             # fp64 field — demote the double bits to fp32 (no fp64 on Metal).
             return f"wp_f64_to_f32({bits})"
+        if finfo.scalar_msl == _F64_EMU_MSL:
+            return f"wp_f64{{{bits}}}"
         return bits if finfo.scalar_msl == "ulong" else f"as_type<{finfo.scalar_msl}>({bits})"
     if finfo.kind == _STRUCT_FIELD_KIND_VEC:
         comps = [_struct_bitcast_read(f"{buf}[({base_expr}) + {k}]", finfo.scalar_msl) for k in range(finfo.size)]
-        ctor = finfo.msl_type if finfo.size in _MSL_VEC_NATIVE_N else f"{finfo.msl_type}_make"
+        ctor = finfo.msl_type if _vec_native(finfo.size, finfo.scalar_msl) else f"{finfo.msl_type}_make"
         return f"{ctor}({', '.join(comps)})"
     if finfo.kind == _STRUCT_FIELD_KIND_MAT:
         rows, cols = finfo.rows, finfo.cols
-        if rows == cols and rows in _MSL_VEC_NATIVE_N:
+        if _mat_native(rows, cols, finfo.scalar_msl):
             msl_vec = finfo.msl_type.split("x")[0]
             col_strs = []
             for c in range(cols):
@@ -16035,17 +16694,14 @@ def _wp_dtype_to_mx_dtype(wp_dtype):
         wpt.bool: mx.bool_,
     }
     if wp_dtype is wpt.float64:
-        import warp.config as _wp_cfg  # noqa: PLC0415
-
-        if _wp_cfg.metal_demote_fp64:
-            # Bound as the raw IEEE-754 double bit pattern, one per element;
-            # the kernel converts on access. Storage stays 8 bytes so host
-            # round-trips are unchanged.
+        if _fp64_mode() != "error":
+            # Bound as the raw IEEE-754 double bit pattern, one per element:
+            # "demote" converts on access, "emulate" reads it as ``wp_f64``.
+            # Storage stays 8 bytes so host round-trips are unchanged.
             return mx.uint64
         raise MetalCodegenError(
             "MSL/MLX has no native float64; use float32 for Metal kernels, or set "
-            "warp.config.metal_demote_fp64 (WARP_METAL_DEMOTE_FP64=1) to compute on float64 "
-            "arrays at single precision"
+            "warp.config.metal_fp64 (WARP_METAL_FP64) to 'demote' or 'emulate'"
         )
     if wp_dtype not in mapping:
         raise MetalCodegenError(f"No MLX dtype for Warp dtype {wp_dtype!r}")
@@ -16259,9 +16915,7 @@ def _is_demoted_f64_array(arg_or_type) -> bool:
     the codegen converts on each read and write. See
     :data:`warp.config.metal_demote_fp64`.
     """
-    import warp.config as _wp_cfg  # noqa: PLC0415
-
-    if not _wp_cfg.metal_demote_fp64:
+    if _fp64_mode() != "demote":
         return False
     return _array_scalar_type_name(arg_or_type) == "float64"
 
@@ -16385,7 +17039,7 @@ def _wrap_msl_for_native_dispatch(artifact) -> str:
                 scalar_cls = arg_var.type._wp_scalar_type_
                 inner = _native_scalar_msl_type(f"wp::{scalar_cls.__name__}")
                 n = arg_var.type._length_
-                if n in _MSL_VEC_NATIVE_N:
+                if _vec_native(n, inner):
                     add_buffer(f"const constant {inner}* {name}__bytes")
                     elems = ", ".join(f"{name}__bytes[{i}]" for i in range(n))
                     value_prologue.append(f"    const {inner}{n} {name} = {inner}{n}({elems});")
@@ -16417,19 +17071,18 @@ def _wrap_msl_for_native_dispatch(artifact) -> str:
                 # so the body's ``name`` references read as the scalar
                 # value directly. The bound bytes (via ``setBytes``)
                 # carry exactly one T.
-                if getattr(arg_var.type, "__name__", None) == "float64":
+                if getattr(arg_var.type, "__name__", None) == "float64" and _fp64_mode() != "emulate":
                     # fp32-demoted float64 scalar: the launch packs the
                     # Python float as a ``c_double`` (8 bytes), so bind
                     # those bits as a ``ulong`` and convert once in the
                     # prologue. The body's ``wp::float64`` locals already
-                    # lower to ``float`` (see ``_msl_var_type``).
-                    import warp.config as _wp_cfg  # noqa: PLC0415
-
-                    if not _wp_cfg.metal_demote_fp64:
+                    # lower to ``float`` (see ``_msl_var_type``). (Under
+                    # "emulate" the same 8 bytes bind directly as a
+                    # ``const constant wp_f64&`` through the generic path.)
+                    if _fp64_mode() != "demote":
                         raise MetalCodegenError(
                             f"Native dispatch: float64 kernel param {name!r} — MSL has no fp64; set "
-                            f"warp.config.metal_demote_fp64 (WARP_METAL_DEMOTE_FP64=1) to compute on it "
-                            f"at single precision"
+                            f"warp.config.metal_fp64 (WARP_METAL_FP64) to 'demote' or 'emulate'"
                         )
                     add_buffer(f"const constant ulong& {name}__f64bits")
                     value_prologue.append(f"    const float {name} = wp_f64_to_f32({name}__f64bits);")
@@ -16542,6 +17195,10 @@ def _wrap_msl_for_native_dispatch(artifact) -> str:
     # not already pull it in.
     if "wp_f64_to_f32(" in prologue and "wp_f64_to_f32(ulong b)" not in header:
         header = _F64_HELPERS + "\n" + header
+    # An emulated-double array or scalar param whose body never names the
+    # type (``y[i] = x[i]``) still needs the ``wp_f64`` definition.
+    if ("wp_f64" in signature or "wp_f64" in prologue) and "struct wp_f64 {" not in header:
+        header = _f64_emulate_helpers() + "\n" + header
     return (
         "#include <metal_stdlib>\n"
         "#include <metal_atomic>\n"

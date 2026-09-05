@@ -190,13 +190,17 @@ cuda_test_devices = get_selected_cuda_test_devices(mode="basic")  # Don't test o
 metal_test_devices = get_metal_test_devices()  # Empty unless the Metal backend is enabled
 gpu_test_devices = cuda_test_devices + metal_test_devices
 test_devices = get_test_devices(mode="basic") + metal_test_devices
-# Apple GPUs have no float64 hardware. Examples that compute in float64 run on Metal only under the opt-in fp32
-# demotion (``WARP_METAL_DEMOTE_FP64=1``), and only when their tolerance survives single precision.
-fp64_metal_test_devices = [d for d in metal_test_devices if wp.config.metal_demote_fp64]
+# Apple GPUs have no float64 hardware. Examples that compute in float64 run on Metal only under an opt-in
+# ``warp.config.metal_fp64`` mode: ``"demote"`` (``WARP_METAL_FP64=demote``, compute in float32) is enough for the
+# examples whose tolerance survives single precision; ``"emulate"`` (software IEEE fp64) also covers the ones that
+# check against NumPy at the default ``rtol=1e-7``.
+_fp64_on_metal = wp.config.metal_fp64 in ("demote", "emulate") or wp.config.metal_demote_fp64
+fp64_metal_test_devices = [d for d in metal_test_devices if _fp64_on_metal]
 fp64_test_devices = get_test_devices(mode="basic") + fp64_metal_test_devices
 fp64_gpu_test_devices = cuda_test_devices + fp64_metal_test_devices
-# ``example_tile_cholesky`` checks against NumPy at the default ``rtol=1e-7``, which fp32 can never meet.
-fp64_exact_test_devices = get_test_devices(mode="basic")
+fp64_exact_metal_test_devices = [d for d in metal_test_devices if wp.config.metal_fp64 == "emulate"]
+fp64_exact_test_devices = get_test_devices(mode="basic") + fp64_exact_metal_test_devices
+fp64_exact_gpu_test_devices = cuda_test_devices + fp64_exact_metal_test_devices
 
 # NOTE: To give the parallel test runner more opportunities to parallelize test cases,
 # we break up the tests into multiple TestCase classes
@@ -328,7 +332,7 @@ add_example_test(
 add_example_test(
     TestTileExamples,
     name="tile.example_tile_convolution",
-    devices=cuda_test_devices,
+    devices=fp64_exact_gpu_test_devices,
     test_options={"headless": True},
 )
 add_example_test(
@@ -340,7 +344,7 @@ add_example_test(
 add_example_test(
     TestTileExamples,
     name="tile.example_tile_filtering",
-    devices=cuda_test_devices,
+    devices=fp64_exact_gpu_test_devices,
     test_options={"headless": True},
 )
 add_example_test(
