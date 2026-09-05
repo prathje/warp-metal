@@ -273,7 +273,7 @@ showcontent = true
 [tool.typos]
 # Skill eval fixtures stand in for third-party codebases under assessment, so
 # their prose and identifiers are deliberately not held to Warp's conventions.
-files.extend-exclude = ["/tools/packman", "/tools/repoman", "/PUBLICATIONS.md", "/licenses", "/warp/native/nanovdb", "/warp/native/cuBQL", "*.svg", "*.usda", "/skills/*/evals/files"]
+files.extend-exclude = ["/tools/packman", "/tools/repoman", "/PUBLICATIONS.md", "/licenses", "/warp/native/nanovdb", "/warp/native/cuBQL", "/warp/native/metal", "*.svg", "*.usda", "/skills/*/evals/files"]
 
 [tool.typos.default]
 extend-ignore-re = [
@@ -287,6 +287,7 @@ extend-ignore-re = [
 arange = "arange"
 commun = "commun"
 dout = "dout"
+fle = "fle"
 iy = "iy"
 iz = "iz"
 lod = "lod"

@@ -152,8 +152,10 @@ cuda_devices = get_selected_cuda_test_devices(mode="basic")
 cuda_devices_with_mempool = get_selected_cuda_test_devices_with_mempool(mode="basic")
 metal_devices = get_metal_test_devices()  # Metal is only present when the backend is enabled
 gpu_devices = cuda_devices + metal_devices
-# Apple GPUs have no float64 hardware; the float64 examples run there only under the opt-in fp32 demotion
-fp64_metal_devices = [d for d in metal_devices if wp.config.metal_demote_fp64]
+# Apple GPUs have no float64 hardware; the float64 examples run there only under an opt-in ``metal_fp64`` mode
+# (``WARP_METAL_FP64=demote`` computes in float32, ``=emulate`` in software fp64).
+_fp64_on_metal = wp.config.metal_fp64 in ("demote", "emulate") or wp.config.metal_demote_fp64
+fp64_metal_devices = [d for d in metal_devices if _fp64_on_metal]
 fp64_gpu_devices = cuda_devices + fp64_metal_devices
 
 

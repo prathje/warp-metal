@@ -1962,8 +1962,13 @@ def integrate(
         device = wp.get_device()
 
     # Apple GPUs have no double precision; fall back to single-precision
-    # accumulation on Metal devices rather than failing at codegen time.
-    if accumulate_dtype is wp.float64 and getattr(wp.get_device(device), "is_metal", False):
+    # accumulation on Metal devices rather than failing at codegen time —
+    # unless the backend emulates fp64 (``warp.config.metal_fp64 = "emulate"``).
+    if (
+        accumulate_dtype is wp.float64
+        and getattr(wp.get_device(device), "is_metal", False)
+        and wp.config.metal_fp64 != "emulate"
+    ):
         from warp._src.utils import warn  # noqa: PLC0415
 
         warn(
