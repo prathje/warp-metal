@@ -9,7 +9,6 @@
 ###########################################################################
 
 import warp as wp
-from warp.tests.unittest_utils import *
 
 
 @wp.func
@@ -88,5 +87,4 @@ if __name__ == "__main__":
 
     args = parser.parse_known_args()[0]
 
-    wp.clear_kernel_cache()
     test_spinlock(device=args.device)

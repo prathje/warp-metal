@@ -107,6 +107,58 @@ def _vector_add_fp64(
     c[tid] = a[tid] + b[tid]
 
 
+# Spin-lock fixtures for the SIMD-lane serialisation pass. ``_spin_lock_counter``
+# is the shape of ``warp/examples/core/example_spin_lock.py``; the others are
+# lookalikes the pass must leave alone.
+@wp.func
+def _spin_acquire(lock: wp.array(dtype=int)):
+    while wp.atomic_cas(lock, 0, 0, 1) == 1:
+        pass
+
+
+@wp.func
+def _spin_release(lock: wp.array(dtype=int)):
+    wp.atomic_exch(lock, 0, 0)
+
+
+@wp.kernel
+def _spin_lock_counter(counter: wp.array(dtype=int), lock: wp.array(dtype=int)):
+    _spin_acquire(lock)
+    value = wp.atomic_exch(counter, 0, 0)
+    counter[0] = value + 1
+    _spin_release(lock)
+
+
+@wp.kernel
+def _spin_lock_no_release(counter: wp.array(dtype=int), lock: wp.array(dtype=int)):
+    _spin_acquire(lock)
+    wp.atomic_add(counter, 0, 1)
+
+
+@wp.kernel
+def _spin_lock_release_in_branch(counter: wp.array(dtype=int), lock: wp.array(dtype=int), flag: int):
+    _spin_acquire(lock)
+    wp.atomic_add(counter, 0, 1)
+    if flag == 1:
+        _spin_release(lock)
+
+
+@wp.kernel
+def _atomic_in_for_loop(counter: wp.array(dtype=int), n: int):
+    for _i in range(n):
+        wp.atomic_add(counter, 0, 1)
+
+
+@wp.kernel
+def _ticket_lock_counter(counter: wp.array(dtype=int), next_ticket: wp.array(dtype=int), serving: wp.array(dtype=int)):
+    ticket = wp.atomic_add(next_ticket, 0, 1)
+    while wp.atomic_add(serving, 0, 0) != ticket:
+        pass
+    value = wp.atomic_exch(counter, 0, 0)
+    counter[0] = value + 1
+    wp.atomic_add(serving, 0, 1)
+
+
 # ---------------------------------------------------------------------------
 # Codegen tests (no MLX needed, just AST -> MSL string)
 # ---------------------------------------------------------------------------
@@ -167,6 +219,79 @@ class TestMetalCodegenStructure(unittest.TestCase):
         # rather than producing invalid MSL.
         with self.assertRaises(MetalCodegenError):
             generate_msl_kernel(_vector_add_fp64)
+
+
+class TestMetalSpinLockSerialization(unittest.TestCase):
+    """Apple GPUs give no independent forward progress between the lanes of a
+    SIMD group, so a lock spun on by two sibling lanes deadlocks. The codegen
+    pass rewrites acquire / critical section / release spans to run one lane
+    per SIMD group at a time; these tests pin what it does and does not touch.
+    """
+
+    @staticmethod
+    def _generate(kernel):
+        import contextlib  # noqa: PLC0415
+        import io  # noqa: PLC0415
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            src = generate_msl_kernel(kernel).source
+        return src, out.getvalue()
+
+    def test_lock_span_is_serialised_across_simd_lanes(self):
+        src, printed = self._generate(_spin_lock_counter)
+        self.assertNotIn("could not be serialised", printed)
+        self.assertIn("simd_is_first()", src)
+        self.assertIn("simd_any(wp_spin_pending_0)", src)
+        # Acquire loop, critical section, and release all sit inside the
+        # elected-lane branch, bracketed by device-scope fences.
+        elected = src.index("simd_is_first()")
+        acquire = src.index("wp_atomic_cas(&lock[", elected)
+        release = src.index("wp_atomic_exch(&lock[", acquire)
+        critical = src.index("atomic_store_explicit(&counter[", acquire)
+        self.assertLess(critical, release)
+        fences = [i for i in range(len(src)) if src.startswith("atomic_thread_fence(", i)]
+        self.assertEqual(len(fences), 2)
+        self.assertLess(acquire, fences[0])
+        self.assertLess(fences[0], critical)
+        self.assertLess(critical, fences[1])
+        self.assertLess(fences[1], release)
+        self.assertIn("memory_order_seq_cst", src)
+        self.assertIn("wp_spin_pending_0 = false;", src[release:])
+
+    def test_missing_release_warns_and_leaves_body(self):
+        src, printed = self._generate(_spin_lock_no_release)
+        self.assertNotIn("simd_is_first", src)
+        self.assertIn("could not be serialised", printed)
+        self.assertIn("no matching release", printed)
+
+    def test_release_in_nested_branch_warns_and_leaves_body(self):
+        src, printed = self._generate(_spin_lock_release_in_branch)
+        self.assertNotIn("simd_is_first", src)
+        self.assertIn("could not be serialised", printed)
+
+    def test_for_loop_with_atomic_is_not_a_spin_lock(self):
+        src, printed = self._generate(_atomic_in_for_loop)
+        self.assertNotIn("simd_is_first", src)
+        self.assertNotIn("could not be serialised", printed)
+
+    def test_ticket_lock_is_left_alone(self):
+        # The ticket is taken before the spin, so electing the first pending
+        # lane could pick a lane whose turn never comes. Only test-and-set
+        # locks (``wp.atomic_cas`` / ``wp.atomic_exch``) are rewritten.
+        src, printed = self._generate(_ticket_lock_counter)
+        self.assertNotIn("simd_is_first", src)
+        self.assertNotIn("could not be serialised", printed)
+
+    def test_kill_switch_disables_rewrite(self):
+        saved = wp.config.metal_serialize_spin_locks
+        wp.config.metal_serialize_spin_locks = False
+        try:
+            src, _ = self._generate(_spin_lock_counter)
+        finally:
+            wp.config.metal_serialize_spin_locks = saved
+        self.assertNotIn("simd_is_first", src)
+        self.assertIn("wp_atomic_cas(&lock[", src)
 
 
 # ---------------------------------------------------------------------------

@@ -229,6 +229,13 @@ add_example_test(
     test_options={"headless": True},
     test_options_cpu={"num_frames": 100},
 )
+add_example_test(
+    TestCoreExamples,
+    name="core.example_spin_lock",
+    # Contended spin locks need independent forward progress or, on Metal, the SIMD-lane serialisation
+    # the backend applies to them; the sequential CPU backend cannot exercise either.
+    devices=gpu_test_devices,
+)
 add_example_test(TestCoreExamples, name="core.example_mesh", devices=test_devices, test_options={"usd_required": True})
 add_example_test(
     TestCoreExamples, name="core.example_mesh_intersect", devices=test_devices, test_options={"usd_required": True}

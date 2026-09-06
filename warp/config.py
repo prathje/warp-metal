@@ -460,6 +460,28 @@ multiply-counting hazard that ``block_dim()`` lowering to ``1`` exists to
 avoid -- so it needs per-kernel analysis rather than a blanket switch.
 """
 
+metal_serialize_spin_locks: bool = _os.environ.get("WARP_METAL_SERIALIZE_SPIN_LOCKS", "").strip().lower() not in (
+    "0",
+    "false",
+    "off",
+)
+"""Rewrite spin locks so they cannot deadlock on Apple GPUs.
+
+Defaults to ``True``; set the ``WARP_METAL_SERIALIZE_SPIN_LOCKS`` environment
+variable to ``0`` to disable (an A/B kill switch).
+
+Apple GPUs do not guarantee independent forward progress between the lanes
+of a SIMD group, so a mutual-exclusion lock of the form
+``while wp.atomic_cas(lock, i, 0, 1) == 1: pass`` followed by a critical
+section and a releasing ``wp.atomic_exch(lock, i, 0)`` deadlocks when two
+lanes of one SIMD group contend for it. When ``True``, the Metal backend
+recognises that shape and runs acquire, critical section, and release one
+lane per SIMD group at a time, with device-scope memory fences around the
+critical section. Spans it cannot prove safe to rewrite (no release in the
+same block, a ``return`` inside the critical section, SIMD-group or tile
+operations in it) are left as written with a warning.
+"""
+
 metal_coop_tiles: bool = _os.environ.get("WARP_METAL_COOP_TILES", "").strip().lower() not in (
     "0",
     "false",
