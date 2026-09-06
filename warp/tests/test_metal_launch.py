@@ -707,6 +707,42 @@ class TestMetalLaunch(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet)
 
+    def test_spin_lock_counter_does_not_deadlock(self):
+        # A mutual-exclusion lock spun on by two lanes of one SIMD group
+        # deadlocks on Apple GPUs unless codegen serialises the span across
+        # lanes. The subprocess timeout turns a regression into a failure
+        # instead of a hung test run; the relaxed-atomics fences are what
+        # keep the counter exact.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+
+            @wp.func
+            def acquire(lock: wp.array(dtype=int)):
+                while wp.atomic_cas(lock, 0, 0, 1) == 1:
+                    pass
+
+            @wp.func
+            def release(lock: wp.array(dtype=int)):
+                wp.atomic_exch(lock, 0, 0)
+
+            @wp.kernel
+            def k(counter: wp.array(dtype=int), lock: wp.array(dtype=int)):
+                acquire(lock)
+                value = wp.atomic_exch(counter, 0, 0)
+                counter[0] = value + 1
+                release(lock)
+
+            N = 4096
+            counter = wp.zeros(1, dtype=int, device='metal:0')
+            lock = wp.zeros(1, dtype=int, device='metal:0')
+            wp.launch(k, dim=N, inputs=[counter, lock], device='metal:0')
+            assert counter.numpy()[0] == N, counter.numpy()[0]
+            assert lock.numpy()[0] == 0, lock.numpy()[0]
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
     def test_atomic_add_int_matches_cpu_bit_exact(self):
         # Integer atomic_add is associative, so the result is deterministic
         # regardless of execution order — bit-exact.

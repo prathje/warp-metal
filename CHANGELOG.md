@@ -50,8 +50,7 @@
   matrix products, and component access on integer vectors.
 - Support `wp.tile_full()`, `wp.tile_scan_inclusive()`, and `wp.tile_scan_exclusive()` on Metal devices.
 - Support `wp.atomic_cas()` and `wp.atomic_exch()` on Metal devices, including through `wp.array` fields of
-  struct kernel arguments. Note that mutual-exclusion spin locks built on these deadlock on Apple GPUs, which
-  do not guarantee independent forward progress within a SIMD group; lock-free retry loops work correctly.
+  struct kernel arguments.
 - Support `wp.tile_atomic_add()` and `wp.outer()` on vectors of differing lengths on Metal devices.
 - Support `wp.atomic_add()` and the other atomic operations on matrix-valued arrays on Metal devices, which
   `warp.sparse.bsr_mm()` uses to accumulate block values.
@@ -100,6 +99,14 @@
   matrices, tiles (including `wp.tile_cholesky()`, `wp.tile_matmul()`, and `vec2d` `wp.tile_fft()`), and the
   atomic operations, at roughly 30x the cost of `float32`; it requires native dispatch. `example_tile_cholesky`,
   `example_tile_convolution`, and `example_tile_filtering` now run on Metal in this mode.
+- Run mutual-exclusion spin locks (`while wp.atomic_cas(lock, i, 0, 1) == 1: pass`, a critical section, then
+  `wp.atomic_exch(lock, i, 0)`) correctly on Metal devices. Apple GPUs do not guarantee independent forward
+  progress between the lanes of a SIMD group, so such locks used to deadlock; the Metal backend now runs the
+  acquire, critical section, and release one lane per SIMD group at a time with device-scope memory fences
+  around the critical section. Spans that cannot be rewritten (no release in the same block, a `return` inside
+  the critical section, SIMD-group or tile operations in it) are left as written with a warning. Add
+  `warp.config.metal_serialize_spin_locks` (environment variable `WARP_METAL_SERIALIZE_SPIN_LOCKS`) to disable
+  the rewrite, and run `core/example_spin_lock` in the examples test suite on GPU devices.
 ### Removed
 
 ### Deprecated

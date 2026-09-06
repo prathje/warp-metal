@@ -8930,6 +8930,275 @@ def _emulate_f64_literal_assigns(source: str) -> str:
     return _F64_EMU_LIT_ASSIGN_PAT.sub(_sub, source)
 
 
+# ---------------------------------------------------------------------------
+# Spin-lock serialisation
+# ---------------------------------------------------------------------------
+#
+# Apple GPUs do not guarantee independent forward progress between the lanes
+# of one SIMD group: when lane A holds a mutual-exclusion lock and lane B of
+# the same SIMD group spins waiting for it, the group keeps executing B's
+# spin loop and A never reaches its release. The classic Warp spin lock
+#
+#     while wp.atomic_cas(lock, 0, 0, 1) == 1: pass   # acquire
+#     ... critical section ...
+#     wp.atomic_exch(lock, 0, 0)                      # release
+#
+# therefore deadlocks silently and permanently (there is no compute watchdog
+# on macOS). Moving the critical section inside the retry loop does NOT help:
+# the Metal compiler sinks the exit-only path back out of the loop and
+# recreates the divergent wait. What does work is to let one lane per SIMD
+# group at a time run acquire, critical section, and release, so no lane
+# ever waits on a sibling lane (waiting on other SIMD groups is fine). The
+# pass below rewrites the translated MSL
+#
+#     while (true) { r = wp_atomic_cas(&lock[i], c, v); ... if (!eq) break; continue; }
+#     <critical section>
+#     wp_atomic_exch(&lock[i], 0);
+#
+# into
+#
+#     { bool pending = true;
+#       while (simd_any(pending)) { if (pending) { if (simd_is_first()) {
+#           <acquire loop>  FENCE  <critical section>  FENCE  <release>
+#           pending = false;
+#       } } } }
+#
+# The fences are not optional: MSL atomics are ``memory_order_relaxed`` only,
+# and without device-scope seq_cst fences around the critical section a
+# 1024-thread counter lost updates (1014/1024) in testing.
+
+_SPIN_ACQUIRE_PAT = re.compile(r"\bwp_atomic_(?:cas|exch)\s*\(\s*&\s*([\w.]+)\s*\[")
+_SPIN_ASSIGN_PAT = re.compile(r"^\s*(?:const\s+)?(?:[\w:<>]+\s+)?(var_\w+)\s*=\s*(.*);\s*$")
+_SPIN_DECL_PAT = re.compile(r"^\s*(?:const\s+)?[\w:<>]+\s+(var_\w+)\s*(?:=.*)?;\s*$")
+_SPIN_BREAK_IF_PAT = re.compile(r"^\s*if\s*\((!?)\s*(var_\w+)\s*\)\s*\{\s*break;\s*\}\s*$")
+_SPIN_RELEASE_PATS = (
+    re.compile(r"\bwp_atomic_(?:cas|exch)\s*\(\s*&\s*([\w.]+)\s*\["),
+    re.compile(r"\batomic_store_explicit\s*\(\s*&\s*([\w.]+)\s*\["),
+    re.compile(r"\batomic_fetch_\w+_explicit\s*\(\s*&\s*([\w.]+)\s*\["),
+    re.compile(r"\bwp_atomic_\w+\s*\(\s*&\s*([\w.]+)\s*\["),
+)
+_SPIN_FENCE = (
+    "metal::atomic_thread_fence(metal::mem_flags::mem_device, metal::memory_order_seq_cst, "
+    "metal::thread_scope::thread_scope_device);"
+)
+# Constructs whose presence inside the serialised region would deadlock
+# (barriers wait for lanes that are parked outside the elected branch) or
+# change meaning (SIMD reductions see one active lane).
+_SPIN_REGION_FORBIDDEN = ("simd_", "threadgroup_barrier", "wp_tile_", "_coop_lane", "WP_TILE_SYNC")
+
+
+def _spin_lock_serialization_enabled() -> bool:
+    """Whether acquire-shaped spin loops are rewritten for Apple GPUs.
+
+    Reads :data:`warp.config.metal_serialize_spin_locks` lazily — importing
+    ``warp.config`` at module scope would be a circular import.
+    """
+    import warp.config as _wp_cfg  # noqa: PLC0415
+
+    return bool(getattr(_wp_cfg, "metal_serialize_spin_locks", True))
+
+
+def _brace_delta(line: str) -> int:
+    """Net change in brace depth over ``line``, ignoring braces inside string
+    literals (``wp.printf`` format strings)."""
+    delta = 0
+    in_str = False
+    prev = ""
+    for ch in line:
+        if in_str:
+            if ch == '"' and prev != "\\":
+                in_str = False
+        elif ch == '"':
+            in_str = True
+        elif ch == "{":
+            delta += 1
+        elif ch == "}":
+            delta -= 1
+        prev = ch
+    return delta
+
+
+def _match_spin_acquire_loop(lines: list[str], start: int) -> tuple[int, str] | None:
+    """Return ``(end_index, lock_array)`` if ``lines[start]`` opens an
+    acquire-shaped spin loop, else ``None``.
+
+    The shape is Warp's ``while`` lowering whose body consists of local
+    assignments only, exactly one of which is a ``wp_atomic_cas`` /
+    ``wp_atomic_exch`` on the lock array, whose exit condition derives from
+    that atomic's result, and which carries no other loop state (so ``for``
+    loops that happen to contain an atomic are not matched). ``end_index``
+    is the index of the loop's closing brace.
+    """
+    if lines[start].strip() != "while (true) {":
+        return None
+    depth = 1
+    end = None
+    for j in range(start + 1, len(lines)):
+        depth += _brace_delta(lines[j])
+        if depth == 0:
+            end = j
+            break
+    if end is None:
+        return None
+
+    lock_arr = None
+    atomic_result = None
+    derived: set[str] = set()
+    assigned: list[tuple[str, str]] = []
+    n_break = 0
+    for j in range(start + 1, end):
+        stripped = lines[j].strip()
+        if not stripped or stripped == "continue;":
+            continue
+        m_break = _SPIN_BREAK_IF_PAT.match(stripped)
+        if m_break:
+            n_break += 1
+            derived_cond = m_break.group(2)
+            continue
+        m_assign = _SPIN_ASSIGN_PAT.match(stripped)
+        if not m_assign:
+            return None
+        target, rhs = m_assign.group(1), m_assign.group(2)
+        m_acq = _SPIN_ACQUIRE_PAT.search(rhs)
+        if m_acq:
+            if lock_arr is not None:
+                return None
+            lock_arr = m_acq.group(1)
+            atomic_result = target
+        assigned.append((target, rhs))
+    if lock_arr is None or n_break != 1:
+        return None
+    # Every value assigned in the loop must derive from the atomic's result
+    # (no loop-carried counters), and so must the exit condition.
+    derived.add(atomic_result)
+    for target, rhs in assigned:
+        if target == atomic_result:
+            continue
+        rhs_names = set(re.findall(r"\bvar_\w+\b", rhs))
+        if not (rhs_names & derived):
+            return None
+        derived.add(target)
+    if derived_cond not in derived:
+        return None
+    return end, lock_arr
+
+
+def _serialize_spin_locks(source: str, kernel_name: str) -> str:
+    """Rewrite acquire-loop / critical-section / release spans so that one
+    lane per SIMD group at a time holds the lock (see the module comment
+    above). Spans the pass cannot prove safe are left untouched with a
+    warning, since the alternative is a silent permanent hang on Apple GPUs.
+    """
+    if "wp_atomic_cas" not in source and "wp_atomic_exch" not in source:
+        return source
+    lines = source.split("\n")
+    out: list[str] = []
+    n_rewritten = 0
+    i = 0
+    while i < len(lines):
+        matched = _match_spin_acquire_loop(lines, i)
+        if matched is None:
+            out.append(lines[i])
+            i += 1
+            continue
+        loop_end, lock_arr = matched
+        bail = _spin_region_bail_reason(lines, i, loop_end, lock_arr)
+        if isinstance(bail, str):
+            from warp._src.utils import warn  # noqa: PLC0415
+
+            warn(
+                f"Kernel {kernel_name!r}: a spin-wait loop on array {lock_arr!r} could not be "
+                f"serialised for Apple GPUs ({bail}). Apple GPUs do not guarantee independent forward "
+                f"progress between lanes of a SIMD group, so a mutual-exclusion lock built on "
+                f"wp.atomic_cas()/wp.atomic_exch() may deadlock on Metal devices.",
+                category=UserWarning,
+            )
+            out.append(lines[i])
+            i += 1
+            continue
+        release = bail
+        indent = re.match(r"\s*", lines[i]).group(0)
+        flag = f"wp_spin_pending_{n_rewritten}"
+        n_rewritten += 1
+        out.append(f"{indent}// Spin lock on `{lock_arr}`: serialised across SIMD lanes (no independent")
+        out.append(f"{indent}// forward progress between lanes on Apple GPUs).")
+        out.append(f"{indent}{{")
+        out.append(f"{indent}bool {flag} = true;")
+        out.append(f"{indent}while (metal::simd_any({flag})) {{")
+        out.append(f"{indent}if ({flag}) {{")
+        out.append(f"{indent}if (metal::simd_is_first()) {{")
+        out.extend(lines[i : loop_end + 1])
+        out.append(f"{indent}{_SPIN_FENCE}")
+        out.extend(lines[loop_end + 1 : release])
+        out.append(f"{indent}{_SPIN_FENCE}")
+        out.append(lines[release])
+        out.append(f"{indent}{flag} = false;")
+        out.append(f"{indent}}}")
+        out.append(f"{indent}}}")
+        out.append(f"{indent}}}")
+        out.append(f"{indent}}}")
+        i = release + 1
+    return "\n".join(out)
+
+
+def _spin_region_bail_reason(lines: list[str], start: int, loop_end: int, lock_arr: str) -> int | str:
+    """Locate the release for the acquire loop at ``lines[start:loop_end+1]``.
+
+    Returns the index of the release line, or a human-readable reason the
+    span cannot be serialised.
+    """
+    for j in range(start, loop_end + 1):
+        if any(tok in lines[j] for tok in _SPIN_REGION_FORBIDDEN):
+            return "the acquire loop uses SIMD-group or tile operations"
+
+    depth = 0
+    # Stack of block kinds opened inside the region (``True`` = a loop that
+    # a ``break``/``continue`` may legally target).
+    blocks: list[bool] = []
+    declared: set[str] = set()
+    release = None
+    for j in range(loop_end + 1, len(lines)):
+        stripped = lines[j].strip()
+        if depth == 0:
+            for pat in _SPIN_RELEASE_PATS:
+                m = pat.search(stripped)
+                if m and m.group(1) == lock_arr:
+                    release = j
+                    break
+            if release is not None:
+                break
+        if any(tok in stripped for tok in _SPIN_REGION_FORBIDDEN):
+            return "the critical section uses SIMD-group, barrier, or tile operations"
+        if stripped == "return;" or stripped.startswith("return "):
+            return "the critical section contains a return"
+        if stripped in ("break;", "continue;") and not any(blocks):
+            return f"the critical section contains a {stripped[:-1]} targeting an enclosing loop"
+        m_decl = _SPIN_DECL_PAT.match(stripped)
+        if m_decl:
+            declared.add(m_decl.group(1))
+        delta = _brace_delta(stripped)
+        if delta > 0:
+            is_loop = stripped.startswith(("do ", "do{", "while", "for"))
+            blocks.extend([is_loop] * delta)
+        elif delta < 0:
+            for _ in range(-delta):
+                if not blocks:
+                    return "no matching release write to the lock array in the same block"
+                blocks.pop()
+        depth += delta
+        if depth < 0:
+            return "no matching release write to the lock array in the same block"
+    if release is None:
+        return "no matching release write to the lock array in the same block"
+    # Locals declared inside the span would go out of scope once the span
+    # is wrapped in its own block.
+    tail = "\n".join(lines[release + 1 :])
+    for name in declared:
+        if re.search(rf"\b{re.escape(name)}\b", tail):
+            return f"local {name!r} declared in the critical section is used after the release"
+    return release
+
+
 # Patterns are applied in order. Each entry is (regex, replacement). Captures
 # can be back-referenced with \1, \2, etc.
 _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
@@ -15546,6 +15815,12 @@ def _generate_msl_kernel_uncached(
     if _shape_arrs_seen:
         source = "\n".join(_shape_idx_pat.sub(_replace_shape_ref, line) for line in body_lines) + "\n"
 
+    # ---- Serialise spin locks across SIMD lanes -----------------------
+    # A mutual-exclusion lock spun on by two lanes of one SIMD group
+    # deadlocks on Apple GPUs; see ``_serialize_spin_locks``.
+    if _spin_lock_serialization_enabled():
+        source = _serialize_spin_locks(source, adj.fun_name)
+
     if _fp64_mode() == "emulate":
         source = _emulate_f64_literal_assigns(source)
         if "wp_f64" in source:
@@ -15941,6 +16216,8 @@ def _artifact_cache_key(kernel, adj) -> str | None:
         # array, and helper ("float" / "ulong" storage vs "wp_f64"); a body
         # cached under one mode is unusable under another.
         f"fp64={_fp64_mode()}",
+        # Spin-lock serialisation rewrites the body; an A/B switch.
+        f"spin={_spin_lock_serialization_enabled()}",
         # Distributed-tile builds share neither IR nor launch geometry
         # with serial builds of the same kernel.
         f"coopblock={getattr(adj, '_metal_coop_block_n', 0)}",
