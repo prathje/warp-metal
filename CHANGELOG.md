@@ -107,6 +107,8 @@
   the critical section, SIMD-group or tile operations in it) are left as written with a warning. Add
   `warp.config.metal_serialize_spin_locks` (environment variable `WARP_METAL_SERIALIZE_SPIN_LOCKS`) to disable
   the rewrite, and run `core/example_spin_lock` in the examples test suite on GPU devices.
+- Add `warp/examples/benchmarks/benchmark_examples.py`, which runs every example of the test suite under CPU, Metal
+  and Metal-with-fp64-emulation configurations and reports per-step and whole-run timings.
 ### Removed
 
 ### Deprecated
