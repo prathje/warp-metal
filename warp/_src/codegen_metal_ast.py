@@ -1760,11 +1760,12 @@ def _inline_one_call(
             },
         )
 
-    from warp._src.codegen_metal import _demote_f64_value_tokens  # noqa: PLC0415
-
     # Same value-level fp32 demotion the kernel body received (no-op unless
     # ``metal_demote_fp64`` is set).
-    from warp._src.codegen_metal import _normalize_adj_ir  # noqa: PLC0415
+    from warp._src.codegen_metal import (
+        _demote_f64_value_tokens,  # noqa: PLC0415
+        _normalize_adj_ir,  # noqa: PLC0415
+    )
 
     _normalize_adj_ir(fn_overload.adj)
     fn_lines = [_demote_f64_value_tokens(ln) for ln in fn_overload.adj.blocks[0].body_forward]
@@ -4349,7 +4350,11 @@ def _apply_view_rewrites(
         # underlying array name and prepend the leading slice indices —
         # downstream the ``wp::tile_load`` intrinsic regex computes the
         # flat ``base`` offset and ``row_stride`` from the array's shape.
-        if isinstance(n, Assign) and isinstance(n.expr, Builtin) and n.expr.name in ("tile_load", "tile_load_indexed", "tile_atomic_add"):
+        if (
+            isinstance(n, Assign)
+            and isinstance(n.expr, Builtin)
+            and n.expr.name in ("tile_load", "tile_load_indexed", "tile_atomic_add")
+        ):
             view_arr_l = _strip_var_prefix(n.expr.args[0]) if n.expr.args else None
             if view_arr_l is not None and view_arr_l in view_aliases:
                 arr_name, lead_idx_labels = view_aliases[view_arr_l]

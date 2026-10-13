@@ -474,9 +474,7 @@ def segmented_sort_pairs(
         from warp._src import metal_utils  # noqa: PLC0415
 
         # Like the CUDA path, segment bounds are not validated on the device.
-        metal_utils.segmented_sort_pairs(
-            keys, values, count, segment_start_indices, segment_end_indices, num_segments
-        )
+        metal_utils.segmented_sort_pairs(keys, values, count, segment_start_indices, segment_end_indices, num_segments)
         return
 
     if _use_host_native_op(keys.device, keys, values):

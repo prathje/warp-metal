@@ -17,7 +17,6 @@ import platform
 import subprocess
 import sys
 import unittest
-
 from typing import Any
 
 import numpy as np
@@ -494,7 +493,6 @@ class TestMetalRuntime(unittest.TestCase):
             with wp.ScopedCapture():
                 wp.capture_if(flag, sub.graph)
 
-
     # -- BVH constructor fallback -----------------------------------------
 
     def test_lbvh_fallback_is_silent(self):
@@ -513,7 +511,6 @@ class TestMetalRuntime(unittest.TestCase):
         self.assertNotEqual(bvh.id, 0)
         messages = [str(w.message) for w in caught if "constructor" in str(w.message)]
         self.assertEqual(messages, [])
-
 
     # -- device-side wp.utils ------------------------------------------------
 
@@ -666,16 +663,16 @@ class TestMetalRuntime(unittest.TestCase):
         for n in (1, 1000, 1000000):
             x = rng.random(n).astype(np.float32)
             y = rng.random(n).astype(np.float32)
-            self.assertAlmostEqual(
-                wp.utils.array_sum(wp.array(x)) / n, x.astype(np.float64).sum() / n, delta=1e-5
-            )
+            self.assertAlmostEqual(wp.utils.array_sum(wp.array(x)) / n, x.astype(np.float64).sum() / n, delta=1e-5)
             self.assertAlmostEqual(
                 wp.utils.array_inner(wp.array(x), wp.array(y)) / n, np.dot(x.astype(np.float64), y) / n, delta=1e-5
             )
         x = rng.random((60, 7, 3)).astype(np.float32)
         for axis in (0, 1, -1):
             a = wp.array(x)
-            np.testing.assert_allclose(wp.utils.array_sum(a, axis=axis).numpy(), x.sum(axis=axis, keepdims=True), rtol=1e-5)
+            np.testing.assert_allclose(
+                wp.utils.array_sum(a, axis=axis).numpy(), x.sum(axis=axis, keepdims=True), rtol=1e-5
+            )
             np.testing.assert_allclose(
                 wp.utils.array_inner(a, a, axis=axis).numpy(), (x * x).sum(axis=axis, keepdims=True), rtol=1e-5
             )
@@ -723,7 +720,6 @@ class TestMetalRuntime(unittest.TestCase):
             unique, counts = np.unique(s, return_counts=True)
             self.assertEqual(run_count.numpy()[0], unique.size)
             np.testing.assert_array_equal(run_lengths.numpy()[: unique.size], counts)
-
 
     # -- atomics -------------------------------------------------------------
 
@@ -860,7 +856,6 @@ class TestMetalRuntime(unittest.TestCase):
         a = wp.ones(64, dtype=float)
         wp.launch(_read_only, dim=64, inputs=[a])
         wp.synchronize_device()
-
 
     # -- strided / indexed kernel arguments -----------------------------------
 

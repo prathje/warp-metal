@@ -495,7 +495,7 @@ class TestMetalMismatch(unittest.TestCase):
         # no tile op or wp.block_dim() call: like CPU it runs one thread per
         # block instead of keeping block_dim independent lanes.
         snippet = textwrap.dedent(
-            '''
+            """
             import numpy as np
 
             @wp.func_native(snippet="WP_TILE_SYNC();")
@@ -517,7 +517,7 @@ class TestMetalMismatch(unittest.TestCase):
                 wp.launch_tiled(k, dim=3, inputs=[count, width], block_dim=64, device=d)
                 np.testing.assert_array_equal(count.numpy(), [1.0, 1.0, 1.0])
                 np.testing.assert_array_equal(width.numpy(), [1, 1, 1])
-            '''
+            """
         )
         _run_with_metal_enabled(self, snippet)
 

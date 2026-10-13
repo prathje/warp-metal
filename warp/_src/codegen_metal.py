@@ -137,6 +137,8 @@ import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from warp._src import codegen_metal_texture as _mtex
+from warp._src import codegen_metal_tiles as _mtiles
 from warp._src.codegen_metal_ast import _STRUCT_DUAL_RESET_MARKER
 from warp._src.codegen_metal_ast import Assign as _AstAssign
 from warp._src.codegen_metal_ast import Builtin as _AstBuiltin
@@ -160,8 +162,6 @@ from warp._src.codegen_metal_ast import fold_struct_array_array_fields as _ast_f
 from warp._src.codegen_metal_ast import fold_tuple_locals as _ast_fold_tuples
 from warp._src.codegen_metal_ast import fold_views as _ast_fold_views
 from warp._src.codegen_metal_ast import has_print_calls as _ast_has_print_calls
-from warp._src import codegen_metal_texture as _mtex
-from warp._src import codegen_metal_tiles as _mtiles
 from warp._src.codegen_metal_ast import inline_user_calls as _ast_inline
 from warp._src.codegen_metal_ast import lower_reverse_ranges as _ast_lower_reverse_ranges
 from warp._src.codegen_metal_ast import parse as _ast_parse
@@ -2982,9 +2982,13 @@ inline T wp_a64_locked(device T* p, uint op, T a, T b) {{
                 fn = f"wp_a64_{op}__{arr}"
                 if strategy == "locked":
                     if op == "cas":
-                        out.append(f"inline {t} {fn}(device {t}* p, {t} c, {t} v) {{ return wp_a64_locked<{t}>(p, 8u, c, v); }}")
+                        out.append(
+                            f"inline {t} {fn}(device {t}* p, {t} c, {t} v) {{ return wp_a64_locked<{t}>(p, 8u, c, v); }}"
+                        )
                     else:
-                        out.append(f"inline {t} {fn}(device {t}* p, {t} v) {{ return wp_a64_locked<{t}>(p, {_A64_OPS[op]}u, v, {t}(0)); }}")
+                        out.append(
+                            f"inline {t} {fn}(device {t}* p, {t} v) {{ return wp_a64_locked<{t}>(p, {_A64_OPS[op]}u, v, {t}(0)); }}"
+                        )
                 elif strategy == "native":
                     native = "atomic_min_explicit" if op == "umin" else "atomic_max_explicit"
                     out.append(
@@ -12986,6 +12990,8 @@ def _native_snippet_lane_dependent(name: str) -> bool:
 def _native_snippet_cuda_only(name: str) -> bool:
     """A lane-dependent snippet whose CUDA branch is not a plain barrier."""
     return "__CUDA_ARCH__" in _NATIVE_SNIPPET_DEFS.get(name, "") and _native_snippet_lane_dependent(name)
+
+
 # ``reinterpret_cast<T&>(x)`` reads (the type-punning idiom snippets use for
 # bit tricks) become ``as_type<T>(x)``; MSL rejects reference punning.
 _NATIVE_REINTERPRET_REF_PAT = re.compile(r"reinterpret_cast\s*<\s*([\w:]+)\s*&\s*>\s*\(\s*(\w+)\s*\)")
@@ -13817,7 +13823,11 @@ def _guard_struct_field_writes(lines: list[str], arrays: set[str]) -> list[str]:
         if not single or body.startswith(("if ", "if(", "for ", "for(", "while")):
             out.append(ln)
             continue
-        if store_pat.match(body) is None and not re.match(r"^(?:\w+\s*=\s*)?[\w:]+\s*\(", body) and not body.startswith("{"):
+        if (
+            store_pat.match(body) is None
+            and not re.match(r"^(?:\w+\s*=\s*)?[\w:]+\s*\(", body)
+            and not body.startswith("{")
+        ):
             out.append(ln)
             continue
         indent = ln[: len(ln) - len(ln.lstrip())]
@@ -13898,9 +13908,13 @@ def _strip_comments_and_directives(line: str) -> str | None:
 # (reverse mode, handled next to ``adj_array_store``).
 
 _SLOT_INDEX_PREFIX = r"wp::index\(\s*var_(?P<arr>\w+)\s*,\s*(?P<idx>[^()]*?)\s*\)"
-_SLOT_REF_PAT = re.compile(r"^(?P<indent>\s*)var_(?P<lhs>\w+)\s*=\s*&\(\s*" + _SLOT_INDEX_PREFIX + r"(?P<acc>[^;]*?)\)\s*;\s*$")
+_SLOT_REF_PAT = re.compile(
+    r"^(?P<indent>\s*)var_(?P<lhs>\w+)\s*=\s*&\(\s*" + _SLOT_INDEX_PREFIX + r"(?P<acc>[^;]*?)\)\s*;\s*$"
+)
 _SLOT_STORE_PAT = re.compile(
-    r"^(?P<indent>\s*)wp::store\(\s*&\(\s*" + _SLOT_INDEX_PREFIX + r"(?P<acc>.*?)\)\s*,\s*(?P<val>[\w\[\]\.]+)\s*\)\s*;\s*$"
+    r"^(?P<indent>\s*)wp::store\(\s*&\(\s*"
+    + _SLOT_INDEX_PREFIX
+    + r"(?P<acc>.*?)\)\s*,\s*(?P<val>[\w\[\]\.]+)\s*\)\s*;\s*$"
 )
 _SLOT_LAMBDA = r"\[&\]\(auto& _e\) -> auto& \{ return _e(?P<acc>.*?); \}"
 _SLOT_ATOMIC_PAT = re.compile(
@@ -14178,7 +14192,6 @@ def _lower_array_slot_ir(lines: list[str], adj, all_lines: list[str]) -> list[st
     return out
 
 
-
 # Warp >= 1.18 spells field lvalues through its lvalue-origin system as
 # ``(base).field`` (``&((var_p).scale)``, ``&(((var_p).a).b)``); older Warp
 # emitted ``&(var_p.scale)``, which is what the regex translator matches.
@@ -14196,8 +14209,12 @@ def _normalize_ir_line(line: str) -> str:
     return line
 
 
-_FIELD_ASSIGN_PAT = re.compile(r"^(?P<indent>\s*)var_(?P<root>\w+)(?P<path>(?:\.\w+)+)\s*=\s*(?P<rhs>[^=;][^;]*?)\s*;\s*$")
-_FIELD_ADDR_CHAIN_PAT = re.compile(r"^(?P<indent>\s*)var_(?P<lhs>\w+)\s*=\s*&\(\s*var_(?P<root>\w+)(?P<path>(?:\.\w+){2,})\s*\)\s*;\s*$")
+_FIELD_ASSIGN_PAT = re.compile(
+    r"^(?P<indent>\s*)var_(?P<root>\w+)(?P<path>(?:\.\w+)+)\s*=\s*(?P<rhs>[^=;][^;]*?)\s*;\s*$"
+)
+_FIELD_ADDR_CHAIN_PAT = re.compile(
+    r"^(?P<indent>\s*)var_(?P<lhs>\w+)\s*=\s*&\(\s*var_(?P<root>\w+)(?P<path>(?:\.\w+){2,})\s*\)\s*;\s*$"
+)
 _FIELD_ADDR_ONE_PAT = re.compile(r"^\s*var_(?P<lhs>\w+)\s*=\s*&\(\s*var_(?P<root>\w+)\.(?P<field>\w+)\s*\)\s*;\s*$")
 # ``&(((*wp::address(var_A, i..))).f.g)`` — a field of an array element
 # (Warp >= 1.18); older Warp emitted ``var_E = wp::address(var_A, i..);
@@ -14263,7 +14280,9 @@ def _normalize_ir_lines(lines: list[str]) -> list[str]:
             continue
         m = _ADJ_FIELD_ZERO_PAT.match(ln)
         if m:
-            out.append(f"{m.group('indent')}{_STRUCT_FIELD_DUAL_ZERO_CALL}(adj_{m.group('root')}, {m.group('path')[1:]});")
+            out.append(
+                f"{m.group('indent')}{_STRUCT_FIELD_DUAL_ZERO_CALL}(adj_{m.group('root')}, {m.group('path')[1:]});"
+            )
             continue
         m = _ELEM_FIELD_ADDR_PAT.match(ln)
         if m:
@@ -14323,7 +14342,9 @@ def _normalize_adj_ir(adj, seen=None) -> None:
             _normalize_adj_ir(func_adj, seen)
 
 
-_ATOMIC_IR_RE = re.compile(r"\bwp::(?:tile_)?atomic_\w+\s*\(|\b(?:tile_)?atomic_(?:add|sub|min|max|and|or|xor|cas|exch)\w*\s*\(")
+_ATOMIC_IR_RE = re.compile(
+    r"\bwp::(?:tile_)?atomic_\w+\s*\(|\b(?:tile_)?atomic_(?:add|sub|min|max|and|or|xor|cas|exch)\w*\s*\("
+)
 
 
 def _requested_deterministic_mode(kernel):
@@ -14747,9 +14768,7 @@ def _generate_msl_kernel_uncached(
             if _ct in _SCALAR_CTYPE_TO_MSL
         },
     }
-    _wrap_consts = {
-        str(_l): _c for _l, _c in {**_const_ints, **_inlined_const_ints}.items() if isinstance(_c, int)
-    }
+    _wrap_consts = {str(_l): _c for _l, _c in {**_const_ints, **_inlined_const_ints}.items() if isinstance(_c, int)}
     _ast_nodes = _ast_wrap_negative_array_indices(
         _ast_nodes,
         {a.label: a.type.ndim for a in adj.args if _is_array_arg_type(a.type) and hasattr(a.type, "ndim")},
@@ -16389,13 +16408,13 @@ def _generate_msl_kernel_uncached(
                 continue
             for fpath, _off, finfo in _iter_scalar_leaves(info):
                 body_lines.append(
-                    _finalize(f"{indent}{_per_field_dual(root, f'{path}__{fpath}')} = {_msl_zero_init(finfo.msl_type)};")
+                    _finalize(
+                        f"{indent}{_per_field_dual(root, f'{path}__{fpath}')} = {_msl_zero_init(finfo.msl_type)};"
+                    )
                 )
             continue
         m_fread = _ADJ_STRUCT_FIELD_READ_PAT.match(line)
-        if m_fread and (
-            m_fread.group("root") in struct_dual_layouts or m_fread.group("root") in builtin_struct_locals
-        ):
+        if m_fread and (m_fread.group("root") in struct_dual_layouts or m_fread.group("root") in builtin_struct_locals):
             root = m_fread.group("root")
             parts = m_fread.group("path").lstrip(".").split(".")
             indent = m_fread.group("indent")
@@ -16423,7 +16442,9 @@ def _generate_msl_kernel_uncached(
                 )
             for fpath, _off, _finfo in _iter_scalar_leaves(info):
                 body_lines.append(
-                    _finalize(f"{indent}{_per_field_dual(dst, fpath)} {op} {_per_field_dual(root, f'{path}__{fpath}')};")
+                    _finalize(
+                        f"{indent}{_per_field_dual(dst, fpath)} {op} {_per_field_dual(root, f'{path}__{fpath}')};"
+                    )
                 )
             continue
         m_adj_field = _ADJ_STRUCT_FIELD_STORE_PAT.match(line)
@@ -17316,14 +17337,20 @@ def _generate_msl_kernel_uncached(
                 _geom, _sc = op_name[len("store_bits_narrow") :].split("_", 1)
                 _bits, _shift = _geom.split("x")
                 narrow_store = _StructFieldInfo(
-                    name="", offset=0, size=1, kind=_STRUCT_FIELD_KIND_SCALAR, msl_type=_sc, scalar_msl=_sc,
-                    bits=int(_bits), byte_shift=int(_shift),
+                    name="",
+                    offset=0,
+                    size=1,
+                    kind=_STRUCT_FIELD_KIND_SCALAR,
+                    msl_type=_sc,
+                    scalar_msl=_sc,
+                    bits=int(_bits),
+                    byte_shift=int(_shift),
                 )
                 op_name = "store"
             elif op_name.startswith("store_bits_"):
                 # Non-float field of flat float32 struct storage: write the bits.
                 op_name = "store"
-                val = f"as_type<float>(({op_name and scalar_store_match.group('op')[len('store_bits_'):]})({val}))"
+                val = f"as_type<float>(({op_name and scalar_store_match.group('op')[len('store_bits_') :]})({val}))"
             output_arg_names = {a.label for a in output_args}
             op_sym = {
                 "store": "=",
@@ -17503,9 +17530,7 @@ def _generate_msl_kernel_uncached(
                                     )
                     for _off, _parts in sorted(_narrow_words.items()):
                         _word = " | ".join(_parts)
-                        body_lines.append(
-                            _finalize(_emit_scalar_write(f"{base} + {_off}", f"as_type<float>({_word})"))
-                        )
+                        body_lines.append(_finalize(_emit_scalar_write(f"{base} + {_off}", f"as_type<float>({_word})")))
                     continue
                 flat_idx = _flat_index_expr(arr, indices)
                 body_lines.append(_finalize(_emit_scalar_write(flat_idx, value)))
@@ -20165,7 +20190,15 @@ def launch_metal_kernel_native(
         if staged is not None:
             return staged.run(
                 lambda k, i, o: launch_metal_kernel_native(
-                    k, dim, i, o, device, block_dim=block_dim, adjoint=adjoint, adj_inputs=adj_inputs, adj_outputs=adj_outputs
+                    k,
+                    dim,
+                    i,
+                    o,
+                    device,
+                    block_dim=block_dim,
+                    adjoint=adjoint,
+                    adj_inputs=adj_inputs,
+                    adj_outputs=adj_outputs,
                 )
             )
 

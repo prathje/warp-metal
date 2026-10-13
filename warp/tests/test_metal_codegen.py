@@ -243,7 +243,6 @@ class TestMetalSpinLockSerialization(unittest.TestCase):
     def _generate(kernel):
         import contextlib  # noqa: PLC0415
         import io  # noqa: PLC0415
-
         import warnings  # noqa: PLC0415
 
         # Warp's logger routes warnings to stderr; capture both streams and

@@ -141,8 +141,15 @@ def _stage_copy(value, dense, direction: int) -> None:
     _mu._dispatch(
         f"wp_stage_copy_{unit}",
         [view_slice, _mu._slice(dense), *idx_bindings, params],
-        [view_mode, dense_mode, "r" if idx_mask & 1 else None, "r" if idx_mask & 2 else None,
-         "r" if idx_mask & 4 else None, "r" if idx_mask & 8 else None, None],
+        [
+            view_mode,
+            dense_mode,
+            "r" if idx_mask & 1 else None,
+            "r" if idx_mask & 2 else None,
+            "r" if idx_mask & 4 else None,
+            "r" if idx_mask & 8 else None,
+            None,
+        ],
         (n, 1, 1),
         (min(256, n), 1, 1),
         source=_MSL_SOURCE,

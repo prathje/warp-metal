@@ -609,7 +609,9 @@ def _scan(src, dst, n, ncomp, tname, inclusive, op=0, in_stride=1, in_cstride=1,
         return
     partials = _scratch.get(disp, f"scan_partials_{level}", nblocks * ncomp * elem)
     params = _scan_params(n, nblocks, inclusive, op, 0, in_stride, in_cstride, out_stride, out_cstride)
-    _dispatch(f"wp_scan_reduce_{tname}", [src, partials, params], ["r", "w", None], (nblocks * _TG, ncomp, 1), (_TG, 1, 1))
+    _dispatch(
+        f"wp_scan_reduce_{tname}", [src, partials, params], ["r", "w", None], (nblocks * _TG, ncomp, 1), (_TG, 1, 1)
+    )
     # Exclusive scan of the per-tile partials (component-major layout).
     _scan(partials, partials, nblocks, ncomp, tname, False, op, 1, nblocks, 1, nblocks, level + 1)
     params = _scan_params(n, nblocks, inclusive, op, 1, in_stride, in_cstride, out_stride, out_cstride)
@@ -680,7 +682,9 @@ def _radix_sort(keys, values, n, key_bits, value_bytes, kind, begin_bit, end_bit
     while shift < end_bit:
         bits = min(8, end_bit - shift)
         params = _bytes("<6I", n, shift, bits, nblocks, kind, 0)
-        _dispatch(f"wp_radix_hist_{key_bits}", [src_k, hist, params], ["r", "w", None], (nblocks * _TG, 1, 1), (_TG, 1, 1))
+        _dispatch(
+            f"wp_radix_hist_{key_bits}", [src_k, hist, params], ["r", "w", None], (nblocks * _TG, 1, 1), (_TG, 1, 1)
+        )
         _scan(hist, hist, (1 << bits) * nblocks, 1, "uint", False)
         _dispatch(
             scatter,
@@ -833,7 +837,9 @@ def _reduce(mode, a, b, out, count, axis):
     b_slice = _slice(b) if b is not None else a_slice
     out_slice = _slice(out)
     if groups == 1:
-        _dispatch("wp_reduce_f32", [a_slice, b_slice, out_slice, params], ["r", "r", "w", None], (_TG, ny, n_out), (_TG, 1, 1))
+        _dispatch(
+            "wp_reduce_f32", [a_slice, b_slice, out_slice, params], ["r", "r", "w", None], (_TG, ny, n_out), (_TG, 1, 1)
+        )
         return
     partials = _scratch.get(disp, "reduce_partials", n_out * ny * groups * 4)
     _dispatch(

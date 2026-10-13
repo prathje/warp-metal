@@ -817,7 +817,6 @@ class MetalDispatcher:
         # legacy unsalted ``metal_pso_archive`` and any orphaned
         # serialize temp files) — they'd never be read again.
         import glob  # noqa: PLC0415
-
         import time  # noqa: PLC0415
 
         for old in glob.glob(os.path.join(cache_dir, "metal_pso_archive*")):
