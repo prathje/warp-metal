@@ -747,6 +747,34 @@ class TestMetalCodegenGaps(unittest.TestCase):
             """,
         )
 
+    def test_print_warning_on_warm_artifact_cache(self):
+        _run(
+            self,
+            """
+            import contextlib
+            import io
+            import warnings
+
+            import warp._src.codegen_metal as cm
+
+            @wp.kernel
+            def k(out: wp.array[float]):
+                wp.printf("boom\\n")
+                out[0] = 1.0
+
+            def generate():
+                buf = io.StringIO()
+                cm._metal_print_warned = False
+                with warnings.catch_warnings(), contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                    warnings.simplefilter("always")
+                    cm.generate_msl_kernel(k)
+                return buf.getvalue()
+
+            assert "compiled out" in generate()  # cold: generates and stores the artifact
+            assert "compiled out" in generate()  # warm: loaded from the on-disk cache
+            """,
+        )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

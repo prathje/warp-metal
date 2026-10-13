@@ -13584,6 +13584,9 @@ class MetalKernelArtifact:
     # Native dispatch: binding slots (pre-spill order) moved into the
     # ``__spill_ptrs`` table. Set by ``_wrap_msl_for_native_dispatch``.
     native_spill_slots: tuple[int, ...] = ()
+    # The kernel calls ``wp.print``/``wp.printf`` (compiled out); a warm
+    # cache load re-applies ``warp.config.metal_print`` from this.
+    has_print: bool = False
     # Per-array shape slot size in ``__shapes_packed`` (each array gets
     # ``shape_packed_slot`` int32s, padded with zeros). Warp arrays cap
     # at 4 dims so 4 is plenty.
@@ -14715,7 +14718,8 @@ def _generate_msl_kernel_uncached(
     _ast_nodes, _tuple_skip = _ast_fold_tuples(_ast_nodes, adj, _inlined_var_ctypes)
     _ast_nodes, _mesh_skip = _ast_fold_mesh_get(_ast_nodes, adj, _inlined_var_ctypes)
     _ast_nodes, _sa_skip, _sa_field_reads = _ast_fold_struct_array_fields(_ast_nodes, adj, _inlined_var_ctypes)
-    if _ast_has_print_calls(_ast_nodes):
+    _has_print = _ast_has_print_calls(_ast_nodes)
+    if _has_print:
         _handle_metal_print(adj.fun_name)
     _ast_nodes, _drop_skip = _ast_fold_drop(_ast_nodes, adj, _inlined_var_ctypes)
     _drop_skip = _drop_skip | _tuple_skip | _mesh_skip | _sa_skip
@@ -18029,6 +18033,7 @@ def _generate_msl_kernel_uncached(
         # ``output_names``.
         return MetalKernelArtifact(
             name=artifact_name,
+            has_print=_has_print,
             source="",
             input_names=[],
             output_names=[],
@@ -18206,6 +18211,7 @@ def _generate_msl_kernel_uncached(
 
     _artifact = MetalKernelArtifact(
         name=artifact_name,
+        has_print=_has_print,
         source=source,
         input_names=base_input_names + inplace_input_names + init_input_names + extra_input_names,
         output_names=final_output_names,
@@ -18530,6 +18536,8 @@ def generate_msl_kernel(
     if key is not None:
         cached = _load_cached_artifact(key, adj)
         if cached is not None:
+            if cached.has_print:
+                _handle_metal_print(adj.fun_name)
             return cached
     artifact = _generate_msl_kernel_uncached(kernel, adjoint=adjoint, grad_args=grad_args)
     if key is not None:
