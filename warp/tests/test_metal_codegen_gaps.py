@@ -84,6 +84,37 @@ class TestMetalCodegenGaps(unittest.TestCase):
             """,
         )
 
+    def test_mesh_eval_adjoints(self):
+        _run(
+            self,
+            """
+            @wp.kernel
+            def k(mid: wp.uint64, uv: wp.array[wp.vec2], out: wp.array[float]):
+                i = wp.tid()
+                p = wp.mesh_eval_position(mid, i, uv[i][0], uv[i][1])
+                v = wp.mesh_eval_velocity(mid, i, uv[i][0], uv[i][1])
+                out[i] = wp.dot(p, wp.vec3(1.0, 2.0, 3.0)) + wp.length(v)
+
+            pts = np.array([[0, 0, 0], [2, 0, 0], [0, 1, 0], [0, 0, 3]], dtype=np.float32)
+            idx = np.array([0, 1, 2, 0, 2, 3], dtype=np.int32)
+
+            def launch(dev):
+                m = wp.Mesh(points=wp.array(pts, dtype=wp.vec3, device=dev),
+                            indices=wp.array(idx, dtype=int, device=dev),
+                            velocities=wp.array(pts * 2.0 + 1.0, dtype=wp.vec3, device=dev))
+                uv = wp.array([[0.2, 0.3], [0.5, 0.1]], dtype=wp.vec2, device=dev, requires_grad=True)
+                o = wp.zeros(2, dtype=float, device=dev, requires_grad=True)
+                tape = wp.Tape()
+                with tape:
+                    wp.launch(k, 2, [m.id, uv], [o], device=dev)
+                tape.backward(grads={o: wp.ones(2, dtype=float, device=dev)})
+                return o.numpy(), uv.grad.numpy()
+
+            cpu, metal = both(launch)
+            assert_same(cpu, metal, rtol=1e-6, atol=1e-6)
+            """,
+        )
+
     def test_shape_suffixed_array_args(self):
         _run(
             self,

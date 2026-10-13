@@ -5050,6 +5050,32 @@ inline float3 wp_mesh_eval_velocity(ulong id, int tri, float u, float v) {
     float3 vr = wp_bvh_load_v3(mesh.velocities, k);
     return vp * u + vq * v + vr * (1.0f - u - v);
 }
+// Reverse mode of ``wp_mesh_eval_position`` (warp/native/mesh.h): only the
+// barycentric coordinates receive a gradient.
+inline void wp_adj_mesh_eval_position(ulong id, int tri, float u, float v, thread ulong& adj_id, thread int& adj_tri,
+                                   thread float& adj_u, thread float& adj_v, float3 adj_ret) {
+    wp_mesh_desc_t mesh = wp_mesh_get_desc(id);
+    if (mesh.points == 0ul) { return; }
+    const device int* tri_indices = wp_bvh_int_ptr(mesh.indices);
+    float3 p = wp_bvh_load_v3(mesh.points, tri_indices[tri * 3 + 0]);
+    float3 q = wp_bvh_load_v3(mesh.points, tri_indices[tri * 3 + 1]);
+    float3 r = wp_bvh_load_v3(mesh.points, tri_indices[tri * 3 + 2]);
+    adj_u += (p[0] - r[0]) * adj_ret[0] + (p[1] - r[1]) * adj_ret[1] + (p[2] - r[2]) * adj_ret[2];
+    adj_v += (q[0] - r[0]) * adj_ret[0] + (q[1] - r[1]) * adj_ret[1] + (q[2] - r[2]) * adj_ret[2];
+}
+// Reverse mode of ``wp_mesh_eval_velocity`` (warp/native/mesh.h): only the
+// barycentric coordinates receive a gradient.
+inline void wp_adj_mesh_eval_velocity(ulong id, int tri, float u, float v, thread ulong& adj_id, thread int& adj_tri,
+                                   thread float& adj_u, thread float& adj_v, float3 adj_ret) {
+    wp_mesh_desc_t mesh = wp_mesh_get_desc(id);
+    if (mesh.velocities == 0ul) { return; }
+    const device int* tri_indices = wp_bvh_int_ptr(mesh.indices);
+    float3 p = wp_bvh_load_v3(mesh.velocities, tri_indices[tri * 3 + 0]);
+    float3 q = wp_bvh_load_v3(mesh.velocities, tri_indices[tri * 3 + 1]);
+    float3 r = wp_bvh_load_v3(mesh.velocities, tri_indices[tri * 3 + 2]);
+    adj_u += (p[0] - r[0]) * adj_ret[0] + (p[1] - r[1]) * adj_ret[1] + (p[2] - r[2]) * adj_ret[2];
+    adj_v += (q[0] - r[0]) * adj_ret[0] + (q[1] - r[1]) * adj_ret[1] + (q[2] - r[2]) * adj_ret[2];
+}
 inline float3 wp_mesh_eval_face_normal(ulong id, int tri) {
     wp_mesh_desc_t mesh = wp_mesh_get_desc(id);
     if (mesh.points == 0ul) { return float3(0.0f); }
@@ -9797,6 +9823,8 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     # barycentric coords w.r.t. the ray origin and direction (ports of
     # mesh.h / intersect.h; the vertex adjoints are dropped upstream too).
     (re.compile(r"\bwp::adj_mesh_query_ray\b"), "wp_adj_mesh_query_ray"),
+    (re.compile(r"\bwp::adj_mesh_eval_position\b"), "wp_adj_mesh_eval_position"),
+    (re.compile(r"\bwp::adj_mesh_eval_velocity\b"), "wp_adj_mesh_eval_velocity"),
     (re.compile(r"\bwp::mesh_query_ray\b"), "wp_mesh_query_ray"),
     (re.compile(r"\bwp::mesh_get_group_root\b"), "wp_mesh_get_group_root"),
     (re.compile(r"\bwp::mesh_query_point_t\b"), "wp_mesh_query_point_t"),
