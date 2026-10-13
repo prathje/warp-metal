@@ -12819,8 +12819,21 @@ def _lower_array_slot_ir(lines: list[str], adj, all_lines: list[str]) -> list[st
                 f64_arrays.add(arg.label)
     joined = "\n".join(all_lines)
 
+    # Native indexing wraps a negative index once (``arr[-1]``); the slot
+    # forms are lowered here, before the AST wrap pass sees them, so wrap
+    # their indices inline. Thread ids and non-negative constants cannot be
+    # negative and are left alone.
+    _nonneg_idx = {
+        f"var_{v.label}" for v in adj.variables if isinstance(v.constant, int) and v.constant >= 0
+    } | {f"var_{t}" for t in re.findall(r"\bvar_(\w+)\s*=\s*builtin_tid", joined)}
+
     def _flat(arr: str, idx: str) -> str:
-        return _flat_index_expr(arr, [a.strip() for a in _split_top_level_args(idx)])
+        parts = [a.strip() for a in _split_top_level_args(idx)]
+        wrapped = [
+            p if p in _nonneg_idx or p.isdigit() else f"wp_wrap_index({p}, {arr}_shape[{k}])"
+            for k, p in enumerate(parts)
+        ]
+        return _flat_index_expr(arr, wrapped)
 
     out: list[str] = []
     for ln in lines:
@@ -13266,6 +13279,21 @@ def _artifact_display_name(kernel, adj) -> str:
     return name
 
 
+def _struct_arg_array_ndims(adj, fields: dict[str, tuple[str, tuple[str, ...]]]) -> dict[str, int]:
+    """ndim of each flattened struct-arg array field (synthetic label -> ndim)."""
+    arg_types = {a.label: a.type for a in adj.args}
+    out: dict[str, int] = {}
+    for label, (arg_label, path) in fields.items():
+        t = arg_types.get(arg_label)
+        for name in path:
+            field = getattr(t, "vars", {}).get(name)
+            t = getattr(field, "type", None)
+        ndim = getattr(t, "ndim", None)
+        if isinstance(ndim, int) and ndim > 0:
+            out[label] = ndim
+    return out
+
+
 def _generate_msl_kernel_uncached(
     kernel, adjoint: bool = False, grad_args: tuple[str, ...] = ()
 ) -> MetalKernelArtifact:
@@ -13413,6 +13441,32 @@ def _generate_msl_kernel_uncached(
     # array input to the signature and the launcher binds the field's
     # buffer by walking the struct instance.
     _struct_arg_array_fields: dict[str, tuple[str, tuple[str, ...]]] = {}
+    # Native Warp wraps a negative index once (``arr[-1]`` is the last
+    # element); the flat-offset translators do not. Wrap every index of a
+    # kernel-array access (and of views of one) before the view fold
+    # flattens views away, then again after it for the struct-arg array
+    # fields the fold exposes as synthetic arrays.
+    _wrap_msl_types = {
+        **{
+            str(_v.label): _SCALAR_CTYPE_TO_MSL.get(_v.ctype(value_type=True))
+            for _v in adj.variables
+            if _v.ctype(value_type=True) in _SCALAR_CTYPE_TO_MSL
+        },
+        **{
+            str(_lbl): _SCALAR_CTYPE_TO_MSL.get(_ct)
+            for _lbl, _ct in _inlined_var_ctypes.items()
+            if _ct in _SCALAR_CTYPE_TO_MSL
+        },
+    }
+    _wrap_consts = {
+        str(_l): _c for _l, _c in {**_const_ints, **_inlined_const_ints}.items() if isinstance(_c, int)
+    }
+    _ast_nodes = _ast_wrap_negative_array_indices(
+        _ast_nodes,
+        {a.label: a.type.ndim for a in adj.args if _is_array_arg_type(a.type) and hasattr(a.type, "ndim")},
+        _wrap_msl_types,
+        _wrap_consts,
+    )
     _ast_nodes, _view_skip = _ast_fold_views(
         _ast_nodes,
         adj,
@@ -13420,27 +13474,10 @@ def _generate_msl_kernel_uncached(
         struct_locals=_inlined_struct_locals,
         struct_arg_arrays_out=_struct_arg_array_fields,
     )
+    _struct_field_ndims = _struct_arg_array_ndims(adj, _struct_arg_array_fields)
+    if _struct_field_ndims:
+        _ast_nodes = _ast_wrap_negative_array_indices(_ast_nodes, _struct_field_ndims, _wrap_msl_types, _wrap_consts)
     _ast_nodes, _indexref_skip = _ast_fold_indexref(_ast_nodes, adj, _early_vec_arr_info)
-    # Native Warp wraps a negative index once (``arr[-1]`` is the last
-    # element); the flat-offset translators below do not, so wrap the index
-    # operands of every kernel-array access up front.
-    _ast_nodes = _ast_wrap_negative_array_indices(
-        _ast_nodes,
-        {a.label: a.type.ndim for a in adj.args if _is_array_arg_type(a.type) and hasattr(a.type, "ndim")},
-        {
-            **{
-                str(_v.label): _SCALAR_CTYPE_TO_MSL.get(_v.ctype(value_type=True))
-                for _v in adj.variables
-                if _v.ctype(value_type=True) in _SCALAR_CTYPE_TO_MSL
-            },
-            **{
-                str(_lbl): _SCALAR_CTYPE_TO_MSL.get(_ct)
-                for _lbl, _ct in _inlined_var_ctypes.items()
-                if _ct in _SCALAR_CTYPE_TO_MSL
-            },
-        },
-        {str(_l) for _l, _c in {**_const_ints, **_inlined_const_ints}.items() if isinstance(_c, int) and _c >= 0},
-    )
     # Flatten multi-dim ``wp::atomic_<op>(arr, i, j, ..., val)`` into the
     # 3-arg form the intrinsic regex handles, expanding to per-component
     # atomics for vec-typed arrays.

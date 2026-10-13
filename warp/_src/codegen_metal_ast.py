@@ -4491,115 +4491,233 @@ def _rewrite_while_body(body: list[Node], k_suffix: str) -> list[Node]:
 # variables counting up from a non-negative start, unsigned locals) are left
 # alone.
 
-# Ops whose leading operands after the array are the ``ndim`` indices.
-_WRAP_INDEX_ASSIGN_OPS = frozenset(
-    {
-        "address",
-        "atomic_add",
-        "atomic_sub",
-        "atomic_min",
-        "atomic_max",
-        "atomic_and",
-        "atomic_or",
-        "atomic_xor",
-        "atomic_exch",
-        "atomic_cas",
-    }
-)
-_WRAP_INDEX_VOID_OPS = frozenset({"array_store", "adj_address", "adj_array_store"}) | {
-    f"adj_{op}" for op in _WRAP_INDEX_ASSIGN_OPS if op.startswith("atomic_")
+# op -> (fixed extra args, index-count multiplier): the full arity is
+# ``fixed + mult * ndim`` and the first ``ndim`` operands after the array are
+# the indices. Calls with any other arity (e.g. atomics already flattened to
+# one index) are left alone. ``view`` takes 1..ndim-1 leading indices.
+_WRAP_INDEX_OPS: dict[str, tuple[int, int]] = {
+    "address": (1, 1),
+    "view": (1, 1),
+    "array_store": (2, 1),
+    "adj_address": (3, 2),
+    "adj_array_store": (4, 2),
+    **{f"atomic_{op}": (2, 1) for op in ("add", "sub", "min", "max", "and", "or", "xor", "exch")},
+    "atomic_cas": (3, 1),
+    **{f"adj_atomic_{op}": (5, 2) for op in ("add", "sub", "min", "max")},
 }
-_WRAP_INDEX_NAME = re.compile(r"^var_(\w+)$")
+_WRAP_INDEX_NAME = re.compile(r"^&?\s*var_(\w+)$")
+_WRAP_NONNEG_LITERAL = re.compile(r"^\(?\s*\d+[uU]?[lL]*\s*\)?$")
+# Signed MSL index types a wrap applies to; unsigned locals cannot be negative.
+_WRAP_SIGNED_MSL = frozenset({"int", "long", "short", "char"})
+# Void calls that only read their operands (no local is written through them).
+_WRAP_READONLY_VOID_OPS = frozenset({"printf", "print"}) | set(_WRAP_INDEX_OPS)
+_WRAP_SEQ = [0]
+
+
+def _wrap_call_span(raw: str, name: str) -> tuple[int, int] | None:
+    """``(open, close)`` paren indices of the ``wp::<name>[<..>](...)`` call."""
+    m = re.search(rf"\bwp::{name}\s*(?:<[^()]*>)?\s*\(", raw)
+    if m is None:
+        return None
+    open_i = m.end() - 1
+    depth = 0
+    for k in range(open_i, len(raw)):
+        if raw[k] == "(":
+            depth += 1
+        elif raw[k] == ")":
+            depth -= 1
+            if depth == 0:
+                return open_i, k
+    return None
+
+
+def _nonneg_locals(nodes: list[Node], const_ints: dict[str, int]) -> set[str]:
+    """Locals provably non-negative on every definition (greatest fixpoint).
+
+    Seeds: thread ids, ``block_dim``, non-negative constants, ``for``
+    counters with non-negative start and step. Propagates through copies,
+    ``+``, ``*``, ``/``, ``%`` (sign of the dividend), ``min``/``max``,
+    ``&`` and ``>>``. A local with any other definition -- a subtraction, a
+    negation, a load, a kernel scalar argument, an in-place update or an
+    unrecognised raw line -- may be negative.
+    """
+    defs: dict[str, list[tuple[str, Any]]] = {}
+
+    def add(label: str, kind: str, payload: Any = None) -> None:
+        defs.setdefault(label, []).append((kind, payload))
+
+    def collect(seq) -> None:
+        for n in seq:
+            if isinstance(n, (If, While, _DoWhileZero)):
+                collect(n.body)
+            elif isinstance(n, For):
+                add(n.iter_var, "for", (n.start, n.step))
+                collect(n.body)
+            elif isinstance(n, Tid):
+                for t in n.targets:
+                    add(t, "nonneg")
+            elif isinstance(n, Assign):
+                if n.raw.lstrip().startswith("adj_"):
+                    continue
+                if n.expr.raw.startswith(("builtin_tid", "builtin_block_dim")):
+                    add(n.lhs, "nonneg")
+                else:
+                    add(n.lhs, "expr", n.expr)
+            elif isinstance(n, VoidCall):
+                if n.op == "assign" and len(n.args) == 2:
+                    m = _WRAP_INDEX_NAME.match(n.args[0].strip())
+                    if m:
+                        add(m.group(1), "expr", _parse_rhs(n.args[1]))
+                elif n.op == "user_call":
+                    for a in n.args:
+                        m = _WRAP_INDEX_NAME.match(a.strip())
+                        if m:
+                            add(m.group(1), "raw")
+                elif n.op not in _WRAP_READONLY_VOID_OPS and n.args:
+                    # In-place updates, stores through a local's address, ...
+                    m = _WRAP_INDEX_NAME.match(n.args[0].strip())
+                    if m:
+                        add(m.group(1), "raw")
+            elif isinstance(n, _RawLine):
+                for m in re.finditer(r"\bvar_(\w+)\s*(?:[-+*/%&|^]|<<|>>)?=(?!=)", n.raw):
+                    add(m.group(1), "raw")
+
+    collect(nodes)
+
+    def operand(text: str, cur: set[str]) -> bool:
+        t = text.strip()
+        if _WRAP_NONNEG_LITERAL.match(t):
+            return True
+        m = _WRAP_INDEX_NAME.match(t)
+        if m is None:
+            return False
+        lbl = m.group(1)
+        if lbl in const_ints:
+            return const_ints[lbl] >= 0
+        return lbl in cur
+
+    def expr(e, cur: set[str]) -> bool:
+        if isinstance(e, Var):
+            return operand(e.raw, cur)
+        if isinstance(e, Const):
+            return bool(_WRAP_NONNEG_LITERAL.match(e.raw))
+        if isinstance(e, Builtin):
+            a = e.args
+            if e.name in ("copy", "int", "int32", "int64", "uint32", "uint64") and len(a) == 1:
+                return operand(a[0], cur)
+            if e.name in ("add", "mul", "div", "floordiv", "min") and len(a) == 2:
+                return operand(a[0], cur) and operand(a[1], cur)
+            if e.name in ("mod", "rshift") and len(a) == 2:
+                return operand(a[0], cur)
+            if e.name in ("max", "bit_and") and len(a) == 2:
+                return operand(a[0], cur) or operand(a[1], cur)
+            return e.name in ("block_dim",)
+        return False
+
+    cur = set(defs) - {lbl for lbl in defs if lbl in const_ints and const_ints[lbl] < 0}
+    changed = True
+    while changed:
+        changed = False
+        for lbl in list(cur):
+            ok = True
+            for kind, payload in defs[lbl]:
+                if kind == "nonneg":
+                    continue
+                if kind == "for":
+                    ok = operand(payload[0], cur) and operand(payload[1], cur)
+                elif kind == "expr":
+                    ok = expr(payload, cur)
+                else:
+                    ok = False
+                if not ok:
+                    break
+            if not ok:
+                cur.discard(lbl)
+                changed = True
+    return cur | {lbl for lbl, c in const_ints.items() if c >= 0}
 
 
 def wrap_negative_array_indices(
     nodes: list[Node],
     arr_ndims: dict[str, int],
     var_msl_types: dict[str, str],
-    nonneg: set[str],
+    const_ints: dict[str, int],
 ) -> list[Node]:
     """Wrap negative indices into ``[0, shape)`` the way native Warp does.
 
-    ``arr_ndims`` maps kernel array-arg labels to their ndim; ``var_msl_types``
-    maps local labels to their MSL scalar type; ``nonneg`` holds local labels
-    known to be non-negative.
+    ``arr_ndims`` maps array labels (kernel array args, flattened struct-arg
+    array fields) to their ndim; views of them (``wp::view``) are tracked so
+    a view's indices wrap against the right base dimension. ``var_msl_types``
+    maps local labels to their MSL scalar type so each temporary keeps the
+    index's own width (an ``int64`` index is not truncated). ``const_ints``
+    maps constant locals to their values.
     """
-    counter = [0]
-    nonneg = set(nonneg)
+    nonneg = _nonneg_locals(nodes, const_ints)
+    views: dict[str, tuple[str, int]] = {}
 
-    def wrap_args(args: tuple[str, ...], indent: str) -> tuple[tuple[str, ...], list[Node]] | None:
-        if not args:
-            return None
-        m = _WRAP_INDEX_NAME.match(args[0].strip())
-        if m is None or m.group(1) not in arr_ndims:
-            return None
-        arr = m.group(1)
-        ndim = arr_ndims[arr]
-        if len(args) < 1 + ndim:
-            return None
+    def rewrite(n: Node) -> list[Node]:
+        if isinstance(n, Assign) and isinstance(n.expr, Builtin) and n.expr.name in _WRAP_INDEX_OPS:
+            name = n.expr.name
+        elif isinstance(n, VoidCall) and n.op in _WRAP_INDEX_OPS:
+            name = n.op
+        else:
+            return [n]
+        span = _wrap_call_span(n.raw, name)
+        if span is None:
+            return [n]
+        open_i, close_i = span
+        args = _split_top_level_args(n.raw[open_i + 1 : close_i])
+        m = _WRAP_INDEX_NAME.match(args[0].strip()) if args else None
+        arr = m.group(1) if m else ""
+        if arr in arr_ndims:
+            base, dim0 = arr, 0
+        elif arr in views:
+            base, dim0 = views[arr]
+        else:
+            return [n]
+        ndim = arr_ndims[base] - dim0
+        if name == "view":
+            nidx = len(args) - 1
+            if not isinstance(n, Assign) or not 1 <= nidx < ndim:
+                return [n]
+            views[n.lhs] = (base, dim0 + nidx)
+        else:
+            fixed, mult = _WRAP_INDEX_OPS[name]
+            if len(args) != fixed + mult * ndim:
+                return [n]
+            nidx = ndim
+        indent = _leading_indent(n.raw)
         new_args = list(args)
         decls: list[Node] = []
-        for k in range(ndim):
-            a = args[1 + k].strip()
-            mi = _WRAP_INDEX_NAME.match(a)
+        for d in range(nidx):
+            mi = _WRAP_INDEX_NAME.match(args[1 + d].strip())
             if mi is None:
-                continue
+                continue  # literal indices are emitted as constant locals
             label = mi.group(1)
             if label in nonneg:
                 continue
-            msl_t = var_msl_types.get(label)
-            if msl_t is None or msl_t not in ("int", "long", "short", "char"):
+            msl_t = var_msl_types.get(label, "int")
+            if msl_t not in _WRAP_SIGNED_MSL:
                 continue
-            new_label = f"{label}__wrap{counter[0]}"
-            counter[0] += 1
+            _WRAP_SEQ[0] += 1
+            tmp = f"{label}__wrap{_WRAP_SEQ[0]}"
             decls.append(
-                _RawLine(raw=f"{indent}{msl_t} var_{new_label} = wp_wrap_index(var_{label}, {arr}_shape[{k}]);")
+                _RawLine(raw=f"{indent}{msl_t} var_{tmp} = wp_wrap_index(var_{label}, {base}_shape[{dim0 + d}]);")
             )
-            new_args[1 + k] = f"var_{new_label}"
+            new_args[1 + d] = f"var_{tmp}"
         if not decls:
-            return None
-        return tuple(new_args), decls
-
-    def rebuild_call(raw: str, op: str, new_args: tuple[str, ...]) -> str:
-        head = raw.find(f"wp::{op}")
-        open_paren = raw.find("(", head)
-        close_paren = raw.rfind(")")
-        return f"{raw[: open_paren + 1]}{', '.join(new_args)}{raw[close_paren:]}"
+            return [n]
+        return [*decls, parse_line(f"{n.raw[: open_i + 1]}{', '.join(a.strip() for a in new_args)}{n.raw[close_i:]}")]
 
     def walk(seq) -> list[Node]:
+        from dataclasses import replace as _dc_replace  # noqa: PLC0415
+
         out: list[Node] = []
         for n in seq:
-            if isinstance(n, Tid):
-                nonneg.update(n.targets)
-            elif isinstance(n, Assign) and n.expr.raw.startswith(("builtin_tid", "builtin_block_dim")):
-                nonneg.add(n.lhs)
-            if isinstance(n, For):
-                start = n.start.strip()
-                step = n.step.strip()
-                if (start.isdigit() or start.removeprefix("var_") in nonneg) and (
-                    step.isdigit() or step.removeprefix("var_") in nonneg
-                ):
-                    nonneg.add(n.iter_var)
             if isinstance(n, (If, For, While, _DoWhileZero)):
-                from dataclasses import replace as _dc_replace  # noqa: PLC0415
-
                 out.append(_dc_replace(n, body=tuple(walk(n.body))))
-                continue
-            indent = _leading_indent(n.raw)
-            res = None
-            op = None
-            if isinstance(n, Assign) and isinstance(n.expr, Builtin) and n.expr.name in _WRAP_INDEX_ASSIGN_OPS:
-                op = n.expr.name
-                res = wrap_args(n.expr.args, indent)
-            elif isinstance(n, VoidCall) and n.op in _WRAP_INDEX_VOID_OPS:
-                op = n.op
-                res = wrap_args(n.args, indent)
-            if res is None:
-                out.append(n)
-                continue
-            new_args, decls = res
-            out.extend(decls)
-            out.append(parse_line(rebuild_call(n.raw, op, new_args)))
+            else:
+                out.extend(rewrite(n))
         return out
 
     return walk(nodes)

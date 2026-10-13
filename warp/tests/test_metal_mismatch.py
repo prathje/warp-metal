@@ -218,6 +218,76 @@ class TestMetalMismatch(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet)
 
+    def test_negative_index_struct_fields_views_components(self):
+        # Struct-arg array fields, component stores, views handed to tiles,
+        # int64 indices and loop-carried decrements must all wrap like
+        # native ``index()``.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            @wp.struct
+            class S:
+                a: wp.array[float]
+                b: wp.array2d[float]
+
+            @wp.kernel
+            def k_struct(s: S, w: wp.array[wp.int32], o: wp.array[float]):
+                t = wp.tid()
+                o[t] = s.a[w[t]] + 10.0 * s.b[w[t], -1]
+
+            @wp.kernel
+            def k_comp(w: wp.array[wp.int32], a: wp.array[wp.vec3]):
+                t = wp.tid()
+                a[w[t]][1] = 5.0
+
+            @wp.kernel
+            def k_view(w: wp.array[wp.int32], a: wp.array2d[float], o: wp.array2d[float]):
+                i = wp.tid()
+                t = wp.tile_load(a[w[0]], shape=3)
+                wp.tile_store(o[0], t)
+
+            @wp.kernel
+            def k_i64(w: wp.array[wp.int64], a: wp.array[float], o: wp.array[float]):
+                t = wp.tid()
+                o[t] = a[w[t]]
+
+            @wp.kernel
+            def k_loop(a: wp.array[float], o: wp.array[float]):
+                t = wp.tid()
+                s = float(0.0)
+                for k in range(3):
+                    s += a[t] * float(k + 1)
+                    t = t - 1
+                o[0] = s
+
+            def cases(d):
+                s = S()
+                s.a = wp.array([1.0, 2.0, 3.0, 4.0], dtype=float, device=d)
+                s.b = wp.array(np.arange(6, dtype=np.float32).reshape(2, 3), device=d)
+                w = wp.array([0, -1], dtype=wp.int32, device=d)
+                o1 = wp.zeros(2, dtype=float, device=d)
+                wp.launch(k_struct, dim=2, inputs=[s, w], outputs=[o1], device=d)
+                v = wp.zeros(3, dtype=wp.vec3, device=d)
+                wp.launch(k_comp, dim=1, inputs=[wp.array([-1], dtype=wp.int32, device=d), v], device=d)
+                o2 = wp.zeros((2, 3), dtype=float, device=d)
+                wp.launch(k_view, dim=1, inputs=[wp.array([-1], dtype=wp.int32, device=d), s.b], outputs=[o2], device=d)
+                o3 = wp.zeros(2, dtype=float, device=d)
+                wp.launch(k_i64, dim=2, inputs=[wp.array([1, -1], dtype=wp.int64, device=d), s.a], outputs=[o3], device=d)
+                o4 = wp.zeros(1, dtype=float, device=d)
+                wp.launch(k_loop, dim=1, inputs=[s.a], outputs=[o4], device=d)
+                return [o1.numpy(), v.numpy(), o2.numpy(), o3.numpy(), o4.numpy()]
+
+            cpu, metal = cases("cpu"), cases("metal:0")
+            for a, b in zip(cpu, metal):
+                np.testing.assert_array_equal(a, b)
+            np.testing.assert_array_equal(metal[1][2], [0.0, 5.0, 0.0])
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
