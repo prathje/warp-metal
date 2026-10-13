@@ -103,6 +103,26 @@ def _i64_minmax_exch(vals: wp.array[wp.int64], out: wp.array[wp.int64], last: wp
 
 
 @wp.kernel
+def _i64_add_old(counter: wp.array[wp.int64], old: wp.array[wp.int64]):
+    i = wp.tid()
+    old[i] = wp.atomic_add(counter, 0, wp.int64(1))
+
+
+@wp.kernel
+def _u64_cas_and_max(keys: wp.array[wp.uint64], best: wp.array[wp.uint64]):
+    i = wp.tid()
+    wp.atomic_cas(keys, i % 8, wp.uint64(0), wp.uint64(i + 1))
+    wp.atomic_max(best, i % 8, wp.uint64(i))
+
+
+@wp.kernel
+def _atomic_add_two(a: wp.array[float], b: wp.array[float]):
+    i = wp.tid()
+    wp.atomic_add(a, 0, 1.0)
+    wp.atomic_add(b, 0, 1.0)
+
+
+@wp.kernel
 def _u64_max_old(vals: wp.array[wp.uint64], out: wp.array[wp.uint64], old: wp.array[wp.uint64]):
     i = wp.tid()
     old[i] = wp.atomic_max(out, 0, vals[i])
@@ -377,9 +397,37 @@ class TestMetalRuntime(unittest.TestCase):
         n = wp.zeros(1, dtype=wp.int32)
         with wp.ScopedCapture() as capture:
             wp.capture_while(c, self._countdown_body(c, n, a))
+        # A single replay that runs out of iterations raises at the next
+        # sync point.
         wp.capture_launch(capture.graph)
+        with self.assertRaisesRegex(RuntimeError, "iteration budget"):
+            wp.synchronize_device()
+        # The error is reported once; the state is the truncated one.
         self.assertEqual(n.numpy()[0], 4)
         self.assertEqual(c.numpy()[0], 6)
+        # Opting into truncation turns the error into a warning.
+        wp.config.metal_capture_while_truncate = True
+        try:
+            wp.capture_launch(capture.graph)
+            wp.synchronize_device()
+            self.assertEqual(n.numpy()[0], 8)
+        finally:
+            wp.config.metal_capture_while_truncate = False
+
+    def test_capture_while_max_iters_kwarg(self):
+        wp.config.metal_capture_while_max_iters = 2
+        a = wp.zeros(2, dtype=wp.float32)
+        c = wp.array([10], dtype=wp.int32)
+        n = wp.zeros(1, dtype=wp.int32)
+        with wp.ScopedCapture() as capture:
+            wp.capture_while(c, self._countdown_body(c, n, a), max_iters=16)
+        wp.capture_launch(capture.graph)
+        wp.synchronize_device()  # no overflow: 10 iterations fit in 16
+        self.assertEqual(n.numpy()[0], 10)
+        # An eager loop ignores max_iters and is unbounded.
+        c.fill_(20)
+        wp.capture_while(c, self._countdown_body(c, n, a), max_iters=1)
+        self.assertEqual(n.numpy()[0], 30)
 
     def test_capture_if_else(self):
         flag = wp.array([1], dtype=wp.int32)
@@ -563,6 +611,30 @@ class TestMetalRuntime(unittest.TestCase):
                 np.testing.assert_array_equal(results[0][0], results[1][0])
                 np.testing.assert_array_equal(results[0][1], results[1][1])
 
+    def test_utils_segmented_sort_unordered_segments(self):
+        self._force_device_utils()
+        rng = np.random.default_rng(11)
+        n = 3000
+        k = rng.integers(-500, 500, n).astype(np.int32)
+        v = np.arange(n, dtype=np.int32)
+        bounds = np.sort(rng.choice(np.arange(1, n), size=60, replace=False)).astype(np.int32)
+        starts, ends = bounds[0::2], bounds[1::2]
+        for order in (np.arange(starts.size)[::-1], rng.permutation(starts.size)):
+            results = []
+            for device in (self.device, "cpu"):
+                keys = wp.array(np.concatenate([k, k]), dtype=wp.int32, device=device)
+                values = wp.array(np.concatenate([v, v]), dtype=wp.int32, device=device)
+                wp.utils.segmented_sort_pairs(
+                    keys,
+                    values,
+                    n,
+                    wp.array(starts[order], dtype=wp.int32, device=device),
+                    wp.array(ends[order], dtype=wp.int32, device=device),
+                )
+                results.append((keys.numpy()[:n], values.numpy()[:n]))
+            np.testing.assert_array_equal(results[0][0], results[1][0])
+            np.testing.assert_array_equal(results[0][1], results[1][1])
+
     def test_utils_runlength_encode(self):
         self._force_device_utils()
         rng = np.random.default_rng(4)
@@ -678,6 +750,31 @@ class TestMetalRuntime(unittest.TestCase):
         o = old.numpy()
         self.assertEqual(int((o == 0).sum()), 1)
         self.assertTrue(np.all(np.isin(o[o != 0], vals)))
+
+    def test_int64_add_previous_values_across_carry(self):
+        # Previous values returned while the low word carries into the high
+        # word must be exact (consumed results take the locked path).
+        n = 4096
+        start = 2**32 - n // 2
+        counter = wp.array(np.array([start], dtype=np.int64), dtype=wp.int64)
+        old = wp.zeros(n, dtype=wp.int64)
+        wp.launch(_i64_add_old, dim=n, inputs=[counter, old])
+        self.assertEqual(int(counter.numpy()[0]), start + n)
+        np.testing.assert_array_equal(np.sort(old.numpy()), np.arange(start, start + n, dtype=np.int64))
+
+    def test_wide_atomic_strategy_per_array(self):
+        from warp._src.codegen_metal import _wide_atomic_strategies, generate_msl_kernel  # noqa: PLC0415
+
+        src = generate_msl_kernel(_u64_cas_and_max).source
+        strategies = _wide_atomic_strategies(src)
+        self.assertEqual(strategies["keys"][0], "locked")
+        self.assertEqual(strategies["best"][0], "native")
+        keys = wp.zeros(8, dtype=wp.uint64)
+        best = wp.zeros(8, dtype=wp.uint64)
+        wp.launch(_u64_cas_and_max, dim=800, inputs=[keys, best])
+        np.testing.assert_array_equal(best.numpy(), np.arange(792, 800, dtype=np.uint64))
+        k = keys.numpy()
+        self.assertTrue(np.all((k - 1) % 8 == np.arange(8)))
 
     def test_int64_min_max_exch(self):
         rng = np.random.default_rng(8)
@@ -798,6 +895,16 @@ class TestMetalRuntime(unittest.TestCase):
         expected = np.zeros(12, dtype=np.float32)
         expected[1::2] = np.arange(0, 12, 2)
         np.testing.assert_array_equal(dst.numpy(), expected)
+
+    def test_aliased_staged_args_raise(self):
+        base = wp.zeros(8, dtype=float)
+        with self.assertRaisesRegex(RuntimeError, "overlaps"):
+            wp.launch(_atomic_add_two, dim=4, inputs=[base[::2], base[0:4]])
+        # Disjoint memory is fine.
+        other = wp.zeros(4, dtype=float)
+        wp.launch(_atomic_add_two, dim=4, inputs=[base[::2], other])
+        np.testing.assert_array_equal(base.numpy()[0], 4.0)
+        np.testing.assert_array_equal(other.numpy()[0], 4.0)
 
     def test_indexed_args_in_capture(self):
         data = wp.array(np.arange(10, dtype=np.float32))
