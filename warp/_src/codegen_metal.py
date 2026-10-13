@@ -10927,6 +10927,30 @@ def _translate_tile_intrinsics(
         n = rows * cols
         if n == 1:
             return f"var_{lhs} = var_{in_label}"
+        vec_n = tile_var_vec_n.get(in_label, 0)
+        if vec_n > 0:
+            # Vec-element tile: ``c[]`` holds ``n * vec_n`` scalars, element-
+            # major. Reduce component-wise; the result is one vector.
+            comb = {
+                "wp::add": "{a} + {b}",
+                "wp::mul": "{a} * {b}",
+                "wp::min": "metal::min({a}, {b})",
+                "metal::min": "metal::min({a}, {b})",
+                "wp::max": "metal::max({a}, {b})",
+                "metal::max": "metal::max({a}, {b})",
+            }.get(op_fn)
+            if comb is None:
+                raise MetalCodegenError(
+                    f"MSL codegen: tile_reduce({op_fn}) over a vec-element tile is not supported on Metal"
+                )
+            parts = []
+            for k in range(vec_n):
+                expr = comb.format(a="_trv_acc", b=f"var_{in_label}.c[_trv_i * {vec_n} + {k}]")
+                parts.append(
+                    f"({{ auto _trv_acc = var_{in_label}.c[{k}]; "
+                    f"for (int _trv_i = 1; _trv_i < {n}; ++_trv_i) _trv_acc = {expr}; _trv_acc; }})"
+                )
+            return f"var_{lhs} = {_msl_vec_ctor(vec_n, _scalar)}({', '.join(parts)})"
         # Map known builtin op names to their accumulation expression.
         if op_fn == "wp::add":
             op_expr = "_tr_acc + var_{lhs}_in.c[_tr_i]"
@@ -10997,7 +11021,12 @@ def _translate_tile_intrinsics(
             return f"var_{lhs} = var_{in_label}"
         vec_n = tile_var_vec_n.get(in_label, 0)
         if vec_n > 0:
-            raise MetalCodegenError(f"MSL codegen: tile_sum on a vec-element tile 'var_{in_label}' is not supported")
+            parts = [
+                f"({{ auto _tsv_acc = var_{in_label}.c[{k}]; for (int _tsv_i = 1; _tsv_i < {n}; ++_tsv_i) "
+                f"_tsv_acc += var_{in_label}.c[_tsv_i * {vec_n} + {k}]; _tsv_acc; }})"
+                for k in range(vec_n)
+            ]
+            return f"var_{lhs} = {_msl_vec_ctor(vec_n, dims[2])}({', '.join(parts)})"
         return (
             f"var_{lhs} = ({{ auto _ts_acc = var_{in_label}.c[0]; "
             f"for (int _ts_i = 1; _ts_i < {n}; ++_ts_i) "
@@ -11406,6 +11435,10 @@ def _translate_tile_intrinsics(
         n = rows * cols
         if n == 1:
             return f"{dst} = ({dst} {op_sym} {src})"
+        # Vec-element tiles store ``vec_n`` scalars per element.
+        dst_vn = tile_var_vec_n.get(dst_label, 0)
+        if dst_vn and src_dims is not None:
+            n *= dst_vn
         if src_dims is None:
             # Scalar broadcast.
             return f"{{ for (int _ti_i = 0; _ti_i < {n}; ++_ti_i) {dst}.c[_ti_i] = {dst}.c[_ti_i] {op_sym} ({src}); }}"
@@ -11756,6 +11789,10 @@ def _translate_tile_intrinsics(
         in_rows, in_cols, _ = in_dims
         l_n = l_rows * l_cols
         in_n = in_rows * in_cols
+        if tile_var_vec_n.get(lhs, 0) or tile_var_vec_n.get(in_label, 0):
+            raise MetalCodegenError(
+                f"MSL codegen: tile_broadcast of a vec-element tile is not supported on Metal ({m.group(0)!r})"
+            )
         if in_n == 1:
             # Single-element source broadcast across the target tile.
             return f"{{ for (int _bc_i = 0; _bc_i < {l_n}; ++_bc_i) var_{lhs}.c[_bc_i] = var_{in_label}.c[0]; }}"

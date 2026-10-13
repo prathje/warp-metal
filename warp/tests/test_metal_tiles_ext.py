@@ -305,6 +305,42 @@ class TestMetalTilesExt(unittest.TestCase):
             """,
         )
 
+    def test_vec_element_tile_reduce_sum_inplace(self):
+        # tile_reduce over a vec-element tile used to fold the flat scalar
+        # storage as if it held one scalar per element (mujoco_warp's
+        # solve_search_sums: search_dot / newton_decrement were wrong).
+        _run(
+            self,
+            """
+            @wp.func
+            def ss(a: float, b: float) -> wp.vec2:
+                return wp.vec2(a * b, b * b)
+
+            @wp.kernel
+            def k(x: wp.array2d[float], y: wp.array2d[float], v: wp.array2d[wp.vec3], o: wp.array2d[float],
+                  ov: wp.array2d[wp.vec3], s: wp.array[wp.vec3]):
+                w = wp.tid()
+                xt = wp.tile_load(x[w], shape=8)
+                yt = wp.tile_load(y[w], shape=8)
+                sums = wp.tile_reduce(wp.add, wp.tile_map(ss, xt, yt))[0]
+                o[w, 0] = sums[0]
+                o[w, 1] = sums[1]
+                vt = wp.tile_load(v[w], shape=4)
+                vt += wp.tile_load(v[w], shape=4, offset=4)
+                wp.tile_store(ov[w], vt)
+                s[w] = wp.tile_sum(vt)[0]
+
+            rng = np.random.default_rng(0)
+            X = rng.standard_normal((2, 8)).astype(np.float32)
+            Y = rng.standard_normal((2, 8)).astype(np.float32)
+            V = rng.standard_normal((2, 8, 3)).astype(np.float32)
+            compare(k, [2], lambda d: [wp.array(X, device=d), wp.array(Y, device=d),
+                                       wp.array(V, dtype=wp.vec3, device=d), wp.zeros((2, 2), dtype=float, device=d),
+                                       wp.zeros((2, 4), dtype=wp.vec3, device=d), wp.zeros(2, dtype=wp.vec3, device=d)],
+                    [3, 4, 5], block_dim=64)
+            """,
+        )
+
     def test_tile_map_builtin_adjoint(self):
         _run(
             self,
