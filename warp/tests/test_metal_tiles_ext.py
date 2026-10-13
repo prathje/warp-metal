@@ -295,6 +295,18 @@ class TestMetalTilesExt(unittest.TestCase):
             \"\"\")
             def rs(value: float, offset: float) -> float: ...
 
+            @wp.func_native(\"\"\"
+            uint32_t i = reinterpret_cast<uint32_t&>(f);
+            uint32_t mask = (uint32_t)(-(int)(i >> 31)) | 0x80000000;
+            return i ^ mask;
+            \"\"\")
+            def float_flip(f: float) -> wp.uint32: ...
+
+            @wp.kernel
+            def k2(v: wp.array[float], o: wp.array[wp.uint32]):
+                i = wp.tid()
+                o[i] = float_flip(v[i])
+
             @wp.kernel
             def k(v: wp.array[float], o: wp.array[float]):
                 i = wp.tid()
@@ -302,6 +314,8 @@ class TestMetalTilesExt(unittest.TestCase):
 
             compare(k, 5, lambda d: [wp.array([0.25, 1.0, 2.0, 4.0, 100.0], dtype=float, device=d),
                                      wp.zeros(5, dtype=float, device=d)], [1], tiled=False)
+            compare(k2, 4, lambda d: [wp.array([-2.0, -0.5, 0.0, 3.0], dtype=float, device=d),
+                                      wp.zeros(4, dtype=wp.uint32, device=d)], [1], tiled=False)
             """,
         )
 

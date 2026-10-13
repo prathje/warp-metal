@@ -902,7 +902,14 @@ def native_func_call_name(fn_overload) -> str | None:
     digest = hashlib.sha1((snippet + "|" + ",".join(params) + ret_type).encode()).hexdigest()[:10]
     name = f"wpn_{fn_overload.native_func}_{digest}"
     if name not in _NATIVE_FUNC_DEFS:
-        _NATIVE_FUNC_DEFS[name] = f"inline {ret_type} {name}({', '.join(params)}) {{\n{snippet}\n}}\n"
+        # MSL references need an address space: bit-cast idioms such as
+        # ``reinterpret_cast<uint32_t&>(f)`` on a local become ``thread``.
+        body = re.sub(
+            r"\b(reinterpret_cast|static_cast)\s*<\s*(?!thread\b|device\b|constant\b|threadgroup\b)([\w:]+)\s*&\s*>",
+            r"\1<thread \2&>",
+            snippet,
+        )
+        _NATIVE_FUNC_DEFS[name] = f"inline {ret_type} {name}({', '.join(params)}) {{\n{body}\n}}\n"
     return name
 
 
