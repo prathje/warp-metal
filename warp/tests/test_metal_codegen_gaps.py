@@ -632,6 +632,33 @@ class TestMetalCodegenGaps(unittest.TestCase):
             """,
         )
 
+    def test_mesh_get_velocities_shape_without_velocities(self):
+        _run(
+            self,
+            """
+            @wp.kernel
+            def k(mid: wp.uint64, o: wp.array[int]):
+                m = wp.mesh_get(mid)
+                o[0] = m.points.shape[0]
+                o[1] = m.velocities.shape[0]
+                o[2] = m.indices.shape[0]
+
+            pts = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0]], dtype=np.float32)
+
+            def launch(dev, with_vel):
+                vel = wp.array(pts, dtype=wp.vec3, device=dev) if with_vel else None
+                m = wp.Mesh(points=wp.array(pts, dtype=wp.vec3, device=dev),
+                            indices=wp.array([0, 1, 2], dtype=int, device=dev), velocities=vel)
+                o = wp.zeros(3, dtype=int, device=dev)
+                wp.launch(k, 1, [m.id, o], device=dev)
+                return o.numpy()
+
+            for with_vel in (False, True):
+                cpu, metal = both(lambda dev: launch(dev, with_vel))
+                assert_same(cpu, metal)
+            """,
+        )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

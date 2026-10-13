@@ -3036,7 +3036,11 @@ _MESH_LEN_PAT = re.compile(r"\bwp::len\s*\(\s*var_(\w+)\s*\)")
 # descriptor expression ``d`` and index ``i``.
 _MESH_ARRAY_FIELDS = {
     "points": (lambda d, i: f"wp_bvh_load_v3({d}.points, {i})", lambda d: f"{d}.num_points"),
-    "velocities": (lambda d, i: f"wp_bvh_load_v3({d}.velocities, {i})", lambda d: f"{d}.num_points"),
+    # A mesh built without velocities has a null array (shape 0), as on CPU.
+    "velocities": (
+        lambda d, i: f"wp_bvh_load_v3({d}.velocities, {i})",
+        lambda d: f"(({d}.velocities != 0ul) ? {d}.num_points : 0)",
+    ),
     "indices": (lambda d, i: f"wp_bvh_int_ptr({d}.indices)[{i}]", lambda d: f"({d}.num_tris * 3)"),
 }
 _MESH_SCALAR_FIELDS = ("num_points", "num_tris", "average_edge_length")
