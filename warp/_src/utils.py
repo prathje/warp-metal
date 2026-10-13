@@ -2144,6 +2144,40 @@ class ScopedPeerAccess:
         wp.set_peer_access_enabled(self.target_device, self.peer_device, self.saved_setting)
 
 
+class ScopedMetalCaptureWhileBudget:
+    """Set the Metal :func:`warp.capture_while` iteration budget for a scope.
+
+    Inside a Metal graph capture, :func:`warp.capture_while` records its body
+    once and replays it unrolled :data:`warp.config.metal_capture_while_max_iters`
+    times; a loop still running after that raises at the next sync point. This
+    context manager overrides that budget for the loops recorded inside it and
+    restores the previous value on exit. It has no effect on other devices or
+    outside Metal captures.
+
+    Args:
+        max_iters: Iteration budget (``>= 1``) for ``capture_while`` loops recorded in the scope.
+
+    Example:
+        >>> with wp.ScopedMetalCaptureWhileBudget(500):  # doctest: +SKIP
+        ...     wp.capture_while(done, solver_iteration)
+    """
+
+    def __init__(self, max_iters: int):
+        max_iters = int(max_iters)
+        if max_iters < 1:
+            raise ValueError(f"max_iters must be >= 1, got {max_iters}")
+        self.max_iters = max_iters
+        self._saved = None
+
+    def __enter__(self):
+        self._saved = wp.config.metal_capture_while_max_iters
+        wp.config.metal_capture_while_max_iters = self.max_iters
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        wp.config.metal_capture_while_max_iters = self._saved
+
+
 class ScopedCapture:
     """Context manager to capture a sequence of operations into a graph.
 

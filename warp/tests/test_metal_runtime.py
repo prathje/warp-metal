@@ -414,20 +414,28 @@ class TestMetalRuntime(unittest.TestCase):
         finally:
             wp.config.metal_capture_while_truncate = False
 
-    def test_capture_while_max_iters_kwarg(self):
+    def test_capture_while_scoped_budget(self):
         wp.config.metal_capture_while_max_iters = 2
         a = wp.zeros(2, dtype=wp.float32)
         c = wp.array([10], dtype=wp.int32)
         n = wp.zeros(1, dtype=wp.int32)
         with wp.ScopedCapture() as capture:
-            wp.capture_while(c, self._countdown_body(c, n, a), max_iters=16)
+            with wp.ScopedMetalCaptureWhileBudget(16):
+                wp.capture_while(c, self._countdown_body(c, n, a))
+            self.assertEqual(wp.config.metal_capture_while_max_iters, 2)
         wp.capture_launch(capture.graph)
         wp.synchronize_device()  # no overflow: 10 iterations fit in 16
         self.assertEqual(n.numpy()[0], 10)
-        # An eager loop ignores max_iters and is unbounded.
+        # An eager loop ignores the budget and is unbounded.
         c.fill_(20)
-        wp.capture_while(c, self._countdown_body(c, n, a), max_iters=1)
+        with wp.ScopedMetalCaptureWhileBudget(1):
+            wp.capture_while(c, self._countdown_body(c, n, a))
         self.assertEqual(n.numpy()[0], 30)
+        # Keyword arguments named like the old parameter reach the body.
+        seen = []
+        c.fill_(1)
+        wp.capture_while(c, lambda max_iters: (seen.append(max_iters), c.fill_(0)), max_iters=7)
+        self.assertEqual(seen, [7])
 
     def test_capture_if_else(self):
         flag = wp.array([1], dtype=wp.int32)

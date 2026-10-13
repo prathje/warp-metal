@@ -438,6 +438,7 @@ from warp._src.utils import ScopedAllocator as ScopedAllocator
 
 from warp._src.context import CaptureMode as CaptureMode
 from warp._src.utils import ScopedCapture as ScopedCapture
+from warp._src.utils import ScopedMetalCaptureWhileBudget as ScopedMetalCaptureWhileBudget
 
 from warp._src.context import is_conditional_graph_supported as is_conditional_graph_supported
 

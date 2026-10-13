@@ -433,9 +433,9 @@ metal_capture_while_max_iters: int = int(_os.environ.get("WARP_METAL_CAPTURE_WHI
 """Default iteration budget of :func:`warp.capture_while` inside a Metal graph capture.
 
 Metal command buffers have no device-side loop construct, so a captured
-``capture_while`` is replayed as its body unrolled ``max_iters`` times (the
-``max_iters`` argument of :func:`warp.capture_while`, falling back to this
-value). At the start of each unrolled iteration the GPU latches the loop
+``capture_while`` is replayed as its body unrolled this many times (use
+:class:`warp.ScopedMetalCaptureWhileBudget` to override it for one loop). The
+value is read when ``capture_while`` is recorded. At the start of each unrolled iteration the GPU latches the loop
 condition, and the iteration's kernels only run while it is nonzero, so
 iterations after the loop has terminated launch no kernel threads. The body is
 recorded once, whatever the budget.

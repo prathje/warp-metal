@@ -1976,7 +1976,7 @@ class MetalDispatcher:
         msg = (
             f"wp.capture_while() in a Metal graph was still running after its iteration budget of "
             f"{max(overflowed)}; the remaining iterations were skipped, so the graph's results are "
-            "truncated. Pass a larger max_iters= to wp.capture_while() (or raise "
+            "truncated. Record the loop under a larger wp.ScopedMetalCaptureWhileBudget(n) (or raise "
             "warp.config.metal_capture_while_max_iters) before capturing, or set "
             "warp.config.metal_capture_while_truncate = True to accept truncation."
         )
