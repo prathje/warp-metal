@@ -154,8 +154,12 @@ from warp._src.codegen_metal_ast import fold as _ast_fold
 from warp._src.codegen_metal_ast import fold_const_branches as _ast_fold_const_branches
 from warp._src.codegen_metal_ast import fold_drop_unsupported_locals as _ast_fold_drop
 from warp._src.codegen_metal_ast import fold_indexref_writes as _ast_fold_indexref
+from warp._src.codegen_metal_ast import fold_mesh_get as _ast_fold_mesh_get
 from warp._src.codegen_metal_ast import fold_multidim_atomics as _ast_fold_multidim_atomics
+from warp._src.codegen_metal_ast import fold_struct_array_array_fields as _ast_fold_struct_array_fields
+from warp._src.codegen_metal_ast import fold_tuple_locals as _ast_fold_tuples
 from warp._src.codegen_metal_ast import fold_views as _ast_fold_views
+from warp._src.codegen_metal_ast import has_print_calls as _ast_has_print_calls
 from warp._src.codegen_metal_ast import inline_user_calls as _ast_inline
 from warp._src.codegen_metal_ast import lower_reverse_ranges as _ast_lower_reverse_ranges
 from warp._src.codegen_metal_ast import parse as _ast_parse
@@ -237,6 +241,9 @@ _SCALAR_CTYPE_TO_MSL: dict[str, str] = _ScalarMslMap(
         # BVH traversal state — the MSL struct is emitted with ``_BVH_HELPERS``.
         "wp::bvh_query_t": "wp_bvh_query_t",
         "wp::mesh_query_aabb_t": "wp_mesh_query_aabb_t",
+        # ``wp.mesh_get(id)`` locals hold the mesh descriptor itself (see
+        # ``fold_mesh_get`` in ``codegen_metal_ast``).
+        "wp::Mesh": "wp_mesh_desc_t",
         "wp::mesh_query_point_t": "wp_mesh_query_point_t",
         "wp::mesh_query_ray_t": "wp_mesh_query_ray_t",
         # Hash-grid traversal state (float32 grids only) — the MSL struct is
@@ -266,6 +273,8 @@ _MSL_VEC_SCALAR_PREFIX: dict[str, str] = _ScalarMslMap(
         "wp::uint16": "ushort",
         "wp::int8": "char",
         "wp::uint8": "uchar",
+        "wp::int64": "long",
+        "wp::uint64": "ulong",
     }
 )
 _MSL_VEC_SUPPORTED_N = (2, 3, 4)
@@ -543,6 +552,14 @@ def _emit_big_vec_struct(name: str, n: int, msl_scalar: str) -> str:
     # Copy overload: ``vec_t<N>(v)`` with a same-type operand (Warp's
     # explicit copy-construction, e.g. warp.fem's vec1 accumulators).
     body_lines.append(f"inline {name} {name}_make({name} v) {{ return v; }}")
+    # ``wp.transform(p, q)``: transform_t is normalized to ``vec_t<7>`` (see
+    # ``_normalize_quat_t``), so its (position, rotation) constructor
+    # reaches here as ``wp_vec7_<scalar>_make(vec3, quat)``.
+    if n == 7 and msl_scalar in _MSL_NATIVE_MAT_SCALARS:
+        body_lines.append(
+            f"inline {name} {name}_make({msl_scalar}3 p, {msl_scalar}4 q) {{ "
+            f"return {name}_make(p.x, p.y, p.z, q.x, q.y, q.z, q.w); }}"
+        )
     # Emulated double <-> native vector conversions (``wp.vec2d(v_f32)`` and
     # ``wp.vec2f(v_f64)``): the native ``floatN`` types always exist, so the
     # overloads can be emitted unconditionally for N in 2..4.
@@ -614,6 +631,50 @@ def _emit_big_vec_struct(name: str, n: int, msl_scalar: str) -> str:
     body_lines.append(f"inline bool operator!=({name} a, {name} b) {{")
     body_lines.append("    return !(a == b);")
     body_lines.append("}")
+
+    # Unary ``wp.min(v)`` / ``wp.max(v)`` and ``wp.argmin(v)`` /
+    # ``wp.argmax(v)``; the native-width forms live in
+    # ``_MISC_MATH_HELPERS``. argmin/argmax skip NaN slots like
+    # warp/native/vec.h.
+    def nan_chk(e: str) -> str:
+        return f"metal::isnan(float({e}))" if msl_scalar in ("float", "half") else "false"
+
+    for fn, cmp in (("min", "<"), ("max", ">")):
+        # Fold like warp/native/vec.h: ``fmin``/``fmax`` (NaN-ignoring) for
+        # floating point, ``a < b ? a : b`` otherwise.
+        if msl_scalar in ("float", "half"):
+            step = f"r = metal::f{fn}(r, v.c[i]);"
+        else:
+            step = f"r = (r {cmp} v.c[i]) ? r : v.c[i];"
+        body_lines.append(f"inline {msl_scalar} wp_v{fn}({name} v) {{")
+        body_lines.append(f"    {msl_scalar} r = v.c[0];")
+        body_lines.append(f"    for (int i = 1; i < {n}; ++i) {step}")
+        body_lines.append("    return r;")
+        body_lines.append("}")
+        body_lines.append(f"inline uint wp_arg{fn}({name} v) {{")
+        body_lines.append("    uint ret = 0;")
+        body_lines.append(f"    while (ret < {n}u && {nan_chk('v.c[ret]')}) ++ret;")
+        body_lines.append(f"    if (ret == {n}u) return 0u;")
+        body_lines.append(f"    for (uint i = ret + 1; i < {n}u; ++i) {{")
+        body_lines.append(f"        if ({nan_chk('v.c[i]')}) continue;")
+        body_lines.append(f"        if (v.c[i] {cmp} v.c[ret]) ret = i;")
+        body_lines.append("    }")
+        body_lines.append("    return ret;")
+        body_lines.append("}")
+    for fn in ("min", "max"):
+        body_lines.append(
+            f"inline void wp_adj_{fn}({name} v, thread {name}& av, {msl_scalar} r) {{ av.c[wp_arg{fn}(v)] += r; }}"
+        )
+    body_lines.append("template <typename V, typename S>")
+    body_lines.append(
+        f"inline void wp_vec_slice_store(thread {name}& d, S s, V v) "
+        "{ int k = 0; for (int i = s.start; (s.step > 0) ? (i < s.stop) : (i > s.stop); i += s.step) d.c[i] = v[k++]; }"
+    )
+    body_lines.append("template <typename D, typename S>")
+    body_lines.append(
+        f"inline void wp_vec_slice_assign(thread D& d, {name} v, S s) "
+        "{ int k = 0; for (int i = s.start; (s.step > 0) ? (i < s.stop) : (i > s.stop); i += s.step) d[k++] = v.c[i]; }"
+    )
     # ``wp.length`` / ``wp.normalize`` — ``metal::length`` only knows the
     # native vector widths. warp.fem's scalar function spaces make ``vec1``
     # dof values, so even n == 1 reaches these.
@@ -692,6 +753,23 @@ def _emit_big_vec_struct(name: str, n: int, msl_scalar: str) -> str:
     body_lines.append("    aa += r / b;")
     body_lines.append(f"    for (int i = 0; i < {n}; ++i) ab -= r.c[i] * ret.c[i] / b;")
     body_lines.append("}")
+    # 5-arg forms (no ``ret``) for vec/scalar and scalar/vec division.
+    body_lines.append(
+        f"inline void wp_adj_div({name} a, {msl_scalar} s, thread {name}& aa, thread {msl_scalar}& as, {name} r) {{"
+    )
+    body_lines.append(f"    {msl_scalar} d = {_sc_zero(msl_scalar)};")
+    body_lines.append(f"    for (int i = 0; i < {n}; ++i) d += a.c[i] * r.c[i];")
+    body_lines.append("    as -= d / (s * s);")
+    body_lines.append(f"    for (int i = 0; i < {n}; ++i) aa.c[i] += r.c[i] / s;")
+    body_lines.append("}")
+    body_lines.append(
+        f"inline void wp_adj_div({msl_scalar} s, {name} a, thread {msl_scalar}& as, thread {name}& aa, {name} r) {{"
+    )
+    body_lines.append(
+        f"    for (int i = 0; i < {n}; ++i) {{ {msl_scalar} inv = {_sc_lit(msl_scalar, 1)} / a.c[i]; "
+        f"aa.c[i] -= s * r.c[i] * inv * inv; as += r.c[i] * inv; }}"
+    )
+    body_lines.append("}")
     # dot / length / length_sq / normalize, mirroring ``_adj_vec_helpers``
     # for the native widths.
     body_lines.append(
@@ -765,6 +843,46 @@ def _emit_spatial_helpers() -> str:
         "    float3 w = metal::cross(aw, bw) + metal::cross(av, bv);\n"
         "    float3 v = metal::cross(aw, bv);\n"
         "    return wp_vec6_float_make(w, v);\n"
+        "}\n"
+        # Reverse-mode counterparts (warp/native/spatial.h). ``adj_cross(a, b,
+        # aa, ab, r)`` accumulates ``aa += b x r`` and ``ab += r x a``.
+        "inline void wp_adj_spatial_top(wp_vec6_float a, thread wp_vec6_float& aa, float3 r) {\n"
+        "    aa.c[0] += r.x; aa.c[1] += r.y; aa.c[2] += r.z;\n"
+        "}\n"
+        "inline void wp_adj_spatial_bottom(wp_vec6_float a, thread wp_vec6_float& aa, float3 r) {\n"
+        "    aa.c[3] += r.x; aa.c[4] += r.y; aa.c[5] += r.z;\n"
+        "}\n"
+        "inline void wp_adj_vec_t(float3 a, float3 b, thread float3& aa, thread float3& ab, wp_vec6_float r) {\n"
+        "    aa += wp_spatial_top(r); ab += wp_spatial_bottom(r);\n"
+        "}\n"
+        "inline void wp_adj_spatial_dot(wp_vec6_float a, wp_vec6_float b, thread wp_vec6_float& aa, "
+        "thread wp_vec6_float& ab, float r) {\n"
+        "    wp_adj_dot(a, b, aa, ab, r);\n"
+        "}\n"
+        "inline void wp_adj_spatial_cross_impl(float3 a, float3 b, thread float3& aa, thread float3& ab, float3 r) {\n"
+        "    aa += metal::cross(b, r); ab += metal::cross(r, a);\n"
+        "}\n"
+        "inline void wp_adj_spatial_cross(wp_vec6_float a, wp_vec6_float b, thread wp_vec6_float& aa, "
+        "thread wp_vec6_float& ab, wp_vec6_float r) {\n"
+        "    float3 aw = wp_spatial_top(a), av = wp_spatial_bottom(a);\n"
+        "    float3 bw = wp_spatial_top(b), bv = wp_spatial_bottom(b);\n"
+        "    float3 rw = wp_spatial_top(r), rv = wp_spatial_bottom(r);\n"
+        "    float3 aaw = float3(0.0f), aav = float3(0.0f), abw = float3(0.0f), abv = float3(0.0f);\n"
+        "    wp_adj_spatial_cross_impl(aw, bw, aaw, abw, rw);\n"
+        "    wp_adj_spatial_cross_impl(av, bw, aav, abw, rv);\n"
+        "    wp_adj_spatial_cross_impl(aw, bv, aaw, abv, rv);\n"
+        "    aa += wp_vec6_float_make(aaw, aav); ab += wp_vec6_float_make(abw, abv);\n"
+        "}\n"
+        "inline void wp_adj_spatial_cross_dual(wp_vec6_float a, wp_vec6_float b, thread wp_vec6_float& aa, "
+        "thread wp_vec6_float& ab, wp_vec6_float r) {\n"
+        "    float3 aw = wp_spatial_top(a), av = wp_spatial_bottom(a);\n"
+        "    float3 bw = wp_spatial_top(b), bv = wp_spatial_bottom(b);\n"
+        "    float3 rw = wp_spatial_top(r), rv = wp_spatial_bottom(r);\n"
+        "    float3 aaw = float3(0.0f), aav = float3(0.0f), abw = float3(0.0f), abv = float3(0.0f);\n"
+        "    wp_adj_spatial_cross_impl(aw, bw, aaw, abw, rw);\n"
+        "    wp_adj_spatial_cross_impl(av, bv, aav, abv, rw);\n"
+        "    wp_adj_spatial_cross_impl(aw, bv, aaw, abv, rv);\n"
+        "    aa += wp_vec6_float_make(aaw, aav); ab += wp_vec6_float_make(abw, abv);\n"
         "}"
     )
 
@@ -1195,6 +1313,11 @@ def _emit_native_mat_extract_overloads(source: str) -> str:
         parts.append(
             f"inline {scalar} wp_mat_extract({scalar}{rows}x{cols} m, int row, int col) {{ return m[col][row]; }}"
         )
+        # MSL matrices have no unary minus, and ``wp::neg`` lowers to ``(-x)``.
+        if scalar in _MSL_NATIVE_MAT_SCALARS:
+            parts.append(
+                f"inline {scalar}{rows}x{cols} operator-({scalar}{rows}x{cols} m) {{ return m * ({scalar})(-1); }}"
+            )
         # Writable element access for ``m[r, c] = v`` (4-arg ``assign_inplace``
         # and friends). Same column-major swap as ``wp_mat_extract``. A
         # reference-returning helper won't compile — MSL forbids binding a
@@ -1955,6 +2078,13 @@ def _adj_vec_helpers(n: int, scalar: str = "float") -> str:
         f"    aa += metal::dot(b, r);\n    ab += a * r;\n}}\n"
         f"inline void wp_adj_div({v} a, {sc} b, {v} ret, thread {v}& aa, thread {sc}& ab, {v} r) {{\n"
         f"    aa += r / b;\n    ab -= metal::dot(r, ret) / b;\n}}\n"
+        # 5-arg forms (no ``ret``) that Warp's IR emits for vec/scalar and
+        # scalar/vec division (warp/native/vec.h).
+        f"inline void wp_adj_div({v} a, {sc} s, thread {v}& aa, thread {sc}& as, {v} r) {{\n"
+        f"    as -= metal::dot(a, r) / (s * s);\n    aa += r / s;\n}}\n"
+        f"inline void wp_adj_div({sc} s, {v} a, thread {sc}& as, thread {v}& aa, {v} r) {{\n"
+        f"    for (int i = 0; i < {n}; ++i) {{ {sc} inv = ({sc})1 / a[i]; aa[i] -= s * r[i] * inv * inv; "
+        f"as += r[i] * inv; }}\n}}\n"
         f"inline void wp_adj_dot({v} a, {v} b, thread {v}& aa, thread {v}& ab, {sc} r) {{\n"
         f"    aa += b * r;\n    ab += a * r;\n}}\n"
         f"inline void wp_adj_length({v} a, {sc} ret, thread {v}& aa, {sc} r) {{\n"
@@ -2067,6 +2197,12 @@ def _adj_mat_helpers(n: int) -> str:
         f"    aa += b * r;\n    ab += {ddot};\n}}\n"
         f"inline void wp_adj_div({m} a, float b, {m} ret, thread {m}& aa, thread float& ab, {m} r) {{\n"
         f"    aa += r / b;\n    ab -= ({ddot_ret}) / b;\n}}\n"
+        # 5-arg forms (no ``ret``), warp/native/mat.h.
+        f"inline void wp_adj_div({m} a, float s, thread {m}& aa, thread float& as, {m} r) {{\n"
+        f"    as -= ({ddot}) / (s * s);\n    aa += r / s;\n}}\n"
+        f"inline void wp_adj_div(float s, {m} a, thread float& as, thread {m}& aa, {m} r) {{\n"
+        f"    for (int i = 0; i < {n}; ++i) for (int j = 0; j < {n}; ++j) {{ float inv = 1.0f / a[j][i]; "
+        f"aa[j][i] -= s * r[j][i] * inv * inv; as += r[j][i] * inv; }}\n}}\n"
         f"inline void wp_adj_ddot({m} a, {m} b, thread {m}& aa, thread {m}& ab, float r) {{\n"
         f"    aa += b * r;\n    ab += a * r;\n}}\n"
         f"inline void wp_adj_cw_mul({m} a, {m} b, thread {m}& aa, thread {m}& ab, {m} r) {{\n{cw}}}\n"
@@ -2197,6 +2333,15 @@ _ADJ_SUPPORTED = frozenset(
         "transform_point",
         "transform_multiply",
         "transform_inverse",
+        "quat_from_axis_angle",
+        "quat_from_matrix",
+        "quat_to_matrix",
+        # spatial_vector family (``_emit_spatial_helpers``).
+        "spatial_top",
+        "spatial_bottom",
+        "spatial_dot",
+        "spatial_cross",
+        "spatial_cross_dual",
     }
 )
 
@@ -2742,13 +2887,10 @@ inline float4 wp_quat_rpy(float roll, float pitch, float yaw) {
 # mirror ``warp/native/spatial.h``. Depends on ``_QUAT_HELPERS`` and the
 # ``wp_vec7_float`` struct — both emitted whenever this block is (see the
 # header assembly in ``_emit_header_helpers``). The two-arg
-# ``wp_vec7_float_make(float3, float4)`` overload mirrors Warp's
-# ``wp.transform(p, q)`` constructor the same way the spatial helpers
-# overload ``wp_vec6_float_make(float3, float3)``.
+# ``wp_vec7_float_make(float3, float4)`` constructor overload is emitted
+# with the struct itself (``_emit_big_vec_struct``), so ``wp.transform(p, q)``
+# compiles even when no ``wp_transform_*`` helper is referenced.
 _TRANSFORM_HELPERS = """\
-inline wp_vec7_float wp_vec7_float_make(float3 p, float4 q) {
-    return wp_vec7_float_make(p[0], p[1], p[2], q[0], q[1], q[2], q[3]);
-}
 inline float3 wp_transform_get_translation(wp_vec7_float t) {
     return float3(t.c[0], t.c[1], t.c[2]);
 }
@@ -2799,6 +2941,180 @@ inline wp_vec7_float wp_transform_inverse(wp_vec7_float t) {
 # transform component is a plain ``wp_vec7_float`` element access, already
 # covered by the big-vec helpers.
 _ADJ_QUAT_HELPERS = """\
+// Port of warp/native/quat.h adj_quat_from_matrix (3x3; MSL matrices are
+// column-major, so ``m.data[r][c]`` reads ``m[c][r]``).
+inline void wp_adj_quat_from_matrix(float3x3 m, thread float3x3& adj_m, float4 adj_ret) {
+    
+
+    const float tr = m[0][0] + m[1][1] + m[2][2];
+    float x = float(0), y = float(0), z = float(0), w = float(0), h = float(0);
+
+    float dx_dm00 = float(0), dx_dm01 = float(0), dx_dm02 = float(0);
+    float dx_dm10 = float(0), dx_dm11 = float(0), dx_dm12 = float(0);
+    float dx_dm20 = float(0), dx_dm21 = float(0), dx_dm22 = float(0);
+    float dy_dm00 = float(0), dy_dm01 = float(0), dy_dm02 = float(0);
+    float dy_dm10 = float(0), dy_dm11 = float(0), dy_dm12 = float(0);
+    float dy_dm20 = float(0), dy_dm21 = float(0), dy_dm22 = float(0);
+    float dz_dm00 = float(0), dz_dm01 = float(0), dz_dm02 = float(0);
+    float dz_dm10 = float(0), dz_dm11 = float(0), dz_dm12 = float(0);
+    float dz_dm20 = float(0), dz_dm21 = float(0), dz_dm22 = float(0);
+    float dw_dm00 = float(0), dw_dm01 = float(0), dw_dm02 = float(0);
+    float dw_dm10 = float(0), dw_dm11 = float(0), dw_dm12 = float(0);
+    float dw_dm20 = float(0), dw_dm21 = float(0), dw_dm22 = float(0);
+
+    if (tr >= float(0)) {
+        h = metal::sqrt(tr + float(1));
+        w = float(0.5) * h;
+        h = float(0.5) / h;
+
+        x = (m[1][2] - m[2][1]) * h;
+        y = (m[2][0] - m[0][2]) * h;
+        z = (m[0][1] - m[1][0]) * h;
+
+        dw_dm00 = float(0.5) * h;
+        dw_dm11 = float(0.5) * h;
+        dw_dm22 = float(0.5) * h;
+        dx_dm21 = h;
+        dx_dm12 = -h;
+        dx_dm00 = float(2) * h * h * h * (m[2][1] - m[1][2]);
+        dx_dm11 = float(2) * h * h * h * (m[2][1] - m[1][2]);
+        dx_dm22 = float(2) * h * h * h * (m[2][1] - m[1][2]);
+        dy_dm02 = h;
+        dy_dm20 = -h;
+        dy_dm00 = float(2) * h * h * h * (m[0][2] - m[2][0]);
+        dy_dm11 = float(2) * h * h * h * (m[0][2] - m[2][0]);
+        dy_dm22 = float(2) * h * h * h * (m[0][2] - m[2][0]);
+        dz_dm10 = h;
+        dz_dm01 = -h;
+        dz_dm00 = float(2) * h * h * h * (m[1][0] - m[0][1]);
+        dz_dm11 = float(2) * h * h * h * (m[1][0] - m[0][1]);
+        dz_dm22 = float(2) * h * h * h * (m[1][0] - m[0][1]);
+    } else {
+        int max_diag = 0;
+        if (m[1][1] > m[0][0]) {
+            max_diag = 1;
+        }
+        if (m[2][2] > m[max_diag][max_diag]) {
+            max_diag = 2;
+        }
+
+        if (max_diag == 0) {
+            h = metal::sqrt((m[0][0] - (m[1][1] + m[2][2])) + float(1));
+            x = float(0.5) * h;
+            h = float(0.5) / h;
+
+            y = (m[1][0] + m[0][1]) * h;
+            z = (m[0][2] + m[2][0]) * h;
+            w = (m[1][2] - m[2][1]) * h;
+
+            dx_dm00 = float(0.5) * h;
+            dx_dm11 = -float(0.5) * h;
+            dx_dm22 = -float(0.5) * h;
+            dy_dm01 = h;
+            dy_dm10 = h;
+            dy_dm00 = -float(2) * h * h * h * (m[1][0] + m[0][1]);
+            dy_dm11 = float(2) * h * h * h * (m[1][0] + m[0][1]);
+            dy_dm22 = float(2) * h * h * h * (m[1][0] + m[0][1]);
+            dz_dm20 = h;
+            dz_dm02 = h;
+            dz_dm00 = -float(2) * h * h * h * (m[0][2] + m[2][0]);
+            dz_dm11 = float(2) * h * h * h * (m[0][2] + m[2][0]);
+            dz_dm22 = float(2) * h * h * h * (m[0][2] + m[2][0]);
+            dw_dm21 = h;
+            dw_dm12 = -h;
+            dw_dm00 = float(2) * h * h * h * (m[2][1] - m[1][2]);
+            dw_dm11 = float(2) * h * h * h * (m[1][2] - m[2][1]);
+            dw_dm22 = float(2) * h * h * h * (m[1][2] - m[2][1]);
+        } else if (max_diag == 1) {
+            h = metal::sqrt((m[1][1] - (m[2][2] + m[0][0])) + float(1));
+            y = float(0.5) * h;
+            h = float(0.5) / h;
+
+            z = (m[2][1] + m[1][2]) * h;
+            x = (m[1][0] + m[0][1]) * h;
+            w = (m[2][0] - m[0][2]) * h;
+
+            dy_dm00 = -float(0.5) * h;
+            dy_dm11 = float(0.5) * h;
+            dy_dm22 = -float(0.5) * h;
+            dz_dm12 = h;
+            dz_dm21 = h;
+            dz_dm00 = float(2) * h * h * h * (m[2][1] + m[1][2]);
+            dz_dm11 = -float(2) * h * h * h * (m[2][1] + m[1][2]);
+            dz_dm22 = float(2) * h * h * h * (m[2][1] + m[1][2]);
+            dx_dm01 = h;
+            dx_dm10 = h;
+            dx_dm00 = float(2) * h * h * h * (m[1][0] + m[0][1]);
+            dx_dm11 = -float(2) * h * h * h * (m[1][0] + m[0][1]);
+            dx_dm22 = float(2) * h * h * h * (m[1][0] + m[0][1]);
+            dw_dm02 = h;
+            dw_dm20 = -h;
+            dw_dm00 = float(2) * h * h * h * (m[2][0] - m[0][2]);
+            dw_dm11 = float(2) * h * h * h * (m[0][2] - m[2][0]);
+            dw_dm22 = float(2) * h * h * h * (m[2][0] - m[0][2]);
+        }
+        if (max_diag == 2) {
+            h = metal::sqrt((m[2][2] - (m[0][0] + m[1][1])) + float(1));
+            z = float(0.5) * h;
+            h = float(0.5) / h;
+
+            x = (m[0][2] + m[2][0]) * h;
+            y = (m[2][1] + m[1][2]) * h;
+            w = (m[0][1] - m[1][0]) * h;
+
+            dz_dm00 = -float(0.5) * h;
+            dz_dm11 = -float(0.5) * h;
+            dz_dm22 = float(0.5) * h;
+            dx_dm20 = h;
+            dx_dm02 = h;
+            dx_dm00 = float(2) * h * h * h * (m[0][2] + m[2][0]);
+            dx_dm11 = float(2) * h * h * h * (m[0][2] + m[2][0]);
+            dx_dm22 = -float(2) * h * h * h * (m[0][2] + m[2][0]);
+            dy_dm12 = h;
+            dy_dm21 = h;
+            dy_dm00 = float(2) * h * h * h * (m[2][1] + m[1][2]);
+            dy_dm11 = float(2) * h * h * h * (m[2][1] + m[1][2]);
+            dy_dm22 = -float(2) * h * h * h * (m[2][1] + m[1][2]);
+            dw_dm10 = h;
+            dw_dm01 = -h;
+            dw_dm00 = float(2) * h * h * h * (m[0][1] - m[1][0]);
+            dw_dm11 = float(2) * h * h * h * (m[0][1] - m[1][0]);
+            dw_dm22 = float(2) * h * h * h * (m[1][0] - m[0][1]);
+        }
+    }
+
+    float4 dq_dm00 = float4(dx_dm00, dy_dm00, dz_dm00, dw_dm00);
+    float4 dq_dm01 = float4(dx_dm01, dy_dm01, dz_dm01, dw_dm01);
+    float4 dq_dm02 = float4(dx_dm02, dy_dm02, dz_dm02, dw_dm02);
+    float4 dq_dm10 = float4(dx_dm10, dy_dm10, dz_dm10, dw_dm10);
+    float4 dq_dm11 = float4(dx_dm11, dy_dm11, dz_dm11, dw_dm11);
+    float4 dq_dm12 = float4(dx_dm12, dy_dm12, dz_dm12, dw_dm12);
+    float4 dq_dm20 = float4(dx_dm20, dy_dm20, dz_dm20, dw_dm20);
+    float4 dq_dm21 = float4(dx_dm21, dy_dm21, dz_dm21, dw_dm21);
+    float4 dq_dm22 = float4(dx_dm22, dy_dm22, dz_dm22, dw_dm22);
+
+    float4 adj_q;
+    { float4 qn = float4(x, y, z, w); float l = metal::precise::sqrt(metal::dot(qn, qn)); adj_q = float4(0.0f);
+      if (l > 0.0f) { float l_inv = 1.0f / l; adj_q = adj_ret * l_inv - qn * (l_inv * l_inv * l_inv * metal::dot(qn, adj_ret)); } }
+
+    adj_m[0][0] += metal::dot(dq_dm00, adj_q);
+    adj_m[1][0] += metal::dot(dq_dm01, adj_q);
+    adj_m[2][0] += metal::dot(dq_dm02, adj_q);
+    adj_m[0][1] += metal::dot(dq_dm10, adj_q);
+    adj_m[1][1] += metal::dot(dq_dm11, adj_q);
+    adj_m[2][1] += metal::dot(dq_dm12, adj_q);
+    adj_m[0][2] += metal::dot(dq_dm20, adj_q);
+    adj_m[1][2] += metal::dot(dq_dm21, adj_q);
+    adj_m[2][2] += metal::dot(dq_dm22, adj_q);
+}
+inline void wp_adj_quat_from_axis_angle(float3 axis, float angle, thread float3& adj_axis, thread float& adj_angle,
+                                       float4 adj_ret) {
+    float s = metal::sin(angle * 0.5f);
+    float c = metal::cos(angle * 0.5f);
+    float4 dqda = float4(axis[0] * c, axis[1] * c, axis[2] * c, -s) * 0.5f;
+    adj_axis += adj_ret.xyz * s;
+    adj_angle += metal::dot(dqda, adj_ret);
+}
 inline void wp_adj_quat_rotate(float4 q, float3 p, thread float4& aq, thread float3& ap, float3 r) {
     {
         float t2 = p[2] * q.z * 2.0f;
@@ -2830,6 +3146,14 @@ inline void wp_adj_quat_rotate(float4 q, float3 p, thread float4& aq, thread flo
         ap[1] += r[2] * (t7 + t8) - r[0] * (t4 - t5) + r[1] * (t3 + (q.y * q.y) * 2.0f - 1.0f);
         ap[2] += -r[1] * (t7 - t8) + r[2] * (t3 + (q.z * q.z) * 2.0f - 1.0f) + r[0] * (t6 + q.x * q.z * 2.0f);
     }
+}
+// adj_quat_to_matrix (warp/native/quat.h): column k of the result is
+// ``quat_rotate(q, e_k)``; MSL ``r[k]`` is that column.
+inline void wp_adj_quat_to_matrix(float4 q, thread float4& aq, float3x3 r) {
+    float3 t = float3(0.0f);
+    wp_adj_quat_rotate(q, float3(1.0f, 0.0f, 0.0f), aq, t, r[0]);
+    wp_adj_quat_rotate(q, float3(0.0f, 1.0f, 0.0f), aq, t, r[1]);
+    wp_adj_quat_rotate(q, float3(0.0f, 0.0f, 1.0f), aq, t, r[2]);
 }
 inline void wp_adj_quat_rotate_inv(float4 q, float3 p, thread float4& aq, thread float3& ap, float3 r) {
     {
@@ -4929,6 +5253,32 @@ inline float3 wp_mesh_eval_velocity(ulong id, int tri, float u, float v) {
     float3 vr = wp_bvh_load_v3(mesh.velocities, k);
     return vp * u + vq * v + vr * (1.0f - u - v);
 }
+// Reverse mode of ``wp_mesh_eval_position`` (warp/native/mesh.h): only the
+// barycentric coordinates receive a gradient.
+inline void wp_adj_mesh_eval_position(ulong id, int tri, float u, float v, thread ulong& adj_id, thread int& adj_tri,
+                                   thread float& adj_u, thread float& adj_v, float3 adj_ret) {
+    wp_mesh_desc_t mesh = wp_mesh_get_desc(id);
+    if (mesh.points == 0ul) { return; }
+    const device int* tri_indices = wp_bvh_int_ptr(mesh.indices);
+    float3 p = wp_bvh_load_v3(mesh.points, tri_indices[tri * 3 + 0]);
+    float3 q = wp_bvh_load_v3(mesh.points, tri_indices[tri * 3 + 1]);
+    float3 r = wp_bvh_load_v3(mesh.points, tri_indices[tri * 3 + 2]);
+    adj_u += (p[0] - r[0]) * adj_ret[0] + (p[1] - r[1]) * adj_ret[1] + (p[2] - r[2]) * adj_ret[2];
+    adj_v += (q[0] - r[0]) * adj_ret[0] + (q[1] - r[1]) * adj_ret[1] + (q[2] - r[2]) * adj_ret[2];
+}
+// Reverse mode of ``wp_mesh_eval_velocity`` (warp/native/mesh.h): only the
+// barycentric coordinates receive a gradient.
+inline void wp_adj_mesh_eval_velocity(ulong id, int tri, float u, float v, thread ulong& adj_id, thread int& adj_tri,
+                                   thread float& adj_u, thread float& adj_v, float3 adj_ret) {
+    wp_mesh_desc_t mesh = wp_mesh_get_desc(id);
+    if (mesh.velocities == 0ul) { return; }
+    const device int* tri_indices = wp_bvh_int_ptr(mesh.indices);
+    float3 p = wp_bvh_load_v3(mesh.velocities, tri_indices[tri * 3 + 0]);
+    float3 q = wp_bvh_load_v3(mesh.velocities, tri_indices[tri * 3 + 1]);
+    float3 r = wp_bvh_load_v3(mesh.velocities, tri_indices[tri * 3 + 2]);
+    adj_u += (p[0] - r[0]) * adj_ret[0] + (p[1] - r[1]) * adj_ret[1] + (p[2] - r[2]) * adj_ret[2];
+    adj_v += (q[0] - r[0]) * adj_ret[0] + (q[1] - r[1]) * adj_ret[1] + (q[2] - r[2]) * adj_ret[2];
+}
 inline float3 wp_mesh_eval_face_normal(ulong id, int tri) {
     wp_mesh_desc_t mesh = wp_mesh_get_desc(id);
     if (mesh.points == 0ul) { return float3(0.0f); }
@@ -5855,6 +6205,135 @@ _MISC_MATH_HELPERS: dict[str, str] = {
         "inline T wp_vmax(metal::vec<T, 4> v) "
         "{ return metal::max(metal::max(v.x, v.y), metal::max(v.z, v.w)); }"
     ),
+    # Reverse mode of unary ``wp.min(v)``: the gradient lands on the
+    # ``argmin`` slot (warp/native/vec.h ``adj_min``). Overloads the
+    # binary ``wp_adj_min`` template in ``_ADJ_HELPERS``.
+    "wp_adj_min": (
+        "template <typename V, typename T, int N>\n"
+        "inline void wp_adj_vmin_impl(V v, thread V& av, T r) {\n"
+        "    int ret = 0;\n"
+        "    while (ret < N && metal::isnan(float(v[ret]))) ++ret;\n"
+        "    if (ret == N) ret = 0;\n"
+        "    for (int i = ret + 1; i < N; ++i) {\n"
+        "        if (metal::isnan(float(v[i]))) continue;\n"
+        "        if (v[i] < v[ret]) ret = i;\n"
+        "    }\n"
+        "    av[ret] += r;\n"
+        "}\n"
+        "template <typename T>\n"
+        "inline void wp_adj_min(metal::vec<T, 2> v, thread metal::vec<T, 2>& av, T r) "
+        "{ wp_adj_vmin_impl<metal::vec<T, 2>, T, 2>(v, av, r); }\n"
+        "template <typename T>\n"
+        "inline void wp_adj_min(metal::vec<T, 3> v, thread metal::vec<T, 3>& av, T r) "
+        "{ wp_adj_vmin_impl<metal::vec<T, 3>, T, 3>(v, av, r); }\n"
+        "template <typename T>\n"
+        "inline void wp_adj_min(metal::vec<T, 4> v, thread metal::vec<T, 4>& av, T r) "
+        "{ wp_adj_vmin_impl<metal::vec<T, 4>, T, 4>(v, av, r); }"
+    ),
+    # Reverse mode of unary ``wp.max(v)``: the gradient lands on the
+    # ``argmax`` slot (warp/native/vec.h ``adj_max``). Overloads the
+    # binary ``wp_adj_max`` template in ``_ADJ_HELPERS``.
+    "wp_adj_max": (
+        "template <typename V, typename T, int N>\n"
+        "inline void wp_adj_vmax_impl(V v, thread V& av, T r) {\n"
+        "    int ret = 0;\n"
+        "    while (ret < N && metal::isnan(float(v[ret]))) ++ret;\n"
+        "    if (ret == N) ret = 0;\n"
+        "    for (int i = ret + 1; i < N; ++i) {\n"
+        "        if (metal::isnan(float(v[i]))) continue;\n"
+        "        if (v[i] > v[ret]) ret = i;\n"
+        "    }\n"
+        "    av[ret] += r;\n"
+        "}\n"
+        "template <typename T>\n"
+        "inline void wp_adj_max(metal::vec<T, 2> v, thread metal::vec<T, 2>& av, T r) "
+        "{ wp_adj_vmax_impl<metal::vec<T, 2>, T, 2>(v, av, r); }\n"
+        "template <typename T>\n"
+        "inline void wp_adj_max(metal::vec<T, 3> v, thread metal::vec<T, 3>& av, T r) "
+        "{ wp_adj_vmax_impl<metal::vec<T, 3>, T, 3>(v, av, r); }\n"
+        "template <typename T>\n"
+        "inline void wp_adj_max(metal::vec<T, 4> v, thread metal::vec<T, 4>& av, T r) "
+        "{ wp_adj_vmax_impl<metal::vec<T, 4>, T, 4>(v, av, r); }"
+    ),
+    # Vector slice ``v[a:b]`` copy (see the ``wp::extract<N>`` 2-arg rule).
+    "wp_vec_slice_store": (
+        "template <typename T, typename S>\n"
+        "inline void wp_vec_slice_store(thread metal::vec<T, 2>& d, S s, metal::vec<T, 2> v) "
+        "{ int k = 0; for (int i = s.start; (s.step > 0) ? (i < s.stop) : (i > s.stop); i += s.step) d[i] = v[k++]; }\n"
+        "template <typename T, typename S>\n"
+        "inline void wp_vec_slice_store(thread metal::vec<T, 3>& d, S s, metal::vec<T, 2> v) "
+        "{ int k = 0; for (int i = s.start; (s.step > 0) ? (i < s.stop) : (i > s.stop); i += s.step) d[i] = v[k++]; }\n"
+        "template <typename T, typename S>\n"
+        "inline void wp_vec_slice_store(thread metal::vec<T, 3>& d, S s, metal::vec<T, 3> v) "
+        "{ int k = 0; for (int i = s.start; (s.step > 0) ? (i < s.stop) : (i > s.stop); i += s.step) d[i] = v[k++]; }\n"
+        "template <typename T, typename S>\n"
+        "inline void wp_vec_slice_store(thread metal::vec<T, 4>& d, S s, metal::vec<T, 2> v) "
+        "{ int k = 0; for (int i = s.start; (s.step > 0) ? (i < s.stop) : (i > s.stop); i += s.step) d[i] = v[k++]; }\n"
+        "template <typename T, typename S>\n"
+        "inline void wp_vec_slice_store(thread metal::vec<T, 4>& d, S s, metal::vec<T, 3> v) "
+        "{ int k = 0; for (int i = s.start; (s.step > 0) ? (i < s.stop) : (i > s.stop); i += s.step) d[i] = v[k++]; }\n"
+        "template <typename T, typename S>\n"
+        "inline void wp_vec_slice_store(thread metal::vec<T, 4>& d, S s, metal::vec<T, 4> v) "
+        "{ int k = 0; for (int i = s.start; (s.step > 0) ? (i < s.stop) : (i > s.stop); i += s.step) d[i] = v[k++]; }"
+    ),
+    "wp_vec_slice_assign": (
+        "template <typename T, typename S>\n"
+        "inline void wp_vec_slice_assign(thread metal::vec<T, 2>& d, metal::vec<T, 2> v, S s) "
+        "{ int k = 0; for (int i = s.start; (s.step > 0) ? (i < s.stop) : (i > s.stop); i += s.step) d[k++] = v[i]; }\n"
+        "template <typename T, typename S>\n"
+        "inline void wp_vec_slice_assign(thread metal::vec<T, 2>& d, metal::vec<T, 3> v, S s) "
+        "{ int k = 0; for (int i = s.start; (s.step > 0) ? (i < s.stop) : (i > s.stop); i += s.step) d[k++] = v[i]; }\n"
+        "template <typename T, typename S>\n"
+        "inline void wp_vec_slice_assign(thread metal::vec<T, 2>& d, metal::vec<T, 4> v, S s) "
+        "{ int k = 0; for (int i = s.start; (s.step > 0) ? (i < s.stop) : (i > s.stop); i += s.step) d[k++] = v[i]; }\n"
+        "template <typename T, typename S>\n"
+        "inline void wp_vec_slice_assign(thread metal::vec<T, 3>& d, metal::vec<T, 3> v, S s) "
+        "{ int k = 0; for (int i = s.start; (s.step > 0) ? (i < s.stop) : (i > s.stop); i += s.step) d[k++] = v[i]; }\n"
+        "template <typename T, typename S>\n"
+        "inline void wp_vec_slice_assign(thread metal::vec<T, 3>& d, metal::vec<T, 4> v, S s) "
+        "{ int k = 0; for (int i = s.start; (s.step > 0) ? (i < s.stop) : (i > s.stop); i += s.step) d[k++] = v[i]; }\n"
+        "template <typename T, typename S>\n"
+        "inline void wp_vec_slice_assign(thread metal::vec<T, 4>& d, metal::vec<T, 4> v, S s) "
+        "{ int k = 0; for (int i = s.start; (s.step > 0) ? (i < s.stop) : (i > s.stop); i += s.step) d[k++] = v[i]; }"
+    ),
+    "wp_argmin": (
+        "template <typename V, int N>\n"
+        "inline uint wp_argmin_impl(V v) {\n"
+        "    uint ret = 0;\n"
+        "    while (ret < uint(N) && metal::isnan(float(v[ret]))) ++ret;\n"
+        "    if (ret == uint(N)) return 0u;\n"
+        "    for (uint i = ret + 1; i < uint(N); ++i) {\n"
+        "        if (metal::isnan(float(v[i]))) continue;\n"
+        "        if (v[i] < v[ret]) ret = i;\n"
+        "    }\n"
+        "    return ret;\n"
+        "}\n"
+        "template <typename T>\n"
+        "inline uint wp_argmin(metal::vec<T, 2> v) { return wp_argmin_impl<metal::vec<T, 2>, 2>(v); }\n"
+        "template <typename T>\n"
+        "inline uint wp_argmin(metal::vec<T, 3> v) { return wp_argmin_impl<metal::vec<T, 3>, 3>(v); }\n"
+        "template <typename T>\n"
+        "inline uint wp_argmin(metal::vec<T, 4> v) { return wp_argmin_impl<metal::vec<T, 4>, 4>(v); }"
+    ),
+    "wp_argmax": (
+        "template <typename V, int N>\n"
+        "inline uint wp_argmax_impl(V v) {\n"
+        "    uint ret = 0;\n"
+        "    while (ret < uint(N) && metal::isnan(float(v[ret]))) ++ret;\n"
+        "    if (ret == uint(N)) return 0u;\n"
+        "    for (uint i = ret + 1; i < uint(N); ++i) {\n"
+        "        if (metal::isnan(float(v[i]))) continue;\n"
+        "        if (v[i] > v[ret]) ret = i;\n"
+        "    }\n"
+        "    return ret;\n"
+        "}\n"
+        "template <typename T>\n"
+        "inline uint wp_argmax(metal::vec<T, 2> v) { return wp_argmax_impl<metal::vec<T, 2>, 2>(v); }\n"
+        "template <typename T>\n"
+        "inline uint wp_argmax(metal::vec<T, 3> v) { return wp_argmax_impl<metal::vec<T, 3>, 3>(v); }\n"
+        "template <typename T>\n"
+        "inline uint wp_argmax(metal::vec<T, 4> v) { return wp_argmax_impl<metal::vec<T, 4>, 4>(v); }"
+    ),
     "wp_isnan": (
         "template <typename T>\n"
         "inline bool wp_isnan(T x) { return metal::isnan(x); }\n"
@@ -6079,6 +6558,9 @@ _MISC_MATH_HELPERS: dict[str, str] = {
         "}"
     ),
 }
+
+
+_ARRAY_LEN_PAT = re.compile(r"\bwp::len\s*\(\s*(?:var_)?(\w+)\s*\)")
 
 
 def _emit_misc_math_helpers(source: str) -> str:
@@ -9254,6 +9736,8 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     # Unary negation: ``wp::neg(X)`` -> ``(-X)``. Works for scalar / vec / mat
     # because MSL's ``operator-`` is defined on all of those.
     (re.compile(r"wp::neg\s*\(\s*([^()]+?)\s*\)"), r"(-\1)"),
+    # Unary plus: identity (MSL matrices reject a unary ``+``).
+    (re.compile(r"wp::pos\s*\(\s*([^()]+?)\s*\)"), r"(\1)"),
     # Boolean not: ``wp::unot(X)`` -> ``(!X)``.
     (re.compile(r"wp::unot\s*\(\s*([^()]+?)\s*\)"), r"(!\1)"),
     # Bitwise ops. Only ``bit_and`` actually shows up in the mujoco_warp
@@ -9302,6 +9786,20 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (
         re.compile(r"wp::slice_t\s*\(\s*([^,()]+?)\s*,\s*([^,()]+?)\s*,\s*([^,()]+?)\s*\)"),
         r"wp_slice_t{\1, \2, \3}",
+    ),
+    # ``var_X = wp::extract<N>(v, s)`` — vector slice ``v[a:b]`` (2-arg
+    # templated form; matrix slices take three args, see below). Lowered to
+    # a component copy into the already-declared result; the helper only
+    # has vector overloads, so an unexpected matrix operand fails to compile
+    # instead of silently copying columns.
+    (
+        re.compile(r"\bvar_(\w+)\s*=\s*wp::extract\s*<\s*\d+\s*>\s*\(\s*([^,()]+?)\s*,\s*([^,()]+?)\s*\)"),
+        r"wp_vec_slice_assign(var_\1, \2, \3)",
+    ),
+    # ``wp::assign_inplace<N>(v, s, x)`` — vector slice store ``v[a:b] = x``.
+    (
+        re.compile(r"\bwp::assign_inplace\s*<\s*\d+\s*>\s*\(\s*([^,()]+?)\s*,\s*([^,()]+?)\s*,\s*([^,()]+?)\s*\)"),
+        r"wp_vec_slice_store(\1, \2, \3)",
     ),
     # ``wp::extract<N>(m, ...)`` — the templated form generated by matrix
     # slicing (``mat[:, c]`` / ``mat[r, :]``). ``N`` is the resulting vec
@@ -9446,6 +9944,9 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     # rename appended from ``_MATH_BUILTIN_NAMES``. Warp IR always passes
     # builtins a bare local, so a comma-free single ``var_X`` operand is
     # an unambiguous match for the unary overload.
+    # ``wp.argmin(v)`` / ``wp.argmax(v)`` — first index of the extreme
+    # non-NaN component (warp/native/vec.h).
+    (re.compile(r"\bwp::(argmin|argmax)\s*\(\s*(var_\w+)\s*\)"), r"wp_\1(\2)"),
     (re.compile(r"\bwp::min\s*\(\s*(var_\w+)\s*\)"), r"wp_vmin(\1)"),
     (re.compile(r"\bwp::max\s*\(\s*(var_\w+)\s*\)"), r"wp_vmax(\1)"),
     # ``wp.invert`` is bitwise NOT (integer types only).
@@ -9585,6 +10086,8 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     # barycentric coords w.r.t. the ray origin and direction (ports of
     # mesh.h / intersect.h; the vertex adjoints are dropped upstream too).
     (re.compile(r"\bwp::adj_mesh_query_ray\b"), "wp_adj_mesh_query_ray"),
+    (re.compile(r"\bwp::adj_mesh_eval_position\b"), "wp_adj_mesh_eval_position"),
+    (re.compile(r"\bwp::adj_mesh_eval_velocity\b"), "wp_adj_mesh_eval_velocity"),
     (re.compile(r"\bwp::mesh_query_ray\b"), "wp_mesh_query_ray"),
     (re.compile(r"\bwp::mesh_get_group_root\b"), "wp_mesh_get_group_root"),
     (re.compile(r"\bwp::mesh_query_point_t\b"), "wp_mesh_query_point_t"),
@@ -12546,6 +13049,14 @@ class MetalKernelArtifact:
     # buffer keeps the total kernel-arg count under Metal's 31-slot
     # hardware limit.
     shape_packed_arrs: tuple[str, ...] = ()
+    # ``wp.array[Struct]`` args whose elements' array fields the kernel reads.
+    # Those reads compile to zero values (see
+    # ``codegen_metal_ast.fold_struct_array_array_fields``); the launcher
+    # refuses a launch where such an arg is non-empty.
+    struct_array_field_reads: tuple[str, ...] = ()
+    # Native dispatch: binding slots (pre-spill order) moved into the
+    # ``__spill_ptrs`` table. Set by ``_wrap_msl_for_native_dispatch``.
+    native_spill_slots: tuple[int, ...] = ()
     # Per-array shape slot size in ``__shapes_packed`` (each array gets
     # ``shape_packed_slot`` int32s, padded with zeros). Warp arrays cap
     # at 4 dims so 4 is plenty.
@@ -13330,6 +13841,35 @@ def _ensure_adj_built(kernel, block_dim: int | None = None, enable_backward: boo
     return adj
 
 
+_metal_print_warned = False
+
+
+def _handle_metal_print(kernel_name: str) -> None:
+    """Apply :data:`warp.config.metal_print` to a kernel that calls
+    ``wp.print`` / ``wp.printf`` (the calls themselves are dropped by
+    ``fold_drop_unsupported_locals``)."""
+    global _metal_print_warned
+    import warp.config as _cfg  # noqa: PLC0415
+
+    mode = str(getattr(_cfg, "metal_print", "warn")).strip().lower()
+    if mode == "error":
+        raise MetalCodegenError(
+            f"Kernel {kernel_name!r} calls wp.print()/wp.printf(), which Metal kernels cannot execute "
+            f"(warp.config.metal_print = 'error')"
+        )
+    if mode == "ignore" or _metal_print_warned:
+        return
+    _metal_print_warned = True
+    from warp._src.logger import log_warning as warn  # noqa: PLC0415
+
+    warn(
+        f"wp.print()/wp.printf() calls are compiled out on Metal devices (first seen in kernel "
+        f"{kernel_name!r}); set warp.config.metal_print = 'error' to make this an error or 'ignore' "
+        f"to silence this warning.",
+        category=UserWarning,
+    )
+
+
 def _artifact_display_name(kernel, adj) -> str:
     """MSL entry-point suffix for a kernel: the def name, qualified by its
     enclosing factory for closure kernels.
@@ -13504,7 +14044,13 @@ def _generate_msl_kernel_uncached(
     # reference array struct fields that are never assigned for the live
     # geom types.
     _ast_nodes = _ast_fold_const_branches(_ast_nodes, adj, _inlined_const_ints)
+    _ast_nodes, _tuple_skip = _ast_fold_tuples(_ast_nodes, adj, _inlined_var_ctypes)
+    _ast_nodes, _mesh_skip = _ast_fold_mesh_get(_ast_nodes, adj, _inlined_var_ctypes)
+    _ast_nodes, _sa_skip, _sa_field_reads = _ast_fold_struct_array_fields(_ast_nodes, adj, _inlined_var_ctypes)
+    if _ast_has_print_calls(_ast_nodes):
+        _handle_metal_print(adj.fun_name)
     _ast_nodes, _drop_skip = _ast_fold_drop(_ast_nodes, adj, _inlined_var_ctypes)
+    _drop_skip = _drop_skip | _tuple_skip | _mesh_skip | _sa_skip
     # ``_struct_arg_array_fields``: synthetic label -> (arg label, field
     # path) for every ``wp.array`` field of a struct-typed kernel arg the
     # body reads. The fold rewrites those accesses against the synthetic
@@ -14587,6 +15133,17 @@ def _generate_msl_kernel_uncached(
     # ``atomic<ulong>`` worth the name in MSL, so they stay plain and their
     # ``wp.atomic_*`` calls go through ``wp_f64_atomic_*`` (see
     # ``_rewrite_f64_atomics``).
+    # 64-bit integer outputs that are only stored to (never an atomic
+    # target) stay plain too: MSL has no ``atomic_store`` on ``long``, and a
+    # kernel that is atomic for other outputs would otherwise route their
+    # plain stores through ``atomic_store_explicit``.
+    _fwd_text = "\n".join(forward_lines)
+    narrow_output_labels |= {
+        a.label
+        for a in output_args
+        if _array_scalar_type_name(a) in ("int64", "uint64")
+        and not re.search(rf"\batomic_\w+\s*(?:<[^()]*>)?\s*\(\s*(?:var_)?{re.escape(a.label)}\b", _fwd_text)
+    }
     nonatomic_label_set = grad_label_set | narrow_output_labels | f64_arr_names | f64_emu_arr_names
     atomic_output_names: set[str] = (
         {a.label for a in output_args if a.label not in nonatomic_label_set} if has_atomic else set()
@@ -14975,6 +15532,12 @@ def _generate_msl_kernel_uncached(
         # sample_* intrinsic pattern) gains the array length here for the
         # same reason as ``lower_bound`` above.
         translated = _SAMPLE_CDF_2ARG_PAT.sub(r"wp_sample_cdf(\1, \2, (int)\2_shape[0])", translated)
+        # ``len(arr)`` on a kernel array argument is its leading dimension.
+        if "wp::len" in translated:
+            _arr_labels = {a.label for a in adj.args if _is_array_arg(a)}
+            translated = _ARRAY_LEN_PAT.sub(
+                lambda m: f"((int){m.group(1)}_shape[0])" if m.group(1) in _arr_labels else m.group(0), translated
+            )
         # When the kernel uses ``wp.atomic_*`` on any output, MLX makes
         # *every* output ``device atomic<T>*``. Plain reads
         # ``var_X = atomic_arr[idx]`` then fail to compile because MSL
@@ -15890,7 +16453,11 @@ def _generate_msl_kernel_uncached(
                     return _struct_bitcast_write(f"({read} {_op[:-1]} {comp_val})", _scalar)
 
                 writes: list[str] = []
-                if finfo.kind == _STRUCT_FIELD_KIND_SCALAR:
+                if finfo.kind == _STRUCT_FIELD_KIND_SCALAR and finfo.bits < 32:
+                    slot = f"{buf}[{base_expr}]"
+                    new_val = value if op == "=" else f"({_struct_narrow_read(slot, finfo)} {op[:-1]} {value})"
+                    writes.append(f"{indent}{slot} = {_struct_narrow_write(slot, new_val, finfo)};")
+                elif finfo.kind == _STRUCT_FIELD_KIND_SCALAR:
                     slot = f"{buf}[{base_expr}]"
                     writes.append(f"{indent}{slot} = {_slot_rhs(slot, value)};")
                 elif finfo.kind == _STRUCT_FIELD_KIND_SCALAR64:
@@ -16115,9 +16682,16 @@ def _generate_msl_kernel_uncached(
                             "struct local; only stores from struct locals are supported on Metal"
                         )
                     base = f"{elem_idx} * {layout.scalars_per_elem}"
+                    # Narrow scalar leaves share 4-byte slots: compose each
+                    # shared slot's word from all of its leaves in one store.
+                    _narrow_words: dict[int, list[str]] = {}
                     for fpath, off, finfo in _iter_scalar_leaves(layout):
                         src = _per_field_local(val_struct_label, fpath)
                         cast = finfo.scalar_msl
+                        if finfo.kind == _STRUCT_FIELD_KIND_SCALAR and finfo.bits < 32:
+                            _w = _struct_narrow_write("0.0f", src, finfo)
+                            _narrow_words.setdefault(off, []).append(f"as_type<uint>({_w})")
+                            continue
                         if finfo.kind == _STRUCT_FIELD_KIND_SCALAR:
                             body_lines.append(
                                 _finalize(_emit_scalar_write(f"{base} + {off}", _struct_bitcast_write(src, cast)))
@@ -16158,6 +16732,11 @@ def _generate_msl_kernel_uncached(
                                             )
                                         )
                                     )
+                    for _off, _parts in sorted(_narrow_words.items()):
+                        _word = " | ".join(_parts)
+                        body_lines.append(
+                            _finalize(_emit_scalar_write(f"{base} + {_off}", f"as_type<float>({_word})"))
+                        )
                     continue
                 flat_idx = _flat_index_expr(arr, indices)
                 body_lines.append(_finalize(_emit_scalar_write(flat_idx, value)))
@@ -16599,7 +17178,12 @@ def _generate_msl_kernel_uncached(
     # ``__shapes_packed`` buffer (with each array's shape at a known
     # offset) brings us back well under the limit.
     _SHAPE_SLOT = 4  # max ndim per array — Warp arrays cap at 4D
-    _shape_idx_pat = re.compile(r"\b(\w+)_shape\[([^\]]+)\]")
+    # The index group excludes ``[`` so a user array whose own name ends
+    # in ``_shape`` (``out_shape[i * out_shape_shape[1] + j]``) does not
+    # swallow the nested generated ``out_shape_shape[1]`` reference; the
+    # substitution below runs to a fixpoint to peel nested references
+    # from the inside out.
+    _shape_idx_pat = re.compile(r"\b(\w+)_shape\[([^\[\]]+)\]")
     _shape_arrs_seen: list[str] = []
     arg_label_set_local = (
         {a.label for a in adj.args} | {v.label for v in struct_field_array_vars} | {v.label for v in grad_array_vars}
@@ -16609,6 +17193,14 @@ def _generate_msl_kernel_uncached(
             _arr = _m.group(1)
             if _arr in arg_label_set_local and _arr not in _shape_arrs_seen:
                 _shape_arrs_seen.append(_arr)
+    for _arr in _shape_arrs_seen:
+        if f"{_arr}_shape" in arg_label_set_local:
+            # ``<arr>_shape[k]`` would be ambiguous between the generated
+            # shape reference and an access of the user argument.
+            raise MetalCodegenError(
+                f"Kernel {adj.fun_name!r}: argument {_arr}_shape collides with the generated shape "
+                f"identifier of array argument {_arr!r} on Metal; rename one of them"
+            )
     _shape_offsets: dict[str, int] = {a: i * _SHAPE_SLOT for i, a in enumerate(_shape_arrs_seen)}
 
     def _replace_shape_ref(m: re.Match[str]) -> str:
@@ -16618,7 +17210,15 @@ def _generate_msl_kernel_uncached(
         return f"__shapes_packed[{_shape_offsets[arr]} + {m.group(2)}]"
 
     if _shape_arrs_seen:
-        source = "\n".join(_shape_idx_pat.sub(_replace_shape_ref, line) for line in body_lines) + "\n"
+
+        def _replace_shape_refs_fix(line: str) -> str:
+            while True:
+                new_line = _shape_idx_pat.sub(_replace_shape_ref, line)
+                if new_line == line:
+                    return line
+                line = new_line
+
+        source = "\n".join(_replace_shape_refs_fix(line) for line in body_lines) + "\n"
 
     # ---- Serialise spin locks across SIMD lanes -----------------------
     # A mutual-exclusion lock spun on by two lanes of one SIMD group
@@ -16808,7 +17408,12 @@ def _generate_msl_kernel_uncached(
     if uses_tid4:
         extra_input_names.append("__tid4_dim3")
 
-    header = _build_kernel_header(source)
+    # By-value vec/quat/transform/mat params are reconstructed as typed
+    # locals by the native-dispatch prologue (``_wrap_msl_for_native_dispatch``)
+    # but their type is never spelled in the body, so the header scan would
+    # miss the struct / extract helpers they need. Name them for the scan.
+    _value_param_types = " ".join(t for t in (_value_param_msl_type(a) for a in input_args) if t)
+    header = _build_kernel_header(source + ("\n" + _value_param_types if _value_param_types else ""))
     if "WP_NATIVE_BLOCK_SYNC" in header or (coop_block_n == 0 and "WP_TILE_" in header):
         header = (_NATIVE_SYNC_COOP if coop_block_n > 0 else _NATIVE_SYNC_SERIAL) + header
     native_lane_dependent = any(
@@ -16835,7 +17440,7 @@ def _generate_msl_kernel_uncached(
         # launcher binds a 1-element placeholder and skips its copy-back.
         final_output_names = ["__wp_unused_out"]
 
-    return MetalKernelArtifact(
+    _artifact = MetalKernelArtifact(
         name=artifact_name,
         source=source,
         input_names=base_input_names + inplace_input_names + init_input_names + extra_input_names,
@@ -16885,6 +17490,8 @@ def _generate_msl_kernel_uncached(
         tid4=uses_tid4,
         struct_array_args=struct_array_args_final,
     )
+    _artifact.struct_array_field_reads = tuple(sorted(_sa_field_reads))
+    return _artifact
 
 
 # ---------------------------------------------------------------------------
@@ -17040,6 +17647,8 @@ def _artifact_cache_key(kernel, adj) -> str | None:
         # Distributed-tile builds share neither IR nor launch geometry
         # with serial builds of the same kernel.
         f"coopblock={getattr(adj, '_metal_coop_block_n', 0)}",
+        # ``metal_print = "error"`` must reach the generator to raise.
+        f"print={getattr(warp.config, 'metal_print', 'warn')}",
     ):
         h.update(part.encode("utf-8"))
         h.update(b"\x00")
@@ -17509,6 +18118,11 @@ class _StructFieldInfo:
     scalar_msl: str = "float"
     # Sub-layout for ``_STRUCT_FIELD_KIND_STRUCT`` (nested struct) fields.
     sub: _StructLayout | None = None
+    # Narrow (1-/2-byte) scalar fields — ``bool``, ``int8``, ``uint16``,
+    # ``float16`` ... — share a 4-byte slot with their neighbours: ``bits``
+    # is the field width and ``byte_shift`` its byte position in the slot.
+    bits: int = 32
+    byte_shift: int = 0
 
 
 @dataclass
@@ -17525,6 +18139,40 @@ class _StructLayout:
 # the ctypes bytes has one buffer slot per component (no packing/padding
 # surprises). Non-float components round-trip via ``as_type<>`` bitcasts.
 _STRUCT_SCALAR_MSL_4BYTE = ("float", "int", "uint")
+# Narrow scalar struct fields (MSL type -> bit width).
+_STRUCT_SCALAR_MSL_NARROW = {"bool": 8, "char": 8, "uchar": 8, "short": 16, "ushort": 16, "half": 16}
+
+
+def _struct_narrow_read(slot_expr: str, finfo) -> str:
+    """Decode a narrow scalar field from its shared float32 storage slot."""
+    word = f"as_type<uint>({slot_expr})"
+    shift = finfo.byte_shift * 8
+    mask = (1 << finfo.bits) - 1
+    raw = f"(({word} >> {shift}u) & {mask:#x}u)"
+    m = finfo.scalar_msl
+    if m == "bool":
+        return f"({raw} != 0u)"
+    if m == "half":
+        return f"as_type<half>(ushort{raw})"
+    if m in ("char", "short"):
+        # Sign-extend through the matching unsigned type.
+        return f"{m}(u{m}{raw})"
+    return f"{m}{raw}"
+
+
+def _struct_narrow_write(slot_expr: str, value_expr: str, finfo) -> str:
+    """Float32 slot value with narrow field ``finfo`` replaced by ``value_expr``."""
+    shift = finfo.byte_shift * 8
+    mask = (1 << finfo.bits) - 1
+    m = finfo.scalar_msl
+    if m == "half":
+        bits = f"uint(as_type<ushort>(half({value_expr})))"
+    elif m == "bool":
+        bits = f"uint(bool({value_expr}) ? 1u : 0u)"
+    else:
+        bits = f"(uint({m}({value_expr})) & {mask:#x}u)"
+    keep = (~(mask << shift)) & 0xFFFFFFFF
+    return f"as_type<float>((as_type<uint>({slot_expr}) & {keep:#x}u) | ({bits} << {shift}u))"
 
 
 def _classify_struct_field(fname: str, ftype) -> _StructFieldInfo:
@@ -17622,6 +18270,19 @@ def _classify_struct_field(fname: str, ftype) -> _StructFieldInfo:
         return _StructFieldInfo(
             name=fname, offset=0, size=2, kind=_STRUCT_FIELD_KIND_SCALAR64, msl_type=msl, scalar_msl=msl
         )
+    if msl in _STRUCT_SCALAR_MSL_NARROW:
+        # Narrow scalar: occupies part of one 4-byte slot (offset/shift are
+        # filled in by ``_struct_layout_for``); reads and writes go through
+        # ``_struct_narrow_read`` / ``_struct_narrow_write``.
+        return _StructFieldInfo(
+            name=fname,
+            offset=0,
+            size=1,
+            kind=_STRUCT_FIELD_KIND_SCALAR,
+            msl_type=msl,
+            scalar_msl=msl,
+            bits=_STRUCT_SCALAR_MSL_NARROW[msl],
+        )
     if msl not in _STRUCT_SCALAR_MSL_4BYTE:
         raise MetalCodegenError(
             f"MSL codegen: struct field {fname!r} of type {ftype!r} is not 4 bytes — struct "
@@ -17646,7 +18307,7 @@ def _struct_layout_for(struct_cls) -> _StructLayout:
     for fname, fvar in getattr(struct_cls, "vars", {}).items():
         finfo = _classify_struct_field(fname, fvar.type)
         byte_off = getattr(ctype, fname).offset if ctype is not None else None
-        if byte_off is None or (byte_off % 4 != 0 and finfo.size > 0):
+        if byte_off is None or (byte_off % 4 != 0 and finfo.size > 0 and finfo.bits == 32):
             # Size-0 fields (empty nested structs, array fields) may land at
             # odd byte offsets — ctypes gives empty structs 1 byte and
             # alignment 1. Nothing is ever read from them, so only fields
@@ -17656,6 +18317,11 @@ def _struct_layout_for(struct_cls) -> _StructLayout:
                 f"MSL codegen: struct field {fname!r} of {layout.name!r} has byte offset "
                 f"{byte_off} — flat float32 struct storage needs 4-byte-aligned fields"
             )
+        if finfo.kind == _STRUCT_FIELD_KIND_SCALAR and finfo.bits < 32 and byte_off is not None:
+            finfo.offset = byte_off // 4
+            finfo.byte_shift = byte_off % 4
+            layout.fields[fname] = finfo
+            continue
         finfo.offset = (byte_off // 4) if finfo.size > 0 else 0
         layout.fields[fname] = finfo
     total = ctypes.sizeof(ctype) if ctype is not None else 0
@@ -17708,6 +18374,8 @@ def _struct_field_read_expr(buf: str, base_expr: str, finfo: _StructFieldInfo) -
     storage ``buf`` at scalar offset ``base_expr`` (the field's absolute
     offset already folded in by the caller)."""
     if finfo.kind == _STRUCT_FIELD_KIND_SCALAR:
+        if finfo.bits < 32:
+            return _struct_narrow_read(f"{buf}[{base_expr}]", finfo)
         return _struct_bitcast_read(f"{buf}[{base_expr}]", finfo.scalar_msl)
     if finfo.kind == _STRUCT_FIELD_KIND_SCALAR64:
         lo = f"as_type<uint>({buf}[{base_expr}])"
@@ -18057,10 +18725,32 @@ def _native_array_inner_msl(arg_var) -> str:
     return _native_scalar_msl_type(scalar_ctype)
 
 
+def _value_param_msl_type(arg_var) -> str | None:
+    """MSL type of a by-value vec/quat/transform/mat kernel param, else ``None``.
+
+    Only float/half/int element types are reconstructed as typed locals;
+    anything else keeps the raw scalar-pointer form.
+    """
+    kind = getattr(arg_var.type, "_wp_generic_type_str_", None)
+    if kind not in ("vec_t", "quat_t", "transform_t", "mat_t") or _is_array_arg(arg_var):
+        return None
+    scalar_ctype = f"wp::{arg_var.type._wp_scalar_type_.__name__}"
+    inner = _SCALAR_CTYPE_TO_MSL.get(scalar_ctype)
+    if inner not in _MSL_PREFIX_TO_SAME:
+        return None
+    if kind == "mat_t":
+        rows, cols = arg_var.type._shape_
+        return _msl_mat_name(rows, cols, inner)
+    return _msl_vec_name(arg_var.type._length_, inner)
+
+
 def _native_scalar_param_msl(arg_var) -> str:
     """Return the MSL type for a Warp *scalar* (non-array, non-struct) argument."""
     scalar_ctype = f"wp::{arg_var.type.__name__}"
     return _native_scalar_msl_type(scalar_ctype)
+
+
+_METAL_MAX_BUFFER_ARGS = 31
 
 
 def _wrap_msl_for_native_dispatch(artifact) -> str:
@@ -18085,12 +18775,13 @@ def _wrap_msl_for_native_dispatch(artifact) -> str:
     out_by_name = {a.label: a for a in artifact.output_args}
 
     params: list[str] = []
-    slot = 0
+    # Buffer parameters in slot order: ``(decl, spill)`` where ``spill`` is
+    # ``(name, pointer_type)`` for array params that may move into the
+    # ``__spill_ptrs`` table when the kernel exceeds Metal's 31 buffer slots.
+    pending: list[tuple[str, tuple[str, str] | None]] = []
 
-    def add_buffer(decl: str) -> None:
-        nonlocal slot
-        params.append(f"  {decl} [[buffer({slot})]]")
-        slot += 1
+    def add_buffer(decl: str, spill: tuple[str, str] | None = None) -> None:
+        pending.append((decl, spill))
 
     # Lines inserted at the top of the kernel body — reconstruct typed
     # locals for by-value vec/mat params bound as raw scalar blobs.
@@ -18118,11 +18809,11 @@ def _wrap_msl_for_native_dispatch(artifact) -> str:
             arg_var = arg_by_name[name]
             if _is_array_arg(arg_var):
                 inner = _native_array_inner_msl(arg_var)
-                add_buffer(f"const constant {inner}* {name}")
+                add_buffer(f"const constant {inner}* {name}", spill=(name, f"const device {inner}*"))
             elif isinstance(arg_var.type, Struct):
                 # Struct arg is serialised as flat float32 storage.
                 add_buffer(f"const constant float* {name}")
-            elif getattr(arg_var.type, "_wp_generic_type_str_", None) in ("vec_t", "quat_t"):
+            elif getattr(arg_var.type, "_wp_generic_type_str_", None) in ("vec_t", "quat_t", "transform_t"):
                 # By-value vector param. Bound as a small ``setBytes`` blob
                 # of N scalars, declared as a raw scalar pointer (a
                 # ``constant floatN*`` would read with MSL's 16-byte vector
@@ -18139,6 +18830,13 @@ def _wrap_msl_for_native_dispatch(artifact) -> str:
                     add_buffer(f"const constant {inner}* {name}__bytes")
                     elems = ", ".join(f"{name}__bytes[{i}]" for i in range(n))
                     value_prologue.append(f"    const {inner}{n} {name} = {inner}{n}({elems});")
+                elif f"struct wp_vec{n}_{inner} {{" in artifact.header:
+                    # Big vec / transform: rebuild the ``wp_vecN_*`` struct so
+                    # whole-value uses (``wp_transform_point(t, p)``) compile;
+                    # element extracts go through its ``operator[]``.
+                    add_buffer(f"const constant {inner}* {name}__bytes")
+                    elems = ", ".join(f"{name}__bytes[{i}]" for i in range(n))
+                    value_prologue.append(f"    const wp_vec{n}_{inner} {name} = wp_vec{n}_{inner}_make({elems});")
                 else:
                     add_buffer(f"const constant {inner}* {name}")
             elif getattr(arg_var.type, "_wp_generic_type_str_", None) == "mat_t":
@@ -18149,6 +18847,14 @@ def _wrap_msl_for_native_dispatch(artifact) -> str:
                 rows, cols = arg_var.type._shape_
                 scalar_cls = arg_var.type._wp_scalar_type_
                 inner = _native_scalar_msl_type(f"wp::{scalar_cls.__name__}")
+                mat_name = _msl_mat_name(rows, cols, inner)
+                if f"struct {mat_name} {{" in artifact.header:
+                    # Big / non-square / integer mat: row-major struct, same
+                    # layout as the blob.
+                    add_buffer(f"const constant {inner}* {name}__bytes")
+                    elems = ", ".join(f"{name}__bytes[{i}]" for i in range(rows * cols))
+                    value_prologue.append(f"    const {mat_name} {name} = {mat_name}_make({elems});")
+                    continue
                 if rows != cols or rows not in _MSL_VEC_NATIVE_N:
                     raise MetalCodegenError(
                         f"Native dispatch: by-value mat_t<{rows}, {cols}> kernel param {name!r} is not "
@@ -18261,7 +18967,42 @@ def _wrap_msl_for_native_dispatch(artifact) -> str:
         inner = _native_array_inner_msl(arg_var)
         atomic_ok = artifact.atomic_outputs and name not in artifact.nonatomic_outputs
         qual = f"device atomic<{inner}>*" if atomic_ok else f"device {inner}*"
-        add_buffer(f"{qual} {name}")
+        add_buffer(f"{qual} {name}", spill=(name, qual))
+
+    # Metal caps a kernel at 31 buffer arguments (slots 0..30). Past that,
+    # move array params — outputs first, then inputs, from the end of the
+    # slot list — into one ``__spill_ptrs`` table of ``gpuAddress`` values;
+    # the prologue rebinds each address to a typed device pointer under the
+    # param's name, so the body is unchanged. The launcher removes the
+    # spilled bindings (``artifact.native_spill_slots``), builds the table
+    # and declares the buffers via ``useResource`` (also under ICB capture).
+    spill_slots: list[int] = []
+    if len(pending) > _METAL_MAX_BUFFER_ARGS:
+        need = len(pending) - (_METAL_MAX_BUFFER_ARGS - 1)
+        for i in range(len(pending) - 1, -1, -1):
+            if len(spill_slots) == need:
+                break
+            if pending[i][1] is not None:
+                spill_slots.append(i)
+        if len(spill_slots) < need:
+            raise MetalCodegenError(
+                f"Kernel {artifact.name!r} needs {len(pending)} Metal buffer arguments and only "
+                f"{len(spill_slots)} array arguments can be moved out of the 31-slot limit"
+            )
+        spill_slots.sort()
+    spill_set = set(spill_slots)
+    for k, i in enumerate(spill_slots):
+        sname, ptype = pending[i][1]
+        value_prologue.append(f"    {ptype} {sname} = reinterpret_cast<{ptype}>(__spill_ptrs[{k}]);")
+    slot = 0
+    for i, (decl, _spill) in enumerate(pending):
+        if i in spill_set:
+            continue
+        params.append(f"  {decl} [[buffer({slot})]]")
+        slot += 1
+    if spill_slots:
+        params.append(f"  const constant ulong* __spill_ptrs [[buffer({slot})]]")
+    artifact.native_spill_slots = tuple(spill_slots)
 
     # Builtins — always include the full set so the body's references
     # resolve regardless of whether it actually uses them. Apple's
@@ -18484,7 +19225,7 @@ def _native_pack_scalar_arg(arg_var, value) -> tuple[bytes, int]:
     # By-value vec/quat/mat params: instances are ctypes arrays of scalars
     # (mats in Warp row-major order), so their raw bytes are exactly the
     # layout the ``{name}__bytes`` scalar-pointer param expects.
-    if getattr(wp_type, "_wp_generic_type_str_", None) in ("vec_t", "quat_t", "mat_t"):
+    if getattr(wp_type, "_wp_generic_type_str_", None) in ("vec_t", "quat_t", "transform_t", "mat_t"):
         inst = value if isinstance(value, wp_type) else wp_type(value)
         return bytes(inst), ctypes.sizeof(inst)
     # ``warp.float32`` etc. expose a ctypes-compatible ``_type_``;
@@ -18647,6 +19388,15 @@ def launch_metal_kernel_native(
             f"but kernel requires {n_kernel_args}."
         )
     _normalize_none_array_args(kernel, fwd_args, device)
+    _sa_reads = getattr(artifact, "struct_array_field_reads", ())
+    if _sa_reads:
+        for _arg, _val in zip(kernel.adj.args, fwd_args):
+            if _arg.label in _sa_reads and getattr(_val, "size", 0):
+                raise MetalCodegenError(
+                    f"Kernel '{kernel.key}' reads array fields of the elements of {_arg.label!r} "
+                    f"(a wp.array of a struct with array members), which the Metal backend does not "
+                    f"support; such reads only work while the array is empty"
+                )
     # Per-kernel metadata dicts are reused across launches — caching
     # them on the kernel object shaves ~10 µs/launch off the hot path.
     arg_by_name = getattr(kernel, "_metal_native_arg_by_name", None)
@@ -19089,10 +19839,15 @@ def launch_metal_kernel_native(
             # would run off the end of it.
             value = _struct_field_launch_value(fwd_args, arg_by_name, sfa[0], sfa[1])
             if value is None:
-                raise RuntimeError(
-                    f"Kernel '{kernel.key}' writes through struct arg {sfa[0]!r} field "
-                    f"{'.'.join(sfa[1])!r}, which is unset; assign a wp.array to it before launching"
-                )
+                # Unset field: CUDA passes a null array whose shape reads as 0,
+                # so a write is only reachable behind a ``shape[0] > 0`` guard
+                # (Newton's optional contact writer outputs). Bind a scratch
+                # buffer; its packed shape is 0 like the CUDA null array.
+                buf, _ = dispatcher.alloc(16)
+                transient_refs.append(buf)
+                bindings.append(buf)
+                binding_modes.append("rw")
+                continue
             arg_var = out_var_by_name[name]
         else:
             idx, arg_var = arg_by_name[name]
@@ -19189,6 +19944,23 @@ def launch_metal_kernel_native(
             if grid_y * grid_z <= 1024:
                 tg = (1, grid_y, grid_z)
             # else: keep default tg and accept potential race (matches MLX path's behaviour).
+
+    # ---- Spilled array params (see ``_wrap_msl_for_native_dispatch``) ----
+    spill_slots = getattr(artifact, "native_spill_slots", ())
+    if spill_slots:
+        table = np.empty(len(spill_slots), dtype=np.uint64)
+        if extra_resources is None:
+            extra_resources = []
+        for k, i in enumerate(spill_slots):
+            mtl, view_off = _split_buffer_slice(bindings[i])
+            table[k] = int(mtl.gpuAddress()) + view_off
+            extra_resources.append((mtl, binding_modes[i] or "rw"))
+        spill_set = set(spill_slots)
+        bindings = [b for i, b in enumerate(bindings) if i not in spill_set]
+        binding_modes = [m for i, m in enumerate(binding_modes) if i not in spill_set]
+        data = table.tobytes()
+        bindings.append((data, len(data)))
+        binding_modes.append(None)
 
     # ---- Dispatch (fire and forget) ----
     try:

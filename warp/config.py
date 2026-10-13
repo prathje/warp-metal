@@ -410,6 +410,20 @@ Setting this to ``True`` selects the ``"demote"`` mode whenever
 ``metal_fp64`` assignment; prefer the string setting.
 """
 
+metal_print: str = _os.environ.get("WARP_METAL_PRINT", "").strip().lower() or "warn"
+"""How Metal kernels handle ``wp.print()`` / ``wp.printf()``.
+
+Metal compute kernels have no ``printf``, so the calls are compiled out:
+
+* ``"warn"`` (default): drop them and warn once per process, naming the first
+  kernel affected.
+* ``"ignore"``: drop them silently.
+* ``"error"``: raise when a kernel containing one is compiled for Metal.
+
+Initialized from the ``WARP_METAL_PRINT`` environment variable. Does not
+affect CPU or CUDA kernels.
+"""
+
 metal_native_dispatch: bool = _env_flag("WARP_METAL_NATIVE_DISPATCH", default=True)
 """Route Metal launches through Apple's Metal API directly instead of MLX.
 
