@@ -6294,12 +6294,10 @@ class Mesh:
         if getattr(self.device, "is_metal", False):
             # Metal meshes build their own warp-backend BVH over host-computed
             # triangle AABBs — see warp/_src/metal_bvh.py. Ray, closest-point,
-            # and AABB queries are implemented in MSL; winding-number sign
-            # queries are not (they need the solid-angle node hierarchy).
+            # AABB and winding-number queries are implemented in MSL (the
+            # solid-angle node data is built on the host, see metal_winding.py).
             from warp._src.metal_bvh import MetalMesh  # noqa: PLC0415
 
-            if support_winding_number:
-                raise RuntimeError("support_winding_number=True is not supported for wp.Mesh on Metal")
             if bvh_constructor in (BvhConstructor.LBVH, BvhConstructor.CUBQL):
                 log_warning(
                     f"{BvhConstructor(bvh_constructor).name} constructor is not available for a Metal mesh. "
@@ -6309,7 +6307,15 @@ class Mesh:
                 bvh_constructor = BvhConstructor.SAH
                 if bvh_leaf_size < 1:  # cubql default resolved to 0 above
                     bvh_leaf_size = 4
-            self._metal = MetalMesh(points, indices, int(bvh_constructor), bvh_leaf_size, groups, velocities=velocities)
+            self._metal = MetalMesh(
+                points,
+                indices,
+                int(bvh_constructor),
+                bvh_leaf_size,
+                groups,
+                velocities=velocities,
+                support_winding_number=support_winding_number,
+            )
             self.id = self._metal.id
             return
 
@@ -7517,6 +7523,30 @@ class Volume:
             raise RuntimeError(
                 "tile_points must be contiguous and either a 1D Warp array of vec3f or vec3i or a 2D n-by-3 array of int32 or float32."
             )
+        if getattr(device, "is_metal", False):
+            # The native tile builder only targets host/CUDA memory: build the
+            # grid on the host, then upload its bytes into a Metal volume.
+            # (Passing Metal pointers to the host builder produced a host-side
+            # volume whose id the GPU cannot read: every lookup returned 0.)
+            if rebuildable or max_tiles is not None or max_lower_nodes is not None or max_upper_nodes is not None:
+                raise NotImplementedError(
+                    "Volume.allocate_by_tiles() on Metal devices does not support rebuildable volumes "
+                    "or rebuild capacities yet."
+                )
+            host = cls.allocate_by_tiles(
+                tile_points.to("cpu"),
+                voxel_size=voxel_size,
+                bg_value=bg_value,
+                translation=translation,
+                device="cpu",
+                transform=transform,
+                point_mask=None if point_mask is None else point_mask.to("cpu"),
+            )
+            grid = warp.clone(host.array(), device=device)
+            volume = cls(grid, copy=False)
+            volume._grid_array = grid
+            return volume
+
         if tile_points.device != device:
             tile_points = tile_points.to(device)
 

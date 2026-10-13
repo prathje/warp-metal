@@ -6852,12 +6852,12 @@ class TestMetalUnsupportedFeaturesRaise(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet)
 
-    def test_mesh_query_winding_number_kernel_raises(self):
-        # The point/ray/aabb query families work on Metal (see
-        # TestMetalBvhMesh); winding-number sign queries need the
-        # solid-angle node hierarchy and stay unsupported. On the MLX
-        # path even mesh CREATION raises (BVH residency needs native
-        # dispatch).
+    def test_mesh_query_winding_number_without_support_matches_cpu(self):
+        # Winding-number sign queries run on Metal (TestMetalMeshWinding in
+        # test_metal_tiles_ext). On a mesh built without
+        # ``support_winding_number`` they fall back to ray-parity signs, as
+        # on CPU. On the MLX path mesh CREATION raises (BVH residency needs
+        # native dispatch).
         snippet = textwrap.dedent(
             """
             import numpy as np
@@ -6868,35 +6868,29 @@ class TestMetalUnsupportedFeaturesRaise(unittest.TestCase):
                 i = wp.tid()
                 q = wp.mesh_query_point_sign_winding_number(mesh, pts[i], 10.0)
                 if q.result:
-                    d[i] = 1.0
+                    d[i] = q.sign + float(q.face) * 10.0
 
             dev = 'metal:0'
-            mesh_pts = wp.array(np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0]], np.float32),
-                                dtype=wp.vec3, device=dev)
-            tris = wp.array(np.array([0, 1, 2], np.int32), device=dev)
             if not wp.config.metal_native_dispatch:
                 try:
-                    wp.Mesh(points=mesh_pts, indices=tris)
+                    wp.Mesh(points=wp.array(np.zeros((3, 3), np.float32), dtype=wp.vec3, device=dev),
+                            indices=wp.array(np.array([0, 1, 2], np.int32), device=dev))
                 except RuntimeError as e:
                     assert 'native dispatch' in str(e), str(e)
                 else:
                     raise AssertionError('Mesh creation should have raised on the MLX path')
                 raise SystemExit(0)
-            try:
-                wp.Mesh(points=mesh_pts, indices=tris, support_winding_number=True)
-            except RuntimeError as e:
-                assert 'winding' in str(e), str(e)
-            else:
-                raise AssertionError('support_winding_number mesh creation should have raised')
-            mesh = wp.Mesh(points=mesh_pts, indices=tris)
-            pts = wp.array(np.zeros((4, 3), np.float32), dtype=wp.vec3, device=dev)
-            d = wp.zeros(4, dtype=wp.float32, device=dev)
-            try:
-                wp.launch(k_mesh, dim=4, inputs=[mesh.id, pts], outputs=[d], device=dev)
-            except Exception as e:
-                assert 'winding_number' in str(e), str(e)
-            else:
-                raise AssertionError('winding-number query launch should have raised')
+            res = {}
+            for d_ in ('cpu', dev):
+                mesh = wp.Mesh(points=wp.array(np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0]], np.float32),
+                                               dtype=wp.vec3, device=d_),
+                               indices=wp.array(np.array([0, 1, 2], np.int32), device=d_))
+                pts = wp.array(np.array([[0.2, 0.2, 0.5], [0.2, 0.2, -0.5], [3, 3, 3], [0, 0, 0]], np.float32),
+                               dtype=wp.vec3, device=d_)
+                d = wp.zeros(4, dtype=wp.float32, device=d_)
+                wp.launch(k_mesh, dim=4, inputs=[mesh.id, pts], outputs=[d], device=d_)
+                res[d_] = d.numpy()
+            np.testing.assert_array_equal(res[dev], res['cpu'])
             """
         )
         _run_with_metal_enabled(self, snippet)

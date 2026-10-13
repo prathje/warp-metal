@@ -160,6 +160,8 @@ from warp._src.codegen_metal_ast import fold_struct_array_array_fields as _ast_f
 from warp._src.codegen_metal_ast import fold_tuple_locals as _ast_fold_tuples
 from warp._src.codegen_metal_ast import fold_views as _ast_fold_views
 from warp._src.codegen_metal_ast import has_print_calls as _ast_has_print_calls
+from warp._src import codegen_metal_texture as _mtex
+from warp._src import codegen_metal_tiles as _mtiles
 from warp._src.codegen_metal_ast import inline_user_calls as _ast_inline
 from warp._src.codegen_metal_ast import lower_reverse_ranges as _ast_lower_reverse_ranges
 from warp._src.codegen_metal_ast import parse as _ast_parse
@@ -4057,6 +4059,7 @@ struct wp_mesh_desc_t {
     int num_tris;
     float average_edge_length;
     int pad1;
+    ulong solid_angle_props;
 };
 inline const device wp_bvh_node_t* wp_bvh_node_ptr(ulong a) { return reinterpret_cast<const device wp_bvh_node_t*>(a); }
 inline const device int* wp_bvh_int_ptr(ulong a) { return reinterpret_cast<const device int*>(a); }
@@ -5219,6 +5222,139 @@ inline wp_mesh_query_point_t wp_mesh_query_point_sign_normal(
         id, point, max_dist, query.sign, query.face, query.u, query.v, epsilon);
     return query;
 }
+// Winding numbers (``support_winding_number=True``): a port of
+// solid_angle_iterative / evaluate_node_solid_angle / robust_solid_angle in
+// warp/native/{mesh,solid_angle}.h. Node data layout: see metal_winding.py.
+struct wp_solid_angle_props_t {
+    packed_float3 average_p; packed_float3 normal; packed_float3 n_ij_diag; packed_float3 n_ijk_diag;
+    float sum_permute_n_xyz; float two_n_xxy_n_yxx; float two_n_xxz_n_zxx; float two_n_yyz_n_zyy;
+    float two_n_yyx_n_xyy; float two_n_zzx_n_xzz; float two_n_zzy_n_yzz;
+    float n_xy; float n_yx; float n_yz; float n_zy; float n_zx; float n_xz;
+    packed_float3 box_lower; packed_float3 box_upper; packed_float3 area_p; float area; float max_p_dist_sq;
+};
+inline bool wp_evaluate_node_solid_angle(float3 query_point, const device wp_solid_angle_props_t& data,
+                                          thread float& solid_angle, float accuracy_scale_sq) {
+    float max_p_sq = data.max_p_dist_sq;
+    float3 q = query_point - float3(data.average_p);
+    float qlength2 = wp_bvh_dot3(q, q);
+    if (qlength2 <= max_p_sq * accuracy_scale_sq) { solid_angle = 0.0f; return true; }
+    float qlength_m2 = 1.0f / qlength2;
+    float qlength_m1 = metal::precise::sqrt(qlength_m2);
+    q = q * qlength_m1;
+    float3 nrm = float3(data.normal);
+    float3 nij = float3(data.n_ij_diag);
+    float3 nijk = float3(data.n_ijk_diag);
+    float omega_approx = -qlength_m2 * wp_bvh_dot3(q, nrm);
+    float3 q2 = q * q;
+    float qlength_m3 = qlength_m2 * qlength_m1;
+    float omega_1 = qlength_m3 * (nij.x + nij.y + nij.z
+        - 3.0f * (wp_bvh_dot3(q2, nij) + q.x * q.y * (data.n_xy + data.n_yx)
+                  + q.x * q.z * (data.n_zx + data.n_xz) + q.y * q.z * (data.n_yz + data.n_zy)));
+    omega_approx += omega_1;
+    float3 q3 = q2 * q;
+    float qlength_m4 = qlength_m2 * qlength_m2;
+    float3 temp0 = float3(data.two_n_yyx_n_xyy + data.two_n_zzx_n_xzz, data.two_n_zzy_n_yzz + data.two_n_xxy_n_yxx,
+                          data.two_n_xxz_n_zxx + data.two_n_yyz_n_zyy);
+    float3 temp1 = float3(q.y * data.two_n_xxy_n_yxx + q.z * data.two_n_xxz_n_zxx,
+                          q.z * data.two_n_yyz_n_zyy + q.x * data.two_n_yyx_n_xyy,
+                          q.x * data.two_n_zzx_n_xzz + q.y * data.two_n_zzy_n_yzz);
+    float omega_2 = qlength_m4 * (1.5f * wp_bvh_dot3(q, 3.0f * nijk + temp0)
+        - 7.5f * (wp_bvh_dot3(q3, nijk) + q.x * q.y * q.z * data.sum_permute_n_xyz + wp_bvh_dot3(q2, temp1)));
+    omega_approx += omega_2;
+    if (!metal::isfinite(omega_approx)) { solid_angle = 0.0f; return true; }
+    solid_angle = omega_approx;
+    return false;
+}
+inline float wp_robust_solid_angle(float3 a, float3 b, float3 c, float3 p) {
+    float3 qa = a - p; float3 qb = b - p; float3 qc = c - p;
+    const float a_length = metal::length(qa);
+    const float b_length = metal::length(qb);
+    const float c_length = metal::length(qc);
+    if (a_length == 0.0f || b_length == 0.0f || c_length == 0.0f) return 0.0f;
+    qa = qa / a_length; qb = qb / b_length; qc = qc / c_length;
+    const float numerator = wp_bvh_dot3(qa, metal::cross(qb - qa, qc - qa));
+    if (numerator == 0.0f) return 0.0f;
+    const float denominator = 1.0f + wp_bvh_dot3(qa, qb) + wp_bvh_dot3(qa, qc) + wp_bvh_dot3(qb, qc);
+    return 2.0f * metal::precise::atan2(numerator, denominator);
+}
+inline float wp_mesh_solid_angle_iterative(const thread wp_mesh_desc_t& mesh, float3 p, float accuracy_sq) {
+    const device wp_bvh_node_t* lowers = wp_bvh_node_ptr(mesh.bvh.node_lowers);
+    const device wp_bvh_node_t* uppers = wp_bvh_node_ptr(mesh.bvh.node_uppers);
+    const device int* prims = wp_bvh_int_ptr(mesh.bvh.primitive_indices);
+    const device int* tri_indices = wp_bvh_int_ptr(mesh.indices);
+    const device wp_solid_angle_props_t* props =
+        reinterpret_cast<const device wp_solid_angle_props_t*>(mesh.solid_angle_props);
+    int stack[32]; int at_child[32]; float angle[32];
+    stack[0] = mesh.bvh.root; at_child[0] = 0; angle[0] = 0.0f;
+    int count = 1;
+    while (count) {
+        const int node_index = stack[count - 1];
+        wp_bvh_node_t lower = lowers[node_index];
+        wp_bvh_node_t upper = uppers[node_index];
+        const int left_index = int(lower.bits & 0x7fffffffu);
+        const int right_index = int(upper.bits & 0x7fffffffu);
+        if (lower.bits & 0x80000000u) {
+            angle[count - 1] = 0.0f;
+            for (int pc = left_index; pc < right_index; ++pc) {
+                int primitive_index = prims[pc];
+                float3 a = wp_bvh_load_v3(mesh.points, tri_indices[primitive_index * 3 + 0]);
+                float3 b = wp_bvh_load_v3(mesh.points, tri_indices[primitive_index * 3 + 1]);
+                float3 c = wp_bvh_load_v3(mesh.points, tri_indices[primitive_index * 3 + 2]);
+                angle[count - 1] += wp_robust_solid_angle(a, b, c, p);
+            }
+            count--;
+        } else if (at_child[count - 1] == 0) {
+            float a = 0.0f;
+            bool des = wp_evaluate_node_solid_angle(p, props[node_index], a, accuracy_sq);
+            angle[count - 1] = a;
+            if (des) {
+                stack[count] = left_index; at_child[count - 1] = 1; angle[count] = 0.0f; at_child[count] = 0; count++;
+            } else {
+                count--;
+            }
+        } else if (at_child[count - 1] == 1) {
+            angle[count - 1] += angle[count];
+            stack[count] = right_index; at_child[count - 1] = 2; angle[count] = 0.0f; at_child[count] = 0; count++;
+        } else {
+            angle[count - 1] += angle[count];
+            count--;
+        }
+    }
+    return angle[0];
+}
+inline float wp_mesh_query_winding_number(ulong id, float3 p, float accuracy) {
+    wp_mesh_desc_t mesh = wp_mesh_get_desc(id);
+    if (mesh.solid_angle_props == 0ul) return 0.0f;
+    return wp_mesh_solid_angle_iterative(mesh, p, accuracy * accuracy) * 0.07957747154f;
+}
+inline bool wp_mesh_query_point_sign_winding_number(
+    ulong id, float3 point, float max_dist,
+    thread float& inside, thread int& face, thread float& u, thread float& v,
+    float accuracy, float winding_number_threshold)
+{
+    wp_mesh_desc_t mesh = wp_mesh_get_desc(id);
+    if (!wp_mesh_closest_point_impl(mesh, point, max_dist, face, u, v)) { return false; }
+    if (mesh.solid_angle_props == 0ul) {
+        inside = wp_mesh_query_inside_ray_tracing(id, point);
+    } else {
+        float w = wp_mesh_solid_angle_iterative(mesh, point, accuracy * accuracy) * 0.07957747154f;
+        inside = (w > winding_number_threshold) ? -1.0f : 1.0f;
+    }
+    return true;
+}
+inline wp_mesh_query_point_t wp_mesh_query_point_sign_winding_number(
+    ulong id, float3 point, float max_dist, float accuracy, float winding_number_threshold)
+{
+    wp_mesh_query_point_t query;
+    query.result = false;
+    query.sign = 0.0f;
+    query.face = 0;
+    query.u = 0.0f;
+    query.v = 0.0f;
+    query.result = wp_mesh_query_point_sign_winding_number(
+        id, point, max_dist, query.sign, query.face, query.u, query.v, accuracy, winding_number_threshold);
+    return query;
+}
 // A mesh descriptor starts with its BVH descriptor, so the generic bvh
 // query machinery reads the right tree straight from a mesh id; item
 // bounds in that descriptor are the per-triangle AABBs, matching the
@@ -5422,6 +5558,18 @@ inline uint32_t wp_volume_grid_type(pnanovdb_buf_t buf) {
 }
 inline pnanovdb_root_handle_t wp_volume_root(pnanovdb_buf_t buf) {
     return pnanovdb_tree_get_root(buf, pnanovdb_grid_get_tree(buf, wp_volume_grid()));
+}
+inline int wp_volume_voxel_count(ulong id) {
+    pnanovdb_buf_t buf = wp_volume_buf(id);
+    pnanovdb_tree_handle_t tree = pnanovdb_grid_get_tree(buf, wp_volume_grid());
+    uint32_t grid_type = wp_volume_grid_type(buf);
+    ulong count;
+    if (grid_type == PNANOVDB_GRID_TYPE_ONINDEX || grid_type == PNANOVDB_GRID_TYPE_ONINDEXMASK) {
+        count = pnanovdb_tree_get_voxel_count(buf, tree);
+    } else {
+        count = ulong(pnanovdb_tree_get_node_count_leaf(buf, tree)) * ulong(PNANOVDB_LEAF_TABLE_COUNT);
+    }
+    return count > 2147483647ul ? 2147483647 : int(count);
 }
 inline pnanovdb_coord_t wp_on_coord(int i, int j, int k) {
     pnanovdb_coord_t c;
@@ -8605,6 +8753,12 @@ def _build_kernel_header(source: str) -> str:
     misc_math = _emit_misc_math_helpers(source)
     if misc_math:
         parts.append(misc_math)
+    tile_ext_helpers = _mtiles.emit_helpers(source)
+    if tile_ext_helpers:
+        parts.append(tile_ext_helpers)
+    texture_helpers = _mtex.emit_helpers(source)
+    if texture_helpers:
+        parts.append(texture_helpers)
     if need_mat1x1:
         parts.append(
             "inline float wp_trace(wp_mat1x1_float m) { return m.c[0]; }\n"
@@ -8995,7 +9149,6 @@ def _msl_pointer_type(ctype: str) -> str:
 
 
 _TILE_CTYPE_HEAD_PAT = re.compile(r"wp::tile_(shared|register)_t<\s*(.+)$")
-_TILE_SHAPE_PAT = re.compile(r"wp::tile_shape_t<\s*(\d+)\s*(?:,\s*(\d+))?\s*>")
 
 
 _VEC_T_INNER_PAT = re.compile(r"wp::vec_t<\s*(\d+)\s*,\s*([\w:]+)\s*>")
@@ -9041,12 +9194,14 @@ def _parse_tile_ctype(ctype: str) -> tuple[str, str, int, int] | None:
             break
     if split_at is None:
         return None
-    dtype_ctype = rest[:split_at].strip()
-    shape_match = _TILE_SHAPE_PAT.search(rest[split_at:])
-    if shape_match is None:
+    # Quats and transforms are vec_t<4> / vec_t<7> on Metal (see
+    # ``_normalize_quat_t``), so their tiles are vec-element tiles.
+    dtype_ctype = _normalize_quat_t(rest[:split_at].strip())
+    full_shape = _mtiles.full_tile_shape(rest[split_at:])
+    if full_shape is None:
         return None
-    rows = int(shape_match.group(1))
-    cols = int(shape_match.group(2)) if shape_match.group(2) else 1
+    # ``(1, R, C)`` and other unit-leading shapes share ``(R, C)``'s storage.
+    rows, cols = _mtiles.collapse_shape(full_shape)
     return kind, _demote_f64_ctype(dtype_ctype), rows, cols
 
 
@@ -9141,6 +9296,11 @@ def _demote_tile_f64_tokens(text: str) -> str:
 
 def _msl_var_type(ctype: str) -> str:
     """Translate a local variable's ctype to MSL."""
+    ext = _mtiles.msl_var_type(ctype)
+    if ext is None:
+        ext = _mtex.msl_var_type(ctype)
+    if ext is not None:
+        return ext
     if ctype.endswith("*"):
         return _msl_pointer_type(ctype)
     # Composite float64 VALUES (``vec_t<2, wp::float64>``, ``mat_t<1, 1,
@@ -10093,6 +10253,8 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bwp::mesh_query_point_t\b"), "wp_mesh_query_point_t"),
     (re.compile(r"\bwp::mesh_query_point_sign_parity\b"), "wp_mesh_query_point_sign_parity"),
     (re.compile(r"\bwp::mesh_query_point_sign_normal\b"), "wp_mesh_query_point_sign_normal"),
+    (re.compile(r"\bwp::mesh_query_point_sign_winding_number\b"), "wp_mesh_query_point_sign_winding_number"),
+    (re.compile(r"\bwp::mesh_query_winding_number\b"), "wp_mesh_query_winding_number"),
     (re.compile(r"\bwp::mesh_query_point_no_sign\b"), "wp_mesh_query_point_no_sign"),
     (re.compile(r"\bwp::mesh_query_furthest_point_no_sign\b"), "wp_mesh_query_furthest_point_no_sign"),
     (re.compile(r"\bwp::mesh_query_point\b"), "wp_mesh_query_point"),
@@ -10124,6 +10286,10 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bwp::volume_lookup_v\b"), "wp_volume_lookup_v"),
     (re.compile(r"\bwp::volume_lookup_i\b"), "wp_volume_lookup_i"),
     (re.compile(r"\bwp::volume_store_f\b"), "wp_volume_store_f"),
+    (re.compile(r"\bwp::volume_voxel_count\b"), "wp_volume_voxel_count"),
+    # Generic ``wp.volume_store`` (value type picks the overload); the MSL
+    # ``wp_volume_store<T>`` template deduces it the same way.
+    (re.compile(r"\bwp::volume_store\s*\("), "wp_volume_store("),
     (re.compile(r"\bwp::volume_store_v\b"), "wp_volume_store_v"),
     (re.compile(r"\bwp::volume_store_i\b"), "wp_volume_store_i"),
     (re.compile(r"\bwp::volume_sample" + _VOLUME_TEMPLATE_ARG), _volume_template_repl("wp_volume_sample")),
@@ -10628,6 +10794,7 @@ def _tile_grad_slots(
     rows: int,
     cols: int,
     vec_n: int,
+    two_d: bool | None = None,
 ) -> list[tuple[str, str]]:
     """``[(array_flat_index, tile_element_accessor)]`` for a tile/array pairing.
 
@@ -10638,9 +10805,11 @@ def _tile_grad_slots(
     plain scalar, ``.c[k]`` for a register tile, plus ``[e]`` for the
     component of a vec-element tile.
     """
-    scalar_inner_dims = (2 if cols > 1 else 1) + (1 if vec_n else 0)
+    if two_d is None:
+        two_d = cols > 1
+    scalar_inner_dims = (2 if two_d else 1) + (1 if vec_n else 0)
     base_expr = _build_flat_base_expr(arr_name, lead_idx_args, inner_dims=scalar_inner_dims)
-    if cols > 1:
+    if two_d:
         row_stride = f"{arr_name}_shape[{len(lead_idx_args) + 1}]"
         row_off, col_off = offsets[0], offsets[1]
     else:
@@ -10878,18 +11047,11 @@ def _translate_tile_intrinsics(
                 # array dims ``n_lead`` and ``n_lead + 1``.
                 n_rows_expr = f"(int){arr_name}_shape[{n_lead}]"
                 n_cols_expr = f"(int){arr_name}_shape[{n_lead + 1}]"
-            elif tile_is_1d:
+            else:
                 # True 1-D tile: it walks the array's innermost dim, and any
                 # leading array indices were parsed as slice indices.
                 n_rows_expr = f"(int){arr_name}_shape[{n_lead}]"
                 n_cols_expr = "1"
-            elif n_lead >= 1:
-                # 2-D tile declared with a single column (``shape=(R, 1)``).
-                # Only one trailing offset is consumed above, so the row
-                # offset landed in ``lead_idx_args`` and the dim the tile
-                # actually walks is one further out.
-                n_rows_expr = f"(int){arr_name}_shape[{n_lead - 1}]"
-                n_cols_expr = f"(int){arr_name}_shape[{n_lead}]"
         if is_f64_src:
             # Same loop as the ``_load`` helper (bounds-checked zero-fill when
             # the extents are known), converting each element's double bits.
@@ -11273,6 +11435,30 @@ def _translate_tile_intrinsics(
         n = rows * cols
         if n == 1:
             return f"var_{lhs} = var_{in_label}"
+        vec_n = tile_var_vec_n.get(in_label, 0)
+        if vec_n > 0:
+            # Vec-element tile: ``c[]`` holds ``n * vec_n`` scalars, element-
+            # major. Reduce component-wise; the result is one vector.
+            comb = {
+                "wp::add": "{a} + {b}",
+                "wp::mul": "{a} * {b}",
+                "wp::min": "metal::min({a}, {b})",
+                "metal::min": "metal::min({a}, {b})",
+                "wp::max": "metal::max({a}, {b})",
+                "metal::max": "metal::max({a}, {b})",
+            }.get(op_fn)
+            if comb is None:
+                raise MetalCodegenError(
+                    f"MSL codegen: tile_reduce({op_fn}) over a vec-element tile is not supported on Metal"
+                )
+            parts = []
+            for k in range(vec_n):
+                expr = comb.format(a="_trv_acc", b=f"var_{in_label}.c[_trv_i * {vec_n} + {k}]")
+                parts.append(
+                    f"({{ auto _trv_acc = var_{in_label}.c[{k}]; "
+                    f"for (int _trv_i = 1; _trv_i < {n}; ++_trv_i) _trv_acc = {expr}; _trv_acc; }})"
+                )
+            return f"var_{lhs} = {_msl_vec_ctor(vec_n, _scalar)}({', '.join(parts)})"
         # Map known builtin op names to their accumulation expression.
         if op_fn == "wp::add":
             op_expr = "_tr_acc + var_{lhs}_in.c[_tr_i]"
@@ -11343,7 +11529,12 @@ def _translate_tile_intrinsics(
             return f"var_{lhs} = var_{in_label}"
         vec_n = tile_var_vec_n.get(in_label, 0)
         if vec_n > 0:
-            raise MetalCodegenError(f"MSL codegen: tile_sum on a vec-element tile 'var_{in_label}' is not supported")
+            parts = [
+                f"({{ auto _tsv_acc = var_{in_label}.c[{k}]; for (int _tsv_i = 1; _tsv_i < {n}; ++_tsv_i) "
+                f"_tsv_acc += var_{in_label}.c[_tsv_i * {vec_n} + {k}]; _tsv_acc; }})"
+                for k in range(vec_n)
+            ]
+            return f"var_{lhs} = {_msl_vec_ctor(vec_n, dims[2])}({', '.join(parts)})"
         return (
             f"var_{lhs} = ({{ auto _ts_acc = var_{in_label}.c[0]; "
             f"for (int _ts_i = 1; _ts_i < {n}; ++_ts_i) "
@@ -11752,6 +11943,10 @@ def _translate_tile_intrinsics(
         n = rows * cols
         if n == 1:
             return f"{dst} = ({dst} {op_sym} {src})"
+        # Vec-element tiles store ``vec_n`` scalars per element.
+        dst_vn = tile_var_vec_n.get(dst_label, 0)
+        if dst_vn and src_dims is not None:
+            n *= dst_vn
         if src_dims is None:
             # Scalar broadcast.
             return f"{{ for (int _ti_i = 0; _ti_i < {n}; ++_ti_i) {dst}.c[_ti_i] = {dst}.c[_ti_i] {op_sym} ({src}); }}"
@@ -12102,6 +12297,10 @@ def _translate_tile_intrinsics(
         in_rows, in_cols, _ = in_dims
         l_n = l_rows * l_cols
         in_n = in_rows * in_cols
+        if tile_var_vec_n.get(lhs, 0) or tile_var_vec_n.get(in_label, 0):
+            raise MetalCodegenError(
+                f"MSL codegen: tile_broadcast of a vec-element tile is not supported on Metal ({m.group(0)!r})"
+            )
         if in_n == 1:
             # Single-element source broadcast across the target tile.
             return f"{{ for (int _bc_i = 0; _bc_i < {l_n}; ++_bc_i) var_{lhs}.c[_bc_i] = var_{in_label}.c[0]; }}"
@@ -13332,7 +13531,64 @@ def _slot_elem_kind(arg) -> tuple | None:
     if gen == "mat_t":
         rows, cols = dtype._shape_
         return ("mat", int(rows), int(cols))
+    from warp._src.codegen import Struct  # noqa: PLC0415
+
+    if isinstance(dtype, Struct):
+        # Struct arrays live as flat float32 storage (see ``_struct_layout_for``);
+        # ``arr[i].field = x`` resolves to the field's scalar slots.
+        layout = _struct_layout_for(dtype)
+        return ("struct", layout.scalars_per_elem, layout)
     return None
+
+
+_SLOT_FIELD_TOKEN_PAT = re.compile(r"\.(?P<field>[A-Za-z_]\w*)(?![\w(])")
+
+
+def _slot_struct_components(kind: tuple, access: str) -> tuple[int, list[str], str] | None:
+    """Struct-array variant of ``_slot_components``: ``(stride, offsets, scalar_msl)``.
+
+    Walks ``.field`` tokens through nested structs to a leaf, then any
+    vec/mat component accessors on that leaf.
+    """
+    stride, layout = kind[1], kind[2]
+    access = access.strip()
+    base = 0
+    pos = 0
+    finfo = None
+    while pos < len(access):
+        m = _SLOT_FIELD_TOKEN_PAT.match(access, pos)
+        if m is None or m.group("field") in ("p", "q", "component_ref", "element_ref", "row_ref"):
+            break
+        finfo = layout.fields.get(m.group("field"))
+        if finfo is None:
+            return None
+        pos = m.end()
+        base += finfo.offset
+        if finfo.kind == _STRUCT_FIELD_KIND_STRUCT:
+            layout = finfo.sub
+            finfo = None
+            continue
+        break
+    if finfo is None:
+        return None
+    rest = access[pos:]
+    if finfo.kind in (_STRUCT_FIELD_KIND_SCALAR,):
+        if rest.strip():
+            return None
+        if finfo.bits < 32:
+            # Narrow field sharing a 4-byte slot: the store rewrites only its
+            # bits (see ``_struct_narrow_write``).
+            return stride, [str(base)], f"narrow{finfo.bits}x{finfo.byte_shift}_{finfo.scalar_msl}"
+        return stride, [str(base)], finfo.scalar_msl
+    if finfo.kind == _STRUCT_FIELD_KIND_VEC:
+        sub = _slot_components(("vec", finfo.size), rest)
+    elif finfo.kind == _STRUCT_FIELD_KIND_MAT:
+        sub = _slot_components(("mat", finfo.rows, finfo.cols), rest)
+    else:
+        return None
+    if sub is None:
+        return None
+    return stride, [f"{base} + {off}" for off in sub[1]], finfo.scalar_msl
 
 
 def _slot_components(kind: tuple, access: str) -> tuple[int, list[str]] | None:
@@ -13433,7 +13689,34 @@ def _lower_array_slot_ir(lines: list[str], adj, all_lines: list[str]) -> list[st
             out.append(ln)
             continue
         m = _SLOT_STORE_PAT.match(ln)
-        if m and m.group("arr") in kinds:
+        if m and m.group("arr") in kinds and kinds[m.group("arr")][0] == "struct":
+            arr = m.group("arr")
+            res = _slot_struct_components(kinds[arr], m.group("acc"))
+            if res is not None:
+                stride, offsets, scalar_msl = res
+                flat = _flat(arr, m.group("idx"))
+                op = "store" if scalar_msl == "float" else f"store_bits_{scalar_msl}"
+                for off, val in zip(offsets, _slot_value_components(m.group("val"), len(offsets))):
+                    out.append(
+                        f"{m.group('indent')}wp::__metal_scalar_store__(var_{arr}, {op}, ({flat}) * {stride} + {off}, {val});"
+                    )
+                continue
+        m = _SLOT_ATOMIC_PAT.match(ln)
+        if m and m.group("arr") in kinds and kinds[m.group("arr")][0] == "struct":
+            arr = m.group("arr")
+            res = _slot_struct_components(kinds[arr], m.group("acc"))
+            if res is not None and res[2] == "float" and m.group("op") in ("add", "sub"):
+                stride, offsets, _scalar = res
+                flat = _flat(arr, m.group("idx"))
+                msl = _ATOMIC_SLOT_TO_MSL[m.group("op")]
+                for off, val in zip(offsets, _slot_value_components(m.group("val"), len(offsets))):
+                    out.append(
+                        f"{m.group('indent')}{msl}((device atomic_float*)&{arr}[({flat}) * {stride} + {off}], {val}, "
+                        "memory_order_relaxed);"
+                    )
+                continue
+        m = _SLOT_STORE_PAT.match(ln)
+        if m and m.group("arr") in kinds and kinds[m.group("arr")][0] != "struct":
             arr = m.group("arr")
             res = _slot_components(kinds[arr], m.group("acc"))
             if res is not None:
@@ -13445,7 +13728,7 @@ def _lower_array_slot_ir(lines: list[str], adj, all_lines: list[str]) -> list[st
                     )
                 continue
         m = _SLOT_ATOMIC_PAT.match(ln)
-        if m and m.group("arr") in kinds:
+        if m and m.group("arr") in kinds and kinds[m.group("arr")][0] != "struct":
             arr = m.group("arr")
             if arr in f64_arrays:
                 raise MetalCodegenError(
@@ -13463,7 +13746,7 @@ def _lower_array_slot_ir(lines: list[str], adj, all_lines: list[str]) -> list[st
                     )
                 continue
         m = _SLOT_ADJ_PAT.match(ln)
-        if m and m.group("arr") in kinds:
+        if m and m.group("arr") in kinds and kinds[m.group("arr")][0] != "struct":
             arr = m.group("arr")
             res = _slot_components(kinds[arr], m.group("acc"))
             if res is not None:
@@ -13655,9 +13938,6 @@ def _requested_deterministic_mode(kernel):
     return mode
 
 
-_TILE_STACK_IR_RE = re.compile(r"\bwp::tile_stack_(?:alloc|init|push|pop|clear|count)\b|\btile_stack_t<")
-
-
 def _ir_matches(adj, pattern, seen=None) -> bool:
     """Whether the built IR of ``adj`` or any user function it calls matches ``pattern``."""
     if seen is None:
@@ -13673,15 +13953,6 @@ def _ir_matches(adj, pattern, seen=None) -> bool:
         if func_adj is not None and _ir_matches(func_adj, pattern, seen):
             return True
     return False
-
-
-def _check_tile_stack_unsupported(adj) -> None:
-    """Reject ``wp.tile_stack()`` (Warp 1.18) with a clear error on Metal."""
-    if _ir_matches(adj, _TILE_STACK_IR_RE):
-        raise MetalCodegenError(
-            f"Kernel {adj.fun_name!r}: wp.tile_stack() and wp.tile_stack_push()/pop()/count()/clear() "
-            "are not supported on Metal devices yet. Run the kernel on a CPU or CUDA device."
-        )
 
 
 def _check_deterministic_mode_supported(kernel, adj) -> None:
@@ -13750,7 +14021,6 @@ def _ensure_adj_built(kernel, block_dim: int | None = None, enable_backward: boo
         )
         _normalize_adj_ir(adj)
         _check_deterministic_mode_supported(kernel, adj)
-        _check_tile_stack_unsupported(adj)
         adj._metal_built_backward = backward
         adj._metal_ir_ok = True
 
@@ -14613,6 +14883,8 @@ def _generate_msl_kernel_uncached(
         subscript_map[field_local] = _struct_field_read_expr(buf, base_expr, finfo)
         buffer_field_stores[field_local] = (buf, base_expr, finfo)
 
+    # Pointers to texture-valued struct-local fields -> the MSL local.
+    texture_value_ptrs: dict[str, str] = {}
     struct_field_addr_pat = re.compile(r"^\s*var_(\w+)\s*=\s*&\s*\(\s*var_(\w+)\s*(->|\.)\s*(\w+)\s*\)\s*;\s*$")
     for raw in forward_lines:
         m = struct_field_addr_pat.match(raw)
@@ -14650,6 +14922,9 @@ def _generate_msl_kernel_uncached(
                     # field accesses resolve against the extended prefix.
                     struct_ptr_locals[field_local] = (f"{struct_local}__{field_name}", field_info.sub)
                     continue
+                if field_info.kind == _STRUCT_FIELD_KIND_TEXTURE:
+                    # A real MSL struct local: members read directly.
+                    texture_value_ptrs[field_local] = _per_field_local(struct_local, field_name)
                 subscript_map[field_local] = _per_field_local(struct_local, field_name)
                 if field_info.kind == _STRUCT_FIELD_KIND_VEC:
                     indexref_vec_bases[field_local] = _per_field_local(struct_local, field_name)
@@ -14670,6 +14945,9 @@ def _generate_msl_kernel_uncached(
                 if field_info.kind == _STRUCT_FIELD_KIND_STRUCT:
                     struct_ptr_bases[field_local] = (struct_local, str(field_info.offset), field_info.sub)
                     continue
+                if field_info.kind == _STRUCT_FIELD_KIND_TEXTURE:
+                    # Whole-value loads and member access (``.width``) both work.
+                    struct_ptr_bases[field_local] = (struct_local, str(field_info.offset), field_info.sub)
                 _bind_buffer_field(field_local, struct_local, str(field_info.offset), field_info)
                 continue
             continue
@@ -14677,6 +14955,9 @@ def _generate_msl_kernel_uncached(
         # accessor == "->": field access through a pointer into flat struct
         # storage (struct-array element / nested-struct chain) or into a
         # struct local's nested-struct field.
+        if struct_local in texture_value_ptrs:
+            subscript_map[field_local] = f"{texture_value_ptrs[struct_local]}.{field_name}"
+            continue
         if struct_local in struct_ptr_locals:
             prefix, layout = struct_ptr_locals[struct_local]
             field_info = layout.fields.get(field_name)
@@ -14704,6 +14985,8 @@ def _generate_msl_kernel_uncached(
         if field_info.kind == _STRUCT_FIELD_KIND_STRUCT:
             struct_ptr_bases[field_local] = (buf, f"{base_expr} + {field_info.offset}", field_info.sub)
             continue
+        if field_info.kind == _STRUCT_FIELD_KIND_TEXTURE:
+            struct_ptr_bases[field_local] = (buf, f"{base_expr} + {field_info.offset}", field_info.sub)
         _bind_buffer_field(field_local, buf, f"{base_expr} + {field_info.offset}", field_info)
 
     # ---- ``wp::indexref`` on vec lvalues -------------------------------
@@ -14830,7 +15113,7 @@ def _generate_msl_kernel_uncached(
                 #     ``T()`` zeros the trailing ``c[N]`` array.
                 _zero = (
                     f"{field_info.msl_type}()"
-                    if field_info.msl_type.startswith(("wp_mat", "wp_vec"))
+                    if field_info.msl_type.startswith(("wp_mat", "wp_vec", "wp_texture"))
                     else f"{field_info.msl_type}(0)"
                 )
                 body_lines.append(f"    {field_info.msl_type} {local_name} = {_zero};")
@@ -14856,6 +15139,14 @@ def _generate_msl_kernel_uncached(
             body_lines.append(f"    {_cd_ty} var_{var.label} = {_cd_ty}();")
             continue
         ctype = var.ctype()
+        if (
+            ctype.endswith("*")
+            and isinstance(getattr(var.type, "dtype", None) or getattr(var, "type", None), _StructEarly)
+            and not any(f"var_{var.label}" in ln for ln in forward_lines)
+        ):
+            # Pointer to a struct-array element left over from slot lowering
+            # (``arr[i].field = x``): never referenced after the rewrite.
+            continue
         msl_type = _msl_var_type(ctype)
         if var.constant is None:
             # Reverse mode reads primal locals the forward pass only wrote
@@ -15042,14 +15333,14 @@ def _generate_msl_kernel_uncached(
             continue
         _kind, dtype_ctype, rows, cols = parsed
         _record_tile(var.label, dtype_ctype, rows, cols)
-    # Tiles declared 2-D (``shape=(R, C)``, including ``C == 1``) take a
-    # (row, col) offset; ``tile_var_dims`` alone cannot tell ``(R, 1)`` from a
-    # 1-D ``R`` tile.
+    # Tiles declared with two or more dims (``shape=(R, C)``, including
+    # ``C == 1`` and unit-leading ``(1, R, C)``) take a (row, col) offset;
+    # ``tile_var_dims`` alone cannot tell ``(R, 1)`` from a 1-D ``R`` tile.
     tile_2d_labels: set[str] = set()
     for _lbl, _ct in [(v.label, v.ctype()) for v in adj.variables] + list(_inlined_var_ctypes.items()):
         if _parse_tile_ctype(_ct) is not None:
-            _sm = _TILE_SHAPE_PAT.search(_ct)
-            if _sm is not None and _sm.group(2) is not None:
+            _shp = _mtiles.full_tile_shape(_ct)
+            if _shp is not None and len(_shp) >= 2:
                 tile_2d_labels.add(str(_lbl))
     # Inlined-function tile locals — the inliner records every spliced
     # local's ctype keyed by its mangled label (e.g. ``136__17``); add
@@ -15097,6 +15388,11 @@ def _generate_msl_kernel_uncached(
             if m_def is None:
                 continue
             rhs = m_def.group(2)
+            # A value read out of an array is data, not an index computed from
+            # ``block_dim``: the taint stops at array addressing (Newton's tiled
+            # FK reads parent slots from a table indexed by the lane).
+            if re.match(r"(?:\(\s*)?(?:&\s*)?wp::(?:address|view|load|index|array_load)\b", rhs.strip()):
+                continue
             if "builtin_block_dim" in rhs or any(f"var_{t}" in rhs for t in _bd_tainted):
                 _bd_tainted.add(m_def.group(1))
         if _bd_tainted:
@@ -15156,6 +15452,13 @@ def _generate_msl_kernel_uncached(
     # (matmul_acc, *_solve_inplace) so writes to the view propagate
     # back to the parent tile struct via an explicit copy.
     view_aliases: dict[str, tuple[str, int, int, int, int, str, str, str]] = {}
+    # Lowerings for the tile ops ``codegen_metal_tiles`` owns (scatter,
+    # load_indexed, view/reshape aliasing, tile_stack, tile queries, ...).
+    _tile_ext_ctypes = {str(v.label): v.ctype() for v in adj.variables}
+    for _lbl_i, _ct_i in _inlined_var_ctypes.items():
+        _tile_ext_ctypes.setdefault(str(_lbl_i), _ct_i)
+    tile_ext = _mtiles.TileExt(forward_lines, tile_var_dims, tile_var_vec_n, _tile_ext_ctypes, view_aliases)
+    tile_2d_labels |= tile_ext.rank2_labels()
     # Set of (N, scalar) pairs for which we emitted the cooperative
     # variant of ``tile_cholesky``. Drives kernel-scope threadgroup
     # memory + lane declaration and the launcher's threadgroup-size
@@ -15426,6 +15729,8 @@ def _generate_msl_kernel_uncached(
         # the tile pattern matches on the raw ``wp::tile_*<...>`` shape,
         # which contains ``var_X`` operands that the substitute would
         # otherwise rewrite to expressions and break the parse.
+        translated = tile_ext.translate(translated)
+        translated = _mtex.translate(translated)
         translated = _translate_tile_intrinsics(
             translated,
             tile_var_dims,
@@ -15997,7 +16302,8 @@ def _generate_msl_kernel_uncached(
                 grad_name = grad_arg_of.get(arr_name)
                 if grad_name is None:
                     continue
-                n_off = 2 if cols > 1 else 1
+                two_d = cols > 1 or tile_label in tile_2d_labels
+                n_off = 2 if two_d else 1
                 index_args = args[1 : 1 + ndim]
                 if len(index_args) < n_off:
                     raise MetalCodegenError(
@@ -16015,8 +16321,8 @@ def _generate_msl_kernel_uncached(
                     # stride the scatter across lanes to add each element
                     # once per block.
                     _lead, _offs = index_args[: ndim - n_off], index_args[ndim - n_off :]
-                    _base = _build_flat_base_expr(arr_name, _lead, inner_dims=2 if cols > 1 else 1)
-                    if cols > 1:
+                    _base = _build_flat_base_expr(arr_name, _lead, inner_dims=2 if two_d else 1)
+                    if two_d:
                         _rstride = f"{arr_name}_shape[{len(_lead) + 1}]"
                         _roff, _coff = _offs[0], _offs[1]
                     else:
@@ -16037,6 +16343,7 @@ def _generate_msl_kernel_uncached(
                     rows,
                     cols,
                     tile_var_vec_n.get(tile_label, 0),
+                    two_d,
                 )
                 for idx_expr, cell in slots:
                     tgt = f"{grad_name}[{idx_expr}]"
@@ -16563,7 +16870,7 @@ def _generate_msl_kernel_uncached(
         scalar_store_match = re.match(
             r"^(?P<indent>\s*)wp::__metal_scalar_store__\s*\(\s*var_(?P<arr>\w+)\s*,\s*"
             r"(?P<op>store|assign_inplace|add_inplace|sub_inplace|mul_inplace|div_inplace|"
-            r"bit_or_inplace|bit_and_inplace|bit_xor_inplace)\s*,\s*"
+            r"bit_or_inplace|bit_and_inplace|bit_xor_inplace|store_bits_\w+)\s*,\s*"
             r"(?P<idx>[^,]+(?:,[^,]+)*?)\s*,\s*(?P<val>[^()]+?)\s*\)\s*;\s*$",
             raw,
         )
@@ -16573,6 +16880,20 @@ def _generate_msl_kernel_uncached(
             op_name = scalar_store_match.group("op")
             idx = scalar_store_match.group("idx").strip()
             val = scalar_store_match.group("val").strip()
+            narrow_store = None
+            if op_name.startswith("store_bits_narrow"):
+                # Narrow (1-/2-byte) field: read-modify-write its bits of the slot.
+                _geom, _sc = op_name[len("store_bits_narrow") :].split("_", 1)
+                _bits, _shift = _geom.split("x")
+                narrow_store = _StructFieldInfo(
+                    name="", offset=0, size=1, kind=_STRUCT_FIELD_KIND_SCALAR, msl_type=_sc, scalar_msl=_sc,
+                    bits=int(_bits), byte_shift=int(_shift),
+                )
+                op_name = "store"
+            elif op_name.startswith("store_bits_"):
+                # Non-float field of flat float32 struct storage: write the bits.
+                op_name = "store"
+                val = f"as_type<float>(({op_name and scalar_store_match.group('op')[len('store_bits_'):]})({val}))"
             output_arg_names = {a.label for a in output_args}
             op_sym = {
                 "store": "=",
@@ -16585,7 +16906,15 @@ def _generate_msl_kernel_uncached(
                 "bit_and_inplace": "&=",
                 "bit_xor_inplace": "^=",
             }[op_name]
-            if arr in f64_arr_names:
+            if narrow_store is not None:
+                slot = f"{arr}[{idx}]"
+                if arr in atomic_output_names:
+                    cur = f"atomic_load_explicit(&{slot}, memory_order_relaxed)"
+                    word = _struct_narrow_write(cur, val, narrow_store)
+                    line_out = f"{indent}atomic_store_explicit(&{slot}, {word}, memory_order_relaxed);"
+                else:
+                    line_out = f"{indent}{slot} = {_struct_narrow_write(slot, val, narrow_store)};"
+            elif arr in f64_arr_names:
                 slot = f"{arr}[{idx}]"
                 if op_sym == "=":
                     line_out = f"{indent}{slot} = wp_f32_to_f64({val});"
@@ -16692,6 +17021,11 @@ def _generate_msl_kernel_uncached(
                             _w = _struct_narrow_write("0.0f", src, finfo)
                             _narrow_words.setdefault(off, []).append(f"as_type<uint>({_w})")
                             continue
+                        if finfo.kind == _STRUCT_FIELD_KIND_TEXTURE:
+                            raise MetalCodegenError(
+                                f"Kernel {adj.fun_name!r}: storing a whole struct with a {finfo.kind} field "
+                                f"({fpath!r}) into array {arr!r} is not supported on Metal"
+                            )
                         if finfo.kind == _STRUCT_FIELD_KIND_SCALAR:
                             body_lines.append(
                                 _finalize(_emit_scalar_write(f"{base} + {off}", _struct_bitcast_write(src, cast)))
@@ -17470,7 +17804,14 @@ def _generate_msl_kernel_uncached(
         init_shadow_ints=tuple(init_shadow_ints),
         inplace_arrays=tuple(mlx_inplace_arrays),
         seeded_outputs=seeded_outputs,
-        uses_bvh=("wp_bvh_" in source or "wp_mesh_" in source or "wp_hash_grid_" in source or "wp_volume_" in source),
+        uses_bvh=(
+            "wp_bvh_" in source
+            or "wp_mesh_" in source
+            or "wp_hash_grid_" in source
+            or "wp_volume_" in source
+            or _mtiles.source_uses_bvh(source)
+            or _mtex.uses_textures(source)
+        ),
         # NB: ``builtin_block_dim`` is checked on the kernel's own IR — a
         # ``wp.block_dim()`` buried in a non-inlined wp.func would be
         # missed, but tile/block kernels call it at kernel scope.
@@ -17484,6 +17825,7 @@ def _generate_msl_kernel_uncached(
                 "WP_TILE_" in _NATIVE_SNIPPET_DEFS.get(_m.group(1), "")
                 for _m in _NATIVE_SNIPPET_REF_PAT.finditer(source)
             )
+            or _mtiles.kernel_uses_tiles(adj)
         ),
         header=header,
         native_lane_dependent=native_lane_dependent,
@@ -17507,7 +17849,7 @@ def _generate_msl_kernel_uncached(
 # back-end compile): artifacts are pickled into the versioned Warp kernel
 # cache directory, keyed by a hash of the kernel's forward IR, its arg
 # signature, and the codegen sources themselves — editing this file or
-# ``codegen_metal_ast.py`` automatically invalidates every entry.
+# ``codegen_metal_ast.py`` / ``codegen_metal_tiles.py`` automatically invalidates every entry.
 #
 # ``input_args`` / ``output_args`` hold Warp ``Var`` objects whose types
 # are dynamically created classes (unpicklable), so they are stored as
@@ -17533,7 +17875,7 @@ def _codegen_source_hash() -> str:
         import warp._src.codegen_metal_ast as _ast_mod  # noqa: PLC0415
 
         h = hashlib.sha256()
-        for mod_file in (__file__, _ast_mod.__file__):
+        for mod_file in (__file__, _ast_mod.__file__, _mtiles.__file__, _mtex.__file__):
             with open(mod_file, "rb") as f:
                 h.update(f.read())
         _codegen_source_hash_cached = h.hexdigest()
@@ -18101,6 +18443,8 @@ their slot has size 0: any read or write through such a field raises a
 clear MetalCodegenError. Used for kernels that pass a model struct with
 mesh array fields where only the primitive (scalar / vec / mat) fields
 are actually accessed at runtime."""
+# ``wp.Texture1D/2D/3D`` field: the ``texture*_t`` value (handle + geometry).
+_STRUCT_FIELD_KIND_TEXTURE = "texture"
 
 
 @dataclass
@@ -18227,6 +18571,21 @@ def _classify_struct_field(fname: str, ftype) -> _StructFieldInfo:
             kind=_STRUCT_FIELD_KIND_STRUCT,
             msl_type=f"<struct {sub.name}>",
             sub=sub,
+        )
+    tex_layout = _mtex.struct_field_layout(ftype)
+    if tex_layout is not None:
+        # The texture value plus a sub-layout of its scalar members, so
+        # ``s.tex.width`` resolves like a nested-struct field.
+        sub = _StructLayout(name=tex_layout[0], native_name=tex_layout[0], scalars_per_elem=tex_layout[1])
+        sub.fields["tex"] = _StructFieldInfo(
+            name="tex", offset=0, size=2, kind=_STRUCT_FIELD_KIND_SCALAR64, msl_type="ulong", scalar_msl="ulong"
+        )
+        for k, member in enumerate(_mtex.int_members(tex_layout[0])):
+            sub.fields[member] = _StructFieldInfo(
+                name=member, offset=2 + k, size=1, kind=_STRUCT_FIELD_KIND_SCALAR, msl_type="int", scalar_msl="int"
+            )
+        return _StructFieldInfo(
+            name=fname, offset=0, size=tex_layout[1], kind=_STRUCT_FIELD_KIND_TEXTURE, msl_type=tex_layout[0], sub=sub
         )
     # array (1D, 2D, ..., any dtype) — tag as unused. Only kernels that
     # never actually read/write the field will codegen successfully; if
@@ -18377,6 +18736,8 @@ def _struct_field_read_expr(buf: str, base_expr: str, finfo: _StructFieldInfo) -
         if finfo.bits < 32:
             return _struct_narrow_read(f"{buf}[{base_expr}]", finfo)
         return _struct_bitcast_read(f"{buf}[{base_expr}]", finfo.scalar_msl)
+    if finfo.kind == _STRUCT_FIELD_KIND_TEXTURE:
+        return _mtex.struct_field_read(finfo.msl_type, buf, base_expr)
     if finfo.kind == _STRUCT_FIELD_KIND_SCALAR64:
         lo = f"as_type<uint>({buf}[{base_expr}])"
         hi = f"as_type<uint>({buf}[({base_expr}) + 1])"
@@ -18746,6 +19107,9 @@ def _value_param_msl_type(arg_var) -> str | None:
 
 def _native_scalar_param_msl(arg_var) -> str:
     """Return the MSL type for a Warp *scalar* (non-array, non-struct) argument."""
+    tex_msl = _mtex.param_msl(arg_var)
+    if tex_msl is not None:
+        return tex_msl
     scalar_ctype = f"wp::{arg_var.type.__name__}"
     return _native_scalar_msl_type(scalar_ctype)
 
@@ -19222,6 +19586,9 @@ def _native_pack_scalar_arg(arg_var, value) -> tuple[bytes, int]:
     import ctypes  # noqa: PLC0415
 
     wp_type = arg_var.type
+    tex_packed = _mtex.pack_param(arg_var, value)
+    if tex_packed is not None:
+        return tex_packed
     # By-value vec/quat/mat params: instances are ctypes arrays of scalars
     # (mats in Warp row-major order), so their raw bytes are exactly the
     # layout the ``{name}__bytes`` scalar-pointer param expects.

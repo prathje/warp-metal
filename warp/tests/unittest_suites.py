@@ -230,6 +230,12 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
     from warp.tests.test_metal_launch import TestMetalLaunch
     from warp.tests.test_metal_mismatch import TestMetalMismatch
     from warp.tests.test_metal_mujoco_warp import TestMetalMujocoWarp
+    from warp.tests.test_metal_tiles_ext import (
+        TestMetalMeshWinding,
+        TestMetalStructFieldWrite,
+        TestMetalTextures,
+        TestMetalTilesExt,
+    )
     from warp.tests.test_module_contamination import TestModuleContamination
     from warp.tests.test_module_hashing import TestModuleHashing
     from warp.tests.test_module_parallel_load import (
@@ -431,6 +437,10 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
         TestMetalLaunch,
         TestMetalMismatch,
         TestMetalMujocoWarp,
+        TestMetalMeshWinding,
+        TestMetalStructFieldWrite,
+        TestMetalTextures,
+        TestMetalTilesExt,
         TestMeshQueryAABBMethods,
         TestMeshQueryPoint,
         TestMeshQueryRay,
