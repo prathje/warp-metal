@@ -3763,24 +3763,28 @@ def _apply_view_rewrites(
         # underlying array name and prepend the leading slice indices —
         # downstream the ``wp::tile_load`` intrinsic regex computes the
         # flat ``base`` offset and ``row_stride`` from the array's shape.
-        if isinstance(n, Assign) and isinstance(n.expr, Builtin) and n.expr.name == "tile_load":
+        if isinstance(n, Assign) and isinstance(n.expr, Builtin) and n.expr.name in ("tile_load", "tile_load_indexed", "tile_atomic_add"):
             view_arr_l = _strip_var_prefix(n.expr.args[0]) if n.expr.args else None
             if view_arr_l is not None and view_arr_l in view_aliases:
                 arr_name, lead_idx_labels = view_aliases[view_arr_l]
                 tail = list(n.expr.args[1:])
                 lead = [f"var_{l}" for l in lead_idx_labels]
                 new_args = (f"var_{arr_name}", *lead, *tail)
-                tpl_match = re.search(r"wp::tile_load\s*(<[^()]*>)", n.expr.raw)
+                # ``tile_load_indexed(view, indices, axis, off...)`` takes the
+                # same rewrite: the lowering in ``codegen_metal_tiles`` reads
+                # the leading slice indices off the front, like tile_load.
+                op = n.expr.name
+                tpl_match = re.search(rf"wp::{op}\s*(<[^()]*>)", n.expr.raw)
                 tpl = tpl_match.group(1) if tpl_match else ""
                 indent = _leading_indent(n.raw)
-                new_raw = f"{indent}var_{n.lhs} = wp::tile_load{tpl}({', '.join(new_args)});"
+                new_raw = f"{indent}var_{n.lhs} = wp::{op}{tpl}({', '.join(new_args)});"
                 out.append(
                     Assign(
                         raw=new_raw,
                         lhs=n.lhs,
                         expr=Builtin(
-                            raw=f"wp::tile_load{tpl}({', '.join(new_args)})",
-                            name="tile_load",
+                            raw=f"wp::{op}{tpl}({', '.join(new_args)})",
+                            name=op,
                             args=new_args,
                         ),
                     )

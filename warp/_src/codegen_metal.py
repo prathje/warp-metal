@@ -156,6 +156,7 @@ from warp._src.codegen_metal_ast import fold_drop_unsupported_locals as _ast_fol
 from warp._src.codegen_metal_ast import fold_indexref_writes as _ast_fold_indexref
 from warp._src.codegen_metal_ast import fold_multidim_atomics as _ast_fold_multidim_atomics
 from warp._src.codegen_metal_ast import fold_views as _ast_fold_views
+from warp._src import codegen_metal_tiles as _mtiles
 from warp._src.codegen_metal_ast import inline_user_calls as _ast_inline
 from warp._src.codegen_metal_ast import lower_reverse_ranges as _ast_lower_reverse_ranges
 from warp._src.codegen_metal_ast import parse as _ast_parse
@@ -8119,6 +8120,10 @@ def _build_kernel_header(source: str) -> str:
     misc_math = _emit_misc_math_helpers(source)
     if misc_math:
         parts.append(misc_math)
+    tile_ext_helpers = _mtiles.emit_helpers(source)
+    if tile_ext_helpers:
+        parts.append(tile_ext_helpers)
+
     if need_mat1x1:
         parts.append(
             "inline float wp_trace(wp_mat1x1_float m) { return m.c[0]; }\n"
@@ -8509,7 +8514,6 @@ def _msl_pointer_type(ctype: str) -> str:
 
 
 _TILE_CTYPE_HEAD_PAT = re.compile(r"wp::tile_(shared|register)_t<\s*(.+)$")
-_TILE_SHAPE_PAT = re.compile(r"wp::tile_shape_t<\s*(\d+)\s*(?:,\s*(\d+))?\s*>")
 
 
 _VEC_T_INNER_PAT = re.compile(r"wp::vec_t<\s*(\d+)\s*,\s*([\w:]+)\s*>")
@@ -8555,12 +8559,14 @@ def _parse_tile_ctype(ctype: str) -> tuple[str, str, int, int] | None:
             break
     if split_at is None:
         return None
-    dtype_ctype = rest[:split_at].strip()
-    shape_match = _TILE_SHAPE_PAT.search(rest[split_at:])
-    if shape_match is None:
+    # Quats and transforms are vec_t<4> / vec_t<7> on Metal (see
+    # ``_normalize_quat_t``), so their tiles are vec-element tiles.
+    dtype_ctype = _normalize_quat_t(rest[:split_at].strip())
+    full_shape = _mtiles.full_tile_shape(rest[split_at:])
+    if full_shape is None:
         return None
-    rows = int(shape_match.group(1))
-    cols = int(shape_match.group(2)) if shape_match.group(2) else 1
+    # ``(1, R, C)`` and other unit-leading shapes share ``(R, C)``'s storage.
+    rows, cols = _mtiles.collapse_shape(full_shape)
     return kind, _demote_f64_ctype(dtype_ctype), rows, cols
 
 
@@ -8655,6 +8661,9 @@ def _demote_tile_f64_tokens(text: str) -> str:
 
 def _msl_var_type(ctype: str) -> str:
     """Translate a local variable's ctype to MSL."""
+    ext = _mtiles.msl_var_type(ctype)
+    if ext is not None:
+        return ext
     if ctype.endswith("*"):
         return _msl_pointer_type(ctype)
     # Composite float64 VALUES (``vec_t<2, wp::float64>``, ``mat_t<1, 1,
@@ -10121,6 +10130,7 @@ def _tile_grad_slots(
     rows: int,
     cols: int,
     vec_n: int,
+    two_d: bool | None = None,
 ) -> list[tuple[str, str]]:
     """``[(array_flat_index, tile_element_accessor)]`` for a tile/array pairing.
 
@@ -10131,9 +10141,11 @@ def _tile_grad_slots(
     plain scalar, ``.c[k]`` for a register tile, plus ``[e]`` for the
     component of a vec-element tile.
     """
-    scalar_inner_dims = (2 if cols > 1 else 1) + (1 if vec_n else 0)
+    if two_d is None:
+        two_d = cols > 1
+    scalar_inner_dims = (2 if two_d else 1) + (1 if vec_n else 0)
     base_expr = _build_flat_base_expr(arr_name, lead_idx_args, inner_dims=scalar_inner_dims)
-    if cols > 1:
+    if two_d:
         row_stride = f"{arr_name}_shape[{len(lead_idx_args) + 1}]"
         row_off, col_off = offsets[0], offsets[1]
     else:
@@ -10209,7 +10221,13 @@ def _translate_tile_intrinsics(
     coldist_tiles: dict[str, tuple[int, str]] | None = None,
     coop_block_n: int = 0,
     f64_arr_names: set[str] | None = None,
+    tile_rank2: set[str] | None = None,
 ) -> str:
+    # Tiles declared with two (or more, unit-leading) dims. A ``(R, 1)`` tile
+    # is a column of a 2-D array: it consumes two offsets and walks rows,
+    # which ``cols > 1`` alone cannot tell from a 1-D ``(R,)`` tile.
+    if tile_rank2 is None:
+        tile_rank2 = set()
     if shaped_array_names is None:
         shaped_array_names = set()
     if f64_arr_names is None:
@@ -10269,18 +10287,20 @@ def _translate_tile_intrinsics(
         # tile offsets. For a 2-D tile we have 2 trailing offsets; for a
         # 1-D tile, 1 trailing offset.
         arr = args[0]
-        n_off = 2 if cols > 1 else 1
+        # ``shape=(R, 1)`` is a 2-D tile: two offsets, walking rows.
+        two_d = cols > 1 or not tile_is_1d
+        n_off = 2 if two_d else 1
         lead_idx_args = args[1:-n_off] if len(args) > 1 + n_off else []
         offsets = args[-n_off:]
         arr_name = arr[len("var_") :] if arr.startswith("var_") else arr
         # Vec-element arrays expose an extra inner scalar dim in MLX
         # (``(*shape, n_elem)``); add it to ``inner_dims`` so the base
         # expression includes the element-size stride.
-        scalar_inner_dims = 2 if cols > 1 else 1
+        scalar_inner_dims = 2 if two_d else 1
         if vec_n_elem > 0:
             scalar_inner_dims += 1
         base_expr = _build_flat_base_expr(arr_name, lead_idx_args, inner_dims=scalar_inner_dims)
-        if cols > 1:
+        if two_d:
             row_stride = f"{arr_name}_shape[{len(lead_idx_args) + 1}]"
             row_off, col_off = offsets
         else:
@@ -10360,23 +10380,16 @@ def _translate_tile_intrinsics(
         n_cols_expr = None
         if arr_name in shaped_array_names:
             n_lead = len(lead_idx_args)
-            if cols > 1:
+            if two_d:
                 # Both tile offsets were consumed as such, so the tile spans
                 # array dims ``n_lead`` and ``n_lead + 1``.
                 n_rows_expr = f"(int){arr_name}_shape[{n_lead}]"
                 n_cols_expr = f"(int){arr_name}_shape[{n_lead + 1}]"
-            elif tile_is_1d:
+            else:
                 # True 1-D tile: it walks the array's innermost dim, and any
                 # leading array indices were parsed as slice indices.
                 n_rows_expr = f"(int){arr_name}_shape[{n_lead}]"
                 n_cols_expr = "1"
-            elif n_lead >= 1:
-                # 2-D tile declared with a single column (``shape=(R, 1)``).
-                # Only one trailing offset is consumed above, so the row
-                # offset landed in ``lead_idx_args`` and the dim the tile
-                # actually walks is one further out.
-                n_rows_expr = f"(int){arr_name}_shape[{n_lead - 1}]"
-                n_cols_expr = f"(int){arr_name}_shape[{n_lead}]"
         if is_f64_src:
             # Same loop as the ``_load`` helper (bounds-checked zero-fill when
             # the extents are known), converting each element's double bits.
@@ -10430,16 +10443,17 @@ def _translate_tile_intrinsics(
         if dims is None:
             return m.group(0)
         rows, cols, _ = dims
-        n_off = 2 if cols > 1 else 1
+        two_d = cols > 1 or tile_label in tile_rank2
+        n_off = 2 if two_d else 1
         middle = args[1:-1]  # leading-idx + offsets
         lead_idx_args = middle[:-n_off] if len(middle) > n_off else []
         offsets = middle[-n_off:]
         arr_name = arr[len("var_") :] if arr.startswith("var_") else arr
-        scalar_inner_dims = 2 if cols > 1 else 1
+        scalar_inner_dims = 2 if two_d else 1
         if vec_n_elem > 0:
             scalar_inner_dims += 1
         base_expr = _build_flat_base_expr(arr_name, lead_idx_args, inner_dims=scalar_inner_dims)
-        if cols > 1:
+        if two_d:
             row_stride = f"{arr_name}_shape[{len(lead_idx_args) + 1}]"
             row_off, col_off = offsets
         else:
@@ -10562,13 +10576,14 @@ def _translate_tile_intrinsics(
         if dims is None:
             return m.group(0)
         rows, cols, _ = dims
-        n_off = 2 if cols > 1 else 1
+        two_d = cols > 1 or tile_label in tile_rank2
+        n_off = 2 if two_d else 1
         middle = args[1:-1]
         lead_idx_args = middle[:-n_off] if len(middle) > n_off else []
         offsets = middle[-n_off:]
         arr_name = arr[len("var_") :] if arr.startswith("var_") else arr
-        base_expr = _build_flat_base_expr(arr_name, lead_idx_args, inner_dims=(2 if cols > 1 else 1))
-        if cols > 1:
+        base_expr = _build_flat_base_expr(arr_name, lead_idx_args, inner_dims=(2 if two_d else 1))
+        if two_d:
             row_stride = f"{arr_name}_shape[{len(lead_idx_args) + 1}]"
             row_off, col_off = offsets
         else:
@@ -12961,9 +12976,6 @@ def _requested_deterministic_mode(kernel):
     return mode
 
 
-_TILE_STACK_IR_RE = re.compile(r"\bwp::tile_stack_(?:alloc|init|push|pop|clear|count)\b|\btile_stack_t<")
-
-
 def _ir_matches(adj, pattern, seen=None) -> bool:
     """Whether the built IR of ``adj`` or any user function it calls matches ``pattern``."""
     if seen is None:
@@ -12979,15 +12991,6 @@ def _ir_matches(adj, pattern, seen=None) -> bool:
         if func_adj is not None and _ir_matches(func_adj, pattern, seen):
             return True
     return False
-
-
-def _check_tile_stack_unsupported(adj) -> None:
-    """Reject ``wp.tile_stack()`` (Warp 1.18) with a clear error on Metal."""
-    if _ir_matches(adj, _TILE_STACK_IR_RE):
-        raise MetalCodegenError(
-            f"Kernel {adj.fun_name!r}: wp.tile_stack() and wp.tile_stack_push()/pop()/count()/clear() "
-            "are not supported on Metal devices yet. Run the kernel on a CPU or CUDA device."
-        )
 
 
 def _check_deterministic_mode_supported(kernel, adj) -> None:
@@ -13056,7 +13059,6 @@ def _ensure_adj_built(kernel, block_dim: int | None = None, enable_backward: boo
         )
         _normalize_adj_ir(adj)
         _check_deterministic_mode_supported(kernel, adj)
-        _check_tile_stack_unsupported(adj)
         adj._metal_built_backward = backward
         adj._metal_ir_ok = True
 
@@ -14353,6 +14355,13 @@ def _generate_msl_kernel_uncached(
     # (matmul_acc, *_solve_inplace) so writes to the view propagate
     # back to the parent tile struct via an explicit copy.
     view_aliases: dict[str, tuple[str, int, int, int, int, str, str, str]] = {}
+    # Lowerings for the tile ops ``codegen_metal_tiles`` owns (scatter,
+    # load_indexed, view/reshape aliasing, tile_stack, tile queries, ...).
+    _tile_ext_ctypes = {str(v.label): v.ctype() for v in adj.variables}
+    for _lbl_i, _ct_i in _inlined_var_ctypes.items():
+        _tile_ext_ctypes.setdefault(str(_lbl_i), _ct_i)
+    tile_ext = _mtiles.TileExt(forward_lines, tile_var_dims, tile_var_vec_n, _tile_ext_ctypes, view_aliases)
+    tile_rank2 = tile_ext.rank2_labels()
     # Set of (N, scalar) pairs for which we emitted the cooperative
     # variant of ``tile_cholesky``. Drives kernel-scope threadgroup
     # memory + lane declaration and the launcher's threadgroup-size
@@ -14614,6 +14623,7 @@ def _generate_msl_kernel_uncached(
         # the tile pattern matches on the raw ``wp::tile_*<...>`` shape,
         # which contains ``var_X`` operands that the substitute would
         # otherwise rewrite to expressions and break the parse.
+        translated = tile_ext.translate(translated)
         translated = _translate_tile_intrinsics(
             translated,
             tile_var_dims,
@@ -14629,6 +14639,7 @@ def _generate_msl_kernel_uncached(
             coldist_tiles,
             coop_block_n,
             f64_arr_names=f64_arr_names,
+            tile_rank2=tile_rank2,
         )
         # Inline subscripts that the address-collapse produced.
         translated = _substitute_subscripts(translated)
@@ -15178,7 +15189,8 @@ def _generate_msl_kernel_uncached(
                 grad_name = grad_arg_of.get(arr_name)
                 if grad_name is None:
                     continue
-                n_off = 2 if cols > 1 else 1
+                two_d = cols > 1 or tile_label in tile_rank2
+                n_off = 2 if two_d else 1
                 index_args = args[1 : 1 + ndim]
                 if len(index_args) < n_off:
                     raise MetalCodegenError(
@@ -15196,8 +15208,8 @@ def _generate_msl_kernel_uncached(
                     # stride the scatter across lanes to add each element
                     # once per block.
                     _lead, _offs = index_args[: ndim - n_off], index_args[ndim - n_off :]
-                    _base = _build_flat_base_expr(arr_name, _lead, inner_dims=2 if cols > 1 else 1)
-                    if cols > 1:
+                    _base = _build_flat_base_expr(arr_name, _lead, inner_dims=2 if two_d else 1)
+                    if two_d:
                         _rstride = f"{arr_name}_shape[{len(_lead) + 1}]"
                         _roff, _coff = _offs[0], _offs[1]
                     else:
@@ -15218,6 +15230,7 @@ def _generate_msl_kernel_uncached(
                     rows,
                     cols,
                     tile_var_vec_n.get(tile_label, 0),
+                    two_d,
                 )
                 for idx_expr, cell in slots:
                     tgt = f"{grad_name}[{idx_expr}]"
@@ -16604,12 +16617,21 @@ def _generate_msl_kernel_uncached(
         init_shadow_ints=tuple(init_shadow_ints),
         inplace_arrays=tuple(mlx_inplace_arrays),
         seeded_outputs=seeded_outputs,
-        uses_bvh=("wp_bvh_" in source or "wp_mesh_" in source or "wp_hash_grid_" in source or "wp_volume_" in source),
+        uses_bvh=(
+            "wp_bvh_" in source
+            or "wp_mesh_" in source
+            or "wp_hash_grid_" in source
+            or "wp_volume_" in source
+            or _mtiles.source_uses_bvh(source)
+        ),
         # NB: ``builtin_block_dim`` is checked on the kernel's own IR — a
         # ``wp.block_dim()`` buried in a non-inlined wp.func would be
         # missed, but tile/block kernels call it at kernel scope.
         tile_block_fold=(
-            "builtin_block_dim" in "\n".join(adj.blocks[0].body_forward) or "wp_tile_" in source or coop_chol_n > 0
+            "builtin_block_dim" in "\n".join(adj.blocks[0].body_forward)
+            or "wp_tile_" in source
+            or coop_chol_n > 0
+            or _mtiles.kernel_uses_tiles(adj)
         ),
         header=header,
         tid4=uses_tid4,
@@ -16630,7 +16652,7 @@ def _generate_msl_kernel_uncached(
 # back-end compile): artifacts are pickled into the versioned Warp kernel
 # cache directory, keyed by a hash of the kernel's forward IR, its arg
 # signature, and the codegen sources themselves — editing this file or
-# ``codegen_metal_ast.py`` automatically invalidates every entry.
+# ``codegen_metal_ast.py`` / ``codegen_metal_tiles.py`` automatically invalidates every entry.
 #
 # ``input_args`` / ``output_args`` hold Warp ``Var`` objects whose types
 # are dynamically created classes (unpicklable), so they are stored as
@@ -16656,7 +16678,7 @@ def _codegen_source_hash() -> str:
         import warp._src.codegen_metal_ast as _ast_mod  # noqa: PLC0415
 
         h = hashlib.sha256()
-        for mod_file in (__file__, _ast_mod.__file__):
+        for mod_file in (__file__, _ast_mod.__file__, _mtiles.__file__):
             with open(mod_file, "rb") as f:
                 h.update(f.read())
         _codegen_source_hash_cached = h.hexdigest()
