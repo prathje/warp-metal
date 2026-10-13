@@ -1669,6 +1669,13 @@ def _inline_one_call(
             f"function inlining exceeded max depth {max_depth} — possible recursion in {fn_overload.key!r}"
         )
 
+    # ``@wp.func_native``: the Python body is a stub, so call the snippet as
+    # an MSL helper instead of splicing an empty body.
+    if getattr(fn_overload, "native_snippet", None) is not None:
+        from warp._src.codegen_metal import _native_snippet_call  # noqa: PLC0415
+
+        return _native_snippet_call(fn_overload, caller_args, return_value_dst)
+
     # Build the callee's IR. Pass the same default options the top-level
     # kernel build uses (see ``codegen_metal.generate_msl_kernel``) so that
     # tile-builtin value funcs (``wp.tile``, ``wp.tile_cholesky_solve``,
@@ -2234,6 +2241,12 @@ def _inline_one_adj_call(
         )
 
     _ensure_func_backward_built(fn_overload)
+    if getattr(fn_overload, "native_snippet", None) is not None:
+        from warp._src.codegen_metal import MetalCodegenError  # noqa: PLC0415
+
+        raise MetalCodegenError(
+            f"@wp.func_native {fn_overload.key!r}: the adjoint of a native snippet is not supported on Metal"
+        )
     adj = fn_overload.adj
     block = adj.blocks[0]
 

@@ -11874,6 +11874,89 @@ _USER_FUNC_MSL_DEFS: dict[str, str] = {
 _USER_FUNC_REF_PAT = re.compile(r"\b([A-Za-z_]\w*_\d+)\s*\(")
 
 
+# ---------------------------------------------------------------------------
+# ``@wp.func_native`` snippets
+# ---------------------------------------------------------------------------
+# A native function's Python body is a stub (``...``), so inlining it like an
+# ordinary ``@wp.func`` splices nothing and the call's result local is never
+# assigned: the kernel silently reads 0 (Newton's contact-reduction
+# ``float_flip``, Kamino's ``uint64_sentinel_value``, VBD's ``next_float_up``).
+# Instead, emit the snippet as an MSL helper function and call it. Snippets
+# are C++ written for the CPU and CUDA compilers; ``__CUDA_ARCH__`` is not
+# defined here, so their CPU branch is compiled. The shims below map the
+# C-library and fixed-width names those CPU branches use onto MSL.
+_NATIVE_SNIPPET_DEFS: dict[str, str] = {}
+_NATIVE_SNIPPET_PREFIX = "wp_native_"
+_NATIVE_SNIPPET_REF_PAT = re.compile(r"\b(" + _NATIVE_SNIPPET_PREFIX + r"\w+)\s*\(")
+_NATIVE_SNIPPET_SHIMS = """\
+#ifndef WP_METAL_NATIVE_SNIPPET_SHIMS
+#define WP_METAL_NATIVE_SNIPPET_SHIMS
+#define sqrtf metal::sqrt
+#define rsqrtf metal::rsqrt
+#define fabsf metal::fabs
+#define fmaxf metal::fmax
+#define fminf metal::fmin
+#define floorf metal::floor
+#define ceilf metal::ceil
+#define expf metal::exp
+#define logf metal::log
+#define powf metal::pow
+#define sinf metal::sin
+#define cosf metal::cos
+#define nextafterf metal::nextafter
+#define __builtin_nextafterf metal::nextafter
+#endif
+"""
+# ``reinterpret_cast<T&>(x)`` reads (the type-punning idiom snippets use for
+# bit tricks) become ``as_type<T>(x)``; MSL rejects reference punning.
+_NATIVE_REINTERPRET_REF_PAT = re.compile(r"reinterpret_cast\s*<\s*([\w:]+)\s*&\s*>\s*\(\s*(\w+)\s*\)")
+
+
+def _native_snippet_scalar_type(t, what: str, key: str) -> str:
+    from warp._src.codegen import Var  # noqa: PLC0415
+
+    from warp._src.types import float32, int32  # noqa: PLC0415
+
+    t = {float: float32, int: int32}.get(t, t)
+    ctype = t if isinstance(t, str) else Var.type_to_ctype(t)
+    msl = _SCALAR_CTYPE_TO_MSL.get(ctype)
+    if msl is None or msl == "wp_f64":
+        raise MetalCodegenError(
+            f"@wp.func_native {key!r}: {what} of type {ctype!r} is not supported on Metal "
+            "(only scalar parameters and return values can be passed to a native snippet)"
+        )
+    return msl
+
+
+def _native_snippet_call(fn_overload, caller_args, return_value_dst):
+    """Lower a call to a ``@wp.func_native`` function to an MSL helper call.
+
+    Registers the helper definition (emitted into the kernel header by
+    ``_emit_referenced_user_funcs``) and returns the call statement node.
+    """
+    from warp._src.codegen_metal_ast import _RawLine  # noqa: PLC0415
+
+    adj = fn_overload.adj
+    key = fn_overload.key
+    if not getattr(adj, "blocks", None):
+        adj.build(
+            builder=None,
+            default_builder_options={"enable_backward": False, "output_arch": None, "block_dim": 256},
+        )
+    params = []
+    for a in adj.args:
+        params.append(f"{_native_snippet_scalar_type(a.ctype(), f'parameter {a.label!r}', key)} {a.label}")
+    ret = adj.arg_types.get("return")
+    ret_msl = "void" if ret is None else _native_snippet_scalar_type(ret, "the return value", key)
+    name = f"{_NATIVE_SNIPPET_PREFIX}{fn_overload.native_func}"
+    body = _NATIVE_REINTERPRET_REF_PAT.sub(r"as_type<\1>(\2)", fn_overload.native_snippet)
+    _NATIVE_SNIPPET_DEFS[name] = f"inline {ret_msl} {name}({', '.join(params)}) {{\n{body}\n}}"
+    call = f"{name}({', '.join(caller_args)})"
+    if return_value_dst is not None:
+        return [_RawLine(raw=f"    var_{return_value_dst} = {call};")]
+    return [_RawLine(raw=f"    {call};")]
+
+
 def _emit_referenced_user_funcs(source: str) -> str:
     """Scan ``source`` for known mujoco_warp helper-function references
     and return their MSL definitions concatenated. Functions not in the
@@ -11886,9 +11969,14 @@ def _emit_referenced_user_funcs(source: str) -> str:
         name = m.group(1)
         if name in _USER_FUNC_MSL_DEFS:
             seen.add(name)
-    if not seen:
+    native = sorted({m.group(1) for m in _NATIVE_SNIPPET_REF_PAT.finditer(source)} & _NATIVE_SNIPPET_DEFS.keys())
+    if not seen and not native:
         return ""
-    return "\n".join(_USER_FUNC_MSL_DEFS[n] for n in sorted(seen)) + "\n"
+    parts = [_USER_FUNC_MSL_DEFS[n] for n in sorted(seen)]
+    if native:
+        parts.append(_NATIVE_SNIPPET_SHIMS)
+        parts.extend(_NATIVE_SNIPPET_DEFS[n] for n in native)
+    return "\n".join(parts) + "\n"
 
 
 # ---------------------------------------------------------------------------
@@ -13359,6 +13447,16 @@ def _generate_msl_kernel_uncached(
     coop_block_n = getattr(adj, "_metal_coop_block_n", 0)
     if coop_block_n > 0:
         forward_lines = [ln.replace("builtin_block_dim()", str(coop_block_n)) for ln in forward_lines]
+        # A native snippet's CPU branch assumes the serial one-thread-per-block
+        # model; with real cooperating lanes its warp shuffles / barriers
+        # would silently become no-ops.
+        for _ln in forward_lines:
+            for _m in _NATIVE_SNIPPET_REF_PAT.finditer(_ln):
+                if "__CUDA_ARCH__" in _NATIVE_SNIPPET_DEFS.get(_m.group(1), ""):
+                    raise MetalCodegenError(
+                        f"Kernel {adj.fun_name!r}: @wp.func_native {_m.group(1)[len(_NATIVE_SNIPPET_PREFIX) :]!r} "
+                        "has a CUDA-only branch, which cannot run with cooperating threads on Metal"
+                    )
 
     # Negative-step Python ``range`` (e.g. ``range(start, -1, -16)`` in
     # blocked-Cholesky backward substitution) emits as

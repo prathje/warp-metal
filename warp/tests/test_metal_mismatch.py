@@ -47,6 +47,63 @@ class TestMetalMismatch(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet)
 
+    def test_func_native_snippet_is_called(self):
+        # The Python body of a ``@wp.func_native`` is a stub; inlining it left
+        # the result local unassigned (silently 0). The snippet's non-CUDA
+        # branch must run instead.
+        snippet = textwrap.dedent(
+            '''
+            import numpy as np
+
+            @wp.func_native("""
+            uint32_t i = reinterpret_cast<uint32_t&>(f);
+            uint32_t mask = (uint32_t)(-(int)(i >> 31)) | 0x80000000;
+            return i ^ mask;
+            """)
+            def float_flip(f: float) -> wp.uint32: ...
+
+            @wp.func_native("""
+            uint32_t mask = ((u >> 31) - 1) | 0x80000000;
+            uint32_t i = u ^ mask;
+            return reinterpret_cast<float&>(i);
+            """)
+            def ifloat_flip(u: wp.uint32) -> float: ...
+
+            @wp.func_native("""return 0x7FFFFFFFFFFFFFFFull;""")
+            def sentinel() -> wp.uint64: ...
+
+            @wp.func_native("""
+            #if defined(__CUDA_ARCH__)
+            return nextafterf(value, INFINITY);
+            #else
+            return __builtin_nextafterf(value, INFINITY);
+            #endif
+            """)
+            def next_up(value: float) -> float: ...
+
+            @wp.kernel
+            def k(x: wp.array[float], flipped: wp.array[wp.uint32], back: wp.array[float],
+                  up: wp.array[float], s: wp.array[wp.uint64]):
+                tid = wp.tid()
+                u = float_flip(x[tid])
+                flipped[tid] = u
+                back[tid] = ifloat_flip(u)
+                up[tid] = next_up(x[tid])
+                s[tid] = sentinel()
+
+            res = {}
+            for dev in ("cpu", "metal:0"):
+                x = wp.array([1.0, -1.0, 0.5, 0.0], dtype=float, device=dev)
+                outs = [wp.zeros(4, dtype=t, device=dev) for t in (wp.uint32, float, float, wp.uint64)]
+                wp.launch(k, dim=4, inputs=[x], outputs=outs, device=dev)
+                res[dev] = [o.numpy() for o in outs]
+            for a, b in zip(res["cpu"], res["metal:0"]):
+                np.testing.assert_array_equal(a, b)
+            assert res["metal:0"][3][0] == 0x7FFFFFFFFFFFFFFF
+            '''
+        )
+        _run_with_metal_enabled(self, snippet)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
