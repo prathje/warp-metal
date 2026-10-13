@@ -238,6 +238,48 @@ class TestMetalTilesExt(unittest.TestCase):
             """,
         )
 
+    def test_tile_index_read_from_lane_table(self):
+        # An index loaded from a table addressed by the lane is data, not a
+        # block_dim-derived index (Newton's level-scheduled tiled FK).
+        _run(
+            self,
+            """
+            @wp.kernel
+            def k(table: wp.array[int], out: wp.array[float]):
+                b, t = wp.tid()
+                buf = wp.tile_zeros(shape=8, dtype=float, storage="shared")
+                for c in range((8 + wp.block_dim() - 1) // wp.block_dim()):
+                    lane = c * wp.block_dim() + t
+                    if lane < 8:
+                        slot = table[lane]
+                        wp.tile_scatter_masked(buf, lane, float(slot) * 2.0, True)
+                        out[b * 8 + lane] = buf[table[7 - lane]]
+
+            compare(k, [2], lambda d: [wp.array([3, 1, 4, 1, 5, 2, 6, 0], dtype=int, device=d),
+                                       wp.zeros(16, dtype=float, device=d)], [1], block_dim=1)
+            """,
+        )
+
+    def test_volume_voxel_count(self):
+        _run(
+            self,
+            """
+            @wp.kernel
+            def k(v: wp.uint64, o: wp.array[int]):
+                o[0] = wp.volume_voxel_count(v)
+
+            pts = np.random.default_rng(0).random((200, 3)).astype(np.float32) * 20
+            keep = []
+
+            def make(d):
+                vol = wp.Volume.allocate_by_voxels(wp.array(pts, dtype=wp.vec3, device=d), voxel_size=0.5, device=d)
+                keep.append(vol)
+                return [vol.id, wp.zeros(1, dtype=int, device=d)]
+
+            compare(k, 1, make, [1], tiled=False)
+            """,
+        )
+
     def test_tile_map_builtin_adjoint(self):
         _run(
             self,

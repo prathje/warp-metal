@@ -5208,6 +5208,18 @@ inline uint32_t wp_volume_grid_type(pnanovdb_buf_t buf) {
 inline pnanovdb_root_handle_t wp_volume_root(pnanovdb_buf_t buf) {
     return pnanovdb_tree_get_root(buf, pnanovdb_grid_get_tree(buf, wp_volume_grid()));
 }
+inline int wp_volume_voxel_count(ulong id) {
+    pnanovdb_buf_t buf = wp_volume_buf(id);
+    pnanovdb_tree_handle_t tree = pnanovdb_grid_get_tree(buf, wp_volume_grid());
+    uint32_t grid_type = wp_volume_grid_type(buf);
+    ulong count;
+    if (grid_type == PNANOVDB_GRID_TYPE_ONINDEX || grid_type == PNANOVDB_GRID_TYPE_ONINDEXMASK) {
+        count = pnanovdb_tree_get_voxel_count(buf, tree);
+    } else {
+        count = ulong(pnanovdb_tree_get_node_count_leaf(buf, tree)) * ulong(PNANOVDB_LEAF_TABLE_COUNT);
+    }
+    return count > 2147483647ul ? 2147483647 : int(count);
+}
 inline pnanovdb_coord_t wp_on_coord(int i, int j, int k) {
     pnanovdb_coord_t c;
     c.x = i;
@@ -9767,6 +9779,7 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bwp::volume_lookup_v\b"), "wp_volume_lookup_v"),
     (re.compile(r"\bwp::volume_lookup_i\b"), "wp_volume_lookup_i"),
     (re.compile(r"\bwp::volume_store_f\b"), "wp_volume_store_f"),
+    (re.compile(r"\bwp::volume_voxel_count\b"), "wp_volume_voxel_count"),
     (re.compile(r"\bwp::volume_store_v\b"), "wp_volume_store_v"),
     (re.compile(r"\bwp::volume_store_i\b"), "wp_volume_store_i"),
     (re.compile(r"\bwp::volume_sample" + _VOLUME_TEMPLATE_ARG), _volume_template_repl("wp_volume_sample")),
@@ -14461,6 +14474,11 @@ def _generate_msl_kernel_uncached(
             if m_def is None:
                 continue
             rhs = m_def.group(2)
+            # A value read out of an array is data, not an index computed from
+            # ``block_dim``: the taint stops at array addressing (Newton's tiled
+            # FK reads parent slots from a table indexed by the lane).
+            if re.match(r"(?:\(\s*)?(?:&\s*)?wp::(?:address|view|load|index|array_load)\b", rhs.strip()):
+                continue
             if "builtin_block_dim" in rhs or any(f"var_{t}" in rhs for t in _bd_tainted):
                 _bd_tainted.add(m_def.group(1))
         if _bd_tainted:
