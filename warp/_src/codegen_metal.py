@@ -156,6 +156,7 @@ from warp._src.codegen_metal_ast import fold_drop_unsupported_locals as _ast_fol
 from warp._src.codegen_metal_ast import fold_indexref_writes as _ast_fold_indexref
 from warp._src.codegen_metal_ast import fold_multidim_atomics as _ast_fold_multidim_atomics
 from warp._src.codegen_metal_ast import fold_views as _ast_fold_views
+from warp._src import codegen_metal_texture as _mtex
 from warp._src import codegen_metal_tiles as _mtiles
 from warp._src.codegen_metal_ast import inline_user_calls as _ast_inline
 from warp._src.codegen_metal_ast import lower_reverse_ranges as _ast_lower_reverse_ranges
@@ -8123,7 +8124,9 @@ def _build_kernel_header(source: str) -> str:
     tile_ext_helpers = _mtiles.emit_helpers(source)
     if tile_ext_helpers:
         parts.append(tile_ext_helpers)
-
+    texture_helpers = _mtex.emit_helpers(source)
+    if texture_helpers:
+        parts.append(texture_helpers)
     if need_mat1x1:
         parts.append(
             "inline float wp_trace(wp_mat1x1_float m) { return m.c[0]; }\n"
@@ -8662,6 +8665,8 @@ def _demote_tile_f64_tokens(text: str) -> str:
 def _msl_var_type(ctype: str) -> str:
     """Translate a local variable's ctype to MSL."""
     ext = _mtiles.msl_var_type(ctype)
+    if ext is None:
+        ext = _mtex.msl_var_type(ctype)
     if ext is not None:
         return ext
     if ctype.endswith("*"):
@@ -13832,6 +13837,8 @@ def _generate_msl_kernel_uncached(
         subscript_map[field_local] = _struct_field_read_expr(buf, base_expr, finfo)
         buffer_field_stores[field_local] = (buf, base_expr, finfo)
 
+    # Pointers to texture-valued struct-local fields -> the MSL local.
+    texture_value_ptrs: dict[str, str] = {}
     struct_field_addr_pat = re.compile(r"^\s*var_(\w+)\s*=\s*&\s*\(\s*var_(\w+)\s*(->|\.)\s*(\w+)\s*\)\s*;\s*$")
     for raw in forward_lines:
         m = struct_field_addr_pat.match(raw)
@@ -13869,6 +13876,9 @@ def _generate_msl_kernel_uncached(
                     # field accesses resolve against the extended prefix.
                     struct_ptr_locals[field_local] = (f"{struct_local}__{field_name}", field_info.sub)
                     continue
+                if field_info.kind == _STRUCT_FIELD_KIND_TEXTURE:
+                    # A real MSL struct local: members read directly.
+                    texture_value_ptrs[field_local] = _per_field_local(struct_local, field_name)
                 subscript_map[field_local] = _per_field_local(struct_local, field_name)
                 if field_info.kind == _STRUCT_FIELD_KIND_VEC:
                     indexref_vec_bases[field_local] = _per_field_local(struct_local, field_name)
@@ -13889,6 +13899,9 @@ def _generate_msl_kernel_uncached(
                 if field_info.kind == _STRUCT_FIELD_KIND_STRUCT:
                     struct_ptr_bases[field_local] = (struct_local, str(field_info.offset), field_info.sub)
                     continue
+                if field_info.kind == _STRUCT_FIELD_KIND_TEXTURE:
+                    # Whole-value loads and member access (``.width``) both work.
+                    struct_ptr_bases[field_local] = (struct_local, str(field_info.offset), field_info.sub)
                 _bind_buffer_field(field_local, struct_local, str(field_info.offset), field_info)
                 continue
             continue
@@ -13896,6 +13909,9 @@ def _generate_msl_kernel_uncached(
         # accessor == "->": field access through a pointer into flat struct
         # storage (struct-array element / nested-struct chain) or into a
         # struct local's nested-struct field.
+        if struct_local in texture_value_ptrs:
+            subscript_map[field_local] = f"{texture_value_ptrs[struct_local]}.{field_name}"
+            continue
         if struct_local in struct_ptr_locals:
             prefix, layout = struct_ptr_locals[struct_local]
             field_info = layout.fields.get(field_name)
@@ -13923,6 +13939,8 @@ def _generate_msl_kernel_uncached(
         if field_info.kind == _STRUCT_FIELD_KIND_STRUCT:
             struct_ptr_bases[field_local] = (buf, f"{base_expr} + {field_info.offset}", field_info.sub)
             continue
+        if field_info.kind == _STRUCT_FIELD_KIND_TEXTURE:
+            struct_ptr_bases[field_local] = (buf, f"{base_expr} + {field_info.offset}", field_info.sub)
         _bind_buffer_field(field_local, buf, f"{base_expr} + {field_info.offset}", field_info)
 
     # ---- ``wp::indexref`` on vec lvalues -------------------------------
@@ -14049,7 +14067,7 @@ def _generate_msl_kernel_uncached(
                 #     ``T()`` zeros the trailing ``c[N]`` array.
                 _zero = (
                     f"{field_info.msl_type}()"
-                    if field_info.msl_type.startswith(("wp_mat", "wp_vec"))
+                    if field_info.msl_type.startswith(("wp_mat", "wp_vec", "wp_texture"))
                     else f"{field_info.msl_type}(0)"
                 )
                 body_lines.append(f"    {field_info.msl_type} {local_name} = {_zero};")
@@ -14624,6 +14642,7 @@ def _generate_msl_kernel_uncached(
         # which contains ``var_X`` operands that the substitute would
         # otherwise rewrite to expressions and break the parse.
         translated = tile_ext.translate(translated)
+        translated = _mtex.translate(translated)
         translated = _translate_tile_intrinsics(
             translated,
             tile_var_dims,
@@ -16623,6 +16642,7 @@ def _generate_msl_kernel_uncached(
             or "wp_hash_grid_" in source
             or "wp_volume_" in source
             or _mtiles.source_uses_bvh(source)
+            or _mtex.uses_textures(source)
         ),
         # NB: ``builtin_block_dim`` is checked on the kernel's own IR — a
         # ``wp.block_dim()`` buried in a non-inlined wp.func would be
@@ -16678,7 +16698,7 @@ def _codegen_source_hash() -> str:
         import warp._src.codegen_metal_ast as _ast_mod  # noqa: PLC0415
 
         h = hashlib.sha256()
-        for mod_file in (__file__, _ast_mod.__file__, _mtiles.__file__):
+        for mod_file in (__file__, _ast_mod.__file__, _mtiles.__file__, _mtex.__file__):
             with open(mod_file, "rb") as f:
                 h.update(f.read())
         _codegen_source_hash_cached = h.hexdigest()
@@ -17238,6 +17258,8 @@ _STRUCT_FIELD_KIND_VEC = "vec"
 _STRUCT_FIELD_KIND_MAT = "mat"
 _STRUCT_FIELD_KIND_STRUCT = "struct"
 _STRUCT_FIELD_KIND_ARRAY_UNUSED = "array_unused"
+# ``wp.Texture1D/2D/3D`` field: the ``texture*_t`` value (handle + geometry).
+_STRUCT_FIELD_KIND_TEXTURE = "texture"
 """Sentinel for ``wp.array``-typed struct fields. We allow them to exist in
 the layout (so the struct's other fields can still be read/written) but
 their slot has size 0: any read or write through such a field raises a
@@ -17331,6 +17353,21 @@ def _classify_struct_field(fname: str, ftype) -> _StructFieldInfo:
             kind=_STRUCT_FIELD_KIND_STRUCT,
             msl_type=f"<struct {sub.name}>",
             sub=sub,
+        )
+    tex_layout = _mtex.struct_field_layout(ftype)
+    if tex_layout is not None:
+        # The texture value plus a sub-layout of its scalar members, so
+        # ``s.tex.width`` resolves like a nested-struct field.
+        sub = _StructLayout(name=tex_layout[0], native_name=tex_layout[0], scalars_per_elem=tex_layout[1])
+        sub.fields["tex"] = _StructFieldInfo(
+            name="tex", offset=0, size=2, kind=_STRUCT_FIELD_KIND_SCALAR64, msl_type="ulong", scalar_msl="ulong"
+        )
+        for k, member in enumerate(_mtex.int_members(tex_layout[0])):
+            sub.fields[member] = _StructFieldInfo(
+                name=member, offset=2 + k, size=1, kind=_STRUCT_FIELD_KIND_SCALAR, msl_type="int", scalar_msl="int"
+            )
+        return _StructFieldInfo(
+            name=fname, offset=0, size=tex_layout[1], kind=_STRUCT_FIELD_KIND_TEXTURE, msl_type=tex_layout[0], sub=sub
         )
     # array (1D, 2D, ..., any dtype) — tag as unused. Only kernels that
     # never actually read/write the field will codegen successfully; if
@@ -17461,6 +17498,8 @@ def _struct_field_read_expr(buf: str, base_expr: str, finfo: _StructFieldInfo) -
     offset already folded in by the caller)."""
     if finfo.kind == _STRUCT_FIELD_KIND_SCALAR:
         return _struct_bitcast_read(f"{buf}[{base_expr}]", finfo.scalar_msl)
+    if finfo.kind == _STRUCT_FIELD_KIND_TEXTURE:
+        return _mtex.struct_field_read(finfo.msl_type, buf, base_expr)
     if finfo.kind == _STRUCT_FIELD_KIND_SCALAR64:
         lo = f"as_type<uint>({buf}[{base_expr}])"
         hi = f"as_type<uint>({buf}[({base_expr}) + 1])"
@@ -17811,6 +17850,9 @@ def _native_array_inner_msl(arg_var) -> str:
 
 def _native_scalar_param_msl(arg_var) -> str:
     """Return the MSL type for a Warp *scalar* (non-array, non-struct) argument."""
+    tex_msl = _mtex.param_msl(arg_var)
+    if tex_msl is not None:
+        return tex_msl
     scalar_ctype = f"wp::{arg_var.type.__name__}"
     return _native_scalar_msl_type(scalar_ctype)
 
@@ -18218,6 +18260,9 @@ def _native_pack_scalar_arg(arg_var, value) -> tuple[bytes, int]:
     import ctypes  # noqa: PLC0415
 
     wp_type = arg_var.type
+    tex_packed = _mtex.pack_param(arg_var, value)
+    if tex_packed is not None:
+        return tex_packed
     # By-value vec/quat/mat params: instances are ctypes arrays of scalars
     # (mats in Warp row-major order), so their raw bytes are exactly the
     # layout the ``{name}__bytes`` scalar-pointer param expects.

@@ -198,6 +198,7 @@ class Texture:
 
     def __new__(cls, *args, **kwargs):
         instance = super().__new__(cls)
+        instance._metal_storage = None
         instance._array_handle = 0
         instance._array_owner = False
         instance._is_mipmapped = False
@@ -397,7 +398,25 @@ class Texture:
         self._surface_access = bool(surface_access and device.is_cuda)
 
         # create texture
-        if device.is_cuda:
+        if getattr(device, "is_metal", False):
+            # Metal: texel buffer + descriptor read by the MSL software sampler
+            # (see ``warp._src.metal_texture``); same semantics as the CPU path.
+            from warp._src.metal_texture import MetalTextureStorage  # noqa: PLC0415
+
+            self._metal_storage = MetalTextureStorage(
+                device,
+                ndim,
+                mip_shapes,
+                num_channels,
+                dtype_code,
+                type_size_in_bytes(dtype),
+                filter_mode,
+                mip_filter_mode,
+                (address_mode_u, address_mode_v, address_mode_w),
+                normalized_coords,
+            )
+            self._tex_handle = self._metal_storage.id
+        elif device.is_cuda:
             # create CUDA array if it was not provided
             if not self._array_handle:
                 self._array_owner = True
@@ -465,7 +484,11 @@ class Texture:
             return
 
         try:
-            if self.device.is_cuda:
+            if self._metal_storage is not None:
+                self._metal_storage.release()
+                self._metal_storage = None
+                self._tex_handle = 0
+            elif self.device.is_cuda:
                 with self.device.context_guard:
                     if self._tex_handle:
                         self._runtime.core.wp_texture_object_destroy_device(self.device.context, self._tex_handle)
@@ -614,7 +637,16 @@ class Texture:
             if not src.is_contiguous:
                 raise ValueError("Source array must be contiguous")
 
-        if self.device.is_cuda:
+        if self._metal_storage is not None:
+            import warp._src.context  # noqa: PLC0415
+
+            if isinstance(src, Texture):
+                staging = warp._src.context.empty(shape=src._get_shape(), dtype=src.dtype, device="cpu")
+                src.copy_to(staging)
+                src = staging
+            self_array = self._metal_storage.level_array(0, self._get_shape(), self.dtype)
+            warp._src.context.copy(self_array, src)
+        elif self.device.is_cuda:
             if isinstance(src, Texture):
                 if src.device == self.device:
                     src_memory_type = MemoryType.ARRAY
@@ -671,7 +703,7 @@ class Texture:
 
             # CPU textures can be copied as contiguous arrays, but copying to a CUDA texture is a special case.
             if isinstance(src, Texture):
-                if src.device.is_cuda:
+                if src.device.is_cuda or src._metal_storage is not None:
                     return src.copy_to(self)
                 src = array(ptr=src._host_ptr, shape=src._get_shape(), dtype=src.dtype, device=src.device)
 
@@ -721,7 +753,14 @@ class Texture:
             if not dst.is_contiguous:
                 raise ValueError("Destination array must be contiguous")
 
-        if self.device.is_cuda:
+        if self._metal_storage is not None:
+            import warp._src.context  # noqa: PLC0415
+
+            self_array = self._metal_storage.level_array(0, self._get_shape(), self.dtype)
+            if isinstance(dst, Texture):
+                return dst.copy_from(self_array.numpy())
+            warp._src.context.copy(dst, self_array)
+        elif self.device.is_cuda:
             if isinstance(dst, Texture):
                 if dst.device == self.device:
                     dst_memory_type = MemoryType.ARRAY
@@ -778,7 +817,7 @@ class Texture:
 
             # CPU textures can be copied as contiguous arrays, but copying to a CUDA texture is a special case.
             if isinstance(dst, Texture):
-                if dst.device.is_cuda:
+                if dst.device.is_cuda or dst._metal_storage is not None:
                     return dst.copy_from(self)
                 dst = array(ptr=dst._host_ptr, shape=dst._get_shape(), dtype=dst.dtype, device=dst.device)
 
@@ -889,7 +928,10 @@ class Texture:
 
         mip_data_list = self._generate_mipmap_chain(data_np)
 
-        if self.device.is_cuda:
+        if self._metal_storage is not None:
+            for level, level_data in enumerate(mip_data_list):
+                self._metal_storage.upload_level(level, np.ascontiguousarray(level_data))
+        elif self.device.is_cuda:
             bytes_per_channel = type_size_in_bytes(self.dtype)
             # Keep host buffers alive until the async copies complete.
             level_array_refs = []
