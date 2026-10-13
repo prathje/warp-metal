@@ -432,6 +432,41 @@ class TestMetalTilesExt(unittest.TestCase):
             """,
         )
 
+    def test_narrow_struct_element_field_writes(self):
+        # ``arr[i].field = x`` into 1- and 2-byte fields sharing a 4-byte
+        # slot must leave the neighbouring fields intact.
+        _run(
+            self,
+            """
+            @wp.struct
+            class S:
+                a: wp.uint8
+                b: wp.bool
+                h: wp.float16
+                u: wp.uint16
+                c: wp.int8
+                d: int
+
+            @wp.kernel
+            def k(arr: wp.array[S]):
+                i = wp.tid()
+                arr[i].u = wp.uint16(1000 + i)
+                arr[i].h = wp.float16(float(i) * 0.5)
+                arr[i].b = (i % 2) == 0
+                arr[i].c = wp.int8(-i)
+                arr[i].a = wp.uint8(200 + i)
+                arr[-1 - i].d = i * 7
+
+            res = {}
+            for dev in ("cpu", "metal:0"):
+                a = wp.zeros(4, dtype=S, device=dev)
+                wp.launch(k, dim=4, inputs=[a], device=dev)
+                res[dev] = a.numpy()
+            for name in ("a", "b", "h", "u", "c", "d"):
+                np.testing.assert_array_equal(res["metal:0"][name], res["cpu"][name])
+            """,
+        )
+
     def test_tile_map_builtin_adjoint(self):
         _run(
             self,
