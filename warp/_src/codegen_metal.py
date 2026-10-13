@@ -740,6 +740,23 @@ def _emit_big_vec_struct(name: str, n: int, msl_scalar: str) -> str:
     body_lines.append("    aa += r / b;")
     body_lines.append(f"    for (int i = 0; i < {n}; ++i) ab -= r.c[i] * ret.c[i] / b;")
     body_lines.append("}")
+    # 5-arg forms (no ``ret``) for vec/scalar and scalar/vec division.
+    body_lines.append(
+        f"inline void wp_adj_div({name} a, {msl_scalar} s, thread {name}& aa, thread {msl_scalar}& as, {name} r) {{"
+    )
+    body_lines.append(f"    {msl_scalar} d = {_sc_zero(msl_scalar)};")
+    body_lines.append(f"    for (int i = 0; i < {n}; ++i) d += a.c[i] * r.c[i];")
+    body_lines.append("    as -= d / (s * s);")
+    body_lines.append(f"    for (int i = 0; i < {n}; ++i) aa.c[i] += r.c[i] / s;")
+    body_lines.append("}")
+    body_lines.append(
+        f"inline void wp_adj_div({msl_scalar} s, {name} a, thread {msl_scalar}& as, thread {name}& aa, {name} r) {{"
+    )
+    body_lines.append(
+        f"    for (int i = 0; i < {n}; ++i) {{ {msl_scalar} inv = {_sc_lit(msl_scalar, 1)} / a.c[i]; "
+        f"aa.c[i] -= s * r.c[i] * inv * inv; as += r.c[i] * inv; }}"
+    )
+    body_lines.append("}")
     # dot / length / length_sq / normalize, mirroring ``_adj_vec_helpers``
     # for the native widths.
     body_lines.append(
@@ -2043,6 +2060,13 @@ def _adj_vec_helpers(n: int, scalar: str = "float") -> str:
         f"    aa += metal::dot(b, r);\n    ab += a * r;\n}}\n"
         f"inline void wp_adj_div({v} a, {sc} b, {v} ret, thread {v}& aa, thread {sc}& ab, {v} r) {{\n"
         f"    aa += r / b;\n    ab -= metal::dot(r, ret) / b;\n}}\n"
+        # 5-arg forms (no ``ret``) that Warp's IR emits for vec/scalar and
+        # scalar/vec division (warp/native/vec.h).
+        f"inline void wp_adj_div({v} a, {sc} s, thread {v}& aa, thread {sc}& as, {v} r) {{\n"
+        f"    as -= metal::dot(a, r) / (s * s);\n    aa += r / s;\n}}\n"
+        f"inline void wp_adj_div({sc} s, {v} a, thread {sc}& as, thread {v}& aa, {v} r) {{\n"
+        f"    for (int i = 0; i < {n}; ++i) {{ {sc} inv = ({sc})1 / a[i]; aa[i] -= s * r[i] * inv * inv; "
+        f"as += r[i] * inv; }}\n}}\n"
         f"inline void wp_adj_dot({v} a, {v} b, thread {v}& aa, thread {v}& ab, {sc} r) {{\n"
         f"    aa += b * r;\n    ab += a * r;\n}}\n"
         f"inline void wp_adj_length({v} a, {sc} ret, thread {v}& aa, {sc} r) {{\n"
@@ -2155,6 +2179,12 @@ def _adj_mat_helpers(n: int) -> str:
         f"    aa += b * r;\n    ab += {ddot};\n}}\n"
         f"inline void wp_adj_div({m} a, float b, {m} ret, thread {m}& aa, thread float& ab, {m} r) {{\n"
         f"    aa += r / b;\n    ab -= ({ddot_ret}) / b;\n}}\n"
+        # 5-arg forms (no ``ret``), warp/native/mat.h.
+        f"inline void wp_adj_div({m} a, float s, thread {m}& aa, thread float& as, {m} r) {{\n"
+        f"    as -= ({ddot}) / (s * s);\n    aa += r / s;\n}}\n"
+        f"inline void wp_adj_div(float s, {m} a, thread float& as, thread {m}& aa, {m} r) {{\n"
+        f"    for (int i = 0; i < {n}; ++i) for (int j = 0; j < {n}; ++j) {{ float inv = 1.0f / a[j][i]; "
+        f"aa[j][i] -= s * r[j][i] * inv * inv; as += r[j][i] * inv; }}\n}}\n"
         f"inline void wp_adj_ddot({m} a, {m} b, thread {m}& aa, thread {m}& ab, float r) {{\n"
         f"    aa += b * r;\n    ab += a * r;\n}}\n"
         f"inline void wp_adj_cw_mul({m} a, {m} b, thread {m}& aa, thread {m}& ab, {m} r) {{\n{cw}}}\n"

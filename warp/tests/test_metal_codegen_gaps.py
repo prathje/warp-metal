@@ -237,6 +237,10 @@ class TestMetalCodegenGaps(unittest.TestCase):
                 s = wp.spatial_vector(wp.spatial_top(x) * 2.0, wp.spatial_bottom(y))
                 out[t] = (wp.spatial_dot(cr, s) + wp.dot(cd, wp.spatial_vector(1.0, 2.0, 3.0, 4.0, 5.0, 6.0))
                           + wp.max(x) + wp.min(y) + wp.max(c[t]) - wp.min(c[t]))
+                d = wp.abs(y[0]) + 1.0
+                m = wp.matrix_from_rows(c[t], c[t] * 2.0, wp.vec3(1.0, 2.0, 3.0))
+                out[t] += (wp.length(c[t] / d) + wp.length(d / (c[t] + wp.vec3(5.0))) + wp.trace(m / d)
+                           + wp.length(x / d))
 
             rng = np.random.default_rng(0)
             an = rng.standard_normal((4, 6)).astype(np.float32)
