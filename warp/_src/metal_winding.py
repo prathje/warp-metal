@@ -213,9 +213,7 @@ def _accum_child(m: _SAProps, c: _SAProps) -> _SAProps:
     m.n_zx = m.n_zx + Nzx
     m.n_xz = m.n_xz + Nxz
     m.n_ijk_diag = m.n_ijk_diag + 2.0 * warp.cw_mul(disp, c.n_ij_diag) + warp.cw_mul(disp, warp.cw_mul(disp, N))
-    m.sum_permute_n_xyz = m.sum_permute_n_xyz + (
-        disp[0] * (Nyz + Nzy) + disp[1] * (Nzx + Nxz) + disp[2] * (Nxy + Nyx)
-    )
+    m.sum_permute_n_xyz = m.sum_permute_n_xyz + (disp[0] * (Nyz + Nzy) + disp[1] * (Nzx + Nxz) + disp[2] * (Nxy + Nyx))
     m.two_n_xxy_n_yxx = (
         m.two_n_xxy_n_yxx
         + 2.0 * (disp[1] * c.n_ij_diag[0] + disp[0] * c.n_xy + N[0] * disp[0] * disp[1])
@@ -376,5 +374,6 @@ def compute_solid_angle_props(bvh, points, indices) -> np.ndarray:
         device=cpu,
     )
     out = props.numpy().view(np.float32).reshape(num_nodes, -1)
-    assert out.shape[1] == PROPS_FLOATS, out.shape
+    if out.shape[1] != PROPS_FLOATS:
+        raise RuntimeError(f"Unexpected solid-angle record size {out.shape}")
     return np.ascontiguousarray(out)

@@ -647,9 +647,7 @@ class TileExt:
 
         vn = self.vec_n.get(dl, 0)
         comps = list(range(vn)) if vn else [None]
-        body = " ".join(
-            f"{self._elem(dst, dl, build('_ta_k'), c)} = {self._elem(src, sl, '_ta_k', c)};" for c in comps
-        )
+        body = " ".join(f"{self._elem(dst, dl, build('_ta_k'), c)} = {self._elem(src, sl, '_ta_k', c)};" for c in comps)
         return f"for (int _ta_k = 0; _ta_k < {n}; ++_ta_k) {{ {body} }}"
 
     # -- tile_stack -----------------------------------------------------

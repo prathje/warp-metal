@@ -75,10 +75,9 @@ class MetalTextureStorage:
         normalized_coords: bool,
     ):
         import warp._src.context  # noqa: PLC0415
+        import warp.config as _cfg  # noqa: PLC0415
         from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
         from warp._src.types import uint8  # noqa: PLC0415
-
-        import warp.config as _cfg  # noqa: PLC0415
 
         if not _cfg.metal_native_dispatch:
             raise RuntimeError(
