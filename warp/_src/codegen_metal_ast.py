@@ -4459,3 +4459,134 @@ def _rewrite_while_body(body: list[Node], k_suffix: str) -> list[Node]:
             continue
         out.append(n)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Negative array indices
+# ---------------------------------------------------------------------------
+# Native Warp wraps a negative index once (``array.h`` ``index()``:
+# ``if (i < 0) i += arr.shape[k]``), so ``arr[-1]`` is the last element.
+# Newton relies on it: global entities carry ``world == -1`` and read
+# ``gravity[world]``. The Metal translators build flat offsets straight from
+# the index locals, so without this pass ``arr[-1]`` reads out of bounds.
+#
+# The pass rewrites every index operand of an array access on a kernel array
+# argument to a fresh local ``var_<i>__wrapN = wp_wrap_index(var_<i>,
+# <arr>_shape[k]);`` declared just before the access. ``<arr>_shape[k]`` is
+# folded into ``__shapes_packed`` downstream. Indices known to be
+# non-negative (thread ids, non-negative constants, ``for`` induction
+# variables counting up from a non-negative start, unsigned locals) are left
+# alone.
+
+# Ops whose leading operands after the array are the ``ndim`` indices.
+_WRAP_INDEX_ASSIGN_OPS = frozenset(
+    {
+        "address",
+        "atomic_add",
+        "atomic_sub",
+        "atomic_min",
+        "atomic_max",
+        "atomic_and",
+        "atomic_or",
+        "atomic_xor",
+        "atomic_exch",
+        "atomic_cas",
+    }
+)
+_WRAP_INDEX_VOID_OPS = frozenset({"array_store", "adj_address", "adj_array_store"}) | {
+    f"adj_{op}" for op in _WRAP_INDEX_ASSIGN_OPS if op.startswith("atomic_")
+}
+_WRAP_INDEX_NAME = re.compile(r"^var_(\w+)$")
+
+
+def wrap_negative_array_indices(
+    nodes: list[Node],
+    arr_ndims: dict[str, int],
+    var_msl_types: dict[str, str],
+    nonneg: set[str],
+) -> list[Node]:
+    """Wrap negative indices into ``[0, shape)`` the way native Warp does.
+
+    ``arr_ndims`` maps kernel array-arg labels to their ndim; ``var_msl_types``
+    maps local labels to their MSL scalar type; ``nonneg`` holds local labels
+    known to be non-negative.
+    """
+    counter = [0]
+    nonneg = set(nonneg)
+
+    def wrap_args(args: tuple[str, ...], indent: str) -> tuple[tuple[str, ...], list[Node]] | None:
+        if not args:
+            return None
+        m = _WRAP_INDEX_NAME.match(args[0].strip())
+        if m is None or m.group(1) not in arr_ndims:
+            return None
+        arr = m.group(1)
+        ndim = arr_ndims[arr]
+        if len(args) < 1 + ndim:
+            return None
+        new_args = list(args)
+        decls: list[Node] = []
+        for k in range(ndim):
+            a = args[1 + k].strip()
+            mi = _WRAP_INDEX_NAME.match(a)
+            if mi is None:
+                continue
+            label = mi.group(1)
+            if label in nonneg:
+                continue
+            msl_t = var_msl_types.get(label)
+            if msl_t is None or msl_t not in ("int", "long", "short", "char"):
+                continue
+            new_label = f"{label}__wrap{counter[0]}"
+            counter[0] += 1
+            decls.append(
+                _RawLine(raw=f"{indent}{msl_t} var_{new_label} = wp_wrap_index(var_{label}, {arr}_shape[{k}]);")
+            )
+            new_args[1 + k] = f"var_{new_label}"
+        if not decls:
+            return None
+        return tuple(new_args), decls
+
+    def rebuild_call(raw: str, op: str, new_args: tuple[str, ...]) -> str:
+        head = raw.find(f"wp::{op}")
+        open_paren = raw.find("(", head)
+        close_paren = raw.rfind(")")
+        return f"{raw[: open_paren + 1]}{', '.join(new_args)}{raw[close_paren:]}"
+
+    def walk(seq) -> list[Node]:
+        out: list[Node] = []
+        for n in seq:
+            if isinstance(n, Tid):
+                nonneg.update(n.targets)
+            elif isinstance(n, Assign) and n.expr.raw.startswith(("builtin_tid", "builtin_block_dim")):
+                nonneg.add(n.lhs)
+            if isinstance(n, For):
+                start = n.start.strip()
+                step = n.step.strip()
+                if (start.isdigit() or start.removeprefix("var_") in nonneg) and (
+                    step.isdigit() or step.removeprefix("var_") in nonneg
+                ):
+                    nonneg.add(n.iter_var)
+            if isinstance(n, (If, For, While, _DoWhileZero)):
+                from dataclasses import replace as _dc_replace  # noqa: PLC0415
+
+                out.append(_dc_replace(n, body=tuple(walk(n.body))))
+                continue
+            indent = _leading_indent(n.raw)
+            res = None
+            op = None
+            if isinstance(n, Assign) and isinstance(n.expr, Builtin) and n.expr.name in _WRAP_INDEX_ASSIGN_OPS:
+                op = n.expr.name
+                res = wrap_args(n.expr.args, indent)
+            elif isinstance(n, VoidCall) and n.op in _WRAP_INDEX_VOID_OPS:
+                op = n.op
+                res = wrap_args(n.args, indent)
+            if res is None:
+                out.append(n)
+                continue
+            new_args, decls = res
+            out.extend(decls)
+            out.append(parse_line(rebuild_call(n.raw, op, new_args)))
+        return out
+
+    return walk(nodes)

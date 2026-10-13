@@ -1,0 +1,52 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Metal kernels that compiled and ran but returned values different from CPU.
+
+Each test launches the same kernel on ``cpu`` and ``metal:0`` and compares.
+"""
+
+import textwrap
+import unittest
+
+from warp.tests.test_metal_launch import _has_mlx, _is_apple_silicon, _run_with_metal_enabled
+
+
+@unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
+@unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
+class TestMetalMismatch(unittest.TestCase):
+    def test_negative_index_wraps(self):
+        # Native ``index()`` maps ``arr[-1]`` to the last element; Newton reads
+        # ``gravity[world]`` with ``world == -1`` for global entities.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            @wp.kernel
+            def k(g: wp.array[wp.vec3], w: wp.array[wp.int32], g2: wp.array2d[float],
+                  out: wp.array[wp.vec3], out2: wp.array[float], out3: wp.array[float]):
+                tid = wp.tid()
+                out[tid] = g[w[tid]]
+                out2[tid] = g2[w[tid], -1]
+                wp.atomic_add(out3, w[tid], 1.0)
+
+            res = {}
+            for dev in ("cpu", "metal:0"):
+                g = wp.array([[1.0, 2.0, 3.0], [0.0, 0.0, -9.81]], dtype=wp.vec3, device=dev)
+                g2 = wp.array(np.arange(6, dtype=np.float32).reshape(2, 3), device=dev)
+                w = wp.array([0, -1], dtype=wp.int32, device=dev)
+                out = wp.zeros(2, dtype=wp.vec3, device=dev)
+                out2 = wp.zeros(2, dtype=float, device=dev)
+                out3 = wp.zeros(2, dtype=float, device=dev)
+                wp.launch(k, dim=2, inputs=[g, w, g2], outputs=[out, out2, out3], device=dev)
+                res[dev] = (out.numpy(), out2.numpy(), out3.numpy())
+            for a, b in zip(res["cpu"], res["metal:0"]):
+                np.testing.assert_array_equal(a, b)
+            np.testing.assert_allclose(res["metal:0"][0][1], [0.0, 0.0, -9.81], rtol=1e-6)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

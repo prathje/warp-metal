@@ -155,6 +155,7 @@ from warp._src.codegen_metal_ast import fold_const_branches as _ast_fold_const_b
 from warp._src.codegen_metal_ast import fold_drop_unsupported_locals as _ast_fold_drop
 from warp._src.codegen_metal_ast import fold_indexref_writes as _ast_fold_indexref
 from warp._src.codegen_metal_ast import fold_multidim_atomics as _ast_fold_multidim_atomics
+from warp._src.codegen_metal_ast import wrap_negative_array_indices as _ast_wrap_negative_array_indices
 from warp._src.codegen_metal_ast import fold_views as _ast_fold_views
 from warp._src.codegen_metal_ast import inline_user_calls as _ast_inline
 from warp._src.codegen_metal_ast import lower_reverse_ranges as _ast_lower_reverse_ranges
@@ -5605,6 +5606,9 @@ _MISC_MATH_HELPERS: dict[str, str] = {
         "    x = metal::clamp((x - edge0) / (edge1 - edge0), T(0), T(1));\n"
         "    return x * x * (T(3) - T(2) * x);\n"
         "}"
+    ),
+    "wp_wrap_index": (
+        "template <typename T, typename S>\ninline T wp_wrap_index(T i, S n) { return i < T(0) ? T(i + T(n)) : i; }"
     ),
     "wp_frac": ("template <typename T>\ninline T wp_frac(T x) { return x - metal::trunc(x); }"),
     "wp_degrees": ("template <typename T>\ninline T wp_degrees(T x) { return x * T(57.29577951308232087679); }"),
@@ -13322,6 +13326,26 @@ def _generate_msl_kernel_uncached(
         struct_arg_arrays_out=_struct_arg_array_fields,
     )
     _ast_nodes, _indexref_skip = _ast_fold_indexref(_ast_nodes, adj, _early_vec_arr_info)
+    # Native Warp wraps a negative index once (``arr[-1]`` is the last
+    # element); the flat-offset translators below do not, so wrap the index
+    # operands of every kernel-array access up front.
+    _ast_nodes = _ast_wrap_negative_array_indices(
+        _ast_nodes,
+        {a.label: a.type.ndim for a in adj.args if _is_array_arg_type(a.type) and hasattr(a.type, "ndim")},
+        {
+            **{
+                str(_v.label): _SCALAR_CTYPE_TO_MSL.get(_v.ctype(value_type=True))
+                for _v in adj.variables
+                if _v.ctype(value_type=True) in _SCALAR_CTYPE_TO_MSL
+            },
+            **{
+                str(_lbl): _SCALAR_CTYPE_TO_MSL.get(_ct)
+                for _lbl, _ct in _inlined_var_ctypes.items()
+                if _ct in _SCALAR_CTYPE_TO_MSL
+            },
+        },
+        {str(_l) for _l, _c in {**_const_ints, **_inlined_const_ints}.items() if isinstance(_c, int) and _c >= 0},
+    )
     # Flatten multi-dim ``wp::atomic_<op>(arr, i, j, ..., val)`` into the
     # 3-arg form the intrinsic regex handles, expanding to per-component
     # atomics for vec-typed arrays.
