@@ -13794,6 +13794,34 @@ def _fix_negative_step_for_loops(
     return out
 
 
+def _guard_struct_field_writes(lines: list[str], arrays: set[str]) -> list[str]:
+    """Prefix single-statement writes into ``arrays`` with a non-null check
+    (``if (<arr>_shape[0] != 0)``; the shape reference is packed later)."""
+    alt = "|".join(re.escape(a) for a in sorted(arrays, key=len, reverse=True))
+    addr_pat = re.compile(rf"&\s*(?P<arr>{alt})\s*\[")
+    store_pat = re.compile(rf"^\s*(?P<arr>{alt})\s*\[")
+    out: list[str] = []
+    for ln in lines:
+        body = ln.strip()
+        m = addr_pat.search(body) or store_pat.match(body)
+        if m is None or not body.endswith((";", "}")):
+            out.append(ln)
+            continue
+        if body.startswith("{"):
+            single = body.endswith("}")
+        else:
+            single = body.count(";") == 1 and "{" not in body and "}" not in body
+        if not single or body.startswith(("if ", "if(", "for ", "for(", "while")):
+            out.append(ln)
+            continue
+        if store_pat.match(body) is None and not re.match(r"^(?:\w+\s*=\s*)?[\w:]+\s*\(", body) and not body.startswith("{"):
+            out.append(ln)
+            continue
+        indent = ln[: len(ln) - len(ln.lstrip())]
+        out.append(f"{indent}if ({m.group('arr')}_shape[0] != 0) {body}")
+    return out
+
+
 def _materialize_for_loop_vars(lines: list[str]) -> list[str]:
     """Give AST-emitted ``for`` loops a private counter when their iteration
     variable is read after the loop.
@@ -17893,6 +17921,14 @@ def _generate_msl_kernel_uncached(
             return ln
 
         body_lines = [_rewrite_bool_from_array(ln) for ln in body_lines]
+
+    # Written struct-arg array fields that the caller left unset are bound
+    # to a small scratch buffer with a zero packed shape (CUDA passes a null
+    # array). Skip writes into a zero-shape field so an unguarded store
+    # cannot run off the scratch buffer into unrelated allocations.
+    _written_sfa = {a.label for a in output_args} & set(_struct_arg_array_fields)
+    if _written_sfa:
+        body_lines = _guard_struct_field_writes(body_lines, _written_sfa)
 
     source = "\n".join(body_lines) + "\n"
 

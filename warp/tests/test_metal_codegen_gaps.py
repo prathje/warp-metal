@@ -659,6 +659,63 @@ class TestMetalCodegenGaps(unittest.TestCase):
             """,
         )
 
+    def test_unset_written_struct_field_writes_are_skipped(self):
+        # An unset written struct-arg array field binds a tiny scratch
+        # buffer with a zero packed shape; unguarded stores into it must not
+        # spill into other allocations, eagerly or under graph replay.
+        _run(
+            self,
+            """
+            @wp.struct
+            class W:
+                out: wp.array[float]
+                cnt: wp.array[int]
+
+            @wp.kernel
+            def k(w: W, x: wp.array[float], o: wp.array[float]):
+                t = wp.tid()
+                w.out[t] = x[t]
+                wp.atomic_add(w.cnt, t, 1)
+                o[t] = float(w.out.shape[0]) + x[t]
+
+            import re
+
+            from warp._src.codegen_metal import generate_msl_kernel
+
+            src = generate_msl_kernel(k).source
+            for store in re.findall(r"^.*&w__(?:out|cnt)\\[.*$", src, flags=re.M):
+                assert re.match(r"\\s*if \\(__shapes_packed\\[\\d+ \\+ 0\\] != 0\\) ", store), store
+
+            dev = "metal:0"
+            n = 65536
+            bufs = [wp.full(4096, 7.0, dtype=float, device=dev) for _ in range(32)]
+            x = wp.array(np.arange(n, dtype=np.float32), device=dev)
+            o = wp.zeros(n, dtype=float, device=dev)
+            wp.launch(k, n, [W(), x, o], device=dev)
+            wp.synchronize()
+            assert all((b.numpy() == 7.0).all() for b in bufs)
+            np.testing.assert_array_equal(o.numpy(), x.numpy())
+
+            o.zero_()
+            with wp.ScopedCapture(device=dev) as cap:
+                wp.launch(k, n, [W(), x, o], device=dev)
+            for _ in range(3):
+                wp.capture_launch(cap.graph)
+            wp.synchronize()
+            assert all((b.numpy() == 7.0).all() for b in bufs)
+            np.testing.assert_array_equal(o.numpy(), x.numpy())
+
+            # A set field still receives every write.
+            w = W()
+            w.out = wp.zeros(n, dtype=float, device=dev)
+            w.cnt = wp.zeros(n, dtype=int, device=dev)
+            wp.launch(k, n, [w, x, o], device=dev)
+            np.testing.assert_array_equal(w.out.numpy(), x.numpy())
+            assert (w.cnt.numpy() == 1).all()
+            """,
+            timeout=300,
+        )
+
     def test_loop_var_after_loop_keeps_last_value(self):
         _run(
             self,
