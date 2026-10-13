@@ -278,6 +278,8 @@ def _make_jacobi_preconditioner(A: _Matrix, use_abs: bool) -> LinearOperator:
         raise ValueError("Unsupported source matrix type for building diagonal preconditioner")
 
     return aslinearoperator(inv_diag)
+
+
 def _as_contiguous_input(x: wp.array):
     """Materialise ``x`` if the device's kernels can't index a strided view.
 

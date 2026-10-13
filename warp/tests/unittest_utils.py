@@ -272,8 +272,10 @@ def get_selected_cuda_test_devices_with_mempool(mode: str | None = None):
     support is required for in-capture allocation on CUDA.
     """
     return [d for d in get_selected_cuda_test_devices(mode) if d.is_mempool_supported]
+
+
 def get_metal_test_devices():
-    """Returns the Metal device when the Metal backend is enabled, else an empty list.
+    """Return the Metal device when the Metal backend is enabled, else an empty list.
 
     Metal is opt-in (``WARP_ENABLE_METAL=1``) and never part of :func:`get_test_devices`,
     so test modules that support it add it explicitly.
