@@ -9780,6 +9780,9 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bwp::volume_lookup_i\b"), "wp_volume_lookup_i"),
     (re.compile(r"\bwp::volume_store_f\b"), "wp_volume_store_f"),
     (re.compile(r"\bwp::volume_voxel_count\b"), "wp_volume_voxel_count"),
+    # Generic ``wp.volume_store`` (value type picks the overload); the MSL
+    # ``wp_volume_store<T>`` template deduces it the same way.
+    (re.compile(r"\bwp::volume_store\s*\("), "wp_volume_store("),
     (re.compile(r"\bwp::volume_store_v\b"), "wp_volume_store_v"),
     (re.compile(r"\bwp::volume_store_i\b"), "wp_volume_store_i"),
     (re.compile(r"\bwp::volume_sample" + _VOLUME_TEMPLATE_ARG), _volume_template_repl("wp_volume_sample")),
@@ -12902,6 +12905,10 @@ def _slot_struct_components(kind: tuple, access: str) -> tuple[int, list[str], s
         if rest.strip():
             return None
         return stride, [str(base)], finfo.scalar_msl
+    if finfo.kind == _STRUCT_FIELD_KIND_BYTE:
+        if rest.strip():
+            return None
+        return stride, [str(base)], f"byte{finfo.byte}_{finfo.scalar_msl}"
     if finfo.kind == _STRUCT_FIELD_KIND_VEC:
         sub = _slot_components(("vec", finfo.size), rest)
     elif finfo.kind == _STRUCT_FIELD_KIND_MAT:
@@ -15945,7 +15952,17 @@ def _generate_msl_kernel_uncached(
                     return _struct_bitcast_write(f"({read} {_op[:-1]} {comp_val})", _scalar)
 
                 writes: list[str] = []
-                if finfo.kind == _STRUCT_FIELD_KIND_SCALAR:
+                if finfo.kind == _STRUCT_FIELD_KIND_BYTE:
+                    slot = f"{buf}[{base_expr}]"
+                    full = value
+                    if op != "=":
+                        full = f"({_struct_field_read_expr(buf, base_expr, finfo)} {op[:-1]} ({value}))"
+                    writes.append(
+                        f"{indent}{{ uchar4 _wp_b4 = as_type<uchar4>({slot}); "
+                        f"_wp_b4[{finfo.byte}] = uchar(({finfo.scalar_msl})({full})); "
+                        f"{slot} = as_type<float>(_wp_b4); }}"
+                    )
+                elif finfo.kind == _STRUCT_FIELD_KIND_SCALAR:
                     slot = f"{buf}[{base_expr}]"
                     writes.append(f"{indent}{slot} = {_slot_rhs(slot, value)};")
                 elif finfo.kind == _STRUCT_FIELD_KIND_SCALAR64:
@@ -16061,7 +16078,13 @@ def _generate_msl_kernel_uncached(
             op_name = scalar_store_match.group("op")
             idx = scalar_store_match.group("idx").strip()
             val = scalar_store_match.group("val").strip()
-            if op_name.startswith("store_bits_"):
+            byte_store = None
+            if op_name.startswith("store_bits_byte"):
+                # One-byte field: read-modify-write its byte of the slot.
+                _b, _sc = op_name[len("store_bits_byte") :].split("_", 1)
+                byte_store = (int(_b), _sc)
+                op_name = "store"
+            elif op_name.startswith("store_bits_"):
                 # Non-float field of flat float32 struct storage: write the bits.
                 op_name = "store"
                 val = f"as_type<float>(({op_name and scalar_store_match.group('op')[len('store_bits_'):]})({val}))"
@@ -16077,7 +16100,19 @@ def _generate_msl_kernel_uncached(
                 "bit_and_inplace": "&=",
                 "bit_xor_inplace": "^=",
             }[op_name]
-            if arr in f64_arr_names:
+            if byte_store is not None:
+                slot = f"{arr}[{idx}]"
+                b4 = f"as_type<uchar4>(atomic_load_explicit(&{slot}, memory_order_relaxed))" if arr in atomic_output_names else f"as_type<uchar4>({slot})"
+                store = (
+                    f"atomic_store_explicit(&{slot}, as_type<float>(_wp_b4), memory_order_relaxed);"
+                    if arr in atomic_output_names
+                    else f"{slot} = as_type<float>(_wp_b4);"
+                )
+                line_out = (
+                    f"{indent}{{ uchar4 _wp_b4 = {b4}; _wp_b4[{byte_store[0]}] = "
+                    f"uchar(({byte_store[1]})({val})); {store} }}"
+                )
+            elif arr in f64_arr_names:
                 slot = f"{arr}[{idx}]"
                 if op_sym == "=":
                     line_out = f"{indent}{slot} = wp_f32_to_f64({val});"
@@ -16177,6 +16212,11 @@ def _generate_msl_kernel_uncached(
                     for fpath, off, finfo in _iter_scalar_leaves(layout):
                         src = _per_field_local(val_struct_label, fpath)
                         cast = finfo.scalar_msl
+                        if finfo.kind in (_STRUCT_FIELD_KIND_BYTE, _STRUCT_FIELD_KIND_TEXTURE):
+                            raise MetalCodegenError(
+                                f"Kernel {adj.fun_name!r}: storing a whole struct with a {finfo.kind} field "
+                                f"({fpath!r}) into array {arr!r} is not supported on Metal"
+                            )
                         if finfo.kind == _STRUCT_FIELD_KIND_SCALAR:
                             body_lines.append(
                                 _finalize(_emit_scalar_write(f"{base} + {off}", _struct_bitcast_write(src, cast)))
@@ -17543,6 +17583,8 @@ _STRUCT_FIELD_KIND_STRUCT = "struct"
 _STRUCT_FIELD_KIND_ARRAY_UNUSED = "array_unused"
 # ``wp.Texture1D/2D/3D`` field: the ``texture*_t`` value (handle + geometry).
 _STRUCT_FIELD_KIND_TEXTURE = "texture"
+# One-byte field (``bool`` / ``int8`` / ``uint8``): one byte of a 4-byte slot.
+_STRUCT_FIELD_KIND_BYTE = "byte"
 """Sentinel for ``wp.array``-typed struct fields. We allow them to exist in
 the layout (so the struct's other fields can still be read/written) but
 their slot has size 0: any read or write through such a field raises a
@@ -17566,6 +17608,8 @@ class _StructFieldInfo:
     scalar_msl: str = "float"
     # Sub-layout for ``_STRUCT_FIELD_KIND_STRUCT`` (nested struct) fields.
     sub: _StructLayout | None = None
+    # Byte within the 4-byte slot for ``_STRUCT_FIELD_KIND_BYTE`` fields.
+    byte: int = 0
 
 
 @dataclass
@@ -17694,6 +17738,8 @@ def _classify_struct_field(fname: str, ftype) -> _StructFieldInfo:
         return _StructFieldInfo(
             name=fname, offset=0, size=2, kind=_STRUCT_FIELD_KIND_SCALAR64, msl_type=msl, scalar_msl=msl
         )
+    if msl in ("bool", "char", "uchar"):
+        return _StructFieldInfo(name=fname, offset=0, size=1, kind=_STRUCT_FIELD_KIND_BYTE, msl_type=msl, scalar_msl=msl)
     if msl not in _STRUCT_SCALAR_MSL_4BYTE:
         raise MetalCodegenError(
             f"MSL codegen: struct field {fname!r} of type {ftype!r} is not 4 bytes — struct "
@@ -17718,6 +17764,11 @@ def _struct_layout_for(struct_cls) -> _StructLayout:
     for fname, fvar in getattr(struct_cls, "vars", {}).items():
         finfo = _classify_struct_field(fname, fvar.type)
         byte_off = getattr(ctype, fname).offset if ctype is not None else None
+        if finfo.kind == _STRUCT_FIELD_KIND_BYTE and byte_off is not None:
+            finfo.offset = byte_off // 4
+            finfo.byte = byte_off % 4
+            layout.fields[fname] = finfo
+            continue
         if byte_off is None or (byte_off % 4 != 0 and finfo.size > 0):
             # Size-0 fields (empty nested structs, array fields) may land at
             # odd byte offsets — ctypes gives empty structs 1 byte and
@@ -17783,6 +17834,11 @@ def _struct_field_read_expr(buf: str, base_expr: str, finfo: _StructFieldInfo) -
         return _struct_bitcast_read(f"{buf}[{base_expr}]", finfo.scalar_msl)
     if finfo.kind == _STRUCT_FIELD_KIND_TEXTURE:
         return _mtex.struct_field_read(finfo.msl_type, buf, base_expr)
+    if finfo.kind == _STRUCT_FIELD_KIND_BYTE:
+        raw = f"as_type<uchar4>({buf}[{base_expr}])[{finfo.byte}]"
+        if finfo.scalar_msl == "bool":
+            return f"({raw} != 0)"
+        return f"as_type<{finfo.scalar_msl}>({raw})"
     if finfo.kind == _STRUCT_FIELD_KIND_SCALAR64:
         lo = f"as_type<uint>({buf}[{base_expr}])"
         hi = f"as_type<uint>({buf}[({base_expr}) + 1])"

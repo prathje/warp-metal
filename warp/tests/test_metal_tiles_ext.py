@@ -341,6 +341,83 @@ class TestMetalTilesExt(unittest.TestCase):
             """,
         )
 
+    def test_volume_allocate_by_tiles_and_store(self):
+        # allocate_by_tiles/load_from_numpy used to build a host-side grid
+        # from Metal pointers: every GPU lookup read 0.
+        _run(
+            self,
+            """
+            @wp.kernel
+            def st(v: wp.uint64):
+                i, j, k = wp.tid()
+                wp.volume_store(v, i, j, k, float(i + j * 10 + k * 100))
+
+            @wp.kernel
+            def rd(v: wp.uint64, n: wp.uint64, o: wp.array[float]):
+                i = wp.tid()
+                o[i] = wp.volume_lookup_f(v, i, 1, 2) + wp.volume_sample_f(n, wp.vec3(float(i), 1.0, 2.0), wp.Volume.LINEAR)
+
+            dense = np.arange(512, dtype=np.float32).reshape(8, 8, 8)
+            keep = []
+
+            def make(d):
+                v = wp.Volume.allocate_by_tiles(wp.array([[0, 0, 0]], dtype=wp.vec3i, device=d), voxel_size=0.1,
+                                                bg_value=-1.0, device=d)
+                wp.launch(st, dim=(8, 8, 8), inputs=[v.id], device=d)
+                n = wp.Volume.load_from_numpy(dense, bg_value=-1.0, device=d)
+                keep.append((v, n))
+                return [v.id, n.id, wp.zeros(8, dtype=float, device=d)]
+
+            compare(rd, 8, make, [2], tiled=False)
+            """,
+        )
+
+    def test_one_byte_struct_fields(self):
+        _run(
+            self,
+            """
+            @wp.struct
+            class S:
+                a: float
+                flag: wp.bool
+                c: wp.int8
+                d: int
+
+            @wp.kernel
+            def k(s: S, arr: wp.array[S], o: wp.array[float], flags: wp.array[int]):
+                i = wp.tid()
+                e = arr[i]
+                v = s.a
+                if s.flag:
+                    v += 10.0
+                if e.flag:
+                    v += 100.0
+                o[i] = v + float(e.c) + float(e.d) * 1000.0
+                arr[i].flag = not e.flag
+                arr[i].c = wp.int8(i - 2)
+                if arr[i].flag:
+                    flags[i] = int(arr[i].c)
+
+            res = {}
+            for dev in ("cpu", "metal:0"):
+                s = S()
+                s.a, s.flag, s.c, s.d = 1.5, True, wp.int8(-3), 7
+                items = []
+                for i in range(4):
+                    t = S()
+                    t.a, t.flag, t.c, t.d = 0.0, bool(i % 2), wp.int8(i), i
+                    items.append(t)
+                arr = wp.array(items, dtype=S, device=dev)
+                o = wp.zeros(4, dtype=float, device=dev)
+                f = wp.zeros(4, dtype=int, device=dev)
+                wp.launch(k, dim=4, inputs=[s, arr, o, f], device=dev)
+                a = arr.numpy()
+                res[dev] = (o.numpy(), f.numpy(), a["flag"], a["c"], a["d"])
+            for a, b in zip(res["cpu"], res["metal:0"]):
+                np.testing.assert_array_equal(b, a)
+            """,
+        )
+
     def test_tile_map_builtin_adjoint(self):
         _run(
             self,

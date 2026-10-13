@@ -7521,6 +7521,30 @@ class Volume:
             raise RuntimeError(
                 "tile_points must be contiguous and either a 1D Warp array of vec3f or vec3i or a 2D n-by-3 array of int32 or float32."
             )
+        if getattr(device, "is_metal", False):
+            # The native tile builder only targets host/CUDA memory: build the
+            # grid on the host, then upload its bytes into a Metal volume.
+            # (Passing Metal pointers to the host builder produced a host-side
+            # volume whose id the GPU cannot read: every lookup returned 0.)
+            if rebuildable or max_tiles is not None or max_lower_nodes is not None or max_upper_nodes is not None:
+                raise NotImplementedError(
+                    "Volume.allocate_by_tiles() on Metal devices does not support rebuildable volumes "
+                    "or rebuild capacities yet."
+                )
+            host = cls.allocate_by_tiles(
+                tile_points.to("cpu"),
+                voxel_size=voxel_size,
+                bg_value=bg_value,
+                translation=translation,
+                device="cpu",
+                transform=transform,
+                point_mask=None if point_mask is None else point_mask.to("cpu"),
+            )
+            grid = warp.clone(host.array(), device=device)
+            volume = cls(grid, copy=False)
+            volume._grid_array = grid
+            return volume
+
         if tile_points.device != device:
             tile_points = tile_points.to(device)
 
