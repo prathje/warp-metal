@@ -26,7 +26,7 @@ Algorithms:
   keys are bit-twiddled into unsigned order), values 4 or 8 bytes.
 * segmented sort: one radix sort over 64-bit composite keys
   ``(segment_start << 32) | radix(key)`` carrying the element index, then a
-  gather. Elements outside every segment keep their own index as the
+  gather. Segments may be listed in any order (they must not overlap). Elements outside every segment keep their own index as the
   composite prefix and therefore stay in place.
 * run-length encode: head flags, inclusive scan, scatter of run heads, and a
   length kernel.
@@ -321,36 +321,41 @@ struct SegParams {
     uint pad0;
 };
 
-// marks[start] = segment + 1 for every non-empty segment.
+// For every non-empty segment: marks[start] = start + 1 and seg_at[start] =
+// segment. An inclusive max-scan of ``marks`` then yields, per element, the
+// largest non-empty segment start at or before it -- independent of the order
+// in which the segments are listed.
 kernel void wp_seg_mark(device const int* seg_start [[buffer(0)]],
                         device const int* seg_end [[buffer(1)]],
                         device int* marks [[buffer(2)]],
-                        constant SegParams& p [[buffer(3)]],
+                        device int* seg_at [[buffer(3)]],
+                        constant SegParams& p [[buffer(4)]],
                         uint s [[thread_position_in_grid]]) {
     if (s >= p.nseg) return;
     const int start = seg_start[s];
     const int end = seg_end[s];
     if (start >= 0 && end > start && uint(start) < p.n) {
-        marks[start] = int(s) + 1;
+        marks[start] = start + 1;
+        seg_at[start] = int(s);
     }
 }
 
-// After an inclusive max-scan of the marks, build composite sort keys and
-// stash the original keys / values in the scratch halves for the gather.
+// After the max-scan, build composite sort keys and stash the original keys /
+// values in the scratch halves for the gather.
 kernel void wp_seg_compose(device uint* keys [[buffer(0)]],
                            device uint* values [[buffer(1)]],
-                           device const int* seg_of [[buffer(2)]],
-                           device const int* seg_start [[buffer(3)]],
+                           device const int* last_start [[buffer(2)]],
+                           device const int* seg_at [[buffer(3)]],
                            device const int* seg_end [[buffer(4)]],
                            device ulong* ckeys [[buffer(5)]],
                            device uint* cvals [[buffer(6)]],
                            constant SegParams& p [[buffer(7)]],
                            uint i [[thread_position_in_grid]]) {
     if (i >= p.n) return;
-    const int s = seg_of[i] - 1;
+    const int start = last_start[i] - 1;
     uint prefix = i;
-    if (s >= 0 && int(i) < seg_end[s]) {
-        prefix = uint(seg_start[s]);
+    if (start >= 0 && int(i) < seg_end[seg_at[start]]) {
+        prefix = uint(start);
     }
     const uint k = keys[i];
     ckeys[i] = (ulong(prefix) << 32) | ulong(wp_to_radix(k, p.kind));
@@ -710,6 +715,7 @@ def segmented_sort_pairs(keys, values, count: int, seg_start, seg_end, num_segme
     n = count
     kind = 2 if keys.dtype == wp.float32 else 1
     marks = _scratch.get(disp, "seg_marks", n * 4)
+    seg_at = _scratch.get(disp, "seg_at", n * 4)
     ckeys = _scratch.get(disp, "seg_ckeys", 2 * n * 8)
     cvals = _scratch.get(disp, "seg_cvals", 2 * n * 4)
     k_slice, v_slice = _slice(keys), _slice(values)
@@ -718,15 +724,15 @@ def segmented_sort_pairs(keys, values, count: int, seg_start, seg_end, num_segme
     disp.device_fill(marks, 0, n * 4)
     _dispatch(
         "wp_seg_mark",
-        [s_slice, e_slice, marks, params],
-        ["r", "r", "w", None],
+        [s_slice, e_slice, marks, seg_at, params],
+        ["r", "r", "w", "w", None],
         (max(num_segments, 1), 1, 1),
         (min(_TG, max(num_segments, 1)), 1, 1),
     )
     _scan(marks, marks, n, 1, "int", True, op=1)
     _dispatch(
         "wp_seg_compose",
-        [k_slice, v_slice, marks, s_slice, e_slice, ckeys, cvals, params],
+        [k_slice, v_slice, marks, seg_at, e_slice, ckeys, cvals, params],
         ["rw", "rw", "r", "r", "r", "w", "w", None],
         (n, 1, 1),
         (min(_TG, n), 1, 1),
