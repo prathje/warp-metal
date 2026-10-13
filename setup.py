@@ -229,6 +229,7 @@ setuptools.setup(
             "native/clang/*.cpp",
             "native/libdevice/*",
             "native/nanovdb/*.h",
+            "native/metal/*.metal",
             "tests/assets/*",
             "examples/assets/*",
             *warp_binary_libraries,
