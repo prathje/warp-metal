@@ -156,6 +156,7 @@ from warp._src.codegen_metal_ast import fold_drop_unsupported_locals as _ast_fol
 from warp._src.codegen_metal_ast import fold_indexref_writes as _ast_fold_indexref
 from warp._src.codegen_metal_ast import fold_mesh_get as _ast_fold_mesh_get
 from warp._src.codegen_metal_ast import fold_multidim_atomics as _ast_fold_multidim_atomics
+from warp._src.codegen_metal_ast import fold_struct_array_array_fields as _ast_fold_struct_array_fields
 from warp._src.codegen_metal_ast import fold_tuple_locals as _ast_fold_tuples
 from warp._src.codegen_metal_ast import fold_views as _ast_fold_views
 from warp._src.codegen_metal_ast import has_print_calls as _ast_has_print_calls
@@ -12781,6 +12782,11 @@ class MetalKernelArtifact:
     # buffer keeps the total kernel-arg count under Metal's 31-slot
     # hardware limit.
     shape_packed_arrs: tuple[str, ...] = ()
+    # ``wp.array[Struct]`` args whose elements' array fields the kernel reads.
+    # Those reads compile to zero values (see
+    # ``codegen_metal_ast.fold_struct_array_array_fields``); the launcher
+    # refuses a launch where such an arg is non-empty.
+    struct_array_field_reads: tuple[str, ...] = ()
     # Per-array shape slot size in ``__shapes_packed`` (each array gets
     # ``shape_packed_slot`` int32s, padded with zeros). Warp arrays cap
     # at 4 dims so 4 is plenty.
@@ -13770,10 +13776,11 @@ def _generate_msl_kernel_uncached(
     _ast_nodes = _ast_fold_const_branches(_ast_nodes, adj, _inlined_const_ints)
     _ast_nodes, _tuple_skip = _ast_fold_tuples(_ast_nodes, adj, _inlined_var_ctypes)
     _ast_nodes, _mesh_skip = _ast_fold_mesh_get(_ast_nodes, adj, _inlined_var_ctypes)
+    _ast_nodes, _sa_skip, _sa_field_reads = _ast_fold_struct_array_fields(_ast_nodes, adj, _inlined_var_ctypes)
     if _ast_has_print_calls(_ast_nodes):
         _handle_metal_print(adj.fun_name)
     _ast_nodes, _drop_skip = _ast_fold_drop(_ast_nodes, adj, _inlined_var_ctypes)
-    _drop_skip = _drop_skip | _tuple_skip | _mesh_skip
+    _drop_skip = _drop_skip | _tuple_skip | _mesh_skip | _sa_skip
     # ``_struct_arg_array_fields``: synthetic label -> (arg label, field
     # path) for every ``wp.array`` field of a struct-typed kernel arg the
     # body reads. The fold rewrites those accesses against the synthetic
@@ -17136,7 +17143,7 @@ def _generate_msl_kernel_uncached(
         # launcher binds a 1-element placeholder and skips its copy-back.
         final_output_names = ["__wp_unused_out"]
 
-    return MetalKernelArtifact(
+    _artifact = MetalKernelArtifact(
         name=artifact_name,
         source=source,
         input_names=base_input_names + inplace_input_names + init_input_names + extra_input_names,
@@ -17178,6 +17185,8 @@ def _generate_msl_kernel_uncached(
         tid4=uses_tid4,
         struct_array_args=struct_array_args_final,
     )
+    _artifact.struct_array_field_reads = tuple(sorted(_sa_field_reads))
+    return _artifact
 
 
 # ---------------------------------------------------------------------------
@@ -18976,6 +18985,15 @@ def launch_metal_kernel_native(
             f"but kernel requires {n_kernel_args}."
         )
     _normalize_none_array_args(kernel, fwd_args, device)
+    _sa_reads = getattr(artifact, "struct_array_field_reads", ())
+    if _sa_reads:
+        for _arg, _val in zip(kernel.adj.args, fwd_args):
+            if _arg.label in _sa_reads and getattr(_val, "size", 0):
+                raise MetalCodegenError(
+                    f"Kernel '{kernel.key}' reads array fields of the elements of {_arg.label!r} "
+                    f"(a wp.array of a struct with array members), which the Metal backend does not "
+                    f"support; such reads only work while the array is empty"
+                )
     # Per-kernel metadata dicts are reused across launches — caching
     # them on the kernel object shaves ~10 µs/launch off the hot path.
     arg_by_name = getattr(kernel, "_metal_native_arg_by_name", None)

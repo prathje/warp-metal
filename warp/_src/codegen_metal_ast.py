@@ -2862,6 +2862,151 @@ def fold_tuple_locals(
 
 
 # ---------------------------------------------------------------------------
+# Array fields of ``wp.array[Struct]`` elements
+# ---------------------------------------------------------------------------
+# A struct element stores its array fields as host-side ``array_t`` records
+# (CPU ``contents()`` pointers on Metal), which a kernel cannot dereference.
+# Kernels that merely *contain* such reads on a path that only runs when the
+# struct array is non-empty (Newton's ``compute_shape_local_bounds`` reads
+# Gaussian splat data, but every model without splats passes ``None``) must
+# still compile. Reads lower to zero values and the arg label is reported so
+# the launcher can refuse a launch with a non-empty array.
+
+_SA_ADDR_PAT = re.compile(r"^\s*var_(?P<lhs>\w+)\s*=\s*wp::address\s*\(\s*var_(?P<arr>\w+)\s*,(?P<rest>.*)\)\s*;\s*$")
+
+
+def fold_struct_array_array_fields(
+    nodes: list[Node], adj, extra_var_ctypes: dict[str, str] | None = None
+) -> tuple[list[Node], set[str], set[str]]:
+    """Stub reads of array fields through ``wp.array[Struct]`` elements.
+
+    Returns ``(nodes, skip_decls, arg_labels)`` where ``arg_labels`` names
+    the struct-array kernel args whose array fields are read.
+    """
+    from warp._src.codegen import Struct  # noqa: PLC0415
+    from warp._src.codegen_metal import (  # noqa: PLC0415
+        MetalCodegenError,
+        _is_array_arg,
+        _is_array_arg_type,
+        _msl_var_type,
+        _msl_zero_init,
+    )
+
+    struct_args: dict[str, set[str]] = {}
+    for a in adj.args:
+        if not _is_array_arg(a):
+            continue
+        dtype = getattr(a.type, "dtype", None)
+        if isinstance(dtype, Struct):
+            fields = {f for f, v in dtype.vars.items() if _is_array_arg_type(v.type)}
+            if fields:
+                struct_args[a.label] = fields
+    if not struct_args:
+        return nodes, set(), set()
+
+    ctypes_of: dict[str, str] = {v.label: v.ctype() for v in adj.variables}
+    ctypes_of.update(extra_var_ctypes or {})
+
+    elem: dict[str, str] = {}  # element ptr / struct copy label -> arg label
+    fptr: dict[str, str] = {}  # array-field ptr / array value label -> arg label
+    eptr: dict[str, str] = {}  # element-of-array-field ptr label -> arg label
+    used: set[str] = set()
+
+    def rewrite_leaf(n: Node) -> list[Node]:
+        raw = getattr(n, "raw", "") or ""
+        if "var_" not in raw:
+            return [n]
+        m = _SA_ADDR_PAT.match(raw)
+        if m and m.group("arr") in struct_args:
+            elem[m.group("lhs")] = m.group("arr")
+            return [n]
+        m = _MESH_LOAD_PAT.match(raw)
+        if m:
+            src, lhs = m.group("src"), m.group("lhs")
+            if src in elem:
+                elem[lhs] = elem[src]
+                return [n]
+            if src in fptr:
+                fptr[lhs] = fptr[src]
+                return []
+            if src in eptr:
+                arg = eptr[src]
+                used.add(arg)
+                try:
+                    zero = _msl_zero_init(_msl_var_type(ctypes_of[lhs]))
+                except Exception as e:
+                    raise MetalCodegenError(
+                        f"Kernel {adj.fun_name!r}: cannot stub a read of an array field of {arg!r}: {e}"
+                    ) from e
+                return [_RawLine(raw=f"{m.group('indent')}var_{lhs} = {zero};")]
+        m = _MESH_COPY_PAT.match(raw)
+        if m and m.group("src") in elem:
+            elem[m.group("lhs")] = elem[m.group("src")]
+            return [n]
+        if m and m.group("src") in fptr:
+            fptr[m.group("lhs")] = fptr[m.group("src")]
+            return []
+        m = _MESH_FIELD_PTR_PAT.match(raw)
+        if m and m.group("root") in elem and m.group("field") in struct_args[elem[m.group("root")]]:
+            fptr[m.group("lhs")] = elem[m.group("root")]
+            return []
+        if m and m.group("root") in fptr and m.group("field") == "shape":
+            fptr[m.group("lhs")] = fptr[m.group("root")]
+            used.add(fptr[m.group("root")])
+            return []
+        m = _SA_ADDR_PAT.match(raw)
+        if m and m.group("arr") in fptr:
+            eptr[m.group("lhs")] = fptr[m.group("arr")]
+            return []
+        stubbed = fptr.keys() | eptr.keys()
+
+        def _sub_extract(mm: re.Match[str]) -> str:
+            if mm.group(1) in fptr:
+                used.add(fptr[mm.group(1)])
+                return "0"
+            return mm.group(0)
+
+        new_raw = _MESH_SHAPE_EXTRACT_PAT.sub(_sub_extract, raw)
+        for ref in re.findall(r"\bvar_(\w+)\b", new_raw):
+            if ref in stubbed:
+                raise MetalCodegenError(
+                    f"Kernel {adj.fun_name!r}: array fields of wp.array[Struct] elements are not supported on "
+                    f"Metal (only reads are stubbed): {raw.strip()!r}"
+                )
+        return [n] if new_raw == raw else parse([new_raw])
+
+    def walk(ns) -> list[Node]:
+        out: list[Node] = []
+        for n in ns:
+            if isinstance(n, If):
+                out.append(
+                    If(raw=n.raw, cond=n.cond, body=tuple(walk(n.body)), raw_open=n.raw_open, raw_close=n.raw_close)
+                )
+            elif isinstance(n, For):
+                out.append(
+                    For(
+                        raw=n.raw,
+                        iter_var=n.iter_var,
+                        range_var=n.range_var,
+                        start=n.start,
+                        stop=n.stop,
+                        body=tuple(walk(n.body)),
+                        step=n.step,
+                    )
+                )
+            elif isinstance(n, While):
+                out.append(While(raw=n.raw, label_k=n.label_k, body=tuple(walk(n.body))))
+            elif isinstance(n, _DoWhileZero):
+                out.append(_DoWhileZero(raw=n.raw, body=tuple(walk(n.body))))
+            else:
+                out.extend(rewrite_leaf(n))
+        return out
+
+    out = walk(nodes)
+    return out, set(fptr) | set(eptr), used
+
+
+# ---------------------------------------------------------------------------
 # ``wp.mesh_get(id)`` field reads
 # ---------------------------------------------------------------------------
 # On Metal a mesh id is the ``gpuAddress`` of a ``wp_mesh_desc_t`` descriptor

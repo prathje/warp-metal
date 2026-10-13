@@ -190,6 +190,53 @@ class TestMetalCodegenGaps(unittest.TestCase):
             """,
         )
 
+    def test_struct_array_with_array_fields(self):
+        # Newton's compute_shape_local_bounds reads Gaussian splat arrays
+        # through a wp.array[Gaussian.Data]; models without splats pass None.
+        _run(
+            self,
+            """
+            @wp.struct
+            class Data:
+                n: int
+                xs: wp.array[wp.vec3]
+
+            @wp.func
+            def first(d: Data, i: int):
+                return d.xs[i]
+
+            @wp.kernel
+            def k(kind: wp.array[int], data: wp.array[Data], out: wp.array[wp.vec3]):
+                i = wp.tid()
+                v = wp.vec3(float(i))
+                if kind[i] == 7:
+                    for j in range(data[0].n):
+                        v += first(data[0], j)
+                out[i] = v
+
+            def launch(dev):
+                out = wp.zeros(2, dtype=wp.vec3, device=dev)
+                wp.launch(k, 2, [wp.array([0, 1], dtype=int, device=dev), None], [out], device=dev)
+                return out.numpy()
+
+            cpu, metal = both(launch)
+            assert_same(cpu, metal)
+
+            from warp._src.codegen_metal import MetalCodegenError
+            d = Data()
+            d.n = 1
+            d.xs = wp.zeros(1, dtype=wp.vec3, device="metal:0")
+            try:
+                wp.launch(k, 2, [wp.array([0, 1], dtype=int, device="metal:0"),
+                                 wp.array([d], dtype=Data, device="metal:0")],
+                          [wp.zeros(2, dtype=wp.vec3, device="metal:0")], device="metal:0")
+            except MetalCodegenError as e:
+                assert "array members" in str(e)
+            else:
+                raise AssertionError("expected a non-empty struct array with array fields to be rejected")
+            """,
+        )
+
     def test_shape_suffixed_array_args(self):
         _run(
             self,
