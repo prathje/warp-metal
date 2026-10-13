@@ -429,6 +429,26 @@ Requires ``pyobjc-framework-metal``. If it is not importable Warp warns at
 :func:`warp.init` and falls back to MLX dispatch. Set before :func:`warp.init`.
 """
 
+metal_capture_while_max_iters: int = int(_os.environ.get("WARP_METAL_CAPTURE_WHILE_MAX_ITERS", "") or 128)
+"""Iteration budget of :func:`warp.capture_while` inside a Metal graph capture.
+
+Metal command buffers have no device-side loop construct, so a captured
+``capture_while`` is replayed as its body unrolled this many times. At the
+start of each unrolled iteration the GPU latches the loop condition, and the
+iteration's kernels only run while it is nonzero, so iterations after the
+loop has terminated cost one tiny gate dispatch plus barriers each but launch
+no kernel threads. The body is recorded once, whatever the budget.
+
+The budget bounds the loop: a loop that is still running after this many
+iterations stops there, and the next replay of the graph emits a warning.
+Larger budgets cost host time on every :func:`warp.capture_launch` (each
+unrolled iteration is re-encoded), roughly a few microseconds per kernel per
+iteration. The value is read when ``capture_while`` is recorded, so it can be
+changed between captures. Can be set with the
+``WARP_METAL_CAPTURE_WHILE_MAX_ITERS`` environment variable. Outside a
+capture, ``capture_while`` runs eagerly and is unbounded, as on other devices.
+"""
+
 metal_threadgroup_tiles: bool = _os.environ.get("WARP_METAL_THREADGROUP_TILES", "").strip().lower() not in (
     "0",
     "false",

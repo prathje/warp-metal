@@ -10048,11 +10048,9 @@ class TestMetalGatedRegion(unittest.TestCase):
                 disp.begin_record(max_commands=64, signature='gate-host-flag')
                 wp.launch(incr, dim=32, inputs=[a])
                 disp.begin_gated_region(flag_buf)
-                try:
-                    disp.begin_gated_region(flag_buf)
-                    raise AssertionError('expected MetalDispatchError on nesting')
-                except MetalDispatchError:
-                    pass
+                # Regions nest; an empty nested region costs nothing.
+                disp.begin_gated_region(flag_buf)
+                disp.end_gated_region()
                 wp.launch(incr, dim=32, inputs=[b])
                 wp.launch(incr, dim=32, inputs=[b])
                 disp.end_gated_region()

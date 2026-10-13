@@ -6400,6 +6400,11 @@ class Device:
             # The best we can do is check whether a graph capture was started by Warp on this
             # device and whether the current stream is capturing.
             return self.captures or self.stream.is_capturing
+        if self.is_metal:
+            # Metal: an ICB recording started by capture_begin() on this
+            # device (paused captures report False, like CUDA).
+            graph = self.runtime._metal_capture_graph
+            return graph is not None and graph.device is self and not graph._metal_paused
         # CPU device: APIC graph capture does not use a CUDA stream. Reflect the active APIC
         # recording state so is_capturing is consistent with Warp's internal capture detection
         # (runtime._apic_capture) and capture-safe code paths that branch on is_capturing
@@ -6809,6 +6814,11 @@ class Graph:
 
         # Metal ICB graph (from a capture on a Metal device)
         self._metal_graph = None  # warp._src.metal_dispatch.MetalGraph
+        # True while a Metal capture is suspended by capture_pause()
+        self._metal_paused = False
+        # Arrays a Metal capture created and its graph must keep alive
+        # (capture_if condition latches)
+        self._metal_retain = []
 
     def __del__(self):
         try:
@@ -12851,6 +12861,10 @@ def synchronize_device(device: DeviceLike = None):
 
         runtime.core.wp_cuda_context_synchronize(device.context)
     elif device.is_metal and warp.config.metal_native_dispatch:
+        # Same contract as CUDA: a host wait inside a capture would run once
+        # at record time and never replay.
+        if device.is_capturing:
+            raise RuntimeError(f"Cannot synchronize device {device} while graph capture is active")
         # Native Metal dispatch batches kernel launches into one
         # ``MTLCommandBuffer`` until a sync point. ``synchronize_device``
         # IS that sync point — flush + wait for completion.
@@ -13821,6 +13835,10 @@ def capture_end(device: DeviceLike = None, stream: Stream | None = None) -> Grap
         from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
 
         graph = runtime._metal_capture_graph
+        if graph._metal_paused:
+            # Resume so the recording state is restored before it is closed.
+            get_dispatcher().resume_record()
+            graph._metal_paused = False
         runtime._metal_capture_graph = None
         graph._metal_graph = get_dispatcher().end_record()
         return graph
@@ -13913,6 +13931,18 @@ def capture_pause(
     *,
     _suspend_apic_recording: bool = True,
 ) -> Graph:
+    # ---- Metal capture path ----
+    # Recording is suspended so launches run eagerly until capture_resume().
+    metal_graph = runtime._metal_capture_graph
+    if metal_graph is not None and stream is None and (device is None or runtime.get_device(device).is_metal):
+        if metal_graph._metal_paused:
+            raise RuntimeError("Graph capture is not active on this device")
+        from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
+
+        get_dispatcher().pause_record()
+        metal_graph._metal_paused = True
+        return metal_graph
+
     # ---- CPU APIC capture path ----
     # A CPU APIC capture has no CUDA stream to pause; suspend byte-stream
     # recording instead so host operations performed while paused (e.g. creating
@@ -13968,6 +13998,16 @@ def capture_resume(
     *,
     _resume_apic_recording: bool = True,
 ):
+    # ---- Metal capture path ---- (mirror of capture_pause)
+    if graph is not None and getattr(graph, "_metal_paused", False):
+        if runtime._metal_capture_graph is not graph:
+            raise RuntimeError("Metal graph capture is not paused")
+        from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
+
+        get_dispatcher().resume_record()
+        graph._metal_paused = False
+        return
+
     # ---- CPU APIC capture path ---- (mirror of capture_pause)
     if graph is not None and graph.device.is_cpu and graph._apic_capture is not None:
         # After capture_end() the graph keeps _apic_capture for replay, so guard
@@ -14081,6 +14121,83 @@ def _apic_record_capture_while(condition, while_body, **kwargs):
     )
 
 
+def _metal_condition_binding(condition, what):
+    from warp._src.metal_dispatch import BufferSlice  # noqa: PLC0415
+
+    buf, off = _metal_find_buffer(condition.ptr) if condition.ptr else (None, 0)
+    if buf is None:
+        raise RuntimeError(
+            f"{what}: the condition array must be allocated by Warp's Metal allocator to be used in a Metal graph capture"
+        )
+    return BufferSlice(buf, off)
+
+
+def _metal_branch_callable(branch, what):
+    if isinstance(branch, Graph):
+        raise NotImplementedError(
+            f"{what} with a Graph branch is not supported inside a Metal graph capture; pass a Callable instead"
+        )
+    if not isinstance(branch, Callable):
+        raise TypeError(f"{what} branch must be a Callable or a Graph")
+    return branch
+
+
+def _metal_record_capture_if(condition, on_true, on_false, **kwargs):
+    """Record ``capture_if`` into the active Metal ICB capture.
+
+    The condition is latched into a graph-owned word by a recorded copy, so
+    it is evaluated once per graph execution at this point of the graph,
+    like a CUDA conditional node: branch kernels that rewrite ``condition``
+    do not affect which branch runs. Each branch becomes a GPU-gated region
+    (see ``MetalDispatcher.begin_gated_region``).
+    """
+    from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
+
+    if on_true is not None:
+        _metal_branch_callable(on_true, "capture_if()")
+    if on_false is not None:
+        _metal_branch_callable(on_false, "capture_if()")
+    disp = get_dispatcher()
+    graph = runtime._metal_capture_graph
+    latch = warp.empty(1, dtype=warp.int32, device=condition.device)
+    graph._metal_retain.append(latch)
+    warp.copy(latch, condition, count=1)
+    latch_slice = _metal_condition_binding(latch, "capture_if()")
+    for branch, negate in ((on_true, False), (on_false, True)):
+        if branch is None:
+            continue
+        disp.begin_gated_region(latch_slice.buffer, latch_slice.offset, negate=negate)
+        try:
+            branch(**kwargs)
+        finally:
+            if disp._record_state is not None:
+                disp.end_gated_region()
+
+
+def _metal_record_capture_while(condition, while_body, **kwargs):
+    """Record ``capture_while`` into the active Metal ICB capture.
+
+    The body is recorded once and replayed unrolled
+    :data:`warp.config.metal_capture_while_max_iters` times; each unrolled
+    iteration latches ``condition`` on the GPU and runs only while it is
+    nonzero (see ``MetalDispatcher.begin_loop``).
+    """
+    from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
+
+    _metal_branch_callable(while_body, "capture_while()")
+    max_iters = int(warp.config.metal_capture_while_max_iters)
+    if max_iters < 1:
+        raise ValueError(f"warp.config.metal_capture_while_max_iters must be >= 1, got {max_iters}")
+    cond = _metal_condition_binding(condition, "capture_while()")
+    disp = get_dispatcher()
+    disp.begin_loop(cond.buffer, cond.offset, max_iters)
+    try:
+        while_body(**kwargs)
+    finally:
+        if disp._record_state is not None:
+            disp.end_loop()
+
+
 def capture_if(
     condition: warp.array[int],
     on_true: Callable | Graph | None = None,
@@ -14134,9 +14251,17 @@ def capture_if(
         _apic_record_capture_if(condition, on_true, on_false, **kwargs)
         return
 
+    if device.is_metal and device.is_capturing:
+        _metal_record_capture_if(condition, on_true, on_false, **kwargs)
+        return
+
     if graph is None:
         # if no graph is active, just execute the correct branch directly
-        if device.is_cuda:
+        if device.is_metal:
+            # Kernels writing the condition may still be queued; numpy()
+            # drains them (and handles private-storage buffers).
+            condition_value = bool(condition.numpy()[0])
+        elif device.is_cuda:
             # use a pinned buffer for condition readback to host
             global condition_host
             if condition_host is None:
@@ -14359,10 +14484,18 @@ def capture_while(condition: warp.array[int], while_body: Callable | Graph, stre
         _apic_record_capture_while(condition, while_body, **kwargs)
         return
 
+    if device.is_metal and device.is_capturing:
+        _metal_record_capture_while(condition, while_body, **kwargs)
+        return
+
     if graph is None:
         # since no graph is active, just execute the kernels directly
         while True:
-            if device.is_cuda:
+            if device.is_metal:
+                # Drain queued kernels that write the condition before the
+                # host reads it (Metal launches are asynchronous).
+                condition_value = bool(condition.numpy()[0])
+            elif device.is_cuda:
                 # use a pinned buffer for condition readback to host
                 global condition_host
                 if condition_host is None:
