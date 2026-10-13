@@ -19,11 +19,12 @@ directly. :func:`stage_launch_args` makes such launches work by staging:
 All steps are ordinary dispatches, so a staged launch is asynchronous and
 records into a Metal graph capture like any other launch.
 
-Semantic limits (documented, not detected): writes through an argument that
-aliases itself (duplicate indices or zero strides) keep the value of the
-last scattered element instead of racing; and a kernel that reads one
-argument while writing another argument aliasing the same memory sees the
-staged copy, not the in-flight writes.
+A staged argument whose memory overlaps another array argument, where
+either side is written by the kernel, is rejected: the kernel would update
+the staged copy and the other argument independently and the scatter-back
+would discard one side's writes. Writes through an argument that aliases
+itself (duplicate indices or zero strides) keep the value of the last
+scattered element instead of racing.
 """
 
 from __future__ import annotations
@@ -176,6 +177,45 @@ def _array_variant(kernel):
     return variant
 
 
+def _byte_range(value):
+    """Conservative ``[lo, hi)`` address range an array argument can touch."""
+    base = value.data if isinstance(value, wp._src.types.indexedarray) else value
+    if base is None or not base.ptr or base.size == 0:
+        return None
+    lo = hi = base.ptr
+    for dim, stride in zip(base.shape, base.strides):
+        extent = (dim - 1) * stride
+        if extent < 0:
+            lo += extent
+        else:
+            hi += extent
+    return lo, hi + wp._src.types.type_size_in_bytes(base.dtype)
+
+
+def _check_staged_aliasing(kernel, values, staged_indices, written) -> None:
+    args = kernel.adj.args
+    ranges = []
+    for i, v in enumerate(values):
+        if isinstance(v, (wp._src.types.array, wp._src.types.indexedarray)):
+            r = _byte_range(v)
+            if r is not None:
+                ranges.append((i, r))
+    for i, (lo, hi) in ranges:
+        if i not in staged_indices:
+            continue
+        for j, (lo2, hi2) in ranges:
+            if j == i or lo >= hi2 or lo2 >= hi:
+                continue
+            if args[i].label in written or args[j].label in written:
+                raise RuntimeError(
+                    f"Kernel '{kernel.key}': strided/indexed argument {args[i].label!r} overlaps the memory of "
+                    f"argument {args[j].label!r}, and one of them is written. On Metal such arguments run "
+                    "through a contiguous staging copy, so writes through one would not be seen through the "
+                    "other (and could be lost on scatter-back). Pass non-overlapping arrays, or make the "
+                    "strided argument contiguous first."
+                )
+
+
 def _written_arg_labels(kernel, block_dim) -> frozenset:
     labels = kernel.__dict__.get("_metal_staged_written")
     if labels is None:
@@ -219,6 +259,9 @@ def stage_launch_args(kernel, inputs, outputs, device, adjoint: bool = False) ->
         )
     from warp._src.context import runtime  # noqa: PLC0415
 
+    variant = _array_variant(kernel)
+    staged_indices = {i for i, v in enumerate(values) if _needs_staging(v)}
+    _check_staged_aliasing(variant, values, staged_indices, _written_arg_labels(variant, None))
     graph = runtime._metal_capture_graph if device.is_capturing else None
     staged = []
     new_values = list(values)
@@ -232,4 +275,4 @@ def stage_launch_args(kernel, inputs, outputs, device, adjoint: bool = False) ->
         new_values[i] = tmp
         staged.append((i, value, tmp))
     n_in = len(inputs)
-    return StagedLaunch(_array_variant(kernel), new_values[:n_in], new_values[n_in:], staged)
+    return StagedLaunch(variant, new_values[:n_in], new_values[n_in:], staged)
