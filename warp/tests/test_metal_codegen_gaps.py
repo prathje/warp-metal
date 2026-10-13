@@ -360,6 +360,9 @@ class TestMetalCodegenGaps(unittest.TestCase):
                 s = vec6(*q[1:7])
                 t = b[i][1:3]
                 r = b[i][::-1]
+                q[3:] = wp.vec4(qq[3], qq[2], qq[1], qq[0])
+                q[0:2] = wp.vec2(-1.0, -2.0)
+                a[i] = q
                 out[i] = qq[0] + 2.0 * qq[3] + p[2] * 10.0 + s[5] * 100.0 + t[1] * 1000.0 + r[0] * 10000.0
 
             def launch(dev):
@@ -367,7 +370,7 @@ class TestMetalCodegenGaps(unittest.TestCase):
                 b = wp.array(np.arange(8, dtype=np.float32).reshape(2, 4), dtype=wp.vec4, device=dev)
                 o = wp.zeros(2, dtype=float, device=dev)
                 wp.launch(k, 2, [a, b], [o], device=dev)
-                return o.numpy()
+                return o.numpy(), a.numpy()
 
             cpu, metal = both(launch)
             assert_same(cpu, metal)
