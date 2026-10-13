@@ -104,6 +104,47 @@ class TestMetalMismatch(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet)
 
+    def test_inlined_transform_and_quat_mul(self):
+        # A transform / quat local of an inlined ``@wp.func`` (reassigned in an
+        # ``if``) lowered ``a * b`` to the component-wise vec7 / float4
+        # product instead of rigid composition / the Hamilton product.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            @wp.func
+            def f(parent: int, a: wp.transform, b: wp.transform, qa: wp.quat, qb: wp.quat):
+                x = b
+                q = qb
+                if parent >= 0:
+                    x = a * b
+                    q = qa * qb
+                return x * b, q * qb
+
+            @wp.kernel
+            def k(xs: wp.array[wp.transform], qs: wp.array[wp.quat],
+                  out: wp.array[wp.transform], outq: wp.array[wp.quat]):
+                x, q = f(0, xs[0], xs[1], qs[0], qs[1])
+                out[0] = x
+                outq[0] = q
+
+            rng = np.random.default_rng(0)
+            q = rng.normal(size=(2, 4)).astype(np.float32)
+            q /= np.linalg.norm(q, axis=1, keepdims=True)
+            xs = np.concatenate([rng.normal(size=(2, 3)).astype(np.float32), q], axis=1)
+            res = {}
+            for dev in ("cpu", "metal:0"):
+                o = wp.zeros(1, dtype=wp.transform, device=dev)
+                oq = wp.zeros(1, dtype=wp.quat, device=dev)
+                wp.launch(k, dim=1, inputs=[wp.array(xs, dtype=wp.transform, device=dev),
+                          wp.array(q, dtype=wp.quat, device=dev)], outputs=[o, oq], device=dev)
+                res[dev] = (o.numpy(), oq.numpy())
+            for a, b in zip(res["cpu"], res["metal:0"]):
+                np.testing.assert_allclose(a, b, rtol=1e-5, atol=1e-6)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

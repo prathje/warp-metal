@@ -14612,6 +14612,15 @@ def _generate_msl_kernel_uncached(
     for raw in forward_lines:
         for m in _transform_decl_pat.finditer(raw):
             transform_var_labels.add(m.group(1))
+    # Locals spliced in from inlined ``@wp.func`` bodies are declared with
+    # their MSL type (``float4`` / ``wp_vec7_float``), so the IR-declaration
+    # scans above miss them; the inliner records their Warp ctypes.
+    for _lbl, _ct in _inlined_var_ctypes.items():
+        _ct_s = str(_ct).replace(" ", "")
+        if _ct_s.startswith("wp::quat_t<"):
+            quat_var_labels.add(_lbl)
+        elif _ct_s.startswith("wp::transform_t<"):
+            transform_var_labels.add(_lbl)
 
     _quat_mul_call_pat = re.compile(r"wp::mul\s*\(\s*var_(\w+)\s*,\s*var_(\w+)\s*\)")
     _quat_normalize_call_pat = re.compile(r"wp::normalize\s*\(\s*var_(\w+)\s*\)")
