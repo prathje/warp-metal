@@ -1407,6 +1407,21 @@ def _build_function_overload_table(adj) -> dict[str, list[Any]]:
         for overload in _overloads(fn):
             _add(overload)
 
+    # ``wp.static(factory(...))(args)`` call targets. ``get_references``
+    # cannot resolve the callee of a call whose ``func`` is itself a call,
+    # and the module sweep below only sees the *last* closure registered
+    # under a given key — each factory invocation (Newton's
+    # ``create_solve_closest_distance(support_map).core``) makes a fresh
+    # ``Function`` with its own ``native_func`` suffix, so the one the
+    # kernel actually calls can be shadowed by a later one.
+    static_objs = list(getattr(adj, "resolved_static_expressions", {}).values())
+    static_objs += [obj for _code, obj in getattr(adj, "deferred_static_expressions", ())]
+    for obj in static_objs:
+        if isinstance(obj, Function) and not obj.is_builtin():
+            for overload in _overloads(obj):
+                _add(overload)
+            _add(obj)
+
     func = getattr(adj, "func", None)
     globals_dict = getattr(func, "__globals__", None) if func is not None else None
     if globals_dict is not None:
@@ -2625,6 +2640,348 @@ def inline_user_calls(
     return out, inlined_const_ints, inlined_struct_locals, var_types
 
 
+_TUPLE_CTYPE_PREFIX = "wp::tuple_t<"
+_TUPLE_CTOR_PAT = re.compile(r"^(?P<indent>\s*)var_(?P<lhs>\w+)\s*=\s*wp::tuple\s*\((?P<args>.*)\)\s*;\s*$")
+_TUPLE_COPY_PAT = re.compile(
+    r"^(?P<indent>\s*)var_(?P<lhs>\w+)\s*=\s*(?:wp::copy\s*\(\s*)?var_(?P<rhs>\w+)\s*\)?\s*;\s*$"
+)
+_TUPLE_EXTRACT_PAT = re.compile(r"\bwp::extract\s*<\s*(\d+)\s*>\s*\(\s*var_(\w+)\s*\)")
+
+
+def _tuple_elem_ctypes(ctype: str) -> list[str] | None:
+    """``wp::tuple_t<wp::int32, wp::vec_t<3,wp::float32>>`` -> element ctypes."""
+    ct = ctype.strip()
+    if not ct.startswith(_TUPLE_CTYPE_PREFIX) or not ct.endswith(">"):
+        return None
+    inner = ct[len(_TUPLE_CTYPE_PREFIX) : -1]
+    elems: list[str] = []
+    depth = 0
+    start = 0
+    for i, ch in enumerate(inner):
+        if ch in "<(":
+            depth += 1
+        elif ch in ">)":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            elems.append(inner[start:i].strip())
+            start = i + 1
+    elems.append(inner[start:].strip())
+    return [e for e in elems if e]
+
+
+def _iter_leaves(nodes):
+    for n in nodes:
+        if isinstance(n, (If, For, While, _DoWhileZero)):
+            yield from _iter_leaves(n.body)
+        else:
+            yield n
+
+
+def fold_tuple_locals(
+    nodes: list[Node], adj, extra_var_ctypes: dict[str, str] | None = None
+) -> tuple[list[Node], set[str]]:
+    """Scalarize ``wp::tuple_t`` locals into one MSL local per element.
+
+    Tuple values reach the IR when a ``@wp.func`` takes a tuple argument
+    (``f((i, 2))``) — after inlining, the callee reads the elements with
+    ``wp::extract<k>(var_T)``. MSL has no tuple type, so a tuple whose
+    every use is a construction (``var_T = wp::tuple(a, b)``), an element
+    read (``wp::extract<k>(var_T)``), or a whole-tuple copy between tuple
+    locals is rewritten to per-element locals ``var_T__tk``. Tuples with
+    any other use (tile shape/offset tuples) are left for
+    :func:`fold_drop_unsupported_locals` to elide as before.
+
+    Returns ``(nodes, scalarized_labels)``; the scalarized labels' tuple
+    declarations must be skipped. ``extra_var_ctypes`` gains the element
+    locals' ctypes.
+    """
+    tuple_types: dict[str, list[str]] = {}
+    for var in adj.variables:
+        elems = _tuple_elem_ctypes(var.ctype())
+        if elems is not None:
+            tuple_types[var.label] = elems
+    for label, ct in (extra_var_ctypes or {}).items():
+        elems = _tuple_elem_ctypes(ct)
+        if elems is not None:
+            tuple_types[label] = elems
+    if not tuple_types:
+        return nodes, set()
+
+    # Classify every reference; a tuple with any unrecognised use is not
+    # scalarized (nor is any tuple it is copied to/from).
+    ok = set(tuple_types)
+    copy_edges: list[tuple[str, str]] = []
+    ref_pat = re.compile(r"\bvar_(\w+)\b")
+    for leaf in _iter_leaves(nodes):
+        raw = getattr(leaf, "raw", "") or ""
+        if "var_" not in raw:
+            continue
+        m = _TUPLE_CTOR_PAT.match(raw)
+        if m and m.group("lhs") in tuple_types:
+            rest = m.group("args")
+            for r in ref_pat.findall(rest):
+                ok.discard(r)
+            continue
+        m = _TUPLE_COPY_PAT.match(raw)
+        if m and m.group("lhs") in tuple_types and m.group("rhs") in tuple_types:
+            copy_edges.append((m.group("lhs"), m.group("rhs")))
+            continue
+        stripped = _TUPLE_EXTRACT_PAT.sub("", raw)
+        for r in ref_pat.findall(stripped):
+            ok.discard(r)
+    changed = True
+    while changed:
+        changed = False
+        for a, b in copy_edges:
+            if (a in ok) != (b in ok):
+                ok.discard(a)
+                ok.discard(b)
+                changed = True
+    if not ok:
+        return nodes, set()
+
+    from warp._src.codegen_metal import _msl_local_init, _msl_var_type  # noqa: PLC0415
+
+    decls: list[Node] = []
+    for label in sorted(ok):
+        for k, etc in enumerate(tuple_types[label]):
+            try:
+                msl_type = _msl_var_type(etc)
+            except Exception:
+                return nodes, set()
+            decls.append(_RawLine(raw=f"    {msl_type} var_{label}__t{k}{_msl_local_init(msl_type)};"))
+            if extra_var_ctypes is not None:
+                extra_var_ctypes[f"{label}__t{k}"] = etc
+
+    def rewrite_leaf(n: Node) -> list[Node]:
+        raw = getattr(n, "raw", "") or ""
+        if "var_" not in raw:
+            return [n]
+        m = _TUPLE_CTOR_PAT.match(raw)
+        if m and m.group("lhs") in ok:
+            args = _split_top_level_args(m.group("args"))
+            lhs = m.group("lhs")
+            return parse([f"{m.group('indent')}var_{lhs}__t{k} = {a.strip()};" for k, a in enumerate(args)])
+        m = _TUPLE_COPY_PAT.match(raw)
+        if m and m.group("lhs") in ok:
+            lhs, rhs = m.group("lhs"), m.group("rhs")
+            n_el = len(tuple_types[lhs])
+            return parse([f"{m.group('indent')}var_{lhs}__t{k} = var_{rhs}__t{k};" for k in range(n_el)])
+
+        def _sub(mm: re.Match[str]) -> str:
+            if mm.group(2) in ok:
+                return f"var_{mm.group(2)}__t{mm.group(1)}"
+            return mm.group(0)
+
+        new_raw = _TUPLE_EXTRACT_PAT.sub(_sub, raw)
+        if new_raw == raw:
+            return [n]
+        return parse([new_raw])
+
+    def walk(ns) -> list[Node]:
+        out: list[Node] = []
+        for n in ns:
+            if isinstance(n, If):
+                out.append(
+                    If(raw=n.raw, cond=n.cond, body=tuple(walk(n.body)), raw_open=n.raw_open, raw_close=n.raw_close)
+                )
+            elif isinstance(n, For):
+                out.append(
+                    For(
+                        raw=n.raw,
+                        iter_var=n.iter_var,
+                        range_var=n.range_var,
+                        start=n.start,
+                        stop=n.stop,
+                        body=tuple(walk(n.body)),
+                        step=n.step,
+                    )
+                )
+            elif isinstance(n, While):
+                out.append(While(raw=n.raw, label_k=n.label_k, body=tuple(walk(n.body))))
+            elif isinstance(n, _DoWhileZero):
+                out.append(_DoWhileZero(raw=n.raw, body=tuple(walk(n.body))))
+            else:
+                out.extend(rewrite_leaf(n))
+        return out
+
+    return [*decls, *walk(nodes)], set(ok)
+
+
+# ---------------------------------------------------------------------------
+# ``wp.mesh_get(id)`` field reads
+# ---------------------------------------------------------------------------
+# On Metal a mesh id is the ``gpuAddress`` of a ``wp_mesh_desc_t`` descriptor
+# (see ``_BVH_HELPERS`` / ``metal_bvh.py``), whose array fields are raw
+# addresses of packed storage. A ``wp::Mesh`` local therefore lowers to a
+# ``wp_mesh_desc_t`` value and the IR's field-pointer / array-load / address
+# chains collapse into direct reads of that storage.
+
+_MESH_GET_PAT = re.compile(r"^(?P<indent>\s*)var_(?P<lhs>\w+)\s*=\s*wp::mesh_get\s*\((?P<arg>.*)\)\s*;\s*$")
+_MESH_FIELD_PTR_PAT = re.compile(
+    r"^\s*var_(?P<lhs>\w+)\s*=\s*&\s*\(\s*\(?\s*var_(?P<root>\w+)\s*\)?\s*(?:\.|->)\s*(?P<field>\w+)\s*\)\s*;\s*$"
+)
+_MESH_LOAD_PAT = re.compile(r"^(?P<indent>\s*)var_(?P<lhs>\w+)\s*=\s*wp::load\s*\(\s*var_(?P<src>\w+)\s*\)\s*;\s*$")
+_MESH_COPY_PAT = re.compile(
+    r"^(?P<indent>\s*)var_(?P<lhs>\w+)\s*=\s*(?:wp::copy\s*\(\s*)?var_(?P<src>\w+)\s*\)?\s*;\s*$"
+)
+_MESH_ADDRESS_PAT = re.compile(
+    r"^\s*var_(?P<lhs>\w+)\s*=\s*wp::address\s*\(\s*var_(?P<arr>\w+)\s*,\s*(?P<idx>[^,()]+?)\s*\)\s*;\s*$"
+)
+_MESH_SHAPE_EXTRACT_PAT = re.compile(r"\bwp::extract\s*\(\s*var_(\w+)\s*,\s*[^,()]+?\s*\)")
+_MESH_LEN_PAT = re.compile(r"\bwp::len\s*\(\s*var_(\w+)\s*\)")
+# Array fields: element read expression and dim-0 length, given the MSL
+# descriptor expression ``d`` and index ``i``.
+_MESH_ARRAY_FIELDS = {
+    "points": (lambda d, i: f"wp_bvh_load_v3({d}.points, {i})", lambda d: f"{d}.num_points"),
+    "velocities": (lambda d, i: f"wp_bvh_load_v3({d}.velocities, {i})", lambda d: f"{d}.num_points"),
+    "indices": (lambda d, i: f"wp_bvh_int_ptr({d}.indices)[{i}]", lambda d: f"({d}.num_tris * 3)"),
+}
+_MESH_SCALAR_FIELDS = ("num_points", "num_tris", "average_edge_length")
+
+
+def fold_mesh_get(
+    nodes: list[Node], adj, extra_var_ctypes: dict[str, str] | None = None
+) -> tuple[list[Node], set[str]]:
+    """Lower ``wp.mesh_get(id)`` locals and their field reads.
+
+    ``var_M = wp::mesh_get(id)`` becomes ``var_M = wp_mesh_get_desc(id)``
+    (``wp::Mesh`` declares as ``wp_mesh_desc_t``). Field pointers
+    (``&((var_M).points)``), the array values loaded from them, their
+    ``shape`` pointers/values and element addresses are aliased away;
+    element loads become ``wp_bvh_load_v3(var_M.points, i)`` /
+    ``wp_bvh_int_ptr(var_M.indices)[i]`` and ``shape[0]`` reads become the
+    descriptor's counts. Writes through a mesh field are rejected.
+
+    Returns ``(nodes, skip_decls)``.
+    """
+    mesh_labels = {v.label for v in adj.variables if v.ctype() == "wp::Mesh"}
+    mesh_labels |= {label for label, ct in (extra_var_ctypes or {}).items() if ct == "wp::Mesh"}
+    if not mesh_labels:
+        return nodes, set()
+
+    # Resolve aliases in program order (the IR defines before it uses).
+    field_ptr: dict[str, tuple[str, str]] = {}  # ptr label -> (mesh, field)
+    arr: dict[str, tuple[str, str]] = {}  # array_t label -> (mesh, field)
+    shape_ptr: dict[str, tuple[str, str]] = {}
+    shape_val: dict[str, tuple[str, str]] = {}
+    elem_ptr: dict[str, tuple[str, str, str]] = {}  # ptr label -> (mesh, field, idx)
+
+    def mesh_expr(m: str) -> str:
+        return f"var_{m}"
+
+    def rewrite_leaf(n: Node) -> list[Node]:
+        raw = getattr(n, "raw", "") or ""
+        if "var_" not in raw:
+            return [n]
+        m = _MESH_GET_PAT.match(raw)
+        if m and m.group("lhs") in mesh_labels:
+            return [_RawLine(raw=f"{m.group('indent')}var_{m.group('lhs')} = wp_mesh_get_desc({m.group('arg')});")]
+        m = _MESH_FIELD_PTR_PAT.match(raw)
+        if m:
+            root, field = m.group("root"), m.group("field")
+            if root in mesh_labels:
+                field_ptr[m.group("lhs")] = (root, field)
+                return []
+            if field == "shape" and root in field_ptr:
+                shape_ptr[m.group("lhs")] = field_ptr[root]
+                return []
+            if field == "shape" and root in arr:
+                shape_ptr[m.group("lhs")] = arr[root]
+                return []
+        m = _MESH_LOAD_PAT.match(raw)
+        if m:
+            src, lhs, indent = m.group("src"), m.group("lhs"), m.group("indent")
+            if src in field_ptr:
+                mesh, field = field_ptr[src]
+                if field in _MESH_SCALAR_FIELDS:
+                    return [_RawLine(raw=f"{indent}var_{lhs} = {mesh_expr(mesh)}.{field};")]
+                if field not in _MESH_ARRAY_FIELDS:
+                    raise _metal_codegen_error(f"wp.mesh_get(): field {field!r} is not supported on Metal")
+                arr[lhs] = (mesh, field)
+                return []
+            if src in shape_ptr:
+                shape_val[lhs] = shape_ptr[src]
+                return []
+            if src in elem_ptr:
+                mesh, field, idx = elem_ptr[src]
+                read = _MESH_ARRAY_FIELDS[field][0](mesh_expr(mesh), idx)
+                return [_RawLine(raw=f"{indent}var_{lhs} = {read};")]
+        m = _MESH_COPY_PAT.match(raw)
+        if m and m.group("src") in arr:
+            arr[m.group("lhs")] = arr[m.group("src")]
+            return []
+        m = _MESH_ADDRESS_PAT.match(raw)
+        if m and m.group("arr") in arr:
+            mesh, field = arr[m.group("arr")]
+            elem_ptr[m.group("lhs")] = (mesh, field, m.group("idx"))
+            return []
+
+        def _len_of(label: str) -> str | None:
+            src = shape_val.get(label) or arr.get(label)
+            if src is None:
+                return None
+            mesh, field = src
+            return _MESH_ARRAY_FIELDS[field][1](mesh_expr(mesh))
+
+        def _sub_extract(mm: re.Match[str]) -> str:
+            ln = _len_of(mm.group(1)) if mm.group(1) in shape_val else None
+            return f"({ln})" if ln is not None else mm.group(0)
+
+        def _sub_len(mm: re.Match[str]) -> str:
+            ln = _len_of(mm.group(1)) if mm.group(1) in arr else None
+            return f"({ln})" if ln is not None else mm.group(0)
+
+        new_raw = _MESH_LEN_PAT.sub(_sub_len, _MESH_SHAPE_EXTRACT_PAT.sub(_sub_extract, raw))
+        aliased = field_ptr.keys() | arr.keys() | shape_ptr.keys() | shape_val.keys() | elem_ptr.keys()
+        for ref in re.findall(r"\bvar_(\w+)\b", new_raw):
+            if ref in aliased:
+                raise _metal_codegen_error(
+                    f"wp.mesh_get(): unsupported use of a mesh field on Metal (only element reads and "
+                    f"shape queries of points/velocities/indices are supported): {raw.strip()!r}"
+                )
+        if new_raw == raw:
+            return [n]
+        return [_RawLine(raw=new_raw)]
+
+    def walk(ns) -> list[Node]:
+        out: list[Node] = []
+        for n in ns:
+            if isinstance(n, If):
+                out.append(
+                    If(raw=n.raw, cond=n.cond, body=tuple(walk(n.body)), raw_open=n.raw_open, raw_close=n.raw_close)
+                )
+            elif isinstance(n, For):
+                out.append(
+                    For(
+                        raw=n.raw,
+                        iter_var=n.iter_var,
+                        range_var=n.range_var,
+                        start=n.start,
+                        stop=n.stop,
+                        body=tuple(walk(n.body)),
+                        step=n.step,
+                    )
+                )
+            elif isinstance(n, While):
+                out.append(While(raw=n.raw, label_k=n.label_k, body=tuple(walk(n.body))))
+            elif isinstance(n, _DoWhileZero):
+                out.append(_DoWhileZero(raw=n.raw, body=tuple(walk(n.body))))
+            else:
+                out.extend(rewrite_leaf(n))
+        return out
+
+    out = walk(nodes)
+    skip = set(field_ptr) | set(arr) | set(shape_ptr) | set(shape_val) | set(elem_ptr)
+    return out, skip
+
+
+def _metal_codegen_error(msg: str) -> Exception:
+    from warp._src.codegen_metal import MetalCodegenError  # noqa: PLC0415
+
+    return MetalCodegenError(msg)
+
+
 _UNSUPPORTED_CTYPE_PREFIXES = ("wp::str", "wp::tuple_t")
 
 
@@ -2657,16 +3014,26 @@ def fold_drop_unsupported_locals(
             drop_locals.add(label)
     skip_decls = set(drop_locals)
 
-    if not drop_locals:
+    if not drop_locals and not has_print_calls(nodes):
         return nodes, skip_decls
 
     return _apply_drop_unsupported(nodes, drop_locals), skip_decls
 
 
+# ``wp.printf`` lowers to ``printf(...)``; ``wp.print(x)`` to ``wp::print(x)``
+# (and ``wp::adj_print`` in reverse bodies). See ``warp.config.metal_print``.
+_PRINT_OPS = frozenset({"printf", "print", "adj_print"})
+
+
+def has_print_calls(nodes) -> bool:
+    """True if the node tree contains a ``wp.print`` / ``wp.printf`` call."""
+    return any(isinstance(n, VoidCall) and n.op in _PRINT_OPS for n in _iter_leaves(nodes))
+
+
 def _apply_drop_unsupported(nodes: tuple[Node, ...] | list[Node], drop: set[str]) -> list[Node]:
     out: list[Node] = []
     for n in nodes:
-        if isinstance(n, VoidCall) and n.op == "printf":
+        if isinstance(n, VoidCall) and n.op in _PRINT_OPS:
             continue
         if isinstance(n, Assign) and n.lhs in drop:
             continue

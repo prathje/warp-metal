@@ -154,8 +154,11 @@ from warp._src.codegen_metal_ast import fold as _ast_fold
 from warp._src.codegen_metal_ast import fold_const_branches as _ast_fold_const_branches
 from warp._src.codegen_metal_ast import fold_drop_unsupported_locals as _ast_fold_drop
 from warp._src.codegen_metal_ast import fold_indexref_writes as _ast_fold_indexref
+from warp._src.codegen_metal_ast import fold_mesh_get as _ast_fold_mesh_get
 from warp._src.codegen_metal_ast import fold_multidim_atomics as _ast_fold_multidim_atomics
+from warp._src.codegen_metal_ast import fold_tuple_locals as _ast_fold_tuples
 from warp._src.codegen_metal_ast import fold_views as _ast_fold_views
+from warp._src.codegen_metal_ast import has_print_calls as _ast_has_print_calls
 from warp._src.codegen_metal_ast import inline_user_calls as _ast_inline
 from warp._src.codegen_metal_ast import lower_reverse_ranges as _ast_lower_reverse_ranges
 from warp._src.codegen_metal_ast import parse as _ast_parse
@@ -237,6 +240,9 @@ _SCALAR_CTYPE_TO_MSL: dict[str, str] = _ScalarMslMap(
         # BVH traversal state — the MSL struct is emitted with ``_BVH_HELPERS``.
         "wp::bvh_query_t": "wp_bvh_query_t",
         "wp::mesh_query_aabb_t": "wp_mesh_query_aabb_t",
+        # ``wp.mesh_get(id)`` locals hold the mesh descriptor itself (see
+        # ``fold_mesh_get`` in ``codegen_metal_ast``).
+        "wp::Mesh": "wp_mesh_desc_t",
         "wp::mesh_query_point_t": "wp_mesh_query_point_t",
         "wp::mesh_query_ray_t": "wp_mesh_query_ray_t",
         # Hash-grid traversal state (float32 grids only) — the MSL struct is
@@ -543,6 +549,14 @@ def _emit_big_vec_struct(name: str, n: int, msl_scalar: str) -> str:
     # Copy overload: ``vec_t<N>(v)`` with a same-type operand (Warp's
     # explicit copy-construction, e.g. warp.fem's vec1 accumulators).
     body_lines.append(f"inline {name} {name}_make({name} v) {{ return v; }}")
+    # ``wp.transform(p, q)``: transform_t is normalized to ``vec_t<7>`` (see
+    # ``_normalize_quat_t``), so its (position, rotation) constructor
+    # reaches here as ``wp_vec7_<scalar>_make(vec3, quat)``.
+    if n == 7 and msl_scalar in _MSL_NATIVE_MAT_SCALARS:
+        body_lines.append(
+            f"inline {name} {name}_make({msl_scalar}3 p, {msl_scalar}4 q) {{ "
+            f"return {name}_make(p.x, p.y, p.z, q.x, q.y, q.z, q.w); }}"
+        )
     # Emulated double <-> native vector conversions (``wp.vec2d(v_f32)`` and
     # ``wp.vec2f(v_f64)``): the native ``floatN`` types always exist, so the
     # overloads can be emitted unconditionally for N in 2..4.
@@ -614,6 +628,40 @@ def _emit_big_vec_struct(name: str, n: int, msl_scalar: str) -> str:
     body_lines.append(f"inline bool operator!=({name} a, {name} b) {{")
     body_lines.append("    return !(a == b);")
     body_lines.append("}")
+
+    # Unary ``wp.min(v)`` / ``wp.max(v)`` and ``wp.argmin(v)`` /
+    # ``wp.argmax(v)``; the native-width forms live in
+    # ``_MISC_MATH_HELPERS``. argmin/argmax skip NaN slots like
+    # warp/native/vec.h.
+    def nan_chk(e: str) -> str:
+        return f"metal::isnan(float({e}))" if msl_scalar in ("float", "half") else "false"
+
+    for fn, cmp in (("min", "<"), ("max", ">")):
+        # Fold like warp/native/vec.h: ``fmin``/``fmax`` (NaN-ignoring) for
+        # floating point, ``a < b ? a : b`` otherwise.
+        if msl_scalar in ("float", "half"):
+            step = f"r = metal::f{fn}(r, v.c[i]);"
+        else:
+            step = f"r = (r {cmp} v.c[i]) ? r : v.c[i];"
+        body_lines.append(f"inline {msl_scalar} wp_v{fn}({name} v) {{")
+        body_lines.append(f"    {msl_scalar} r = v.c[0];")
+        body_lines.append(f"    for (int i = 1; i < {n}; ++i) {step}")
+        body_lines.append("    return r;")
+        body_lines.append("}")
+        body_lines.append(f"inline uint wp_arg{fn}({name} v) {{")
+        body_lines.append("    uint ret = 0;")
+        body_lines.append(f"    while (ret < {n}u && {nan_chk('v.c[ret]')}) ++ret;")
+        body_lines.append(f"    if (ret == {n}u) return 0u;")
+        body_lines.append(f"    for (uint i = ret + 1; i < {n}u; ++i) {{")
+        body_lines.append(f"        if ({nan_chk('v.c[i]')}) continue;")
+        body_lines.append(f"        if (v.c[i] {cmp} v.c[ret]) ret = i;")
+        body_lines.append("    }")
+        body_lines.append("    return ret;")
+        body_lines.append("}")
+    for fn in ("min", "max"):
+        body_lines.append(
+            f"inline void wp_adj_{fn}({name} v, thread {name}& av, {msl_scalar} r) {{ av.c[wp_arg{fn}(v)] += r; }}"
+        )
     # ``wp.length`` / ``wp.normalize`` — ``metal::length`` only knows the
     # native vector widths. warp.fem's scalar function spaces make ``vec1``
     # dof values, so even n == 1 reaches these.
@@ -765,6 +813,46 @@ def _emit_spatial_helpers() -> str:
         "    float3 w = metal::cross(aw, bw) + metal::cross(av, bv);\n"
         "    float3 v = metal::cross(aw, bv);\n"
         "    return wp_vec6_float_make(w, v);\n"
+        "}\n"
+        # Reverse-mode counterparts (warp/native/spatial.h). ``adj_cross(a, b,
+        # aa, ab, r)`` accumulates ``aa += b x r`` and ``ab += r x a``.
+        "inline void wp_adj_spatial_top(wp_vec6_float a, thread wp_vec6_float& aa, float3 r) {\n"
+        "    aa.c[0] += r.x; aa.c[1] += r.y; aa.c[2] += r.z;\n"
+        "}\n"
+        "inline void wp_adj_spatial_bottom(wp_vec6_float a, thread wp_vec6_float& aa, float3 r) {\n"
+        "    aa.c[3] += r.x; aa.c[4] += r.y; aa.c[5] += r.z;\n"
+        "}\n"
+        "inline void wp_adj_vec_t(float3 a, float3 b, thread float3& aa, thread float3& ab, wp_vec6_float r) {\n"
+        "    aa += wp_spatial_top(r); ab += wp_spatial_bottom(r);\n"
+        "}\n"
+        "inline void wp_adj_spatial_dot(wp_vec6_float a, wp_vec6_float b, thread wp_vec6_float& aa, "
+        "thread wp_vec6_float& ab, float r) {\n"
+        "    wp_adj_dot(a, b, aa, ab, r);\n"
+        "}\n"
+        "inline void wp_adj_spatial_cross_impl(float3 a, float3 b, thread float3& aa, thread float3& ab, float3 r) {\n"
+        "    aa += metal::cross(b, r); ab += metal::cross(r, a);\n"
+        "}\n"
+        "inline void wp_adj_spatial_cross(wp_vec6_float a, wp_vec6_float b, thread wp_vec6_float& aa, "
+        "thread wp_vec6_float& ab, wp_vec6_float r) {\n"
+        "    float3 aw = wp_spatial_top(a), av = wp_spatial_bottom(a);\n"
+        "    float3 bw = wp_spatial_top(b), bv = wp_spatial_bottom(b);\n"
+        "    float3 rw = wp_spatial_top(r), rv = wp_spatial_bottom(r);\n"
+        "    float3 aaw = float3(0.0f), aav = float3(0.0f), abw = float3(0.0f), abv = float3(0.0f);\n"
+        "    wp_adj_spatial_cross_impl(aw, bw, aaw, abw, rw);\n"
+        "    wp_adj_spatial_cross_impl(av, bw, aav, abw, rv);\n"
+        "    wp_adj_spatial_cross_impl(aw, bv, aaw, abv, rv);\n"
+        "    aa += wp_vec6_float_make(aaw, aav); ab += wp_vec6_float_make(abw, abv);\n"
+        "}\n"
+        "inline void wp_adj_spatial_cross_dual(wp_vec6_float a, wp_vec6_float b, thread wp_vec6_float& aa, "
+        "thread wp_vec6_float& ab, wp_vec6_float r) {\n"
+        "    float3 aw = wp_spatial_top(a), av = wp_spatial_bottom(a);\n"
+        "    float3 bw = wp_spatial_top(b), bv = wp_spatial_bottom(b);\n"
+        "    float3 rw = wp_spatial_top(r), rv = wp_spatial_bottom(r);\n"
+        "    float3 aaw = float3(0.0f), aav = float3(0.0f), abw = float3(0.0f), abv = float3(0.0f);\n"
+        "    wp_adj_spatial_cross_impl(aw, bw, aaw, abw, rw);\n"
+        "    wp_adj_spatial_cross_impl(av, bv, aav, abv, rw);\n"
+        "    wp_adj_spatial_cross_impl(aw, bv, aaw, abv, rv);\n"
+        "    aa += wp_vec6_float_make(aaw, aav); ab += wp_vec6_float_make(abw, abv);\n"
         "}"
     )
 
@@ -2197,6 +2285,12 @@ _ADJ_SUPPORTED = frozenset(
         "transform_point",
         "transform_multiply",
         "transform_inverse",
+        # spatial_vector family (``_emit_spatial_helpers``).
+        "spatial_top",
+        "spatial_bottom",
+        "spatial_dot",
+        "spatial_cross",
+        "spatial_cross_dual",
     }
 )
 
@@ -2742,13 +2836,10 @@ inline float4 wp_quat_rpy(float roll, float pitch, float yaw) {
 # mirror ``warp/native/spatial.h``. Depends on ``_QUAT_HELPERS`` and the
 # ``wp_vec7_float`` struct — both emitted whenever this block is (see the
 # header assembly in ``_emit_header_helpers``). The two-arg
-# ``wp_vec7_float_make(float3, float4)`` overload mirrors Warp's
-# ``wp.transform(p, q)`` constructor the same way the spatial helpers
-# overload ``wp_vec6_float_make(float3, float3)``.
+# ``wp_vec7_float_make(float3, float4)`` constructor overload is emitted
+# with the struct itself (``_emit_big_vec_struct``), so ``wp.transform(p, q)``
+# compiles even when no ``wp_transform_*`` helper is referenced.
 _TRANSFORM_HELPERS = """\
-inline wp_vec7_float wp_vec7_float_make(float3 p, float4 q) {
-    return wp_vec7_float_make(p[0], p[1], p[2], q[0], q[1], q[2], q[3]);
-}
 inline float3 wp_transform_get_translation(wp_vec7_float t) {
     return float3(t.c[0], t.c[1], t.c[2]);
 }
@@ -5854,6 +5945,94 @@ _MISC_MATH_HELPERS: dict[str, str] = {
         "template <typename T>\n"
         "inline T wp_vmax(metal::vec<T, 4> v) "
         "{ return metal::max(metal::max(v.x, v.y), metal::max(v.z, v.w)); }"
+    ),
+    # Reverse mode of unary ``wp.min(v)``: the gradient lands on the
+    # ``argmin`` slot (warp/native/vec.h ``adj_min``). Overloads the
+    # binary ``wp_adj_min`` template in ``_ADJ_HELPERS``.
+    "wp_adj_min": (
+        "template <typename V, typename T, int N>\n"
+        "inline void wp_adj_vmin_impl(V v, thread V& av, T r) {\n"
+        "    int ret = 0;\n"
+        "    while (ret < N && metal::isnan(float(v[ret]))) ++ret;\n"
+        "    if (ret == N) ret = 0;\n"
+        "    for (int i = ret + 1; i < N; ++i) {\n"
+        "        if (metal::isnan(float(v[i]))) continue;\n"
+        "        if (v[i] < v[ret]) ret = i;\n"
+        "    }\n"
+        "    av[ret] += r;\n"
+        "}\n"
+        "template <typename T>\n"
+        "inline void wp_adj_min(metal::vec<T, 2> v, thread metal::vec<T, 2>& av, T r) "
+        "{ wp_adj_vmin_impl<metal::vec<T, 2>, T, 2>(v, av, r); }\n"
+        "template <typename T>\n"
+        "inline void wp_adj_min(metal::vec<T, 3> v, thread metal::vec<T, 3>& av, T r) "
+        "{ wp_adj_vmin_impl<metal::vec<T, 3>, T, 3>(v, av, r); }\n"
+        "template <typename T>\n"
+        "inline void wp_adj_min(metal::vec<T, 4> v, thread metal::vec<T, 4>& av, T r) "
+        "{ wp_adj_vmin_impl<metal::vec<T, 4>, T, 4>(v, av, r); }"
+    ),
+    # Reverse mode of unary ``wp.max(v)``: the gradient lands on the
+    # ``argmax`` slot (warp/native/vec.h ``adj_max``). Overloads the
+    # binary ``wp_adj_max`` template in ``_ADJ_HELPERS``.
+    "wp_adj_max": (
+        "template <typename V, typename T, int N>\n"
+        "inline void wp_adj_vmax_impl(V v, thread V& av, T r) {\n"
+        "    int ret = 0;\n"
+        "    while (ret < N && metal::isnan(float(v[ret]))) ++ret;\n"
+        "    if (ret == N) ret = 0;\n"
+        "    for (int i = ret + 1; i < N; ++i) {\n"
+        "        if (metal::isnan(float(v[i]))) continue;\n"
+        "        if (v[i] > v[ret]) ret = i;\n"
+        "    }\n"
+        "    av[ret] += r;\n"
+        "}\n"
+        "template <typename T>\n"
+        "inline void wp_adj_max(metal::vec<T, 2> v, thread metal::vec<T, 2>& av, T r) "
+        "{ wp_adj_vmax_impl<metal::vec<T, 2>, T, 2>(v, av, r); }\n"
+        "template <typename T>\n"
+        "inline void wp_adj_max(metal::vec<T, 3> v, thread metal::vec<T, 3>& av, T r) "
+        "{ wp_adj_vmax_impl<metal::vec<T, 3>, T, 3>(v, av, r); }\n"
+        "template <typename T>\n"
+        "inline void wp_adj_max(metal::vec<T, 4> v, thread metal::vec<T, 4>& av, T r) "
+        "{ wp_adj_vmax_impl<metal::vec<T, 4>, T, 4>(v, av, r); }"
+    ),
+    "wp_argmin": (
+        "template <typename V, int N>\n"
+        "inline uint wp_argmin_impl(V v) {\n"
+        "    uint ret = 0;\n"
+        "    while (ret < uint(N) && metal::isnan(float(v[ret]))) ++ret;\n"
+        "    if (ret == uint(N)) return 0u;\n"
+        "    for (uint i = ret + 1; i < uint(N); ++i) {\n"
+        "        if (metal::isnan(float(v[i]))) continue;\n"
+        "        if (v[i] < v[ret]) ret = i;\n"
+        "    }\n"
+        "    return ret;\n"
+        "}\n"
+        "template <typename T>\n"
+        "inline uint wp_argmin(metal::vec<T, 2> v) { return wp_argmin_impl<metal::vec<T, 2>, 2>(v); }\n"
+        "template <typename T>\n"
+        "inline uint wp_argmin(metal::vec<T, 3> v) { return wp_argmin_impl<metal::vec<T, 3>, 3>(v); }\n"
+        "template <typename T>\n"
+        "inline uint wp_argmin(metal::vec<T, 4> v) { return wp_argmin_impl<metal::vec<T, 4>, 4>(v); }"
+    ),
+    "wp_argmax": (
+        "template <typename V, int N>\n"
+        "inline uint wp_argmax_impl(V v) {\n"
+        "    uint ret = 0;\n"
+        "    while (ret < uint(N) && metal::isnan(float(v[ret]))) ++ret;\n"
+        "    if (ret == uint(N)) return 0u;\n"
+        "    for (uint i = ret + 1; i < uint(N); ++i) {\n"
+        "        if (metal::isnan(float(v[i]))) continue;\n"
+        "        if (v[i] > v[ret]) ret = i;\n"
+        "    }\n"
+        "    return ret;\n"
+        "}\n"
+        "template <typename T>\n"
+        "inline uint wp_argmax(metal::vec<T, 2> v) { return wp_argmax_impl<metal::vec<T, 2>, 2>(v); }\n"
+        "template <typename T>\n"
+        "inline uint wp_argmax(metal::vec<T, 3> v) { return wp_argmax_impl<metal::vec<T, 3>, 3>(v); }\n"
+        "template <typename T>\n"
+        "inline uint wp_argmax(metal::vec<T, 4> v) { return wp_argmax_impl<metal::vec<T, 4>, 4>(v); }"
     ),
     "wp_isnan": (
         "template <typename T>\n"
@@ -9446,6 +9625,9 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     # rename appended from ``_MATH_BUILTIN_NAMES``. Warp IR always passes
     # builtins a bare local, so a comma-free single ``var_X`` operand is
     # an unambiguous match for the unary overload.
+    # ``wp.argmin(v)`` / ``wp.argmax(v)`` — first index of the extreme
+    # non-NaN component (warp/native/vec.h).
+    (re.compile(r"\bwp::(argmin|argmax)\s*\(\s*(var_\w+)\s*\)"), r"wp_\1(\2)"),
     (re.compile(r"\bwp::min\s*\(\s*(var_\w+)\s*\)"), r"wp_vmin(\1)"),
     (re.compile(r"\bwp::max\s*\(\s*(var_\w+)\s*\)"), r"wp_vmax(\1)"),
     # ``wp.invert`` is bitwise NOT (integer types only).
@@ -13313,6 +13495,35 @@ def _ensure_adj_built(kernel, block_dim: int | None = None, enable_backward: boo
     return adj
 
 
+_metal_print_warned = False
+
+
+def _handle_metal_print(kernel_name: str) -> None:
+    """Apply :data:`warp.config.metal_print` to a kernel that calls
+    ``wp.print`` / ``wp.printf`` (the calls themselves are dropped by
+    ``fold_drop_unsupported_locals``)."""
+    global _metal_print_warned
+    import warp.config as _cfg  # noqa: PLC0415
+
+    mode = str(getattr(_cfg, "metal_print", "warn")).strip().lower()
+    if mode == "error":
+        raise MetalCodegenError(
+            f"Kernel {kernel_name!r} calls wp.print()/wp.printf(), which Metal kernels cannot execute "
+            f"(warp.config.metal_print = 'error')"
+        )
+    if mode == "ignore" or _metal_print_warned:
+        return
+    _metal_print_warned = True
+    from warp._src.logger import log_warning as warn  # noqa: PLC0415
+
+    warn(
+        f"wp.print()/wp.printf() calls are compiled out on Metal devices (first seen in kernel "
+        f"{kernel_name!r}); set warp.config.metal_print = 'error' to make this an error or 'ignore' "
+        f"to silence this warning.",
+        category=UserWarning,
+    )
+
+
 def _artifact_display_name(kernel, adj) -> str:
     """MSL entry-point suffix for a kernel: the def name, qualified by its
     enclosing factory for closure kernels.
@@ -13487,7 +13698,12 @@ def _generate_msl_kernel_uncached(
     # reference array struct fields that are never assigned for the live
     # geom types.
     _ast_nodes = _ast_fold_const_branches(_ast_nodes, adj, _inlined_const_ints)
+    _ast_nodes, _tuple_skip = _ast_fold_tuples(_ast_nodes, adj, _inlined_var_ctypes)
+    _ast_nodes, _mesh_skip = _ast_fold_mesh_get(_ast_nodes, adj, _inlined_var_ctypes)
+    if _ast_has_print_calls(_ast_nodes):
+        _handle_metal_print(adj.fun_name)
     _ast_nodes, _drop_skip = _ast_fold_drop(_ast_nodes, adj, _inlined_var_ctypes)
+    _drop_skip = _drop_skip | _tuple_skip | _mesh_skip
     # ``_struct_arg_array_fields``: synthetic label -> (arg label, field
     # path) for every ``wp.array`` field of a struct-typed kernel arg the
     # body reads. The fold rewrites those accesses against the synthetic
@@ -16582,7 +16798,12 @@ def _generate_msl_kernel_uncached(
     # ``__shapes_packed`` buffer (with each array's shape at a known
     # offset) brings us back well under the limit.
     _SHAPE_SLOT = 4  # max ndim per array — Warp arrays cap at 4D
-    _shape_idx_pat = re.compile(r"\b(\w+)_shape\[([^\]]+)\]")
+    # The index group excludes ``[`` so a user array whose own name ends
+    # in ``_shape`` (``out_shape[i * out_shape_shape[1] + j]``) does not
+    # swallow the nested generated ``out_shape_shape[1]`` reference; the
+    # substitution below runs to a fixpoint to peel nested references
+    # from the inside out.
+    _shape_idx_pat = re.compile(r"\b(\w+)_shape\[([^\[\]]+)\]")
     _shape_arrs_seen: list[str] = []
     arg_label_set_local = (
         {a.label for a in adj.args} | {v.label for v in struct_field_array_vars} | {v.label for v in grad_array_vars}
@@ -16592,6 +16813,14 @@ def _generate_msl_kernel_uncached(
             _arr = _m.group(1)
             if _arr in arg_label_set_local and _arr not in _shape_arrs_seen:
                 _shape_arrs_seen.append(_arr)
+    for _arr in _shape_arrs_seen:
+        if f"{_arr}_shape" in arg_label_set_local:
+            # ``<arr>_shape[k]`` would be ambiguous between the generated
+            # shape reference and an access of the user argument.
+            raise MetalCodegenError(
+                f"Kernel {adj.fun_name!r}: argument {_arr}_shape collides with the generated shape "
+                f"identifier of array argument {_arr!r} on Metal; rename one of them"
+            )
     _shape_offsets: dict[str, int] = {a: i * _SHAPE_SLOT for i, a in enumerate(_shape_arrs_seen)}
 
     def _replace_shape_ref(m: re.Match[str]) -> str:
@@ -16601,7 +16830,15 @@ def _generate_msl_kernel_uncached(
         return f"__shapes_packed[{_shape_offsets[arr]} + {m.group(2)}]"
 
     if _shape_arrs_seen:
-        source = "\n".join(_shape_idx_pat.sub(_replace_shape_ref, line) for line in body_lines) + "\n"
+
+        def _replace_shape_refs_fix(line: str) -> str:
+            while True:
+                new_line = _shape_idx_pat.sub(_replace_shape_ref, line)
+                if new_line == line:
+                    return line
+                line = new_line
+
+        source = "\n".join(_replace_shape_refs_fix(line) for line in body_lines) + "\n"
 
     # ---- Serialise spin locks across SIMD lanes -----------------------
     # A mutual-exclusion lock spun on by two lanes of one SIMD group
@@ -16791,7 +17028,12 @@ def _generate_msl_kernel_uncached(
     if uses_tid4:
         extra_input_names.append("__tid4_dim3")
 
-    header = _build_kernel_header(source)
+    # By-value vec/quat/transform/mat params are reconstructed as typed
+    # locals by the native-dispatch prologue (``_wrap_msl_for_native_dispatch``)
+    # but their type is never spelled in the body, so the header scan would
+    # miss the struct / extract helpers they need. Name them for the scan.
+    _value_param_types = " ".join(t for t in (_value_param_msl_type(a) for a in input_args) if t)
+    header = _build_kernel_header(source + ("\n" + _value_param_types if _value_param_types else ""))
     if "WP_NATIVE_BLOCK_SYNC" in header:
         header = (_NATIVE_SYNC_COOP if coop_block_n > 0 else _NATIVE_SYNC_SERIAL) + header
     native_lane_dependent = any(
@@ -17015,6 +17257,8 @@ def _artifact_cache_key(kernel, adj) -> str | None:
         # Distributed-tile builds share neither IR nor launch geometry
         # with serial builds of the same kernel.
         f"coopblock={getattr(adj, '_metal_coop_block_n', 0)}",
+        # ``metal_print = "error"`` must reach the generator to raise.
+        f"print={getattr(warp.config, 'metal_print', 'warn')}",
     ):
         h.update(part.encode("utf-8"))
         h.update(b"\x00")
@@ -18032,6 +18276,25 @@ def _native_array_inner_msl(arg_var) -> str:
     return _native_scalar_msl_type(scalar_ctype)
 
 
+def _value_param_msl_type(arg_var) -> str | None:
+    """MSL type of a by-value vec/quat/transform/mat kernel param, else ``None``.
+
+    Only float/half/int element types are reconstructed as typed locals;
+    anything else keeps the raw scalar-pointer form.
+    """
+    kind = getattr(arg_var.type, "_wp_generic_type_str_", None)
+    if kind not in ("vec_t", "quat_t", "transform_t", "mat_t") or _is_array_arg(arg_var):
+        return None
+    scalar_ctype = f"wp::{arg_var.type._wp_scalar_type_.__name__}"
+    inner = _SCALAR_CTYPE_TO_MSL.get(scalar_ctype)
+    if inner not in _MSL_PREFIX_TO_SAME:
+        return None
+    if kind == "mat_t":
+        rows, cols = arg_var.type._shape_
+        return _msl_mat_name(rows, cols, inner)
+    return _msl_vec_name(arg_var.type._length_, inner)
+
+
 def _native_scalar_param_msl(arg_var) -> str:
     """Return the MSL type for a Warp *scalar* (non-array, non-struct) argument."""
     scalar_ctype = f"wp::{arg_var.type.__name__}"
@@ -18097,7 +18360,7 @@ def _wrap_msl_for_native_dispatch(artifact) -> str:
             elif isinstance(arg_var.type, Struct):
                 # Struct arg is serialised as flat float32 storage.
                 add_buffer(f"const constant float* {name}")
-            elif getattr(arg_var.type, "_wp_generic_type_str_", None) in ("vec_t", "quat_t"):
+            elif getattr(arg_var.type, "_wp_generic_type_str_", None) in ("vec_t", "quat_t", "transform_t"):
                 # By-value vector param. Bound as a small ``setBytes`` blob
                 # of N scalars, declared as a raw scalar pointer (a
                 # ``constant floatN*`` would read with MSL's 16-byte vector
@@ -18114,6 +18377,13 @@ def _wrap_msl_for_native_dispatch(artifact) -> str:
                     add_buffer(f"const constant {inner}* {name}__bytes")
                     elems = ", ".join(f"{name}__bytes[{i}]" for i in range(n))
                     value_prologue.append(f"    const {inner}{n} {name} = {inner}{n}({elems});")
+                elif f"struct wp_vec{n}_{inner} {{" in artifact.header:
+                    # Big vec / transform: rebuild the ``wp_vecN_*`` struct so
+                    # whole-value uses (``wp_transform_point(t, p)``) compile;
+                    # element extracts go through its ``operator[]``.
+                    add_buffer(f"const constant {inner}* {name}__bytes")
+                    elems = ", ".join(f"{name}__bytes[{i}]" for i in range(n))
+                    value_prologue.append(f"    const wp_vec{n}_{inner} {name} = wp_vec{n}_{inner}_make({elems});")
                 else:
                     add_buffer(f"const constant {inner}* {name}")
             elif getattr(arg_var.type, "_wp_generic_type_str_", None) == "mat_t":
@@ -18124,6 +18394,14 @@ def _wrap_msl_for_native_dispatch(artifact) -> str:
                 rows, cols = arg_var.type._shape_
                 scalar_cls = arg_var.type._wp_scalar_type_
                 inner = _native_scalar_msl_type(f"wp::{scalar_cls.__name__}")
+                mat_name = _msl_mat_name(rows, cols, inner)
+                if f"struct {mat_name} {{" in artifact.header:
+                    # Big / non-square / integer mat: row-major struct, same
+                    # layout as the blob.
+                    add_buffer(f"const constant {inner}* {name}__bytes")
+                    elems = ", ".join(f"{name}__bytes[{i}]" for i in range(rows * cols))
+                    value_prologue.append(f"    const {mat_name} {name} = {mat_name}_make({elems});")
+                    continue
                 if rows != cols or rows not in _MSL_VEC_NATIVE_N:
                     raise MetalCodegenError(
                         f"Native dispatch: by-value mat_t<{rows}, {cols}> kernel param {name!r} is not "
@@ -18459,7 +18737,7 @@ def _native_pack_scalar_arg(arg_var, value) -> tuple[bytes, int]:
     # By-value vec/quat/mat params: instances are ctypes arrays of scalars
     # (mats in Warp row-major order), so their raw bytes are exactly the
     # layout the ``{name}__bytes`` scalar-pointer param expects.
-    if getattr(wp_type, "_wp_generic_type_str_", None) in ("vec_t", "quat_t", "mat_t"):
+    if getattr(wp_type, "_wp_generic_type_str_", None) in ("vec_t", "quat_t", "transform_t", "mat_t"):
         inst = value if isinstance(value, wp_type) else wp_type(value)
         return bytes(inst), ctypes.sizeof(inst)
     # ``warp.float32`` etc. expose a ctypes-compatible ``_type_``;
