@@ -16195,7 +16195,11 @@ def _generate_msl_kernel_uncached(
                     return _struct_bitcast_write(f"({read} {_op[:-1]} {comp_val})", _scalar)
 
                 writes: list[str] = []
-                if finfo.kind == _STRUCT_FIELD_KIND_SCALAR:
+                if finfo.kind == _STRUCT_FIELD_KIND_SCALAR and finfo.bits < 32:
+                    slot = f"{buf}[{base_expr}]"
+                    new_val = value if op == "=" else f"({_struct_narrow_read(slot, finfo)} {op[:-1]} {value})"
+                    writes.append(f"{indent}{slot} = {_struct_narrow_write(slot, new_val, finfo)};")
+                elif finfo.kind == _STRUCT_FIELD_KIND_SCALAR:
                     slot = f"{buf}[{base_expr}]"
                     writes.append(f"{indent}{slot} = {_slot_rhs(slot, value)};")
                 elif finfo.kind == _STRUCT_FIELD_KIND_SCALAR64:
@@ -16420,9 +16424,16 @@ def _generate_msl_kernel_uncached(
                             "struct local; only stores from struct locals are supported on Metal"
                         )
                     base = f"{elem_idx} * {layout.scalars_per_elem}"
+                    # Narrow scalar leaves share 4-byte slots: compose each
+                    # shared slot's word from all of its leaves in one store.
+                    _narrow_words: dict[int, list[str]] = {}
                     for fpath, off, finfo in _iter_scalar_leaves(layout):
                         src = _per_field_local(val_struct_label, fpath)
                         cast = finfo.scalar_msl
+                        if finfo.kind == _STRUCT_FIELD_KIND_SCALAR and finfo.bits < 32:
+                            _w = _struct_narrow_write("0.0f", src, finfo)
+                            _narrow_words.setdefault(off, []).append(f"as_type<uint>({_w})")
+                            continue
                         if finfo.kind == _STRUCT_FIELD_KIND_SCALAR:
                             body_lines.append(
                                 _finalize(_emit_scalar_write(f"{base} + {off}", _struct_bitcast_write(src, cast)))
@@ -16463,6 +16474,11 @@ def _generate_msl_kernel_uncached(
                                             )
                                         )
                                     )
+                    for _off, _parts in sorted(_narrow_words.items()):
+                        _word = " | ".join(_parts)
+                        body_lines.append(
+                            _finalize(_emit_scalar_write(f"{base} + {_off}", f"as_type<float>({_word})"))
+                        )
                     continue
                 flat_idx = _flat_index_expr(arr, indices)
                 body_lines.append(_finalize(_emit_scalar_write(flat_idx, value)))
@@ -17836,6 +17852,11 @@ class _StructFieldInfo:
     scalar_msl: str = "float"
     # Sub-layout for ``_STRUCT_FIELD_KIND_STRUCT`` (nested struct) fields.
     sub: _StructLayout | None = None
+    # Narrow (1-/2-byte) scalar fields — ``bool``, ``int8``, ``uint16``,
+    # ``float16`` ... — share a 4-byte slot with their neighbours: ``bits``
+    # is the field width and ``byte_shift`` its byte position in the slot.
+    bits: int = 32
+    byte_shift: int = 0
 
 
 @dataclass
@@ -17852,6 +17873,40 @@ class _StructLayout:
 # the ctypes bytes has one buffer slot per component (no packing/padding
 # surprises). Non-float components round-trip via ``as_type<>`` bitcasts.
 _STRUCT_SCALAR_MSL_4BYTE = ("float", "int", "uint")
+# Narrow scalar struct fields (MSL type -> bit width).
+_STRUCT_SCALAR_MSL_NARROW = {"bool": 8, "char": 8, "uchar": 8, "short": 16, "ushort": 16, "half": 16}
+
+
+def _struct_narrow_read(slot_expr: str, finfo) -> str:
+    """Decode a narrow scalar field from its shared float32 storage slot."""
+    word = f"as_type<uint>({slot_expr})"
+    shift = finfo.byte_shift * 8
+    mask = (1 << finfo.bits) - 1
+    raw = f"(({word} >> {shift}u) & {mask:#x}u)"
+    m = finfo.scalar_msl
+    if m == "bool":
+        return f"({raw} != 0u)"
+    if m == "half":
+        return f"as_type<half>(ushort{raw})"
+    if m in ("char", "short"):
+        # Sign-extend through the matching unsigned type.
+        return f"{m}(u{m}{raw})"
+    return f"{m}{raw}"
+
+
+def _struct_narrow_write(slot_expr: str, value_expr: str, finfo) -> str:
+    """Float32 slot value with narrow field ``finfo`` replaced by ``value_expr``."""
+    shift = finfo.byte_shift * 8
+    mask = (1 << finfo.bits) - 1
+    m = finfo.scalar_msl
+    if m == "half":
+        bits = f"uint(as_type<ushort>(half({value_expr})))"
+    elif m == "bool":
+        bits = f"uint(bool({value_expr}) ? 1u : 0u)"
+    else:
+        bits = f"(uint({m}({value_expr})) & {mask:#x}u)"
+    keep = (~(mask << shift)) & 0xFFFFFFFF
+    return f"as_type<float>((as_type<uint>({slot_expr}) & {keep:#x}u) | ({bits} << {shift}u))"
 
 
 def _classify_struct_field(fname: str, ftype) -> _StructFieldInfo:
@@ -17949,6 +18004,19 @@ def _classify_struct_field(fname: str, ftype) -> _StructFieldInfo:
         return _StructFieldInfo(
             name=fname, offset=0, size=2, kind=_STRUCT_FIELD_KIND_SCALAR64, msl_type=msl, scalar_msl=msl
         )
+    if msl in _STRUCT_SCALAR_MSL_NARROW:
+        # Narrow scalar: occupies part of one 4-byte slot (offset/shift are
+        # filled in by ``_struct_layout_for``); reads and writes go through
+        # ``_struct_narrow_read`` / ``_struct_narrow_write``.
+        return _StructFieldInfo(
+            name=fname,
+            offset=0,
+            size=1,
+            kind=_STRUCT_FIELD_KIND_SCALAR,
+            msl_type=msl,
+            scalar_msl=msl,
+            bits=_STRUCT_SCALAR_MSL_NARROW[msl],
+        )
     if msl not in _STRUCT_SCALAR_MSL_4BYTE:
         raise MetalCodegenError(
             f"MSL codegen: struct field {fname!r} of type {ftype!r} is not 4 bytes — struct "
@@ -17973,7 +18041,7 @@ def _struct_layout_for(struct_cls) -> _StructLayout:
     for fname, fvar in getattr(struct_cls, "vars", {}).items():
         finfo = _classify_struct_field(fname, fvar.type)
         byte_off = getattr(ctype, fname).offset if ctype is not None else None
-        if byte_off is None or (byte_off % 4 != 0 and finfo.size > 0):
+        if byte_off is None or (byte_off % 4 != 0 and finfo.size > 0 and finfo.bits == 32):
             # Size-0 fields (empty nested structs, array fields) may land at
             # odd byte offsets — ctypes gives empty structs 1 byte and
             # alignment 1. Nothing is ever read from them, so only fields
@@ -17983,6 +18051,11 @@ def _struct_layout_for(struct_cls) -> _StructLayout:
                 f"MSL codegen: struct field {fname!r} of {layout.name!r} has byte offset "
                 f"{byte_off} — flat float32 struct storage needs 4-byte-aligned fields"
             )
+        if finfo.kind == _STRUCT_FIELD_KIND_SCALAR and finfo.bits < 32 and byte_off is not None:
+            finfo.offset = byte_off // 4
+            finfo.byte_shift = byte_off % 4
+            layout.fields[fname] = finfo
+            continue
         finfo.offset = (byte_off // 4) if finfo.size > 0 else 0
         layout.fields[fname] = finfo
     total = ctypes.sizeof(ctype) if ctype is not None else 0
@@ -18035,6 +18108,8 @@ def _struct_field_read_expr(buf: str, base_expr: str, finfo: _StructFieldInfo) -
     storage ``buf`` at scalar offset ``base_expr`` (the field's absolute
     offset already folded in by the caller)."""
     if finfo.kind == _STRUCT_FIELD_KIND_SCALAR:
+        if finfo.bits < 32:
+            return _struct_narrow_read(f"{buf}[{base_expr}]", finfo)
         return _struct_bitcast_read(f"{buf}[{base_expr}]", finfo.scalar_msl)
     if finfo.kind == _STRUCT_FIELD_KIND_SCALAR64:
         lo = f"as_type<uint>({buf}[{base_expr}])"

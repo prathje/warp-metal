@@ -287,6 +287,62 @@ class TestMetalCodegenGaps(unittest.TestCase):
             """,
         )
 
+    def test_narrow_struct_fields(self):
+        # mujoco_warp 3.15's GJKResult has ``separated: bool``.
+        _run(
+            self,
+            """
+            @wp.struct
+            class R:
+                separated: bool
+                flag: wp.uint8
+                small: wp.int16
+                dist: float
+                neg: wp.int8
+
+            @wp.func
+            def make(x: float) -> R:
+                r = R()
+                r.separated = x > 0.5
+                r.flag = wp.uint8(7)
+                r.small = wp.int16(-3)
+                r.dist = x * 2.0
+                r.neg = wp.int8(-5)
+                return r
+
+            @wp.kernel
+            def k(xs: wp.array[float], arr: wp.array[R], inp: wp.array[R], out: wp.array[float]):
+                i = wp.tid()
+                r = make(xs[i])
+                arr[i] = r
+                q = inp[i]
+                out[i] = (float(q.separated) + float(q.flag) * 10.0 + float(q.small) * 100.0 + q.dist
+                          + float(q.neg) * 1000.0)
+                if r.separated:
+                    out[i] += 0.25
+
+            def launch(dev):
+                src = []
+                for j in range(2):
+                    r = R()
+                    r.separated = bool(j)
+                    r.flag = 3 + j
+                    r.small = -7 + j
+                    r.dist = 1.5
+                    r.neg = -2
+                    src.append(r)
+                arr = wp.zeros(2, dtype=R, device=dev)
+                out = wp.zeros(2, dtype=float, device=dev)
+                wp.launch(k, 2, [wp.array([0.2, 0.9], dtype=float, device=dev), arr,
+                                 wp.array(src, dtype=R, device=dev)], [out], device=dev)
+                return out.numpy(), arr.numpy().tolist()
+
+            cpu, metal = both(launch)
+            np.testing.assert_array_equal(metal[0], cpu[0])
+            assert metal[1] == cpu[1], (metal[1], cpu[1])
+            """,
+        )
+
     def test_shape_suffixed_array_args(self):
         _run(
             self,
