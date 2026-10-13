@@ -10213,7 +10213,10 @@ def _translate_tile_intrinsics(
     coldist_tiles: dict[str, tuple[int, str]] | None = None,
     coop_block_n: int = 0,
     f64_arr_names: set[str] | None = None,
+    tile_2d_labels: set[str] | None = None,
 ) -> str:
+    if tile_2d_labels is None:
+        tile_2d_labels = set()
     if shaped_array_names is None:
         shaped_array_names = set()
     if f64_arr_names is None:
@@ -10273,18 +10276,21 @@ def _translate_tile_intrinsics(
         # tile offsets. For a 2-D tile we have 2 trailing offsets; for a
         # 1-D tile, 1 trailing offset.
         arr = args[0]
-        n_off = 2 if cols > 1 else 1
+        # A ``shape=(R, 1)`` tile is 2-D: it takes a (row, col) offset and
+        # walks down the rows, so its row stride is the array's row length.
+        two_d = cols > 1 or not tile_is_1d
+        n_off = 2 if two_d else 1
         lead_idx_args = args[1:-n_off] if len(args) > 1 + n_off else []
         offsets = args[-n_off:]
         arr_name = arr[len("var_") :] if arr.startswith("var_") else arr
         # Vec-element arrays expose an extra inner scalar dim in MLX
         # (``(*shape, n_elem)``); add it to ``inner_dims`` so the base
         # expression includes the element-size stride.
-        scalar_inner_dims = 2 if cols > 1 else 1
+        scalar_inner_dims = 2 if two_d else 1
         if vec_n_elem > 0:
             scalar_inner_dims += 1
         base_expr = _build_flat_base_expr(arr_name, lead_idx_args, inner_dims=scalar_inner_dims)
-        if cols > 1:
+        if two_d:
             row_stride = f"{arr_name}_shape[{len(lead_idx_args) + 1}]"
             row_off, col_off = offsets
         else:
@@ -10364,7 +10370,7 @@ def _translate_tile_intrinsics(
         n_cols_expr = None
         if arr_name in shaped_array_names:
             n_lead = len(lead_idx_args)
-            if cols > 1:
+            if two_d:
                 # Both tile offsets were consumed as such, so the tile spans
                 # array dims ``n_lead`` and ``n_lead + 1``.
                 n_rows_expr = f"(int){arr_name}_shape[{n_lead}]"
@@ -10434,16 +10440,17 @@ def _translate_tile_intrinsics(
         if dims is None:
             return m.group(0)
         rows, cols, _ = dims
-        n_off = 2 if cols > 1 else 1
+        two_d = cols > 1 or tile_label in tile_2d_labels
+        n_off = 2 if two_d else 1
         middle = args[1:-1]  # leading-idx + offsets
         lead_idx_args = middle[:-n_off] if len(middle) > n_off else []
         offsets = middle[-n_off:]
         arr_name = arr[len("var_") :] if arr.startswith("var_") else arr
-        scalar_inner_dims = 2 if cols > 1 else 1
+        scalar_inner_dims = 2 if two_d else 1
         if vec_n_elem > 0:
             scalar_inner_dims += 1
         base_expr = _build_flat_base_expr(arr_name, lead_idx_args, inner_dims=scalar_inner_dims)
-        if cols > 1:
+        if two_d:
             row_stride = f"{arr_name}_shape[{len(lead_idx_args) + 1}]"
             row_off, col_off = offsets
         else:
@@ -10566,13 +10573,14 @@ def _translate_tile_intrinsics(
         if dims is None:
             return m.group(0)
         rows, cols, _ = dims
-        n_off = 2 if cols > 1 else 1
+        two_d = cols > 1 or tile_label in tile_2d_labels
+        n_off = 2 if two_d else 1
         middle = args[1:-1]
         lead_idx_args = middle[:-n_off] if len(middle) > n_off else []
         offsets = middle[-n_off:]
         arr_name = arr[len("var_") :] if arr.startswith("var_") else arr
-        base_expr = _build_flat_base_expr(arr_name, lead_idx_args, inner_dims=(2 if cols > 1 else 1))
-        if cols > 1:
+        base_expr = _build_flat_base_expr(arr_name, lead_idx_args, inner_dims=(2 if two_d else 1))
+        if two_d:
             row_stride = f"{arr_name}_shape[{len(lead_idx_args) + 1}]"
             row_off, col_off = offsets
         else:
@@ -14380,6 +14388,15 @@ def _generate_msl_kernel_uncached(
             continue
         _kind, dtype_ctype, rows, cols = parsed
         _record_tile(var.label, dtype_ctype, rows, cols)
+    # Tiles declared 2-D (``shape=(R, C)``, including ``C == 1``) take a
+    # (row, col) offset; ``tile_var_dims`` alone cannot tell ``(R, 1)`` from a
+    # 1-D ``R`` tile.
+    tile_2d_labels: set[str] = set()
+    for _lbl, _ct in [(v.label, v.ctype()) for v in adj.variables] + list(_inlined_var_ctypes.items()):
+        if _parse_tile_ctype(_ct) is not None:
+            _sm = _TILE_SHAPE_PAT.search(_ct)
+            if _sm is not None and _sm.group(2) is not None:
+                tile_2d_labels.add(str(_lbl))
     # Inlined-function tile locals — the inliner records every spliced
     # local's ctype keyed by its mangled label (e.g. ``136__17``); add
     # the tile-typed ones here so the regex translators can resolve
@@ -14759,6 +14776,7 @@ def _generate_msl_kernel_uncached(
             coldist_tiles,
             coop_block_n,
             f64_arr_names=f64_arr_names,
+            tile_2d_labels=tile_2d_labels,
         )
         # Inline subscripts that the address-collapse produced.
         translated = _substitute_subscripts(translated)

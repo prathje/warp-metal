@@ -185,6 +185,39 @@ class TestMetalMismatch(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet)
 
+    def test_column_tile_load_store(self):
+        # A ``shape=(R, 1)`` tile is 2-D: offset (row, col) and rows walk the
+        # array's leading dim. It was lowered as a 1-D tile (row stride 1),
+        # which broke Kamino's semi-sparse Cholesky solve with >1 RHS.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            @wp.kernel
+            def k(src: wp.array3d[float], dst: wp.array3d[float], acc: wp.array2d[float]):
+                b, c, _t = wp.tid()
+                s = src[b]
+                d = dst[b]
+                for i in range(0, 8, 4):
+                    t = wp.tile_load(s, shape=(4, 1), offset=(i, c))
+                    wp.tile_store(d, t, offset=(i, c))
+                    wp.tile_atomic_add(acc, t, offset=(i, c))
+
+            src_np = np.arange(2 * 8 * 5, dtype=np.float32).reshape(2, 8, 5)
+            res = {}
+            for dev in ("cpu", "metal:0"):
+                dst = wp.zeros((2, 8, 5), dtype=float, device=dev)
+                acc = wp.zeros((8, 5), dtype=float, device=dev)
+                wp.launch_tiled(k, dim=[2, 5], inputs=[wp.array(src_np, device=dev)], outputs=[dst, acc],
+                                block_dim=64, device=dev)
+                res[dev] = (dst.numpy(), acc.numpy())
+            np.testing.assert_array_equal(res["cpu"][0], src_np)
+            for a, b in zip(res["cpu"], res["metal:0"]):
+                np.testing.assert_array_equal(a, b)
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
