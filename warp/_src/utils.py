@@ -59,7 +59,7 @@ def _use_host_native_op(device, *arrays) -> bool:
     if device.is_cpu:
         return True
     if getattr(device, "is_metal", False):
-        if warp._src.context.runtime._metal_capture_graph is not None:
+        if device.is_capturing:
             raise RuntimeError(
                 "wp.utils host ops on Metal arrays are not supported inside a Metal graph "
                 "capture — they run on the host and would not be replayed. Move the call "
@@ -75,6 +75,16 @@ def _use_host_native_op(device, *arrays) -> bool:
         wp.synchronize_device(device)
         return True
     return False
+
+
+def _metal_device_op(device, scalar_type=None, count=None) -> bool:
+    """Return ``True`` if a ``wp.utils`` call on ``device`` runs as Metal
+    device kernels (see :mod:`warp._src.metal_utils`)."""
+    if not getattr(device, "is_metal", False):
+        return False
+    from warp._src import metal_utils  # noqa: PLC0415
+
+    return metal_utils.use_device_path(device, scalar_type, count)
 
 
 def array_scan(in_array: wp.array, out_array: wp.array, inclusive: bool = True) -> None:
@@ -146,6 +156,14 @@ def array_scan(in_array: wp.array, out_array: wp.array, inclusive: bool = True) 
             raise NotImplementedError("APIC capture does not yet support array_scan() with negative strides")
         apic_capture.track_array(in_array)
         apic_capture.track_array(out_array)
+
+    if _metal_device_op(in_array.device, scalar_type, in_array.size):
+        from warp._src import metal_utils  # noqa: PLC0415
+
+        if scalar_type not in (wp.int32, wp.int64, wp.float32):
+            raise RuntimeError(f"Unsupported data type: {type_repr(in_array.dtype)}")
+        metal_utils.array_scan(in_array, out_array, inclusive)
+        return
 
     if _use_host_native_op(in_array.device, in_array, out_array):
         if scalar_type == wp.int32:
@@ -255,6 +273,12 @@ def radix_sort_pairs(
     if apic_capture is not None:
         apic_capture.track_array(keys)
         apic_capture.track_array(values)
+
+    if _metal_device_op(keys.device, None, count) and key_bit_width is not None:
+        from warp._src import metal_utils  # noqa: PLC0415
+
+        metal_utils.radix_sort_pairs(keys, values, count, begin_bit, end_bit)
+        return
 
     if _use_host_native_op(keys.device, keys, values):
         if keys.dtype == wp.int32:
@@ -446,6 +470,15 @@ def segmented_sort_pairs(
         apic_capture.track_array(segment_start_indices)
         apic_capture.track_array(segment_end_indices)
 
+    if _metal_device_op(keys.device) and keys.dtype in (wp.int32, wp.float32) and values.dtype == wp.int32:
+        from warp._src import metal_utils  # noqa: PLC0415
+
+        # Like the CUDA path, segment bounds are not validated on the device.
+        metal_utils.segmented_sort_pairs(
+            keys, values, count, segment_start_indices, segment_end_indices, num_segments
+        )
+        return
+
     if _use_host_native_op(keys.device, keys, values):
         if keys.dtype == wp.int32 and values.dtype == wp.int32:
             success = runtime.core.wp_segmented_sort_pairs_int_host(
@@ -583,7 +616,11 @@ def runlength_encode(
         apic_capture.track_array(run_lengths)
         apic_capture.track_array(run_count)
 
-    if _use_host_native_op(values.device, values):
+    if _metal_device_op(values.device, None, value_count) and values.dtype == wp.int32:
+        from warp._src import metal_utils  # noqa: PLC0415
+
+        metal_utils.runlength_encode(values, run_values, run_lengths, run_count, value_count)
+    elif _use_host_native_op(values.device, values):
         if values.dtype == wp.int32:
             runtime.core.wp_runlength_encode_int_host(
                 values.ptr, run_values.ptr, run_lengths.ptr, run_count.ptr, value_count
@@ -754,6 +791,14 @@ def array_sum(
             return out.numpy()[0]
         return out
 
+    if _metal_device_op(values.device, scalar_type, values.size * type_size) and scalar_type == wp.float32:
+        from warp._src import metal_utils  # noqa: PLC0415
+
+        metal_utils.array_sum(values, out, value_count, axis)
+        if axis is None and host_return:
+            return out.numpy()[0]
+        return out
+
     if _use_host_native_op(values.device, values):
         if scalar_type == wp.float32:
             native_func = context.runtime.core.wp_array_sum_float_host
@@ -902,6 +947,14 @@ def array_inner(
         if axis is None and host_return:
             return 0.0
         out.zero_()
+        return out
+
+    if _metal_device_op(a.device, scalar_type, a.size * type_size) and scalar_type == wp.float32:
+        from warp._src import metal_utils  # noqa: PLC0415
+
+        metal_utils.array_inner(a, b, out, count, axis)
+        if axis is None and host_return:
+            return out.numpy()[0]
         return out
 
     if _use_host_native_op(a.device, a):
