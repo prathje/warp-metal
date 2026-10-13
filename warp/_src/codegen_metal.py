@@ -17187,6 +17187,10 @@ def _generate_msl_kernel_uncached(
 
                 writes: list[str] = []
                 if finfo.kind == _STRUCT_FIELD_KIND_SCALAR and finfo.bits < 32:
+                    # Non-atomic read-modify-write of the whole 4-byte slot:
+                    # two threads writing different narrow fields of one slot
+                    # concurrently would lose an update. Must stay unreachable
+                    # for concurrent single-field writes (CPU/CUDA write bytes).
                     slot = f"{buf}[{base_expr}]"
                     new_val = value if op == "=" else f"({_struct_narrow_read(slot, finfo)} {op[:-1]} {value})"
                     writes.append(f"{indent}{slot} = {_struct_narrow_write(slot, new_val, finfo)};")
@@ -17333,6 +17337,11 @@ def _generate_msl_kernel_uncached(
                 "bit_xor_inplace": "^=",
             }[op_name]
             if narrow_store is not None:
+                # Read-modify-write of the whole 4-byte slot, not atomic even
+                # on atomic outputs (load and store are separate): threads
+                # writing different narrow fields of one slot concurrently
+                # would lose updates. Must stay unreachable for concurrent
+                # single-field writes.
                 slot = f"{arr}[{idx}]"
                 if arr in atomic_output_names:
                     cur = f"atomic_load_explicit(&{slot}, memory_order_relaxed)"
