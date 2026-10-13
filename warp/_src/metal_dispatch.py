@@ -1744,7 +1744,10 @@ class MetalDispatcher:
             for k, (_b, _o, neg) in enumerate(conds):
                 if neg:
                     negmask |= 1 << k
-            return (len(conds) | 0, negmask)
+            # Pre-packed ``WpGateParams`` plus the per-slot flag bindings
+            # (unused slots repeat the first condition).
+            slots = tuple(conds[k] if k < len(conds) else conds[0] for k in range(self._MAX_CONDS))
+            return (struct.pack("<II", len(conds), negmask), slots)
 
         cmd_tables: dict[int, tuple] = {}
         snapshots: dict[int, Any] = {}
@@ -1926,17 +1929,14 @@ class MetalDispatcher:
             elif code == _OP_EXEC_IND:
                 exec_indirect(icb, op[1], op[2])
             elif code == _OP_GATE or code == _OP_LOOP_CHECK:
-                conds, (nflags, negmask) = op[1], op[2]
+                params, slots = op[2]
                 set_pso(gate_pso if code == _OP_GATE else check_pso)
-                for k in range(self._MAX_CONDS):
-                    buf, off, _neg = conds[k] if k < nflags else conds[0]
+                for k, (buf, off, _neg) in enumerate(slots):
                     set_buffer(buf, off, k)
+                set_buffer(op[3], 0, 8)
                 if code == _OP_GATE:
-                    set_buffer(op[3], 0, 8)
                     set_buffer(op[4], 0, 9)
-                else:
-                    set_buffer(op[3], 0, 8)
-                set_bytes(struct.pack("<II", nflags, negmask), 8, 10)
+                set_bytes(params, 8, 10)
                 if code == _OP_GATE:
                     dispatch(op[5], op[6])
                 else:
