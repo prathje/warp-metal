@@ -515,6 +515,32 @@ class TestMetalTextures(unittest.TestCase):
             timeout=600,
         )
 
+    def test_texture_sample_boundary_bit_exact(self):
+        # ``coord * size - 0.5`` must not be contracted into an FMA: at
+        # u = 8/7 on a 7-texel MIRROR + CLOSEST texture that lands on the
+        # other texel (7.5000005 vs CPU's 7.5).
+        _run(
+            self,
+            """
+            @wp.kernel
+            def k(tex: wp.Texture1D, u: wp.array[float], o: wp.array[float]):
+                i = wp.tid()
+                o[i] = wp.texture_sample(tex, u[i], dtype=float)
+
+            data = np.arange(7, dtype=np.float32) * 1.5 + 1.0
+            us = np.array([8.0 / 7.0, 1.0 / 7.0, 0.5, 15.0 / 14.0, -1.0 / 7.0, 9.0 / 7.0], dtype=np.float32)
+            res = {}
+            for mode in (wp.TextureAddressMode.MIRROR, wp.TextureAddressMode.WRAP, wp.TextureAddressMode.CLAMP):
+                for filt in (wp.TextureFilterMode.CLOSEST, wp.TextureFilterMode.LINEAR):
+                    for dev in ("cpu", "metal:0"):
+                        tex = wp.Texture1D(data, filter_mode=filt, address_mode=mode, device=dev)
+                        o = wp.zeros(len(us), dtype=float, device=dev)
+                        wp.launch(k, dim=len(us), inputs=[tex, wp.array(us, device=dev), o], device=dev)
+                        res[dev] = o.numpy()
+                    np.testing.assert_array_equal(res["metal:0"], res["cpu"])
+            """,
+        )
+
     def test_texture_struct_fields(self):
         _run(
             self,

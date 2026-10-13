@@ -142,6 +142,12 @@ def uses_textures(source: str) -> bool:
     return "wp_tex_sample_" in source or "wp_texture" in source
 
 
+# The CPU sampler (texture.h, built by the host compiler) evaluates
+# ``coord * size - 0.5f`` and the lerps unfused; the Metal compiler would
+# contract them into FMAs and land on the other side of a texel boundary
+# (e.g. 7.5000005 vs 7.5 for MIRROR + CLOSEST). Contraction is switched off
+# inside the sampler helper bodies only (``#pragma clang fp contract`` is
+# scoped to the enclosing compound statement).
 _HELPERS = r"""
 struct wp_texture1d_t { ulong tex; int width; int num_channels; int dtype; };
 struct wp_texture2d_t { ulong tex; int width; int height; int num_channels; int dtype; };
@@ -156,6 +162,7 @@ struct wp_tex_desc_t {
 };
 inline const device wp_tex_desc_t& wp_tex_desc(ulong h) { return *reinterpret_cast<const device wp_tex_desc_t*>(h); }
 inline float wp_tex_addr_coord(float coord, int size, int mode) {
+    #pragma clang fp contract(off)
     float texel = coord * size - 0.5f;
     float fsize = (float)size;
     if (mode == 0) {
@@ -202,6 +209,7 @@ inline float wp_tex_fetch(const device wp_tex_desc_t& t, int level, int x, int y
     return wp_tex_decode(t.mip_data[level], t.dtype, idx);
 }
 inline float wp_tex_sample_level(const device wp_tex_desc_t& t, int level, float u, float v, float wc, int ch) {
+    #pragma clang fp contract(off)
     const int nd = t.ndim;
     const int w = t.mip_w[level], h = t.mip_h[level], d = t.mip_d[level];
     float cu = t.normalized ? u : (u / (float)t.width);
@@ -256,6 +264,7 @@ inline float wp_tex_sample_level(const device wp_tex_desc_t& t, int level, float
     return v0 * (1.0f - fz) + v1 * fz;
 }
 inline float wp_tex_sample_ch(ulong h, float u, float v, float w, int ch, float lod) {
+    #pragma clang fp contract(off)
     if (h == 0ul) return 0.0f;
     const device wp_tex_desc_t& t = wp_tex_desc(h);
     if (lod < 0.0f) return wp_tex_sample_level(t, 0, u, v, w, ch);
