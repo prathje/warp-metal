@@ -6537,17 +6537,13 @@ class Device:
         if self is other:
             return True
         elif isinstance(other, Device):
-            # CUDA devices may be represented by multiple Device instances that
-            # share a context (primary + non-primary alias), so context equality
-            # is the right check when both sides are CUDA. For non-CUDA devices,
-            # ``context`` is ``None`` for everything, so context equality would
-            # collapse CPU and Metal into one bucket — fall back to identity,
-            # which is correct because Runtime constructs each non-CUDA device
-            # exactly once and hands it out via ``device_map``.
-            if self.is_cuda and other.is_cuda:
-                return self.context == other.context
-            else:
+            # Metal devices have ``context=None`` like the CPU, so context
+            # equality would make ``metal:0 == cpu``. Each Metal device is
+            # constructed once by the Runtime, so identity (checked above)
+            # is the right test; everything else keeps upstream semantics.
+            if getattr(self, "is_metal", False) or getattr(other, "is_metal", False):
                 return False
+            return self.context == other.context
         elif isinstance(other, str):
             if other == "cuda":
                 return self == self.runtime.get_current_cuda_device()
