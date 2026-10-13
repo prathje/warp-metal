@@ -13816,10 +13816,15 @@ def _generate_msl_kernel_uncached(
 
     import warp.config as _wp_cfg_out  # noqa: PLC0415
 
+    # Read-only kernels compile to a no-op under native dispatch; anything
+    # that looks like a write the classifier did not attribute to an array
+    # argument (e.g. a store through an array constructed from a pointer
+    # inside the kernel) must keep failing loudly instead.
+    _unattributed_write = any(("store" in ln or "atomic" in ln or "array_t<" in ln) for ln in forward_lines)
     if (
         not output_args
         and not any("volume_store" in ln for ln in forward_lines)
-        and not _wp_cfg_out.metal_native_dispatch
+        and (not _wp_cfg_out.metal_native_dispatch or _unattributed_write)
     ):
         # (A kernel whose only writes go through ``wp.volume_store`` into a
         # resident NanoVDB buffer legitimately has no output array. Native
