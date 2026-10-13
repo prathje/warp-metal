@@ -452,6 +452,31 @@ class TestMetalMismatch(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet)
 
+    def test_func_native_without_adjoint_has_zero_gradient(self):
+        snippet = textwrap.dedent(
+            '''
+            import numpy as np
+
+            @wp.func_native("""return 1.0f / sqrtf(value);""")
+            def rsqrt_rn(value: float) -> float: ...
+
+            @wp.kernel
+            def k(x: wp.array[float], o: wp.array[float]):
+                i = wp.tid()
+                o[i] = rsqrt_rn(x[i]) + x[i] * x[i]
+
+            for d in ("cpu", "metal:0"):
+                x = wp.array([1.0, 4.0], dtype=float, device=d, requires_grad=True)
+                o = wp.zeros(2, dtype=float, device=d, requires_grad=True)
+                tape = wp.Tape()
+                with tape:
+                    wp.launch(k, dim=2, inputs=[x], outputs=[o], device=d)
+                tape.backward(grads={o: wp.ones(2, dtype=float, device=d)})
+                np.testing.assert_array_equal(x.grad.numpy(), [2.0, 8.0])
+            '''
+        )
+        _run_with_metal_enabled(self, snippet)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

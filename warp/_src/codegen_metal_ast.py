@@ -2242,6 +2242,10 @@ def _inline_one_adj_call(
 
     _ensure_func_backward_built(fn_overload)
     if getattr(fn_overload, "native_snippet", None) is not None:
+        # Without an ``adj_snippet`` the native adjoint is empty, so the call
+        # contributes no gradient (as on CPU/CUDA).
+        if not getattr(fn_overload, "adj_native_snippet", None):
+            return []
         from warp._src.codegen_metal import MetalCodegenError  # noqa: PLC0415
 
         raise MetalCodegenError(
