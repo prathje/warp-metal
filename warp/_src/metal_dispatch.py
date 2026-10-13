@@ -811,12 +811,23 @@ class MetalDispatcher:
         # serialize temp files) — they'd never be read again.
         import glob  # noqa: PLC0415
 
+        import time  # noqa: PLC0415
+
         for old in glob.glob(os.path.join(cache_dir, "metal_pso_archive*")):
-            if old != archive_path:
+            if old == archive_path:
+                continue
+            if ".tmp." in os.path.basename(old):
+                # Another process may be serializing into this temp file
+                # right now; only reap ones abandoned long ago.
                 try:
-                    os.remove(old)
+                    if time.time() - os.path.getmtime(old) < 3600:
+                        continue
                 except OSError:
-                    pass
+                    continue
+            try:
+                os.remove(old)
+            except OSError:
+                pass
 
         # Size sanity cap: a runaway archive is worse than a cold cache
         # (multi-GB serialize at every exit, and Apple's serializer has
@@ -859,33 +870,32 @@ class MetalDispatcher:
         """
         if self._archive is None or self._archive_path is None or not self._archive_dirty:
             return
+        # Best effort: the archive is only a cache, and concurrent processes
+        # (test runners, training workers) race on the same directory, so
+        # failures are logged at debug level and never raised.
+        from warp._src.logger import log_debug  # noqa: PLC0415
+
+        tmp_path = f"{self._archive_path}.tmp.{os.getpid()}"
         try:
             import Foundation  # noqa: PLC0415
 
-            tmp_path = f"{self._archive_path}.tmp.{os.getpid()}"
+            os.makedirs(os.path.dirname(self._archive_path), exist_ok=True)
             tmp_url = Foundation.NSURL.fileURLWithPath_(tmp_path)
             ok, err = self._archive.serializeToURL_error_(tmp_url, None)
             if not ok:
-                import warnings  # noqa: PLC0415
-
-                warnings.warn(
-                    f"MetalDispatcher: failed to serialize binary archive: {err}",
-                    stacklevel=2,
-                )
-                try:
-                    os.remove(tmp_path)
-                except OSError:
-                    pass
-            else:
-                os.replace(tmp_path, self._archive_path)
-                self._archive_dirty = False
+                log_debug(f"MetalDispatcher: failed to serialize binary archive: {err}")
+                return
+            # ``os.replace`` is atomic, so a concurrent reader sees either the
+            # old archive or the complete new one.
+            os.replace(tmp_path, self._archive_path)
+            self._archive_dirty = False
         except Exception as exc:
-            import warnings  # noqa: PLC0415
-
-            warnings.warn(
-                f"MetalDispatcher: archive serialize raised {exc!r}",
-                stacklevel=2,
-            )
+            log_debug(f"MetalDispatcher: archive serialize raised {exc!r}")
+        finally:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
     @staticmethod
     def _hash(source: str) -> str:
@@ -1524,6 +1534,10 @@ class MetalDispatcher:
             # Per-command kernel entry names for diagnostics
             # (``replay_timed`` attribution).
             "names": [],
+            # Per-command ``(pso, [(buffer, offset, slot)...], grid, tg)``
+            # so the commands can be re-encoded into a larger ICB when the
+            # recording outgrows ``max`` (see ``_grow_icb``).
+            "specs": [],
         }
 
     def end_record(self) -> MetalGraph:
@@ -2083,10 +2097,7 @@ class MetalDispatcher:
         st = self._record_state
         assert st is not None  # caller checked
         if st["count"] >= st["max"]:
-            raise MetalDispatchError(
-                f"ICB recording overflowed allocation of {st['max']} commands — "
-                "raise begin_record(max_commands=...) for this workload."
-            )
+            self._grow_icb(st)
         # Compute this command's read/write sets over shared buffers.
         # Done BEFORE encoding the command so we know whether to close
         # the open chunk first. We use ``id(entry)`` as the buffer key
@@ -2156,6 +2167,7 @@ class MetalDispatcher:
         self._record_cmd_index(st)
         cmd = st["icb"].indirectComputeCommandAtIndex_(st["count"])
         cmd.setComputePipelineState_(pso)
+        spec_bindings: list = []
         res_set = st["resources_set"]
         resources = st["resources"]
         owned = st["owned_buffers"]
@@ -2184,6 +2196,7 @@ class MetalDispatcher:
                 ctypes.memmove(addr, data, length)
                 owned.append(buf)
                 cmd.setKernelBuffer_offset_atIndex_(buf, 0, idx)
+                spec_bindings.append((buf, 0, idx))
                 # ``alloc`` returned a fresh buffer not yet known to
                 # the caller; add it to the resource set unconditionally.
                 bid = id(buf)
@@ -2196,6 +2209,7 @@ class MetalDispatcher:
                 else:
                     buf, off = entry, 0
                 cmd.setKernelBuffer_offset_atIndex_(buf, off, idx)
+                spec_bindings.append((buf, off, idx))
                 bid = id(buf)
                 if bid not in res_set:
                     res_set.add(bid)
@@ -2207,4 +2221,23 @@ class MetalDispatcher:
             Metal.MTLSizeMake(tx, ty, tz),
         )
         st["names"].append(self._pso_name.get(id(pso), "<unknown>"))
+        st["specs"].append((pso, spec_bindings, (gx, gy, gz), (tx, ty, tz)))
         st["count"] += 1
+
+    def _grow_icb(self, st) -> None:
+        """Double the recording's ICB capacity, re-encoding the commands
+        recorded so far (ICBs cannot be resized in place). Command indices
+        are unchanged, so chunks and the conditional tree stay valid."""
+        Metal = self._Metal
+        new_max = st["max"] * 2
+        icb = self._device.newIndirectCommandBufferWithDescriptor_maxCommandCount_options_(self._icb_desc, new_max, 0)
+        if icb is None:
+            raise MetalDispatchError(f"newIndirectCommandBufferWithDescriptor returned None for max_commands={new_max}")
+        for i, (pso, bindings, grid, tg) in enumerate(st["specs"]):
+            cmd = icb.indirectComputeCommandAtIndex_(i)
+            cmd.setComputePipelineState_(pso)
+            for buf, off, idx in bindings:
+                cmd.setKernelBuffer_offset_atIndex_(buf, off, idx)
+            cmd.concurrentDispatchThreads_threadsPerThreadgroup_(Metal.MTLSizeMake(*grid), Metal.MTLSizeMake(*tg))
+        st["icb"] = icb
+        st["max"] = new_max

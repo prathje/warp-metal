@@ -221,6 +221,64 @@ class TestMetalRuntime(unittest.TestCase):
         np.testing.assert_array_equal(a.numpy(), 2.0)
         np.testing.assert_array_equal(b.numpy(), 1.0)
 
+    def test_icb_grows_past_initial_capacity(self):
+        from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
+
+        a = wp.zeros(4, dtype=wp.float32)
+        flag = wp.array([1], dtype=wp.int32)
+        wp.launch(_incr, dim=4, inputs=[a])
+        a.zero_()
+        disp = get_dispatcher()
+        disp.begin_record(max_commands=4)
+        for _ in range(10):
+            wp.launch(_incr, dim=4, inputs=[a])
+        # Conditional structure recorded across a growth step.
+        from warp._src.context import _metal_find_buffer  # noqa: PLC0415
+
+        flag_buf, flag_off = _metal_find_buffer(flag.ptr)
+        disp.begin_loop(flag_buf, flag_off, max_iters=3)
+        wp.launch(_incr, dim=4, inputs=[a])
+        wp.launch(_clear_flag, dim=1, inputs=[flag])
+        disp.end_loop()
+        for _ in range(10):
+            wp.launch(_incr, dim=4, inputs=[a])
+        graph = disp.end_record()
+        self.assertGreaterEqual(graph.count, 22)
+        disp.replay(graph)
+        np.testing.assert_array_equal(a.numpy(), 21.0)
+
+    def test_pso_archive_tolerates_concurrent_processes(self):
+        import tempfile  # noqa: PLC0415
+        import warnings  # noqa: PLC0415
+
+        from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
+
+        disp = get_dispatcher()
+        saved = (disp._archive, disp._archive_path, disp._archive_dirty, wp.config.kernel_cache_dir)
+        saved_env = os.environ.pop("WARP_METAL_PSO_ARCHIVE", None)
+        with tempfile.TemporaryDirectory() as cache_dir:
+            try:
+                wp.config.kernel_cache_dir = cache_dir
+                # Another process is mid-serialize into its temp file.
+                other_tmp = os.path.join(cache_dir, "metal_pso_archive_0123456789abcdef.tmp.99999")
+                with open(other_tmp, "wb"):
+                    pass
+                disp._init_binary_archive()
+                self.assertTrue(os.path.exists(other_tmp))
+                disp._archive_dirty = True
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always")
+                    disp._serialize_archive_if_dirty()
+                    # The archive directory vanishing must not warn either.
+                    disp._archive_dirty = True
+                    disp._archive_path = os.path.join(cache_dir, "gone", "sub", "metal_pso_archive_x")
+                    disp._serialize_archive_if_dirty()
+                self.assertEqual([str(w.message) for w in caught if "archive" in str(w.message)], [])
+            finally:
+                disp._archive, disp._archive_path, disp._archive_dirty, wp.config.kernel_cache_dir = saved
+                if saved_env is not None:
+                    os.environ["WARP_METAL_PSO_ARCHIVE"] = saved_env
+
     # -- conditional graph nodes -------------------------------------------
 
     def _countdown_body(self, c, n, a):
