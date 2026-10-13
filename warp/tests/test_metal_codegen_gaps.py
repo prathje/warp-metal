@@ -500,6 +500,12 @@ class TestMetalCodegenGaps(unittest.TestCase):
                 m = wp.matrix_from_rows(c[t], c[t] * 2.0, wp.vec3(1.0, 2.0, 3.0))
                 q = wp.quat_from_axis_angle(wp.normalize(c[t]), y[1])
                 out[t] += q[0] + 2.0 * q[3]
+                for rot in range(4):
+                    ax = wp.vec3(0.0)
+                    ax[rot % 3] = 1.0
+                    rm = wp.quat_to_matrix(wp.quat_from_axis_angle(ax, 0.3 + 1.2 * float(rot))) * (1.0 + 0.1 * y[2])
+                    qm = wp.quat_from_matrix(rm)
+                    out[t] += qm[0] - 0.5 * qm[1] + 0.25 * qm[2] + qm[3]
                 out[t] += (wp.length(c[t] / d) + wp.length(d / (c[t] + wp.vec3(5.0))) + wp.trace(m / d)
                            + wp.length(x / d))
 

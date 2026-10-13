@@ -2324,6 +2324,8 @@ _ADJ_SUPPORTED = frozenset(
         "transform_multiply",
         "transform_inverse",
         "quat_from_axis_angle",
+        "quat_from_matrix",
+        "quat_to_matrix",
         # spatial_vector family (``_emit_spatial_helpers``).
         "spatial_top",
         "spatial_bottom",
@@ -2929,6 +2931,172 @@ inline wp_vec7_float wp_transform_inverse(wp_vec7_float t) {
 # transform component is a plain ``wp_vec7_float`` element access, already
 # covered by the big-vec helpers.
 _ADJ_QUAT_HELPERS = """\
+// Port of warp/native/quat.h adj_quat_from_matrix (3x3; MSL matrices are
+// column-major, so ``m.data[r][c]`` reads ``m[c][r]``).
+inline void wp_adj_quat_from_matrix(float3x3 m, thread float3x3& adj_m, float4 adj_ret) {
+    
+
+    const float tr = m[0][0] + m[1][1] + m[2][2];
+    float x = float(0), y = float(0), z = float(0), w = float(0), h = float(0);
+
+    float dx_dm00 = float(0), dx_dm01 = float(0), dx_dm02 = float(0);
+    float dx_dm10 = float(0), dx_dm11 = float(0), dx_dm12 = float(0);
+    float dx_dm20 = float(0), dx_dm21 = float(0), dx_dm22 = float(0);
+    float dy_dm00 = float(0), dy_dm01 = float(0), dy_dm02 = float(0);
+    float dy_dm10 = float(0), dy_dm11 = float(0), dy_dm12 = float(0);
+    float dy_dm20 = float(0), dy_dm21 = float(0), dy_dm22 = float(0);
+    float dz_dm00 = float(0), dz_dm01 = float(0), dz_dm02 = float(0);
+    float dz_dm10 = float(0), dz_dm11 = float(0), dz_dm12 = float(0);
+    float dz_dm20 = float(0), dz_dm21 = float(0), dz_dm22 = float(0);
+    float dw_dm00 = float(0), dw_dm01 = float(0), dw_dm02 = float(0);
+    float dw_dm10 = float(0), dw_dm11 = float(0), dw_dm12 = float(0);
+    float dw_dm20 = float(0), dw_dm21 = float(0), dw_dm22 = float(0);
+
+    if (tr >= float(0)) {
+        h = metal::sqrt(tr + float(1));
+        w = float(0.5) * h;
+        h = float(0.5) / h;
+
+        x = (m[1][2] - m[2][1]) * h;
+        y = (m[2][0] - m[0][2]) * h;
+        z = (m[0][1] - m[1][0]) * h;
+
+        dw_dm00 = float(0.5) * h;
+        dw_dm11 = float(0.5) * h;
+        dw_dm22 = float(0.5) * h;
+        dx_dm21 = h;
+        dx_dm12 = -h;
+        dx_dm00 = float(2) * h * h * h * (m[2][1] - m[1][2]);
+        dx_dm11 = float(2) * h * h * h * (m[2][1] - m[1][2]);
+        dx_dm22 = float(2) * h * h * h * (m[2][1] - m[1][2]);
+        dy_dm02 = h;
+        dy_dm20 = -h;
+        dy_dm00 = float(2) * h * h * h * (m[0][2] - m[2][0]);
+        dy_dm11 = float(2) * h * h * h * (m[0][2] - m[2][0]);
+        dy_dm22 = float(2) * h * h * h * (m[0][2] - m[2][0]);
+        dz_dm10 = h;
+        dz_dm01 = -h;
+        dz_dm00 = float(2) * h * h * h * (m[1][0] - m[0][1]);
+        dz_dm11 = float(2) * h * h * h * (m[1][0] - m[0][1]);
+        dz_dm22 = float(2) * h * h * h * (m[1][0] - m[0][1]);
+    } else {
+        int max_diag = 0;
+        if (m[1][1] > m[0][0]) {
+            max_diag = 1;
+        }
+        if (m[2][2] > m[max_diag][max_diag]) {
+            max_diag = 2;
+        }
+
+        if (max_diag == 0) {
+            h = metal::sqrt((m[0][0] - (m[1][1] + m[2][2])) + float(1));
+            x = float(0.5) * h;
+            h = float(0.5) / h;
+
+            y = (m[1][0] + m[0][1]) * h;
+            z = (m[0][2] + m[2][0]) * h;
+            w = (m[1][2] - m[2][1]) * h;
+
+            dx_dm00 = float(0.5) * h;
+            dx_dm11 = -float(0.5) * h;
+            dx_dm22 = -float(0.5) * h;
+            dy_dm01 = h;
+            dy_dm10 = h;
+            dy_dm00 = -float(2) * h * h * h * (m[1][0] + m[0][1]);
+            dy_dm11 = float(2) * h * h * h * (m[1][0] + m[0][1]);
+            dy_dm22 = float(2) * h * h * h * (m[1][0] + m[0][1]);
+            dz_dm20 = h;
+            dz_dm02 = h;
+            dz_dm00 = -float(2) * h * h * h * (m[0][2] + m[2][0]);
+            dz_dm11 = float(2) * h * h * h * (m[0][2] + m[2][0]);
+            dz_dm22 = float(2) * h * h * h * (m[0][2] + m[2][0]);
+            dw_dm21 = h;
+            dw_dm12 = -h;
+            dw_dm00 = float(2) * h * h * h * (m[2][1] - m[1][2]);
+            dw_dm11 = float(2) * h * h * h * (m[1][2] - m[2][1]);
+            dw_dm22 = float(2) * h * h * h * (m[1][2] - m[2][1]);
+        } else if (max_diag == 1) {
+            h = metal::sqrt((m[1][1] - (m[2][2] + m[0][0])) + float(1));
+            y = float(0.5) * h;
+            h = float(0.5) / h;
+
+            z = (m[2][1] + m[1][2]) * h;
+            x = (m[1][0] + m[0][1]) * h;
+            w = (m[2][0] - m[0][2]) * h;
+
+            dy_dm00 = -float(0.5) * h;
+            dy_dm11 = float(0.5) * h;
+            dy_dm22 = -float(0.5) * h;
+            dz_dm12 = h;
+            dz_dm21 = h;
+            dz_dm00 = float(2) * h * h * h * (m[2][1] + m[1][2]);
+            dz_dm11 = -float(2) * h * h * h * (m[2][1] + m[1][2]);
+            dz_dm22 = float(2) * h * h * h * (m[2][1] + m[1][2]);
+            dx_dm01 = h;
+            dx_dm10 = h;
+            dx_dm00 = float(2) * h * h * h * (m[1][0] + m[0][1]);
+            dx_dm11 = -float(2) * h * h * h * (m[1][0] + m[0][1]);
+            dx_dm22 = float(2) * h * h * h * (m[1][0] + m[0][1]);
+            dw_dm02 = h;
+            dw_dm20 = -h;
+            dw_dm00 = float(2) * h * h * h * (m[2][0] - m[0][2]);
+            dw_dm11 = float(2) * h * h * h * (m[0][2] - m[2][0]);
+            dw_dm22 = float(2) * h * h * h * (m[2][0] - m[0][2]);
+        }
+        if (max_diag == 2) {
+            h = metal::sqrt((m[2][2] - (m[0][0] + m[1][1])) + float(1));
+            z = float(0.5) * h;
+            h = float(0.5) / h;
+
+            x = (m[0][2] + m[2][0]) * h;
+            y = (m[2][1] + m[1][2]) * h;
+            w = (m[0][1] - m[1][0]) * h;
+
+            dz_dm00 = -float(0.5) * h;
+            dz_dm11 = -float(0.5) * h;
+            dz_dm22 = float(0.5) * h;
+            dx_dm20 = h;
+            dx_dm02 = h;
+            dx_dm00 = float(2) * h * h * h * (m[0][2] + m[2][0]);
+            dx_dm11 = float(2) * h * h * h * (m[0][2] + m[2][0]);
+            dx_dm22 = -float(2) * h * h * h * (m[0][2] + m[2][0]);
+            dy_dm12 = h;
+            dy_dm21 = h;
+            dy_dm00 = float(2) * h * h * h * (m[2][1] + m[1][2]);
+            dy_dm11 = float(2) * h * h * h * (m[2][1] + m[1][2]);
+            dy_dm22 = -float(2) * h * h * h * (m[2][1] + m[1][2]);
+            dw_dm10 = h;
+            dw_dm01 = -h;
+            dw_dm00 = float(2) * h * h * h * (m[0][1] - m[1][0]);
+            dw_dm11 = float(2) * h * h * h * (m[0][1] - m[1][0]);
+            dw_dm22 = float(2) * h * h * h * (m[1][0] - m[0][1]);
+        }
+    }
+
+    float4 dq_dm00 = float4(dx_dm00, dy_dm00, dz_dm00, dw_dm00);
+    float4 dq_dm01 = float4(dx_dm01, dy_dm01, dz_dm01, dw_dm01);
+    float4 dq_dm02 = float4(dx_dm02, dy_dm02, dz_dm02, dw_dm02);
+    float4 dq_dm10 = float4(dx_dm10, dy_dm10, dz_dm10, dw_dm10);
+    float4 dq_dm11 = float4(dx_dm11, dy_dm11, dz_dm11, dw_dm11);
+    float4 dq_dm12 = float4(dx_dm12, dy_dm12, dz_dm12, dw_dm12);
+    float4 dq_dm20 = float4(dx_dm20, dy_dm20, dz_dm20, dw_dm20);
+    float4 dq_dm21 = float4(dx_dm21, dy_dm21, dz_dm21, dw_dm21);
+    float4 dq_dm22 = float4(dx_dm22, dy_dm22, dz_dm22, dw_dm22);
+
+    float4 adj_q;
+    { float4 qn = float4(x, y, z, w); float l = metal::precise::sqrt(metal::dot(qn, qn)); adj_q = float4(0.0f);
+      if (l > 0.0f) { float l_inv = 1.0f / l; adj_q = adj_ret * l_inv - qn * (l_inv * l_inv * l_inv * metal::dot(qn, adj_ret)); } }
+
+    adj_m[0][0] += metal::dot(dq_dm00, adj_q);
+    adj_m[1][0] += metal::dot(dq_dm01, adj_q);
+    adj_m[2][0] += metal::dot(dq_dm02, adj_q);
+    adj_m[0][1] += metal::dot(dq_dm10, adj_q);
+    adj_m[1][1] += metal::dot(dq_dm11, adj_q);
+    adj_m[2][1] += metal::dot(dq_dm12, adj_q);
+    adj_m[0][2] += metal::dot(dq_dm20, adj_q);
+    adj_m[1][2] += metal::dot(dq_dm21, adj_q);
+    adj_m[2][2] += metal::dot(dq_dm22, adj_q);
+}
 inline void wp_adj_quat_from_axis_angle(float3 axis, float angle, thread float3& adj_axis, thread float& adj_angle,
                                        float4 adj_ret) {
     float s = metal::sin(angle * 0.5f);
@@ -2968,6 +3136,14 @@ inline void wp_adj_quat_rotate(float4 q, float3 p, thread float4& aq, thread flo
         ap[1] += r[2] * (t7 + t8) - r[0] * (t4 - t5) + r[1] * (t3 + (q.y * q.y) * 2.0f - 1.0f);
         ap[2] += -r[1] * (t7 - t8) + r[2] * (t3 + (q.z * q.z) * 2.0f - 1.0f) + r[0] * (t6 + q.x * q.z * 2.0f);
     }
+}
+// adj_quat_to_matrix (warp/native/quat.h): column k of the result is
+// ``quat_rotate(q, e_k)``; MSL ``r[k]`` is that column.
+inline void wp_adj_quat_to_matrix(float4 q, thread float4& aq, float3x3 r) {
+    float3 t = float3(0.0f);
+    wp_adj_quat_rotate(q, float3(1.0f, 0.0f, 0.0f), aq, t, r[0]);
+    wp_adj_quat_rotate(q, float3(0.0f, 1.0f, 0.0f), aq, t, r[1]);
+    wp_adj_quat_rotate(q, float3(0.0f, 0.0f, 1.0f), aq, t, r[2]);
 }
 inline void wp_adj_quat_rotate_inv(float4 q, float3 p, thread float4& aq, thread float3& ap, float3 r) {
     {
