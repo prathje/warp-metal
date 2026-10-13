@@ -744,6 +744,9 @@ def _static_int(expr: str, const_ints: dict[str, int]) -> int | None:
         return None
 
 
+_PRE_LOOP_ASSIGN = re.compile(r"^\s*var_\w+\s*=\s*[^;]*;\s*$")
+
+
 def lower_reverse_ranges(sections: list[list[str]], const_ints: dict[str, int], what: str) -> list[list[str]]:
     """Replace ``iter_reverse`` openers with the equivalent reversed range.
 
@@ -776,7 +779,20 @@ def lower_reverse_ranges(sections: list[list[str]], const_ints: dict[str, int], 
                 defs[m.group("dst")] = bounds
                 # Keep it only when it opens a real forward loop; standing
                 # alone it is just the record the reverse pass reads.
-                nxt = next((line_ for line_ in lines[i + 1 :] if not _is_inert_line(line_)), "")
+                # Loop-carried copies may sit between the range and its label
+                # (see ``_hoist_pre_loop_assigns``).
+                nxt = ""
+                for line_ in lines[i + 1 :]:
+                    if _is_inert_line(line_):
+                        continue
+                    if (
+                        _PRE_LOOP_ASSIGN.match(line_)
+                        and not _RANGE_LINE.match(line_)
+                        and not re.search(rf"\bvar_{m.group('dst')}\b", line_)
+                    ):
+                        continue
+                    nxt = line_
+                    break
                 if not _START_FOR_LABEL.match(nxt):
                     continue
             out.append(line)
@@ -839,8 +855,45 @@ def fold(nodes: list[Node], query_iter_vars: dict[str, str] | None = None) -> tu
     but iterate an opaque query object instead of a ``wp::range_t``.
     """
     skip: set[str] = set()
+    nodes = _hoist_pre_loop_assigns(nodes)
     folded, _ = _fold_range(nodes, 0, len(nodes), end_label=None, skip=skip, query_iter_vars=query_iter_vars)
     return folded, skip
+
+
+def _hoist_pre_loop_assigns(nodes: list[Node]) -> list[Node]:
+    """Move assignments Warp places between a loop's ``wp::range`` and its
+    ``start_for_K:;`` label in front of the ``wp::range`` line.
+
+    When a variable reassigned inside a loop already holds a value (e.g. a
+    ``for kk in range(i)`` index reused by a second loop inside an unrolled
+    ``range(wp.static(N))``), Warp emits the loop-carried copy
+    (``var_26 = wp::copy(var_18);``) after the range object, which breaks
+    the 4-line opener :func:`_match_for_opener` folds and leaves a raw
+    ``wp::iter_next`` behind. Moving the copies is safe when they neither
+    read the range object nor write a variable the range bounds read.
+    """
+    out = list(nodes)
+    i = 0
+    while i < len(out):
+        n = out[i]
+        m = _RANGE_LINE.match(n.raw) if isinstance(n, Assign) else None
+        if m is None:
+            i += 1
+            continue
+        range_var = m.group("dst")
+        bound_refs = set(re.findall(r"\bvar_(\w+)\b", m.group("args")))
+        j = i + 1
+        while j < len(out) and isinstance(out[j], Assign) and not _RANGE_LINE.match(out[j].raw):
+            a = out[j]
+            if a.lhs in bound_refs or a.lhs == range_var or re.search(rf"\bvar_{range_var}\b", a.expr.raw):
+                break
+            j += 1
+        if j > i + 1 and j < len(out) and isinstance(out[j], Label) and out[j].name.startswith("start_for_"):
+            out[i:j] = [*out[i + 1 : j], n]
+            i = j + 1
+            continue
+        i += 1
+    return out
 
 
 # Query-object ctypes whose Python-style iterator protocol the MSL header

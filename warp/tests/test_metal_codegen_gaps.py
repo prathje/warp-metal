@@ -115,6 +115,46 @@ class TestMetalCodegenGaps(unittest.TestCase):
             """,
         )
 
+    def test_reused_loop_var_in_unrolled_loop(self):
+        # mujoco_warp's small Cholesky: ``kk`` is reused by two dynamic loops
+        # inside an unrolled ``range(wp.static(N))``; Warp emits the loop-
+        # carried copy between ``wp::range`` and the loop label.
+        _run(
+            self,
+            """
+            N = 4
+
+            @wp.kernel
+            def k(x: wp.array2d[float], y: wp.array2d[float]):
+                w = wp.tid()
+                size = wp.static(N)
+                for i in range(wp.static(N)):
+                    d = x[w, i]
+                    for kk in range(i):
+                        d -= x[w, kk] * 0.5
+                    y[w, i] = d
+                    for j in range(i + 1, size):
+                        v = x[w, j]
+                        for kk in range(i):
+                            v -= x[w, kk] * 0.25
+                        y[w, j] += v
+
+            xn = np.arange(8, dtype=np.float32).reshape(2, N) + 1.0
+
+            def launch(dev):
+                x = wp.array(xn, dtype=float, device=dev, requires_grad=True)
+                y = wp.zeros((2, N), dtype=float, device=dev, requires_grad=True)
+                tape = wp.Tape()
+                with tape:
+                    wp.launch(k, 2, [x], [y], device=dev)
+                tape.backward(grads={y: wp.ones((2, N), dtype=float, device=dev)})
+                return y.numpy(), x.grad.numpy()
+
+            cpu, metal = both(launch)
+            assert_same(cpu, metal, rtol=1e-6, atol=1e-6)
+            """,
+        )
+
     def test_shape_suffixed_array_args(self):
         _run(
             self,
