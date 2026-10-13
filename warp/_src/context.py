@@ -14174,20 +14174,22 @@ def _metal_record_capture_if(condition, on_true, on_false, **kwargs):
                 disp.end_gated_region()
 
 
-def _metal_record_capture_while(condition, while_body, **kwargs):
+def _metal_record_capture_while(condition, while_body, max_iters=None, **kwargs):
     """Record ``capture_while`` into the active Metal ICB capture.
 
-    The body is recorded once and replayed unrolled
-    :data:`warp.config.metal_capture_while_max_iters` times; each unrolled
+    The body is recorded once and replayed unrolled ``max_iters`` times
+    (default :data:`warp.config.metal_capture_while_max_iters`); each unrolled
     iteration latches ``condition`` on the GPU and runs only while it is
     nonzero (see ``MetalDispatcher.begin_loop``).
     """
     from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
 
     _metal_branch_callable(while_body, "capture_while()")
-    max_iters = int(warp.config.metal_capture_while_max_iters)
+    if max_iters is None:
+        max_iters = warp.config.metal_capture_while_max_iters
+    max_iters = int(max_iters)
     if max_iters < 1:
-        raise ValueError(f"warp.config.metal_capture_while_max_iters must be >= 1, got {max_iters}")
+        raise ValueError(f"capture_while(): max_iters must be >= 1, got {max_iters}")
     cond = _metal_condition_binding(condition, "capture_while()")
     disp = get_dispatcher()
     disp.begin_loop(cond.buffer, cond.offset, max_iters)
@@ -14442,7 +14444,13 @@ def capture_if(
         )
 
 
-def capture_while(condition: warp.array[int], while_body: Callable | Graph, stream: Stream | None = None, **kwargs):
+def capture_while(
+    condition: warp.array[int],
+    while_body: Callable | Graph,
+    stream: Stream | None = None,
+    max_iters: int | None = None,
+    **kwargs,
+):
     """Create a dynamic loop based on a condition.
 
     The condition value is retrieved from the first element of the ``condition`` array.
@@ -14458,6 +14466,9 @@ def capture_while(condition: warp.array[int], while_body: Callable | Graph, stre
         condition: Warp array holding the condition value.
         while_body: A callback function or :class:`Graph` to execute while the loop condition is True.
         stream: The CUDA stream where the condition was written. If None, use the current stream on the device where ``condition`` resides.
+        max_iters: Metal graph captures only: the loop is replayed unrolled this many times (default
+            :data:`warp.config.metal_capture_while_max_iters`); a loop still running after that raises at the
+            next sync point. Ignored on other devices and outside captures.
 
     Any additional keyword arguments are forwarded to the callback function.
     """
@@ -14485,7 +14496,7 @@ def capture_while(condition: warp.array[int], while_body: Callable | Graph, stre
         return
 
     if device.is_metal and device.is_capturing:
-        _metal_record_capture_while(condition, while_body, **kwargs)
+        _metal_record_capture_while(condition, while_body, max_iters, **kwargs)
         return
 
     if graph is None:

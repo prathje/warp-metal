@@ -197,7 +197,6 @@ class MetalGraph:
         "_icb",
         "_names",
         "_loop_checks",
-        "_overflow_warned",
         "_owned_buffers",
         "_program",
         "_resources",
@@ -284,6 +283,11 @@ def get_dispatcher() -> MetalDispatcher:
 
 class MetalDispatchError(RuntimeError):
     """Raised on Metal API failure (compile, dispatch, allocate)."""
+
+
+class MetalCaptureWhileOverflowError(RuntimeError):
+    """A replayed Metal graph's ``capture_while`` loop needed more
+    iterations than its unrolled budget (raised at the next sync point)."""
 
 
 class BufferSlice:
@@ -527,6 +531,9 @@ class MetalDispatcher:
         self._record_state: dict | None = None
         # Recording suspended by ``pause_record`` (``wp.capture_pause``).
         self._paused_record_state: dict | None = None
+        # Loop-overflow words of replayed graphs, checked at the next sync
+        # (``addr -> (buf, addr, max_iters)``).
+        self._armed_loop_checks: dict = {}
         # Cached descriptor used to allocate new ICBs. We reuse it
         # across captures (mutating the slot count per call) to avoid
         # the PyObjC alloc/init overhead on every record session.
@@ -1424,6 +1431,10 @@ class MetalDispatcher:
         self._pending_commits = []
         # Everything has completed — release the pinned transient refs.
         self._inflight_refs_by_buf = []
+        if self._armed_loop_checks:
+            armed = list(self._armed_loop_checks.values())
+            self._armed_loop_checks.clear()
+            self._check_loop_overflow(armed)
 
     def _drain_at_exit(self) -> None:
         """``atexit`` hook: block until outstanding GPU work finishes.
@@ -1575,6 +1586,14 @@ class MetalDispatcher:
                 chunks = [(i, 1) for i in range(st["count"])]
             loop_checks = []
             program = self._build_program(st["root"], chunks, st["owned_buffers"], loop_checks)
+            # Conditional replay executes whole command runs as single
+            # ranges; ICB command barriers keep the dependency order that
+            # chunk boundaries describe (verified to serialize dependent
+            # dispatches within one ``executeCommandsInBuffer`` range).
+            icb = st["icb"]
+            for start, _length in chunks:
+                if start > 0:
+                    icb.indirectComputeCommandAtIndex_(start).setBarrier()
         return MetalGraph(
             icb=st["icb"],
             count=st["count"],
@@ -1729,8 +1748,6 @@ class MetalDispatcher:
         unrolled copy -- the copies execute strictly in order, separated
         by barriers.
         """
-        Metal = self._Metal
-        chunk_starts = {s: i for i, (s, _n) in enumerate(chunks)}
         program: list = []
 
         def owned_word():
@@ -1744,10 +1761,9 @@ class MetalDispatcher:
             for k, (_b, _o, neg) in enumerate(conds):
                 if neg:
                     negmask |= 1 << k
-            # Pre-packed ``WpGateParams`` plus the per-slot flag bindings
-            # (unused slots repeat the first condition).
-            slots = tuple(conds[k] if k < len(conds) else conds[0] for k in range(self._MAX_CONDS))
-            return (struct.pack("<II", len(conds), negmask), slots)
+            # Pre-packed ``WpGateParams`` plus the flag bindings. Only the
+            # ``nflags`` slots the kernel reads are bound.
+            return (struct.pack("<II", len(conds), negmask), tuple(conds))
 
         cmd_tables: dict[int, tuple] = {}
         snapshots: dict[int, Any] = {}
@@ -1756,38 +1772,28 @@ class MetalDispatcher:
             for node in block:
                 kind = node[0]
                 if kind == "cmds":
+                    # Chunk boundaries inside the run are enforced by ICB
+                    # command barriers (``setBarrier`` on every chunk's first
+                    # command, see ``end_record``), so the whole run executes
+                    # as ONE range -- encoding cost per run is constant
+                    # instead of one execute + barrier per chunk.
                     lo, hi = node[1], node[2]
-                    i = chunk_starts[lo]
-                    run = []
-                    while i < len(chunks) and chunks[i][0] < hi:
-                        run.append(chunks[i])
-                        i += 1
                     if not conds:
-                        for start, length in run:
-                            program.append((_OP_EXEC, start, length))
+                        program.append((_OP_EXEC, lo, hi - lo))
                         continue
                     table = cmd_tables.get(id(node))
                     if table is None:
-                        n = len(run)
-                        full_buf, full_addr = self.alloc(8 * n)
-                        ranges_buf, _ = self.alloc(8 * n)
-                        packed = (ctypes.c_uint32 * (2 * n)).from_address(full_addr)
-                        for j, (start, length) in enumerate(run):
-                            packed[2 * j] = start
-                            packed[2 * j + 1] = length
+                        full_buf, full_addr = self.alloc(8)
+                        ranges_buf, _ = self.alloc(8)
+                        packed = (ctypes.c_uint32 * 2).from_address(full_addr)
+                        packed[0] = lo
+                        packed[1] = hi - lo
                         owned_buffers.extend((full_buf, ranges_buf))
-                        table = (
-                            ranges_buf,
-                            full_buf,
-                            Metal.MTLSizeMake(n, 1, 1),
-                            Metal.MTLSizeMake(min(n, 64), 1, 1),
-                            n,
-                        )
+                        table = (ranges_buf, full_buf)
                         cmd_tables[id(node)] = table
-                    ranges_buf, full_buf, grid, tg, n = table
-                    program.append((_OP_GATE, tuple(conds), conds_params(conds), ranges_buf, full_buf, grid, tg))
-                    for j in range(n):
-                        program.append((_OP_EXEC_IND, ranges_buf, 8 * j))
+                    ranges_buf, full_buf = table
+                    program.append((_OP_GATE, tuple(conds), conds_params(conds), ranges_buf, full_buf))
+                    program.append((_OP_EXEC_IND, ranges_buf, 0))
                 elif kind == "gate":
                     _k, flag_buf, flag_off, negate, snapshot, body = node
                     if not body:
@@ -1840,7 +1846,12 @@ class MetalDispatcher:
         if self._record_state is not None:
             raise MetalDispatchError("Cannot replay while a recording is open")
         if graph._loop_checks:
-            self._poll_loop_overflow(graph)
+            # Overflow from an earlier replay of this graph that has
+            # already completed (non-blocking); the next sync point
+            # reports replays still in flight.
+            self._check_loop_overflow(graph._loop_checks)
+            for check in graph._loop_checks:
+                self._armed_loop_checks[check[1]] = check
         if graph.count == 0 and graph._program is None:
             return
         Metal = self._Metal
@@ -1937,10 +1948,7 @@ class MetalDispatcher:
                 if code == _OP_GATE:
                     set_buffer(op[4], 0, 9)
                 set_bytes(params, 8, 10)
-                if code == _OP_GATE:
-                    dispatch(op[5], op[6])
-                else:
-                    dispatch(one, one)
+                dispatch(one, one)
             elif code == _OP_SNAPSHOT:
                 set_pso(snap_pso)
                 set_buffer(op[1], op[2], 0)
@@ -1949,27 +1957,35 @@ class MetalDispatcher:
             if i < last:
                 barrier(scope)
 
-    def _poll_loop_overflow(self, graph: MetalGraph) -> None:
-        """Warn (once per graph) when an unrolled ``capture_while`` ran out
-        of iterations on an earlier replay. Reads the host-visible flag
-        without synchronizing, so it reports replays that have completed."""
-        for buf, addr, max_iters in graph._loop_checks:
+    def _check_loop_overflow(self, checks) -> None:
+        """Report unrolled ``capture_while`` loops that exhausted their
+        iteration budget in a completed replay (the GPU sets a sticky word
+        per loop). Raises :class:`MetalCaptureWhileOverflowError` unless
+        :data:`warp.config.metal_capture_while_truncate` opts into
+        truncation, in which case it warns."""
+        overflowed = []
+        for _buf, addr, max_iters in checks:
             word = ctypes.c_int32.from_address(addr)
             if word.value:
                 word.value = 0
-                if getattr(graph, "_overflow_warned", False):
-                    continue
-                try:
-                    graph._overflow_warned = True
-                except AttributeError:
-                    pass
-                from warp._src.logger import log_warning  # noqa: PLC0415
+                overflowed.append(max_iters)
+        if not overflowed:
+            return
+        import warp.config  # noqa: PLC0415
 
-                log_warning(
-                    f"wp.capture_while() in a Metal graph was still running after its iteration budget of "
-                    f"{max_iters}; the remaining iterations were skipped, so results may differ from an "
-                    "eager run. Raise warp.config.metal_capture_while_max_iters before capturing."
-                )
+        msg = (
+            f"wp.capture_while() in a Metal graph was still running after its iteration budget of "
+            f"{max(overflowed)}; the remaining iterations were skipped, so the graph's results are "
+            "truncated. Pass a larger max_iters= to wp.capture_while() (or raise "
+            "warp.config.metal_capture_while_max_iters) before capturing, or set "
+            "warp.config.metal_capture_while_truncate = True to accept truncation."
+        )
+        if getattr(warp.config, "metal_capture_while_truncate", False):
+            from warp._src.logger import log_warning  # noqa: PLC0415
+
+            log_warning(msg, once=True)
+            return
+        raise MetalCaptureWhileOverflowError(msg)
 
     # Hardware bound on ``MTLCounterSampleBuffer`` length is 32 KiB =
     # 4096 uint64 timestamps = 2048 encoders (verified empirically on
