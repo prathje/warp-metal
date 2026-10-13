@@ -155,6 +155,41 @@ class TestMetalCodegenGaps(unittest.TestCase):
             """,
         )
 
+    def test_misc_value_ops(self):
+        _run(
+            self,
+            """
+            vec2ul = wp.types.vector(2, wp.uint64)
+
+            @wp.kernel
+            def k(a: wp.array[wp.mat33], f: wp.array[float], u: wp.array[vec2ul], g: wp.array2d[float],
+                  out: wp.array[wp.mat33], fo: wp.array[float], uo: wp.array[wp.uint64], n: wp.array[int]):
+                i = wp.tid()
+                out[i] = -a[i] + (-(a[i] * 2.0))
+                fo[i] = +f[i]
+                v = u[i]
+                w = vec2ul(v[1], v[0])
+                uo[i] = w[0] + w[1] * wp.uint64(2)
+                n[0] = len(f)
+                n[1] = len(g)
+
+            def launch(dev):
+                a = wp.array(np.arange(18, dtype=np.float32).reshape(2, 3, 3), dtype=wp.mat33, device=dev)
+                f = wp.array([1.0, -2.0], dtype=float, device=dev)
+                u = wp.array(np.array([[1, 2], [3, 4]], dtype=np.uint64), dtype=vec2ul, device=dev)
+                g = wp.zeros((3, 4), dtype=float, device=dev)
+                out = wp.zeros(2, dtype=wp.mat33, device=dev)
+                fo = wp.zeros(2, dtype=float, device=dev)
+                uo = wp.zeros(2, dtype=wp.uint64, device=dev)
+                n = wp.zeros(2, dtype=int, device=dev)
+                wp.launch(k, 2, [a, f, u, g], [out, fo, uo, n], device=dev)
+                return out.numpy(), fo.numpy(), uo.numpy(), n.numpy()
+
+            cpu, metal = both(launch)
+            assert_same(cpu, metal)
+            """,
+        )
+
     def test_shape_suffixed_array_args(self):
         _run(
             self,

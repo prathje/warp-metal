@@ -272,6 +272,8 @@ _MSL_VEC_SCALAR_PREFIX: dict[str, str] = _ScalarMslMap(
         "wp::uint16": "ushort",
         "wp::int8": "char",
         "wp::uint8": "uchar",
+        "wp::int64": "long",
+        "wp::uint64": "ulong",
     }
 )
 _MSL_VEC_SUPPORTED_N = (2, 3, 4)
@@ -1300,6 +1302,11 @@ def _emit_native_mat_extract_overloads(source: str) -> str:
         parts.append(
             f"inline {scalar} wp_mat_extract({scalar}{rows}x{cols} m, int row, int col) {{ return m[col][row]; }}"
         )
+        # MSL matrices have no unary minus, and ``wp::neg`` lowers to ``(-x)``.
+        if scalar in _MSL_NATIVE_MAT_SCALARS:
+            parts.append(
+                f"inline {scalar}{rows}x{cols} operator-({scalar}{rows}x{cols} m) {{ return m * ({scalar})(-1); }}"
+            )
         # Writable element access for ``m[r, c] = v`` (4-arg ``assign_inplace``
         # and friends). Same column-major swap as ``wp_mat_extract``. A
         # reference-returning helper won't compile — MSL forbids binding a
@@ -6316,6 +6323,9 @@ _MISC_MATH_HELPERS: dict[str, str] = {
 }
 
 
+_ARRAY_LEN_PAT = re.compile(r"\bwp::len\s*\(\s*(?:var_)?(\w+)\s*\)")
+
+
 def _emit_misc_math_helpers(source: str) -> str:
     """Emit the misc-math helper definitions the source references."""
     parts = [body for name, body in _MISC_MATH_HELPERS.items() if name in source]
@@ -9489,6 +9499,8 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     # Unary negation: ``wp::neg(X)`` -> ``(-X)``. Works for scalar / vec / mat
     # because MSL's ``operator-`` is defined on all of those.
     (re.compile(r"wp::neg\s*\(\s*([^()]+?)\s*\)"), r"(-\1)"),
+    # Unary plus: identity (MSL matrices reject a unary ``+``).
+    (re.compile(r"wp::pos\s*\(\s*([^()]+?)\s*\)"), r"(\1)"),
     # Boolean not: ``wp::unot(X)`` -> ``(!X)``.
     (re.compile(r"wp::unot\s*\(\s*([^()]+?)\s*\)"), r"(!\1)"),
     # Bitwise ops. Only ``bit_and`` actually shows up in the mujoco_warp
@@ -15232,6 +15244,12 @@ def _generate_msl_kernel_uncached(
         # sample_* intrinsic pattern) gains the array length here for the
         # same reason as ``lower_bound`` above.
         translated = _SAMPLE_CDF_2ARG_PAT.sub(r"wp_sample_cdf(\1, \2, (int)\2_shape[0])", translated)
+        # ``len(arr)`` on a kernel array argument is its leading dimension.
+        if "wp::len" in translated:
+            _arr_labels = {a.label for a in adj.args if _is_array_arg(a)}
+            translated = _ARRAY_LEN_PAT.sub(
+                lambda m: f"((int){m.group(1)}_shape[0])" if m.group(1) in _arr_labels else m.group(0), translated
+            )
         # When the kernel uses ``wp.atomic_*`` on any output, MLX makes
         # *every* output ``device atomic<T>*``. Plain reads
         # ``var_X = atomic_arr[idx]`` then fail to compile because MSL
