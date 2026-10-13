@@ -26,6 +26,7 @@ import atexit
 import ctypes
 import hashlib
 import os
+import struct
 import threading
 from typing import Any
 
@@ -90,20 +91,71 @@ kernel void wp_tile1(device const uchar* pat [[buffer(0)]],
 
 // Gate for conditionally-executed graph regions. One thread per chunk of
 // the gated region: copies the chunk's full execution range, zeroing its
-// length when the int32 flag reads 0. The replay encoder points each
-// chunk's ``executeCommandsInBuffer:indirectBuffer:`` at ``ranges``, so
-// the command processor resolves skip-vs-run on the GPU timeline — the
-// Metal equivalent of a CUDA conditional graph node.
+// length unless every condition holds. Condition k is the int32 at
+// ``flag<k>`` (nonzero = true), inverted when bit k of ``negmask`` is set
+// (the else-branch of a capture_if). The replay encoder points each chunk's
+// ``executeCommandsInBuffer:indirectBuffer:`` at ``ranges``, so the command
+// processor resolves skip-vs-run on the GPU timeline -- the Metal
+// equivalent of a CUDA conditional graph node. Nested conditionals pass
+// the whole chain of enclosing conditions (up to WP_ICB_MAX_CONDS).
 struct WpExecRange { uint location; uint length; };
-kernel void wp_icb_gate(device const int* flag [[buffer(0)]],
-                        device WpExecRange* ranges [[buffer(1)]],
-                        const device WpExecRange* full [[buffer(2)]],
+struct WpGateParams { uint nflags; uint negmask; };
+#define WP_ICB_MAX_CONDS 8
+inline bool wp_icb_conds_hold(device const int* f0, device const int* f1, device const int* f2,
+                              device const int* f3, device const int* f4, device const int* f5,
+                              device const int* f6, device const int* f7, WpGateParams p) {
+    device const int* f[WP_ICB_MAX_CONDS] = {f0, f1, f2, f3, f4, f5, f6, f7};
+    for (uint k = 0; k < p.nflags; ++k) {
+        bool c = f[k][0] != 0;
+        if ((p.negmask >> k) & 1u) { c = !c; }
+        if (!c) { return false; }
+    }
+    return true;
+}
+kernel void wp_icb_gate(device const int* f0 [[buffer(0)]], device const int* f1 [[buffer(1)]],
+                        device const int* f2 [[buffer(2)]], device const int* f3 [[buffer(3)]],
+                        device const int* f4 [[buffer(4)]], device const int* f5 [[buffer(5)]],
+                        device const int* f6 [[buffer(6)]], device const int* f7 [[buffer(7)]],
+                        device WpExecRange* ranges [[buffer(8)]],
+                        const device WpExecRange* full [[buffer(9)]],
+                        constant WpGateParams& p [[buffer(10)]],
                         uint tid [[thread_position_in_grid]]) {
     WpExecRange r = full[tid];
-    if (flag[0] == 0) { r.length = 0u; }
+    if (!wp_icb_conds_hold(f0, f1, f2, f3, f4, f5, f6, f7, p)) { r.length = 0u; }
     ranges[tid] = r;
 }
+
+// Snapshot a condition flag into a graph-owned word at the start of a
+// conditional region / loop iteration, so kernels inside the region that
+// rewrite the condition do not change which of the region's later chunks
+// run (CUDA evaluates a conditional node's condition once per entry).
+kernel void wp_icb_snapshot(device const int* src [[buffer(0)]],
+                            device int* dst [[buffer(1)]],
+                            uint tid [[thread_position_in_grid]]) {
+    dst[0] = src[0];
+}
+
+// After an unrolled capture_while: record in ``out`` whether the loop was
+// still running (enclosing conditions true and loop condition nonzero) when
+// the iteration budget ran out.
+kernel void wp_icb_loop_check(device const int* f0 [[buffer(0)]], device const int* f1 [[buffer(1)]],
+                              device const int* f2 [[buffer(2)]], device const int* f3 [[buffer(3)]],
+                              device const int* f4 [[buffer(4)]], device const int* f5 [[buffer(5)]],
+                              device const int* f6 [[buffer(6)]], device const int* f7 [[buffer(7)]],
+                              device int* out [[buffer(8)]],
+                              constant WpGateParams& p [[buffer(10)]],
+                              uint tid [[thread_position_in_grid]]) {
+    if (wp_icb_conds_hold(f0, f1, f2, f3, f4, f5, f6, f7, p)) { out[0] = 1; }
+}
 """
+
+
+# Replay-program opcodes (see ``MetalDispatcher._build_program``).
+_OP_EXEC = 0
+_OP_GATE = 1
+_OP_EXEC_IND = 2
+_OP_SNAPSHOT = 3
+_OP_LOOP_CHECK = 4
 
 
 def _u32(value: int) -> tuple[bytes, int]:
@@ -144,8 +196,9 @@ class MetalGraph:
         "_count",
         "_icb",
         "_names",
+        "_loop_checks",
         "_owned_buffers",
-        "_regions",
+        "_program",
         "_resources",
         "_signature",
     )
@@ -158,8 +211,9 @@ class MetalGraph:
         owned_buffers: list,
         signature: Any = None,
         chunks: list[tuple[int, int]] | None = None,
-        regions: list[tuple] | None = None,
+        program: list[tuple] | None = None,
         names: list[str] | None = None,
+        loop_checks: list[tuple] | None = None,
     ):
         self._icb = icb
         self._count = count
@@ -188,14 +242,21 @@ class MetalGraph:
         # command). When ``chunks`` is ``None`` the replay falls back
         # to per-command ranges with barriers (safe but slow).
         self._chunks = chunks
-        # GPU-conditional regions (see ``begin_gated_region``). Each
-        # entry is ``(chunk_lo, chunk_hi, flag_buf, flag_offset,
-        # ranges_buf, full_buf)``: at replay a ``wp_icb_gate`` dispatch
-        # reads the int32 flag and writes ``ranges_buf`` with either the
-        # chunks' real execution ranges or zero-length ones, and every
-        # chunk in ``[chunk_lo, chunk_hi)`` executes via
-        # ``executeCommandsInBuffer:indirectBuffer:`` against it.
-        self._regions = regions
+        # GPU-conditional structure (see ``begin_gated_region`` /
+        # ``begin_loop``). ``None`` for a graph without conditionals;
+        # otherwise the flattened replay program -- a list of ops built by
+        # ``_build_program``: ``(_OP_EXEC, start, length)`` executes a
+        # chunk, ``(_OP_GATE, ...)`` dispatches ``wp_icb_gate`` to resolve a
+        # gated run of chunks into ``ranges_buf``, ``(_OP_EXEC_IND,
+        # ranges_buf, offset)`` executes one of those chunks through
+        # ``executeCommandsInBuffer:indirectBuffer:``, ``(_OP_SNAPSHOT,
+        # ...)`` latches a condition flag and ``(_OP_LOOP_CHECK, ...)``
+        # records whether an unrolled loop ran out of iterations.
+        self._program = program
+        # ``(overflow_buf, overflow_addr, max_iters)`` per unrolled loop;
+        # :meth:`MetalDispatcher.replay` polls the host-visible word to
+        # warn when a capture_while hit its iteration budget.
+        self._loop_checks = loop_checks
         # Per-command kernel entry names, parallel to the ICB slots.
         # Only used for diagnostics (``replay_timed`` attribution);
         # ``None`` for graphs recorded before names were tracked.
@@ -222,6 +283,11 @@ def get_dispatcher() -> MetalDispatcher:
 
 class MetalDispatchError(RuntimeError):
     """Raised on Metal API failure (compile, dispatch, allocate)."""
+
+
+class MetalCaptureWhileOverflowError(RuntimeError):
+    """A replayed Metal graph's ``capture_while`` loop needed more
+    iterations than its unrolled budget (raised at the next sync point)."""
 
 
 class BufferSlice:
@@ -463,6 +529,11 @@ class MetalDispatcher:
         # Holds either ``None`` (not recording) or a small dict with the
         # in-flight recording state.
         self._record_state: dict | None = None
+        # Recording suspended by ``pause_record`` (``wp.capture_pause``).
+        self._paused_record_state: dict | None = None
+        # Loop-overflow words of replayed graphs, checked at the next sync
+        # (``addr -> (buf, addr, max_iters)``).
+        self._armed_loop_checks: dict = {}
         # Cached descriptor used to allocate new ICBs. We reuse it
         # across captures (mutating the slot count per call) to avoid
         # the PyObjC alloc/init overhead on every record session.
@@ -524,7 +595,26 @@ class MetalDispatcher:
                 if lib is None:
                     raise MetalDispatchError(f"MSL compilation failed for entry point {entry_point!r}: {err}")
                 self._library_cache[key[0]] = lib
-            fn = lib.newFunctionWithName_(entry_point)
+            if "wp_a64_lock_lo" in source:
+                # Kernels with lock-emulated 64-bit atomics reach the lock
+                # table through its GPU address, passed as two function
+                # constants (see ``codegen_metal._wide_atomic_helpers``).
+                from warp._src.codegen_metal import (  # noqa: PLC0415
+                    WIDE_ATOMIC_LOCK_FC_HI,
+                    WIDE_ATOMIC_LOCK_FC_LO,
+                )
+
+                addr = self.wide_atomic_lock_table().gpuAddress()
+                lo = ctypes.c_uint32(addr & 0xFFFFFFFF)
+                hi = ctypes.c_uint32(addr >> 32)
+                fcv = Metal.MTLFunctionConstantValues.alloc().init()
+                fcv.setConstantValue_type_atIndex_(ctypes.addressof(lo), Metal.MTLDataTypeUInt, WIDE_ATOMIC_LOCK_FC_LO)
+                fcv.setConstantValue_type_atIndex_(ctypes.addressof(hi), Metal.MTLDataTypeUInt, WIDE_ATOMIC_LOCK_FC_HI)
+                fn, err = lib.newFunctionWithName_constantValues_error_(entry_point, fcv, None)
+                if fn is None:
+                    raise MetalDispatchError(f"Failed to specialize {entry_point!r}: {err}")
+            else:
+                fn = lib.newFunctionWithName_(entry_point)
             if fn is None:
                 raise MetalDispatchError(f"MSL library has no function named {entry_point!r}")
             pso_desc = Metal.MTLComputePipelineDescriptor.alloc().init()
@@ -556,6 +646,21 @@ class MetalDispatcher:
             self._pipeline_cache[key] = pso
             self._pso_name[id(pso)] = entry_point
             return pso
+
+    def wide_atomic_lock_table(self):
+        """Zeroed table of 32-bit lock words for lock-emulated 64-bit
+        atomics, resident in every encoder (kernels address it through
+        its ``gpuAddress``). Created on first use."""
+        table = getattr(self, "_wide_atomic_locks", None)
+        if table is None:
+            from warp._src.codegen_metal import WIDE_ATOMIC_LOCK_COUNT  # noqa: PLC0415
+
+            nbytes = 4 * WIDE_ATOMIC_LOCK_COUNT
+            table, addr = self.alloc(nbytes)
+            ctypes.memset(addr, 0, nbytes)
+            self.add_resident_resource(table)
+            self._wide_atomic_locks = table
+        return table
 
     # ------------------------------------------------------------------
     # MTLBinaryArchive helpers
@@ -713,12 +818,23 @@ class MetalDispatcher:
         # serialize temp files) — they'd never be read again.
         import glob  # noqa: PLC0415
 
+        import time  # noqa: PLC0415
+
         for old in glob.glob(os.path.join(cache_dir, "metal_pso_archive*")):
-            if old != archive_path:
+            if old == archive_path:
+                continue
+            if ".tmp." in os.path.basename(old):
+                # Another process may be serializing into this temp file
+                # right now; only reap ones abandoned long ago.
                 try:
-                    os.remove(old)
+                    if time.time() - os.path.getmtime(old) < 3600:
+                        continue
                 except OSError:
-                    pass
+                    continue
+            try:
+                os.remove(old)
+            except OSError:
+                pass
 
         # Size sanity cap: a runaway archive is worse than a cold cache
         # (multi-GB serialize at every exit, and Apple's serializer has
@@ -761,33 +877,32 @@ class MetalDispatcher:
         """
         if self._archive is None or self._archive_path is None or not self._archive_dirty:
             return
+        # Best effort: the archive is only a cache, and concurrent processes
+        # (test runners, training workers) race on the same directory, so
+        # failures are logged at debug level and never raised.
+        from warp._src.logger import log_debug  # noqa: PLC0415
+
+        tmp_path = f"{self._archive_path}.tmp.{os.getpid()}"
         try:
             import Foundation  # noqa: PLC0415
 
-            tmp_path = f"{self._archive_path}.tmp.{os.getpid()}"
+            os.makedirs(os.path.dirname(self._archive_path), exist_ok=True)
             tmp_url = Foundation.NSURL.fileURLWithPath_(tmp_path)
             ok, err = self._archive.serializeToURL_error_(tmp_url, None)
             if not ok:
-                import warnings  # noqa: PLC0415
-
-                warnings.warn(
-                    f"MetalDispatcher: failed to serialize binary archive: {err}",
-                    stacklevel=2,
-                )
-                try:
-                    os.remove(tmp_path)
-                except OSError:
-                    pass
-            else:
-                os.replace(tmp_path, self._archive_path)
-                self._archive_dirty = False
+                log_debug(f"MetalDispatcher: failed to serialize binary archive: {err}")
+                return
+            # ``os.replace`` is atomic, so a concurrent reader sees either the
+            # old archive or the complete new one.
+            os.replace(tmp_path, self._archive_path)
+            self._archive_dirty = False
         except Exception as exc:
-            import warnings  # noqa: PLC0415
-
-            warnings.warn(
-                f"MetalDispatcher: archive serialize raised {exc!r}",
-                stacklevel=2,
-            )
+            log_debug(f"MetalDispatcher: archive serialize raised {exc!r}")
+        finally:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
     @staticmethod
     def _hash(source: str) -> str:
@@ -1316,6 +1431,10 @@ class MetalDispatcher:
         self._pending_commits = []
         # Everything has completed — release the pinned transient refs.
         self._inflight_refs_by_buf = []
+        if self._armed_loop_checks:
+            armed = list(self._armed_loop_checks.values())
+            self._armed_loop_checks.clear()
+            self._check_loop_overflow(armed)
 
     def _drain_at_exit(self) -> None:
         """``atexit`` hook: block until outstanding GPU work finishes.
@@ -1357,7 +1476,7 @@ class MetalDispatcher:
         Nested recording is forbidden; live dispatches inside a
         capture region would split GPU state across two paths.
         """
-        if self._record_state is not None:
+        if self._record_state is not None or self._paused_record_state is not None:
             raise MetalDispatchError("Already recording an ICB graph; call end_record() first")
         Metal = self._Metal
         # Flush any in-flight encoder so live work doesn't accidentally
@@ -1412,16 +1531,24 @@ class MetalDispatcher:
             # unless someone actually told us which bindings are
             # read-only vs written.
             "has_modes": False,
-            # GPU-conditional regions: closed entries are
-            # ``(cmd_lo, cmd_hi, flag_buf, flag_offset)`` command-index
-            # ranges; ``region_open`` holds the in-progress
-            # ``(cmd_lo, flag_buf, flag_offset)`` between
-            # ``begin_gated_region`` and ``end_gated_region``.
-            "regions": [],
-            "region_open": None,
+            # GPU-conditional structure, recorded as a tree: ``root`` is
+            # the top-level block (a list of children); ``stack`` holds the
+            # open gated-region / loop nodes, innermost last. Children are
+            # ``["cmds", lo, hi]`` command runs, ``["gate", flag_buf,
+            # flag_off, negate, snapshot, block]`` and ``["loop", flag_buf,
+            # flag_off, max_iters, block]``. ``conditional`` flips to True
+            # on the first gated region / loop so plain graphs keep the
+            # cheaper flat replay.
+            "root": [],
+            "stack": [],
+            "conditional": False,
             # Per-command kernel entry names for diagnostics
             # (``replay_timed`` attribution).
             "names": [],
+            # Per-command ``(pso, [(buffer, offset, slot)...], grid, tg)``
+            # so the commands can be re-encoded into a larger ICB when the
+            # recording outgrows ``max`` (see ``_grow_icb``).
+            "specs": [],
         }
 
     def end_record(self) -> MetalGraph:
@@ -1430,8 +1557,11 @@ class MetalDispatcher:
             raise MetalDispatchError("Not currently recording an ICB graph")
         st = self._record_state
         self._record_state = None
-        if st["region_open"] is not None:
-            raise MetalDispatchError("end_record() with a gated region still open; call end_gated_region() first")
+        self._paused_record_state = None
+        if st["stack"]:
+            kind = st["stack"][-1][0]
+            what = "end_loop()" if kind == "loop" else "end_gated_region()"
+            raise MetalDispatchError(f"end_record() with a {kind} region still open; call {what} first")
         # Close the still-open chunk. Only emit chunk info if at least
         # one dispatch passed ``binding_modes``; otherwise the chunks
         # would all conservatively collapse to length-1 anyway and we
@@ -1444,16 +1574,26 @@ class MetalDispatcher:
             chunks = st["chunks"] or None
         else:
             chunks = None
-        regions = None
-        if st["regions"]:
+        program = None
+        loop_checks = None
+        if st["conditional"]:
             if chunks is None:
                 # No ``binding_modes`` ever recorded, so ``st["chunks"]``
                 # holds region-boundary closes without any conflict
-                # analysis inside them — unsafe to execute concurrently.
+                # analysis inside them -- unsafe to execute concurrently.
                 # Synthesize the per-command fallback explicitly so gated
                 # regions still map onto executable ranges.
                 chunks = [(i, 1) for i in range(st["count"])]
-            regions = self._build_gated_regions(st["regions"], chunks, st["owned_buffers"])
+            loop_checks = []
+            program = self._build_program(st["root"], chunks, st["owned_buffers"], loop_checks)
+            # Conditional replay executes whole command runs as single
+            # ranges; ICB command barriers keep the dependency order that
+            # chunk boundaries describe (verified to serialize dependent
+            # dispatches within one ``executeCommandsInBuffer`` range).
+            icb = st["icb"]
+            for start, _length in chunks:
+                if start > 0:
+                    icb.indirectComputeCommandAtIndex_(start).setBarrier()
         return MetalGraph(
             icb=st["icb"],
             count=st["count"],
@@ -1461,9 +1601,30 @@ class MetalDispatcher:
             owned_buffers=st["owned_buffers"],
             signature=st["signature"],
             chunks=chunks,
-            regions=regions,
+            program=program,
             names=st["names"],
+            loop_checks=loop_checks or None,
         )
+
+    def pause_record(self) -> None:
+        """Suspend the active recording; dispatches run live until
+        :meth:`resume_record` (``wp.capture_pause`` on Metal)."""
+        if self._record_state is None:
+            raise MetalDispatchError("pause_record() without an active recording")
+        self._paused_record_state = self._record_state
+        self._record_state = None
+
+    def resume_record(self) -> None:
+        """Resume a recording suspended by :meth:`pause_record`."""
+        if self._paused_record_state is None:
+            raise MetalDispatchError("resume_record() without a paused recording")
+        if self._record_state is not None:
+            raise MetalDispatchError("resume_record() while another recording is active")
+        # Live work issued while paused must not interleave with the
+        # graph's commands in a shared encoder.
+        self._end_encoder()
+        self._record_state = self._paused_record_state
+        self._paused_record_state = None
 
     @staticmethod
     def _close_open_chunk(st) -> None:
@@ -1474,81 +1635,197 @@ class MetalDispatcher:
             st["chunk_reads"] = set()
             st["chunk_writes"] = set()
 
-    def begin_gated_region(self, flag_buf, flag_offset: int = 0) -> None:
+    @staticmethod
+    def _current_block(st) -> list:
+        return st["stack"][-1][-1] if st["stack"] else st["root"]
+
+    def _require_recording(self, what: str):
+        st = self._record_state
+        if st is None:
+            raise MetalDispatchError(f"{what} is only valid while recording")
+        return st
+
+    def begin_gated_region(self, flag_buf, flag_offset: int = 0, negate: bool = False, snapshot: bool = False) -> None:
         """Start a GPU-conditional region inside an active recording.
 
         Every dispatch recorded until the matching
         :meth:`end_gated_region` executes on replay only while the
-        int32 at byte ``flag_offset`` of ``flag_buf`` reads nonzero —
-        evaluated on the GPU timeline at the region's position in the
-        graph, so a command *earlier in the same graph* (or an earlier
-        replay) can flip the flag and skip the region's work. This is
-        the Metal equivalent of a CUDA conditional graph node; the
-        canonical use is an iterative solver whose per-world
-        convergence kernel decrements a "worlds still solving" counter.
+        int32 at byte ``flag_offset`` of ``flag_buf`` reads nonzero (zero
+        when ``negate`` is set) — evaluated on the GPU timeline at the
+        region's position in the graph, so a command *earlier in the same
+        graph* (or an earlier replay) can flip the flag and skip the
+        region's work. This is the Metal equivalent of a CUDA conditional
+        graph node; the canonical use is an iterative solver whose
+        per-world convergence kernel decrements a "worlds still solving"
+        counter.
+
+        With ``snapshot`` the flag is latched once when the region is
+        entered (``wp.capture_if`` semantics): kernels inside the region
+        that rewrite the flag do not change which of its later commands
+        run. Without it every gated run of chunks re-reads the flag.
 
         Skipped regions still cost their inter-chunk barriers plus one
         tiny gate dispatch, but no kernel threads launch — the
         ``executeCommandsInBuffer:indirectBuffer:`` ranges collapse to
         zero length.
 
-        Regions cannot nest. An empty region (no dispatches recorded
-        inside) is dropped silently.
+        Regions (and loops, see :meth:`begin_loop`) nest up to
+        ``_MAX_CONDS`` levels; an inner command runs only while every
+        enclosing condition holds. An empty region (no dispatches
+        recorded inside) costs nothing.
         """
-        st = self._record_state
-        if st is None:
-            raise MetalDispatchError("begin_gated_region() is only valid while recording")
-        if st["region_open"] is not None:
-            raise MetalDispatchError("Gated regions cannot nest")
-        # Region boundaries must coincide with chunk boundaries: the
-        # gate's range table covers whole chunks only.
-        self._close_open_chunk(st)
-        st["region_open"] = (st["count"], flag_buf, flag_offset)
+        st = self._require_recording("begin_gated_region()")
+        self._push_node(st, ["gate", flag_buf, int(flag_offset), bool(negate), bool(snapshot), []])
 
     def end_gated_region(self) -> None:
         """Close the gated region opened by :meth:`begin_gated_region`."""
         st = self._record_state
-        if st is None or st["region_open"] is None:
+        if st is None or not st["stack"] or st["stack"][-1][0] != "gate":
             raise MetalDispatchError("end_gated_region() without a matching begin_gated_region()")
-        cmd_lo, flag_buf, flag_offset = st["region_open"]
-        st["region_open"] = None
-        if st["count"] == cmd_lo:
-            return
-        self._close_open_chunk(st)
-        st["regions"].append((cmd_lo, st["count"], flag_buf, flag_offset))
+        self._pop_node(st)
 
-    def _build_gated_regions(self, cmd_regions: list, chunks: list, owned_buffers: list) -> list:
-        """Map recorded command-index regions onto chunk indices and
-        allocate each region's execution-range buffers.
+    def begin_loop(self, flag_buf, flag_offset: int = 0, max_iters: int = 1) -> None:
+        """Start a GPU-conditional loop (``wp.capture_while`` on Metal).
 
-        ``full_buf`` holds the chunks' real ``{location, length}``
-        ranges (immutable); ``ranges_buf`` is the gate kernel's output
-        the replay encoder actually points
-        ``executeCommandsInBuffer:indirectBuffer:`` at. Both live as
-        long as the graph via ``owned_buffers``.
+        The commands recorded until :meth:`end_loop` form the loop body.
+        Replay unrolls the body ``max_iters`` times; at the start of each
+        iteration the int32 flag is latched and the iteration's commands
+        run only if it was nonzero, so once a body kernel clears the flag
+        every remaining iteration collapses to gate dispatches and
+        barriers. ``max_iters`` bounds the iteration count — a loop still
+        running when the budget is exhausted stops there (replay warns,
+        see :meth:`replay`); the body is recorded once, so the ICB holds a
+        single copy regardless of ``max_iters``.
         """
-        Metal = self._Metal
-        regions = []
-        for cmd_lo, cmd_hi, flag_buf, flag_offset in cmd_regions:
-            # begin/end_gated_region close the open chunk, so region
-            # bounds align exactly with chunk starts.
-            chunk_lo = next(i for i, (s, _n) in enumerate(chunks) if s == cmd_lo)
-            chunk_hi = chunk_lo
-            while chunk_hi < len(chunks) and chunks[chunk_hi][0] < cmd_hi:
-                chunk_hi += 1
-            n = chunk_hi - chunk_lo
-            full_buf, full_addr = self.alloc(8 * n)
-            ranges_buf, _ = self.alloc(8 * n)
-            packed = (ctypes.c_uint32 * (2 * n)).from_address(full_addr)
-            for j in range(n):
-                start, length = chunks[chunk_lo + j]
-                packed[2 * j] = start
-                packed[2 * j + 1] = length
-            owned_buffers.extend((full_buf, ranges_buf))
-            gate_grid = Metal.MTLSizeMake(n, 1, 1)
-            gate_tg = Metal.MTLSizeMake(min(n, 64), 1, 1)
-            regions.append((chunk_lo, chunk_hi, flag_buf, flag_offset, ranges_buf, full_buf, gate_grid, gate_tg))
-        return regions
+        st = self._require_recording("begin_loop()")
+        max_iters = int(max_iters)
+        if max_iters < 1:
+            raise MetalDispatchError(f"begin_loop(): max_iters must be >= 1, got {max_iters}")
+        self._push_node(st, ["loop", flag_buf, int(flag_offset), max_iters, []])
+
+    def end_loop(self) -> None:
+        """Close the loop opened by :meth:`begin_loop`."""
+        st = self._record_state
+        if st is None or not st["stack"] or st["stack"][-1][0] != "loop":
+            raise MetalDispatchError("end_loop() without a matching begin_loop()")
+        self._pop_node(st)
+
+    _MAX_CONDS = 8
+
+    def _push_node(self, st, node: list) -> None:
+        if len(st["stack"]) >= self._MAX_CONDS:
+            raise MetalDispatchError(
+                f"Metal graph conditionals nest at most {self._MAX_CONDS} levels deep "
+                "(capture_if / capture_while / gated regions)"
+            )
+        # Structure boundaries must coincide with chunk boundaries: the
+        # gate's range table covers whole chunks only.
+        self._close_open_chunk(st)
+        self._current_block(st).append(node)
+        st["stack"].append(node)
+        st["conditional"] = True
+
+    def _pop_node(self, st) -> None:
+        self._close_open_chunk(st)
+        st["stack"].pop()
+
+    def _record_cmd_index(self, st) -> None:
+        """Attach the command about to be recorded (index ``st["count"]``)
+        to the innermost open block of the conditional tree."""
+        block = self._current_block(st)
+        idx = st["count"]
+        if block and block[-1][0] == "cmds" and block[-1][2] == idx:
+            block[-1][2] = idx + 1
+        else:
+            block.append(["cmds", idx, idx + 1])
+
+    def _build_program(self, root: list, chunks: list, owned_buffers: list, loop_checks: list) -> list:
+        """Flatten the recorded conditional tree into a replay program.
+
+        Loops are unrolled ``max_iters`` times here, so replay is a single
+        pass over a flat op list. Per-node GPU state (range tables,
+        condition snapshots) is allocated once and shared by every
+        unrolled copy -- the copies execute strictly in order, separated
+        by barriers.
+        """
+        program: list = []
+
+        def owned_word():
+            buf, addr = self.alloc(4)
+            ctypes.memset(addr, 0, 4)
+            owned_buffers.append(buf)
+            return buf, addr
+
+        def conds_params(conds):
+            negmask = 0
+            for k, (_b, _o, neg) in enumerate(conds):
+                if neg:
+                    negmask |= 1 << k
+            # Pre-packed ``WpGateParams`` plus the flag bindings. Only the
+            # ``nflags`` slots the kernel reads are bound.
+            return (struct.pack("<II", len(conds), negmask), tuple(conds))
+
+        cmd_tables: dict[int, tuple] = {}
+        snapshots: dict[int, Any] = {}
+
+        def emit(block, conds):
+            for node in block:
+                kind = node[0]
+                if kind == "cmds":
+                    # Chunk boundaries inside the run are enforced by ICB
+                    # command barriers (``setBarrier`` on every chunk's first
+                    # command, see ``end_record``), so the whole run executes
+                    # as ONE range -- encoding cost per run is constant
+                    # instead of one execute + barrier per chunk.
+                    lo, hi = node[1], node[2]
+                    if not conds:
+                        program.append((_OP_EXEC, lo, hi - lo))
+                        continue
+                    table = cmd_tables.get(id(node))
+                    if table is None:
+                        full_buf, full_addr = self.alloc(8)
+                        ranges_buf, _ = self.alloc(8)
+                        packed = (ctypes.c_uint32 * 2).from_address(full_addr)
+                        packed[0] = lo
+                        packed[1] = hi - lo
+                        owned_buffers.extend((full_buf, ranges_buf))
+                        table = (ranges_buf, full_buf)
+                        cmd_tables[id(node)] = table
+                    ranges_buf, full_buf = table
+                    program.append((_OP_GATE, tuple(conds), conds_params(conds), ranges_buf, full_buf))
+                    program.append((_OP_EXEC_IND, ranges_buf, 0))
+                elif kind == "gate":
+                    _k, flag_buf, flag_off, negate, snapshot, body = node
+                    if not body:
+                        continue
+                    if snapshot:
+                        snap = snapshots.get(id(node))
+                        if snap is None:
+                            snap = owned_word()[0]
+                            snapshots[id(node)] = snap
+                        program.append((_OP_SNAPSHOT, flag_buf, flag_off, snap))
+                        emit(body, [*conds, (snap, 0, negate)])
+                    else:
+                        emit(body, [*conds, (flag_buf, flag_off, negate)])
+                elif kind == "loop":
+                    _k, flag_buf, flag_off, max_iters, body = node
+                    snap = snapshots.get(id(node))
+                    if snap is None:
+                        snap = owned_word()[0]
+                        snapshots[id(node)] = snap
+                    inner = [*conds, (snap, 0, False)]
+                    for _ in range(max_iters):
+                        program.append((_OP_SNAPSHOT, flag_buf, flag_off, snap))
+                        if body:
+                            emit(body, inner)
+                    # Budget exhausted while the loop still wanted to run?
+                    check_buf, check_addr = owned_word()
+                    loop_checks.append((check_buf, check_addr, max_iters))
+                    check_conds = [*conds, (flag_buf, flag_off, False)]
+                    program.append((_OP_LOOP_CHECK, tuple(check_conds), conds_params(check_conds), check_buf))
+
+        emit(root, [])
+        return program
 
     def replay(self, graph: MetalGraph) -> None:
         """Execute ``graph`` on the GPU (fire-and-forget).
@@ -1568,7 +1845,14 @@ class MetalDispatcher:
         """
         if self._record_state is not None:
             raise MetalDispatchError("Cannot replay while a recording is open")
-        if graph.count == 0:
+        if graph._loop_checks:
+            # Overflow from an earlier replay of this graph that has
+            # already completed (non-blocking); the next sync point
+            # reports replays still in flight.
+            self._check_loop_overflow(graph._loop_checks)
+            for check in graph._loop_checks:
+                self._armed_loop_checks[check[1]] = check
+        if graph.count == 0 and graph._program is None:
             return
         Metal = self._Metal
         if self._cmd_buf is None:
@@ -1610,41 +1894,8 @@ class MetalDispatcher:
         scope = self._barrier_scope_buffers
         icb = graph._icb
         chunks = graph._chunks
-        if chunks is not None and graph._regions:
-            # Region-aware walk: chunks inside a gated region execute
-            # via GPU-resolved indirect ranges, preceded (once per
-            # region) by the gate dispatch that writes them. The gate
-            # must observe flag writes from earlier commands in this
-            # same encoder — memoryBarrierWithScope: covers both that
-            # and the command processor's later range read (verified
-            # empirically; see test_metal_launch.py gate tests).
-            gate_pso = self._device_op("wp_icb_gate")
-            exec_indirect = encoder.executeCommandsInBuffer_indirectBuffer_indirectBufferOffset_
-            regions = graph._regions
-            nregions = len(regions)
-            ridx = 0
-            last = len(chunks) - 1
-            for i, (start, length) in enumerate(chunks):
-                if ridx < nregions:
-                    reg = regions[ridx]
-                    if i == reg[0]:
-                        _lo, _hi, flag_buf, flag_off, ranges_buf, full_buf, gate_grid, gate_tg = reg
-                        encoder.setComputePipelineState_(gate_pso)
-                        encoder.setBuffer_offset_atIndex_(flag_buf, flag_off, 0)
-                        encoder.setBuffer_offset_atIndex_(ranges_buf, 0, 1)
-                        encoder.setBuffer_offset_atIndex_(full_buf, 0, 2)
-                        encoder.dispatchThreads_threadsPerThreadgroup_(gate_grid, gate_tg)
-                        encoder.memoryBarrierWithScope_(scope)
-                    if reg[0] <= i < reg[1]:
-                        exec_indirect(icb, reg[4], (i - reg[0]) * 8)
-                        if i + 1 == reg[1]:
-                            ridx += 1
-                        if i < last:
-                            encoder.memoryBarrierWithScope_(scope)
-                        continue
-                encoder.executeCommandsInBuffer_withRange_(icb, nsrange(start, length))
-                if i < last:
-                    encoder.memoryBarrierWithScope_(scope)
+        if graph._program is not None:
+            self._replay_program(encoder, graph)
         elif chunks is not None:
             last = len(chunks) - 1
             for i, (start, length) in enumerate(chunks):
@@ -1662,6 +1913,79 @@ class MetalDispatcher:
         if self._dispatch_count >= self._autoflush_every:
             self.flush()
             self._dispatch_count = 0
+
+    def _replay_program(self, encoder, graph: MetalGraph) -> None:
+        """Encode a conditional graph's flattened program (see
+        :meth:`_build_program`), one barrier between consecutive ops."""
+        nsrange = self._NSMakeRange
+        scope = self._barrier_scope_buffers
+        icb = graph._icb
+        barrier = encoder.memoryBarrierWithScope_
+        exec_range = encoder.executeCommandsInBuffer_withRange_
+        exec_indirect = encoder.executeCommandsInBuffer_indirectBuffer_indirectBufferOffset_
+        set_pso = encoder.setComputePipelineState_
+        set_buffer = encoder.setBuffer_offset_atIndex_
+        set_bytes = encoder.setBytes_length_atIndex_
+        dispatch = encoder.dispatchThreads_threadsPerThreadgroup_
+        gate_pso = self._device_op("wp_icb_gate")
+        snap_pso = self._device_op("wp_icb_snapshot")
+        check_pso = self._device_op("wp_icb_loop_check")
+        one = self._Metal.MTLSizeMake(1, 1, 1)
+        program = graph._program
+        last = len(program) - 1
+        for i, op in enumerate(program):
+            code = op[0]
+            if code == _OP_EXEC:
+                exec_range(icb, nsrange(op[1], op[2]))
+            elif code == _OP_EXEC_IND:
+                exec_indirect(icb, op[1], op[2])
+            elif code == _OP_GATE or code == _OP_LOOP_CHECK:
+                params, slots = op[2]
+                set_pso(gate_pso if code == _OP_GATE else check_pso)
+                for k, (buf, off, _neg) in enumerate(slots):
+                    set_buffer(buf, off, k)
+                set_buffer(op[3], 0, 8)
+                if code == _OP_GATE:
+                    set_buffer(op[4], 0, 9)
+                set_bytes(params, 8, 10)
+                dispatch(one, one)
+            elif code == _OP_SNAPSHOT:
+                set_pso(snap_pso)
+                set_buffer(op[1], op[2], 0)
+                set_buffer(op[3], 0, 1)
+                dispatch(one, one)
+            if i < last:
+                barrier(scope)
+
+    def _check_loop_overflow(self, checks) -> None:
+        """Report unrolled ``capture_while`` loops that exhausted their
+        iteration budget in a completed replay (the GPU sets a sticky word
+        per loop). Raises :class:`MetalCaptureWhileOverflowError` unless
+        :data:`warp.config.metal_capture_while_truncate` opts into
+        truncation, in which case it warns."""
+        overflowed = []
+        for _buf, addr, max_iters in checks:
+            word = ctypes.c_int32.from_address(addr)
+            if word.value:
+                word.value = 0
+                overflowed.append(max_iters)
+        if not overflowed:
+            return
+        import warp.config  # noqa: PLC0415
+
+        msg = (
+            f"wp.capture_while() in a Metal graph was still running after its iteration budget of "
+            f"{max(overflowed)}; the remaining iterations were skipped, so the graph's results are "
+            "truncated. Record the loop under a larger wp.ScopedMetalCaptureWhileBudget(n) (or raise "
+            "warp.config.metal_capture_while_max_iters) before capturing, or set "
+            "warp.config.metal_capture_while_truncate = True to accept truncation."
+        )
+        if getattr(warp.config, "metal_capture_while_truncate", False):
+            from warp._src.logger import log_warning  # noqa: PLC0415
+
+            log_warning(msg, once=True)
+            return
+        raise MetalCaptureWhileOverflowError(msg)
 
     # Hardware bound on ``MTLCounterSampleBuffer`` length is 32 KiB =
     # 4096 uint64 timestamps = 2048 encoders (verified empirically on
@@ -1789,10 +2113,7 @@ class MetalDispatcher:
         st = self._record_state
         assert st is not None  # caller checked
         if st["count"] >= st["max"]:
-            raise MetalDispatchError(
-                f"ICB recording overflowed allocation of {st['max']} commands — "
-                "raise begin_record(max_commands=...) for this workload."
-            )
+            self._grow_icb(st)
         # Compute this command's read/write sets over shared buffers.
         # Done BEFORE encoding the command so we know whether to close
         # the open chunk first. We use ``id(entry)`` as the buffer key
@@ -1859,8 +2180,10 @@ class MetalDispatcher:
                 chunk_writes |= cmd_writes
         # Encode the command.
         Metal = self._Metal
+        self._record_cmd_index(st)
         cmd = st["icb"].indirectComputeCommandAtIndex_(st["count"])
         cmd.setComputePipelineState_(pso)
+        spec_bindings: list = []
         res_set = st["resources_set"]
         resources = st["resources"]
         owned = st["owned_buffers"]
@@ -1889,6 +2212,7 @@ class MetalDispatcher:
                 ctypes.memmove(addr, data, length)
                 owned.append(buf)
                 cmd.setKernelBuffer_offset_atIndex_(buf, 0, idx)
+                spec_bindings.append((buf, 0, idx))
                 # ``alloc`` returned a fresh buffer not yet known to
                 # the caller; add it to the resource set unconditionally.
                 bid = id(buf)
@@ -1901,6 +2225,7 @@ class MetalDispatcher:
                 else:
                     buf, off = entry, 0
                 cmd.setKernelBuffer_offset_atIndex_(buf, off, idx)
+                spec_bindings.append((buf, off, idx))
                 bid = id(buf)
                 if bid not in res_set:
                     res_set.add(bid)
@@ -1912,4 +2237,23 @@ class MetalDispatcher:
             Metal.MTLSizeMake(tx, ty, tz),
         )
         st["names"].append(self._pso_name.get(id(pso), "<unknown>"))
+        st["specs"].append((pso, spec_bindings, (gx, gy, gz), (tx, ty, tz)))
         st["count"] += 1
+
+    def _grow_icb(self, st) -> None:
+        """Double the recording's ICB capacity, re-encoding the commands
+        recorded so far (ICBs cannot be resized in place). Command indices
+        are unchanged, so chunks and the conditional tree stay valid."""
+        Metal = self._Metal
+        new_max = st["max"] * 2
+        icb = self._device.newIndirectCommandBufferWithDescriptor_maxCommandCount_options_(self._icb_desc, new_max, 0)
+        if icb is None:
+            raise MetalDispatchError(f"newIndirectCommandBufferWithDescriptor returned None for max_commands={new_max}")
+        for i, (pso, bindings, grid, tg) in enumerate(st["specs"]):
+            cmd = icb.indirectComputeCommandAtIndex_(i)
+            cmd.setComputePipelineState_(pso)
+            for buf, off, idx in bindings:
+                cmd.setKernelBuffer_offset_atIndex_(buf, off, idx)
+            cmd.concurrentDispatchThreads_threadsPerThreadgroup_(Metal.MTLSizeMake(*grid), Metal.MTLSizeMake(*tg))
+        st["icb"] = icb
+        st["max"] = new_max

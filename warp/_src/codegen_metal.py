@@ -2721,6 +2721,321 @@ def _rewrite_f64_atomics(text: str, arr_names: set[str]) -> str:
     return text
 
 
+# ---------------------------------------------------------------------------
+# 64-bit integer and half-precision atomics
+# ---------------------------------------------------------------------------
+# MSL offers no ``atomic<long>``, and ``atomic<ulong>`` supports only
+# ``atomic_min/max_explicit`` (Apple7+). ``atomic<half>`` does not exist.
+# Arrays with such elements therefore stay plain ``device T*`` (see the
+# ``nonatomic_label_set`` plumbing) and ``_rewrite_wide_atomics`` routes every
+# atomic on them through the ``wp_a64_*`` / ``wp_a16_*`` helpers below. The
+# helpers are specialized per array, and each array gets one strategy (see
+# ``_wide_atomic_strategies``):
+#
+# * only unsigned ``min``/``max`` with every result discarded: the native
+#   ``atomic<ulong>`` ops;
+# * only ``add``/``sub``, or only ``and``/``or``/``xor``, with every result
+#   discarded: lock-free, one 32-bit atomic per word (the carry of the
+#   low-word add is folded into the high-word add). Exact final value; never
+#   used when a result is consumed, because the two halves of a returned
+#   previous value could come from different moments;
+# * anything else (compare-and-swap, exchange, signed min/max, consumed
+#   results, or a mix of the classes above): every 64-bit atomic on that
+#   array serializes on a lock from a global table of 32-bit words hashed by
+#   element address. The table's GPU address reaches the kernel as two
+#   function constants (see ``MetalDispatcher.compile``). The update is
+#   published with a single 64-bit store, so plain racing reads observe
+#   either the old or the new value.
+#
+# Cost of the locked path: lanes of one SIMD group updating the same element
+# share one lock acquisition (one load, one store and two device fences per
+# group), so an element costs one lock handoff per contending SIMD group,
+# serialized on the lock word. Spread-out updates (a hash table, per-slot
+# counters) cost a few native atomics each. Pathological contention -- every
+# thread of a launch on one element -- grows superlinearly because waiting
+# groups occupy the GPU while the holder works (measured on M3 Max, int64
+# add with consumed results: 4K threads 9 ms, 64K 0.13 s, 1M 7.5 s); discard
+# the result, or use 32-bit / per-thread partial sums, for such counters.
+#
+# ``float16`` atomics compare-exchange the aligned 32-bit word that contains
+# the element.
+
+_WIDE_ATOMIC_NEEDLES: tuple[tuple[str, str], ...] = (
+    ("atomic_fetch_add_explicit(&", "add"),
+    ("atomic_fetch_sub_explicit(&", "sub"),
+    ("atomic_fetch_or_explicit(&", "or"),
+    ("atomic_fetch_and_explicit(&", "and"),
+    ("atomic_fetch_xor_explicit(&", "xor"),
+    ("wp_atomic_min(&", "min"),
+    ("wp_atomic_max(&", "max"),
+    ("wp_atomic_cas(&", "cas"),
+    ("wp_atomic_exch(&", "exch"),
+)
+
+# Function-constant indices carrying the lock table address (low / high word).
+WIDE_ATOMIC_LOCK_FC_LO = 30
+WIDE_ATOMIC_LOCK_FC_HI = 31
+WIDE_ATOMIC_LOCK_COUNT = 1 << 16
+
+
+def _wide_atomic_array_names(arg_vars) -> tuple[set[str], set[str], set[str]]:
+    i64: set[str] = set()
+    u64: set[str] = set()
+    f16: set[str] = set()
+    for arg in arg_vars:
+        if not _is_array_arg(arg) or _is_demoted_f64_array(arg):
+            continue
+        name = _array_scalar_type_name(arg)
+        if name == "int64":
+            i64.add(arg.label)
+        elif name == "uint64":
+            u64.add(arg.label)
+        elif name == "float16":
+            f16.add(arg.label)
+    return i64, u64, f16
+
+
+def _rewrite_wide_atomics(text: str, i64: set[str], u64: set[str], f16: set[str]) -> str:
+    """Route atomics on 64-bit integer and float16 array elements to the
+    ``wp_a64_<op>`` / ``wp_a16_<op>`` helpers.
+
+    Signed and unsigned 64-bit min/max get distinct names (``smin``/``umax``
+    ...) so the helper block can tell which ones have a native lowering.
+    """
+    for needle, op in _WIDE_ATOMIC_NEEDLES:
+        pos = 0
+        while True:
+            pos = text.find(needle, pos)
+            if pos < 0:
+                break
+            name_start = pos + len(needle)
+            bracket = text.find("[", name_start)
+            name = text[name_start:bracket].strip() if bracket > 0 else ""
+            if name in i64 or name in u64:
+                prefix = "wp_a64_"
+                helper_op = ("s" if name in i64 else "u") + op if op in ("min", "max") else op
+            elif name in f16:
+                prefix = "wp_a16_"
+                helper_op = op
+                if op not in ("add", "sub"):
+                    raise MetalCodegenError(f"MSL codegen: wp.atomic_{op}() on float16 array {name!r} is not supported")
+            else:
+                pos = name_start
+                continue
+            args, end = _split_f64_atomic_call_args(text, pos + len(needle) - 1)
+            nargs = 3 if op == "cas" else 2
+            if len(args) < nargs:
+                raise MetalCodegenError(f"MSL codegen: cannot rewrite atomic {text[pos : end + 1]!r}")
+            call_args = ", ".join(a.strip() for a in args[:nargs])
+            # 64-bit helpers are specialized per array (``__<array>`` suffix)
+            # so each array gets its own strategy (see ``_wide_atomic_helpers``).
+            suffix = f"__{name}" if prefix == "wp_a64_" else ""
+            replacement = f"{prefix}{helper_op}{suffix}({call_args})"
+            text = text[:pos] + replacement + text[end + 1 :]
+            pos += len(replacement)
+    return text
+
+
+_A64_OPS = {"add": 0, "sub": 1, "or": 2, "and": 3, "xor": 4, "smin": 5, "umin": 5, "smax": 6, "umax": 6, "exch": 7}
+
+
+_A64_CALL_PAT = re.compile(r"\bwp_a64_([a-z]+)__(\w+?)\s*\(")
+
+
+def _wide_atomic_strategies(source: str) -> dict[str, tuple[str, set[str]]]:
+    """``array -> (strategy, ops)`` for the 64-bit atomics in ``source``.
+
+    Chosen per array (atomics on different arrays never touch the same
+    memory, so they need not agree):
+
+    * ``native``: only unsigned min/max whose results are all discarded --
+      MSL's ``atomic<ulong>`` min/max return nothing, so they cannot report
+      the previous value;
+    * ``split``: only add/sub, or only and/or/xor, with results discarded --
+      one 32-bit atomic per word gives the exact final value, but the two
+      halves of the returned previous value can come from different moments
+      (e.g. a racing carry into the high word), so it is never used when the
+      result is consumed;
+    * ``locked``: everything else.
+    """
+    per_array: dict[str, set[str]] = {}
+    for m in _A64_CALL_PAT.finditer(source):
+        per_array.setdefault(m.group(2), set()).add(m.group(1))
+    used: set[str] = set()
+    for m in re.finditer(r"\b(\w+)\s*=\s*wp_a64_[a-z]+__(\w+?)\s*\(", source):
+        # The IR assigns every atomic's result to a local; it is dead when
+        # the local appears only in its declaration and this assignment.
+        if len(re.findall(rf"\b{re.escape(m.group(1))}\b", source)) > 2:
+            used.add(m.group(2))
+    out = {}
+    for arr, ops in per_array.items():
+        if arr not in used and ops <= {"umin", "umax"}:
+            out[arr] = ("native", ops)
+        elif arr not in used and (ops <= {"add", "sub"} or ops <= {"or", "and", "xor"}):
+            out[arr] = ("split", ops)
+        else:
+            out[arr] = ("locked", ops)
+    return out
+
+
+def _wide_atomic_helpers(source: str) -> str:
+    """Emit the per-array ``wp_a64_<op>__<array>`` helpers ``source`` uses."""
+    strategies = _wide_atomic_strategies(source)
+    out = []
+    if any(st == "locked" for st, _ops in strategies.values()):
+        out.append(
+            f"""\
+constant uint wp_a64_lock_lo [[function_constant({WIDE_ATOMIC_LOCK_FC_LO})]];
+constant uint wp_a64_lock_hi [[function_constant({WIDE_ATOMIC_LOCK_FC_HI})]];
+inline device metal::atomic_uint* wp_a64_lock_for(device const void* p) {{
+    device metal::atomic_uint* table = reinterpret_cast<device metal::atomic_uint*>(
+        (ulong(wp_a64_lock_hi) << 32) | ulong(wp_a64_lock_lo));
+    return table + ((reinterpret_cast<ulong>(p) >> 3) & {WIDE_ATOMIC_LOCK_COUNT - 1}ul);
+}}
+// Lanes of one SIMD group that target the same element are served by a
+// single lock acquisition: the outer loop picks the address of the first
+// still-active lane, its first lane takes the lock, the group's lanes apply
+// their updates one at a time in lane order, and the lock is released. This
+// keeps lock traffic proportional to the number of contending SIMD groups
+// rather than threads (lock handoff between groups costs O(contenders)
+// atomics each). No lane ever spins on a lock held by its own SIMD group,
+// which would deadlock on Apple GPUs (no independent forward progress
+// between lanes); spinning on another group's lock is fine.
+inline uint wp_a64_ldw(device metal::atomic_uint* w) {{
+    return metal::atomic_load_explicit(w, metal::memory_order_relaxed);
+}}
+template <typename T>
+inline T wp_a64_apply(uint op, T old, T a, T b) {{
+    switch (op) {{
+        case 0: return old + a;
+        case 1: return old - a;
+        case 2: return old | a;
+        case 3: return old & a;
+        case 4: return old ^ a;
+        case 5: return a < old ? a : old;
+        case 6: return a > old ? a : old;
+        case 7: return a;
+        default: return old == a ? b : old;
+    }}
+}}
+template <typename T>
+inline T wp_a64_locked(device T* p, uint op, T a, T b) {{
+    device metal::atomic_uint* l = wp_a64_lock_for(p);
+    device metal::atomic_uint* w = (device metal::atomic_uint*)p;
+    const uint2 addr = as_type<uint2>(reinterpret_cast<ulong>(p));
+    T old = T(0);
+    bool done = false;
+    while (!done) {{
+        const uint2 lead = metal::simd_broadcast_first(addr);
+        if (lead.x == addr.x && lead.y == addr.y) {{
+            // Highest lane of this group targeting the element: it applies
+            // the last update and so holds the final value.
+            const ulong group = ulong(simd_vote::vote_t(metal::simd_ballot(true)));
+            const ushort last_lane = ushort(63 - metal::clz(group));
+            if (metal::simd_is_first()) {{
+                // Test-and-test-and-set: spin on plain loads and only try
+                // the exchange when the lock looks free.
+                while (true) {{
+                    if (metal::atomic_load_explicit(l, metal::memory_order_relaxed) == 0u &&
+                        metal::atomic_exchange_explicit(l, 1u, metal::memory_order_relaxed) == 0u) {{
+                        break;
+                    }}
+                }}
+                metal::atomic_thread_fence(metal::mem_flags::mem_device, metal::memory_order_seq_cst,
+                                           metal::thread_scope_device);
+            }}
+            // One coherent read of the element per group; the group's
+            // updates are then applied in lane order on registers, passing
+            // the running value lane to lane, and published with a single
+            // store -- a lock handoff costs one load, one store and two
+            // fences regardless of how many lanes it serves.
+            uint2 cur = metal::simd_is_first() ? uint2(wp_a64_ldw(w), wp_a64_ldw(w + 1)) : uint2(0u);
+            cur = metal::simd_broadcast_first(cur);
+            bool pending = true;
+            uint2 mine = cur;
+            while (pending) {{
+                const bool me = metal::simd_is_first();
+                if (me) {{
+                    old = as_type<T>(cur);
+                    mine = as_type<uint2>(wp_a64_apply<T>(op, old, a, b));
+                    pending = false;
+                }}
+                cur = metal::simd_broadcast_first(me ? mine : cur);
+            }}
+            const uint2 final_value = metal::simd_broadcast(mine, last_lane);
+            if (metal::simd_is_first()) {{
+                *(volatile device T*)p = as_type<T>(final_value);
+                metal::atomic_thread_fence(metal::mem_flags::mem_device, metal::memory_order_seq_cst,
+                                           metal::thread_scope_device);
+                metal::atomic_exchange_explicit(l, 0u, metal::memory_order_relaxed);
+            }}
+            done = true;
+        }}
+    }}
+    return old;
+}}"""
+        )
+    for arr, (strategy, ops) in sorted(strategies.items()):
+        for op in sorted(ops):
+            types = ("long",) if op.startswith("s") else ("ulong",) if op.startswith("u") else ("long", "ulong")
+            for t in types:
+                fn = f"wp_a64_{op}__{arr}"
+                if strategy == "locked":
+                    if op == "cas":
+                        out.append(f"inline {t} {fn}(device {t}* p, {t} c, {t} v) {{ return wp_a64_locked<{t}>(p, 8u, c, v); }}")
+                    else:
+                        out.append(f"inline {t} {fn}(device {t}* p, {t} v) {{ return wp_a64_locked<{t}>(p, {_A64_OPS[op]}u, v, {t}(0)); }}")
+                elif strategy == "native":
+                    native = "atomic_min_explicit" if op == "umin" else "atomic_max_explicit"
+                    out.append(
+                        f"inline ulong {fn}(device ulong* p, ulong v) {{\n"
+                        f"    {native}((device metal::atomic_ulong*)p, v, metal::memory_order_relaxed);\n"
+                        f"    return 0ul;  // result unused (see _wide_atomic_strategies)\n"
+                        f"}}"
+                    )
+                elif op in ("add", "sub"):
+                    neg = "-v" if op == "sub" else "v"
+                    out.append(
+                        f"inline {t} {fn}(device {t}* p, {t} v) {{\n"
+                        f"    device metal::atomic_uint* w = (device metal::atomic_uint*)p;\n"
+                        f"    uint2 d = as_type<uint2>({t}({neg}));\n"
+                        f"    uint lo = metal::atomic_fetch_add_explicit(w, d.x, metal::memory_order_relaxed);\n"
+                        f"    uint carry = (lo + d.x) < lo ? 1u : 0u;\n"
+                        f"    metal::atomic_fetch_add_explicit(w + 1, d.y + carry, metal::memory_order_relaxed);\n"
+                        f"    return {t}(0);  // result unused (see _wide_atomic_strategies)\n"
+                        f"}}"
+                    )
+                else:
+                    out.append(
+                        f"inline {t} {fn}(device {t}* p, {t} v) {{\n"
+                        f"    device metal::atomic_uint* w = (device metal::atomic_uint*)p;\n"
+                        f"    uint2 d = as_type<uint2>(v);\n"
+                        f"    metal::atomic_fetch_{op}_explicit(w, d.x, metal::memory_order_relaxed);\n"
+                        f"    metal::atomic_fetch_{op}_explicit(w + 1, d.y, metal::memory_order_relaxed);\n"
+                        f"    return {t}(0);  // result unused (see _wide_atomic_strategies)\n"
+                        f"}}"
+                    )
+    if "wp_a16_" in source:
+        for op, expr in (("add", "cur + v"), ("sub", "cur - v")):
+            out.append(
+                f"""\
+inline half wp_a16_{op}(device half* p, half v) {{
+    device metal::atomic_uint* w = (device metal::atomic_uint*)(reinterpret_cast<ulong>(p) & ~3ul);
+    const uint shift = (reinterpret_cast<ulong>(p) & 2ul) ? 16u : 0u;
+    uint old = metal::atomic_load_explicit(w, metal::memory_order_relaxed);
+    while (true) {{
+        half cur = as_type<half>(ushort(old >> shift));
+        uint upd = (old & ~(0xffffu << shift)) | (uint(as_type<ushort>(half({expr}))) << shift);
+        if (metal::atomic_compare_exchange_weak_explicit(w, &old, upd, metal::memory_order_relaxed,
+                                                         metal::memory_order_relaxed)) {{
+            return cur;
+        }}
+    }}
+}}"""
+            )
+    return "\n".join(out)
+
+
 # ``wp.normalize`` must match ``warp/native/vec.h``/``quat.h`` exactly:
 # zero-length input returns the zero vector (identity quat for quats),
 # never NaN — Warp's ``kEps`` is 0.0f, hence the ``l > 0`` guard. Do NOT
@@ -8687,6 +9002,8 @@ def _build_kernel_header(source: str) -> str:
         parts.append(_F64_HELPERS)
     if "wp_f64_atomic_" in source or (_emu and "wp_adj_accum" in source):
         parts.append(_F64_EMU_ATOMIC_HELPERS if _emu else _F64_ATOMIC_HELPERS)
+    if "wp_a64_" in source or "wp_a16_" in source:
+        parts.append(_wide_atomic_helpers(source))
     if "wp_adj_" in source:
         parts.append(_ADJ_HELPERS)
         for _n in _ADJ_VEC_HELPER_LENGTHS:
@@ -10013,6 +10330,17 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (
         re.compile(r"wp::atomic_sub\s*\(\s*([^,()]+?)\s*,\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)"),
         r"atomic_fetch_sub_explicit(&\1[\2], \3, memory_order_relaxed)",
+    ),
+    # Bitwise atomics (``wp.atomic_and/or/xor``) map 1:1 onto MSL fetch ops
+    # for 32-bit elements; 64-bit elements are rewritten onto the
+    # ``wp_a64_*`` helpers (see ``_rewrite_wide_atomics``).
+    # (One pattern per op: the intrinsic index keys on the literal name.)
+    *(
+        (
+            re.compile(rf"wp::atomic_{_op}\s*\(\s*([^,()]+?)\s*,\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)"),
+            rf"atomic_fetch_{_op}_explicit(&\1[\2], \3, memory_order_relaxed)",
+        )
+        for _op in ("and", "or", "xor")
     ),
     # min/max dispatch through ``wp_atomic_min``/``wp_atomic_max`` helpers
     # instead of calling ``atomic_fetch_min/max_explicit`` directly: MSL has
@@ -14422,7 +14750,7 @@ def _generate_msl_kernel_uncached(
     atomic_op_kinds: dict[str, set[str]] = {}
     plain_store_arg_names: set[str] = set()
     array_store_pat = re.compile(r"\s*wp::array_store\s*\(\s*var_([A-Za-z_]\w*)")
-    atomic_pat = re.compile(r"wp::atomic_(add|sub|min|max|cas|exch)\s*\(\s*var_([A-Za-z_]\w*)")
+    atomic_pat = re.compile(r"wp::atomic_(add|sub|min|max|cas|exch|and|or|xor)\s*\(\s*var_([A-Za-z_]\w*)")
     scalar_store_pat = re.compile(r"\s*wp::__metal_scalar_store__\s*\(\s*var_([A-Za-z_]\w*)")
     # ``wp::tile_store<...>(arr, tile, off...)`` — the blocked-Cholesky
     # path writes through tile_store directly (no array_store wrapper).
@@ -14451,7 +14779,7 @@ def _generate_msl_kernel_uncached(
     # min/max raw lines dispatch through the wp_atomic_* helpers (float
     # emulation — see ``_MISC_MATH_HELPERS``), so match both spellings.
     raw_atomic_pat = re.compile(
-        r"(?:atomic_fetch_(add|sub|min|max)_explicit|wp_atomic_(min|max|cas|exch))\s*\(\s*&\s*(\w+)\["
+        r"(?:atomic_fetch_(add|sub|min|max|and|or|xor)_explicit|wp_atomic_(min|max|cas|exch))\s*\(\s*&\s*(\w+)\["
     )
     for raw in forward_lines:
         m = array_store_pat.match(raw)
@@ -14604,9 +14932,23 @@ def _generate_msl_kernel_uncached(
             grad_arg_of[syn_var.label] = gname
             output_args.append(gvar)
 
-    if not output_args and not any("volume_store" in ln for ln in forward_lines):
+    import warp.config as _wp_cfg_out  # noqa: PLC0415
+
+    # Read-only kernels compile to a no-op under native dispatch; anything
+    # that looks like a write the classifier did not attribute to an array
+    # argument (e.g. a store through an array constructed from a pointer
+    # inside the kernel) must keep failing loudly instead.
+    _unattributed_write = any(("store" in ln or "atomic" in ln or "array_t<" in ln) for ln in forward_lines)
+    if (
+        not output_args
+        and not any("volume_store" in ln for ln in forward_lines)
+        and (not _wp_cfg_out.metal_native_dispatch or _unattributed_write)
+    ):
         # (A kernel whose only writes go through ``wp.volume_store`` into a
-        # resident NanoVDB buffer legitimately has no output array.)
+        # resident NanoVDB buffer legitimately has no output array. Native
+        # dispatch binds whatever the signature declares, so read-only
+        # kernels -- e.g. ones that only check ``wp.expect_eq`` -- are fine
+        # there; only ``mx.fast.metal_kernel`` insists on an output.)
         raise MetalCodegenError(
             f"Kernel {adj.fun_name!r} has no output array; MSL kernels must write through at least one output buffer"
         )
@@ -14656,6 +14998,8 @@ def _generate_msl_kernel_uncached(
     # their ``wp.atomic_*`` calls route through the lock-emulated
     # ``wp_f64_atomic_*`` overloads for ``device wp_f64*``.
     f64_emu_arr_names: set[str] = set()
+    # (int64 arrays, uint64 arrays, float16 arrays) for ``_rewrite_wide_atomics``.
+    wide_atomic_arr_names = _wide_atomic_array_names((*adj.args, *struct_field_array_vars, *grad_array_vars))
     if _fp64_mode() == "emulate":
         for arg in (*adj.args, *struct_field_array_vars, *grad_array_vars):
             if _is_array_arg(arg) and _array_scalar_type_name(arg) == "float64":
@@ -15441,6 +15785,10 @@ def _generate_msl_kernel_uncached(
         and not re.search(rf"\batomic_\w+\s*(?:<[^()]*>)?\s*\(\s*(?:var_)?{re.escape(a.label)}\b", _fwd_text)
     }
     nonatomic_label_set = grad_label_set | narrow_output_labels | f64_arr_names | f64_emu_arr_names
+    # 64-bit integer outputs: MSL has no ``atomic<long>`` and only min/max
+    # on ``atomic<ulong>``, so they stay plain and their atomics go through
+    # the ``wp_a64_*`` helpers (see ``_rewrite_wide_atomics``).
+    nonatomic_label_set = nonatomic_label_set | wide_atomic_arr_names[0] | wide_atomic_arr_names[1]
     atomic_output_names: set[str] = (
         {a.label for a in output_args if a.label not in nonatomic_label_set} if has_atomic else set()
     )
@@ -15868,6 +16216,8 @@ def _generate_msl_kernel_uncached(
                 translated = _rewrite_f64_atomics(translated, f64_arr_names | f64_emu_arr_names)
             else:
                 _reject_f64_atomics(translated, f64_arr_names | f64_emu_arr_names, adj.fun_name)
+        if any(wide_atomic_arr_names):
+            translated = _rewrite_wide_atomics(translated, *wide_atomic_arr_names)
         _check_no_unsupported_intrinsics(translated)
         return translated
 
@@ -19653,6 +20003,17 @@ def _native_lane_launch_error(kernel, block_dim: int) -> str:
     )
 
 
+from warp._src.types import array as _WpArrayType  # noqa: E402
+
+
+def _maybe_staged_arg(value) -> bool:
+    """Cheap pre-check for ``metal_array_args``: an indexed array, or a
+    ``wp.array`` that is not contiguous."""
+    if isinstance(value, _WpArrayType):
+        return not value.is_contiguous
+    return type(value).__name__ == "indexedarray"
+
+
 def launch_metal_kernel_native(
     kernel,
     dim,
@@ -19697,6 +20058,19 @@ def launch_metal_kernel_native(
         dims_check = tuple(dim)
     if any(d <= 0 for d in dims_check):
         return
+
+    # Strided / indexed array arguments run through contiguous staging
+    # copies (see ``warp._src.metal_array_args``).
+    if any(_maybe_staged_arg(v) for v in (*inputs, *outputs)):
+        from warp._src.metal_array_args import stage_launch_args  # noqa: PLC0415
+
+        staged = stage_launch_args(kernel, inputs, outputs, device, adjoint)
+        if staged is not None:
+            return staged.run(
+                lambda k, i, o: launch_metal_kernel_native(
+                    k, dim, i, o, device, block_dim=block_dim, adjoint=adjoint, adj_inputs=adj_inputs, adj_outputs=adj_outputs
+                )
+            )
 
     _reject_unsupported_launch_args(kernel, [*inputs, *outputs])
 

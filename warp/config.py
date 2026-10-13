@@ -443,6 +443,40 @@ Requires ``pyobjc-framework-metal``. If it is not importable Warp warns at
 :func:`warp.init` and falls back to MLX dispatch. Set before :func:`warp.init`.
 """
 
+metal_capture_while_max_iters: int = int(_os.environ.get("WARP_METAL_CAPTURE_WHILE_MAX_ITERS", "") or 128)
+"""Default iteration budget of :func:`warp.capture_while` inside a Metal graph capture.
+
+Metal command buffers have no device-side loop construct, so a captured
+``capture_while`` is replayed as its body unrolled this many times (use
+:class:`warp.ScopedMetalCaptureWhileBudget` to override it for one loop). The
+value is read when ``capture_while`` is recorded. At the start of each unrolled iteration the GPU latches the loop
+condition, and the iteration's kernels only run while it is nonzero, so
+iterations after the loop has terminated launch no kernel threads. The body is
+recorded once, whatever the budget.
+
+A loop that is still running after its budget is an error: the next sync point
+(:func:`warp.synchronize_device`, ``array.numpy()``, ...) or the next
+:func:`warp.capture_launch` of the graph raises a ``RuntimeError``, unless
+:data:`metal_capture_while_truncate` is set.
+
+Each unrolled iteration costs host time on every :func:`warp.capture_launch`:
+about a dozen Metal API calls (condition latch, gate, one indirect execute and
+three barriers) per gated command run, independent of how many kernels the run
+contains, so budgets of a few hundred iterations cost on the order of a
+millisecond per launch. Can be set with the ``WARP_METAL_CAPTURE_WHILE_MAX_ITERS``
+environment variable. Outside a capture, ``capture_while`` runs eagerly and is
+unbounded, as on other devices.
+"""
+
+metal_capture_while_truncate: bool = _env_flag("WARP_METAL_CAPTURE_WHILE_TRUNCATE")
+"""Accept truncated captured :func:`warp.capture_while` loops on Metal.
+
+When ``False`` (default), a replayed loop that exhausts its unrolled iteration
+budget raises at the next sync point. When ``True`` it only warns once and the
+loop's results are those after ``max_iters`` iterations (a fixed-iteration
+solver).
+"""
+
 metal_threadgroup_tiles: bool = _os.environ.get("WARP_METAL_THREADGROUP_TILES", "").strip().lower() not in (
     "0",
     "false",

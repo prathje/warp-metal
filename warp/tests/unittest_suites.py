@@ -236,6 +236,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
         TestMetalTextures,
         TestMetalTilesExt,
     )
+    from warp.tests.test_metal_runtime import TestMetalRuntime, TestMetalRuntimeSubprocess
     from warp.tests.test_module_contamination import TestModuleContamination
     from warp.tests.test_module_hashing import TestModuleHashing
     from warp.tests.test_module_parallel_load import (
@@ -441,6 +442,8 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
         TestMetalStructFieldWrite,
         TestMetalTextures,
         TestMetalTilesExt,
+        TestMetalRuntime,
+        TestMetalRuntimeSubprocess,
         TestMeshQueryAABBMethods,
         TestMeshQueryPoint,
         TestMeshQueryRay,

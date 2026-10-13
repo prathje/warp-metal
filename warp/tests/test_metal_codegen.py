@@ -194,8 +194,18 @@ class TestMetalCodegenStructure(unittest.TestCase):
         self.assertIn("b[var_", src)
 
     def test_no_output_array_raises(self):
-        with self.assertRaises(MetalCodegenError):
-            generate_msl_kernel(_all_inputs_no_output)
+        # Only the MLX path needs an output buffer; native dispatch runs
+        # read-only kernels (e.g. ones that only check ``wp.expect_eq``).
+        saved = wp.config.metal_native_dispatch
+        try:
+            wp.config.metal_native_dispatch = False
+            with self.assertRaises(MetalCodegenError):
+                generate_msl_kernel(_all_inputs_no_output)
+            wp.config.metal_native_dispatch = True
+            # A kernel without writes compiles to a no-op (empty source).
+            self.assertEqual(generate_msl_kernel(_all_inputs_no_output).source, "")
+        finally:
+            wp.config.metal_native_dispatch = saved
 
     def test_typed_float_constants_are_not_truncated(self):
         # ``wp.float32(0.5)`` is neither a Python ``float`` nor a Python
