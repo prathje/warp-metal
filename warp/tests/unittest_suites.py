@@ -225,6 +225,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
     from warp.tests.test_math import TestMath
     from warp.tests.test_metal_ast import TestMetalASTFold, TestMetalASTParseShapes, TestMetalASTRoundTrip
     from warp.tests.test_metal_codegen import TestMetalCodegenCompiles, TestMetalCodegenStructure
+    from warp.tests.test_metal_codegen_gaps import TestMetalCodegenGaps
     from warp.tests.test_metal_device import TestMetalAllocator, TestMetalDevice, TestMetalDisabled
     from warp.tests.test_metal_launch import TestMetalLaunch
     from warp.tests.test_metal_mismatch import TestMetalMismatch
@@ -423,6 +424,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
         TestMetalASTParseShapes,
         TestMetalASTRoundTrip,
         TestMetalCodegenCompiles,
+        TestMetalCodegenGaps,
         TestMetalCodegenStructure,
         TestMetalDevice,
         TestMetalDisabled,
