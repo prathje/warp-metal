@@ -19,6 +19,7 @@ import numpy as np
 import warp as wp
 from warp._src.codegen_metal import (
     MetalCodegenError,
+    _generate_msl_kernel_uncached,
     _msl_constant_str,
     generate_msl_kernel,
 )
@@ -247,10 +248,12 @@ class TestMetalSpinLockSerialization(unittest.TestCase):
 
         # Warp's logger routes warnings to stderr; capture both streams and
         # disable the warnings registry dedup so each test sees its warning.
+        # Bypass the on-disk artifact cache: a warm entry skips the pass
+        # that emits the warning.
         out = io.StringIO()
         with warnings.catch_warnings(), contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
             warnings.simplefilter("always")
-            src = generate_msl_kernel(kernel).source
+            src = _generate_msl_kernel_uncached(kernel).source
         return src, out.getvalue()
 
     def test_lock_span_is_serialised_across_simd_lanes(self):
