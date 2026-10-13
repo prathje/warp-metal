@@ -3618,15 +3618,15 @@ class TestMetalLaunch(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet)
 
-    def test_noncontiguous_array_arg_is_rejected(self):
-        # Metal builds flat indices from an array's shape, so a strided or
-        # broadcast view would be read at the wrong offsets. That must be an
-        # error rather than a silently wrong result.
+    def test_noncontiguous_array_arg_is_staged(self):
+        # Metal builds flat indices from an array's shape, so strided and
+        # broadcast views are staged through contiguous copies at launch
+        # (``warp._src.metal_array_args``) instead of being read at the
+        # wrong offsets.
         snippet = textwrap.dedent(
             """
             import warp as wp
             import numpy as np
-            from warp._src.codegen_metal import MetalCodegenError
 
             @wp.kernel
             def k(a: wp.array2d(dtype=wp.float32), out: wp.array2d(dtype=wp.float32)):
@@ -3640,15 +3640,7 @@ class TestMetalLaunch(unittest.TestCase):
             rep = wp.array(ptr=base.ptr, shape=base.shape, dtype=base.dtype,
                            strides=(0, *base.strides[1:]), device=base.device)
             rep._ref = base
-            try:
-                wp.launch(k, dim=(2, 8), inputs=[rep], outputs=[out], device="metal:0")
-            except MetalCodegenError as exc:
-                assert "non-contiguous" in str(exc), str(exc)
-            else:
-                raise AssertionError("expected a non-contiguous array argument to be rejected")
-
-            # Materialising the view is the documented workaround.
-            wp.launch(k, dim=(2, 8), inputs=[rep.contiguous()], outputs=[out], device="metal:0")
+            wp.launch(k, dim=(2, 8), inputs=[rep], outputs=[out], device="metal:0")
             np.testing.assert_array_equal(out.numpy(), np.broadcast_to(base.numpy()[0], (2, 8)))
             """
         )
@@ -6750,7 +6742,9 @@ class TestMetalUnsupportedFeaturesRaise(unittest.TestCase):
     """Unsupported subsystems must raise clear errors, never return silently
     wrong results (zero gradients, flat-indexed indexedarray reads)."""
 
-    def test_indexedarray_launch_raises(self):
+    def test_indexedarray_launch_reads_through_indices(self):
+        # wp.indexedarray arguments are gathered through their indices
+        # (never read flat from the base storage).
         snippet = textwrap.dedent(
             """
             import numpy as np
@@ -6766,12 +6760,8 @@ class TestMetalUnsupportedFeaturesRaise(unittest.TestCase):
             indices = wp.array(np.array([3, 7, 11, 19], np.int32), device=dev)
             ia = wp.indexedarray(a, [indices])
             out = wp.zeros(4, dtype=wp.float32, device=dev)
-            try:
-                wp.launch(k_idx, dim=4, inputs=[ia], outputs=[out], device=dev)
-            except Exception as e:
-                assert 'indexedarray' in str(e), str(e)
-            else:
-                raise AssertionError('indexedarray launch should have raised')
+            wp.launch(k_idx, dim=4, inputs=[ia], outputs=[out], device=dev)
+            np.testing.assert_array_equal(out.numpy(), [6.0, 14.0, 22.0, 38.0])
             """
         )
         _run_with_metal_enabled(self, snippet)
