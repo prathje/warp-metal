@@ -11927,12 +11927,16 @@ _NATIVE_SYNC_COOP = (
     "#define WP_NATIVE_WARP_SYNC() metal::simdgroup_barrier(metal::mem_flags::mem_threadgroup | "
     "metal::mem_flags::mem_device)\n"
 )
-_NATIVE_SYNC_SERIAL = "#define WP_NATIVE_BLOCK_SYNC() ((void)0)\n#define WP_NATIVE_WARP_SYNC() ((void)0)\n"
+_NATIVE_SYNC_SERIAL = (
+    "#define WP_NATIVE_BLOCK_SYNC() ((void)0)\n#define WP_NATIVE_WARP_SYNC() ((void)0)\n"
+    # One thread per block, as on CPU.
+    "#define WP_TILE_THREAD_IDX 0\n#define WP_TILE_BLOCK_DIM 1\n"
+)
 # CUDA intra-block primitives. A snippet using any of them (guarded or not)
 # depends on how lanes are grouped, which Metal reproduces only in the two
 # models above.
 _NATIVE_LANE_PAT = re.compile(
-    r"__shfl\w*|__syncthreads|__syncwarp|WP_TILE_SYNC|__ballot\w*|__activemask|__any_sync|__all_sync|"
+    r"__shfl\w*|__syncthreads|__syncwarp|WP_TILE_\w+|__ballot\w*|__activemask|__any_sync|__all_sync|"
     r"__match_\w+|__reduce_\w+_sync|threadIdx|blockDim|__threadfence\w*"
 )
 # ``#if defined(__CUDA_ARCH__)`` blocks with no ``#else`` that only hold
@@ -11955,6 +11959,11 @@ def _native_snippet_cuda_only(name: str) -> bool:
 # ``reinterpret_cast<T&>(x)`` reads (the type-punning idiom snippets use for
 # bit tricks) become ``as_type<T>(x)``; MSL rejects reference punning.
 _NATIVE_REINTERPRET_REF_PAT = re.compile(r"reinterpret_cast\s*<\s*([\w:]+)\s*&\s*>\s*\(\s*(\w+)\s*\)")
+# A pun that is assigned through (``reinterpret_cast<uint32_t&>(f) ^= m``)
+# needs a real reference; MSL references carry an address space.
+_NATIVE_REINTERPRET_WRITE_PAT = re.compile(
+    r"reinterpret_cast\s*<\s*([\w:]+)\s*&\s*>(\s*\(\s*\w+\s*\)\s*(?:[-+*/%&|^]|<<|>>)?=(?!=))"
+)
 
 
 def _native_snippet_value_type(t, what: str, key: str) -> str:
@@ -12003,8 +12012,16 @@ def _native_snippet_call(fn_overload, caller_args, return_value_dst):
         params.append(f"{_native_snippet_value_type(a.ctype(), f'parameter {a.label!r}', key)} {a.label}")
     ret = adj.arg_types.get("return")
     ret_msl = "void" if ret is None else _native_snippet_value_type(ret, "the return value", key)
-    name = f"{_NATIVE_SNIPPET_PREFIX}{fn_overload.native_func}"
-    body = _NATIVE_REINTERPRET_REF_PAT.sub(r"as_type<\1>(\2)", fn_overload.native_snippet)
+    # Hash the snippet and signature into the name: two snippets that share
+    # a Python name (in different modules) must not collide in one kernel.
+    import hashlib  # noqa: PLC0415
+
+    digest = hashlib.sha1(
+        f"{fn_overload.native_snippet}|{','.join(params)}|{ret_msl}".encode(), usedforsecurity=False
+    ).hexdigest()[:10]
+    name = f"{_NATIVE_SNIPPET_PREFIX}{fn_overload.native_func}_{digest}"
+    body = _NATIVE_REINTERPRET_WRITE_PAT.sub(r"reinterpret_cast<thread \1&>\2", fn_overload.native_snippet)
+    body = _NATIVE_REINTERPRET_REF_PAT.sub(r"as_type<\1>(\2)", body)
     body = _NATIVE_GUARDED_SYNC_PAT.sub(lambda m: m.group("body"), body)
     _NATIVE_SNIPPET_DEFS[name] = f"inline {ret_msl} {name}({', '.join(params)}) {{\n{body}\n}}"
     call = f"{name}({', '.join(caller_args)})"
@@ -12877,9 +12894,9 @@ def _lower_array_slot_ir(lines: list[str], adj, all_lines: list[str]) -> list[st
     # forms are lowered here, before the AST wrap pass sees them, so wrap
     # their indices inline. Thread ids and non-negative constants cannot be
     # negative and are left alone.
-    _nonneg_idx = {
-        f"var_{v.label}" for v in adj.variables if isinstance(v.constant, int) and v.constant >= 0
-    } | {f"var_{t}" for t in re.findall(r"\bvar_(\w+)\s*=\s*builtin_tid", joined)}
+    _nonneg_idx = {f"var_{v.label}" for v in adj.variables if isinstance(v.constant, int) and v.constant >= 0} | {
+        f"var_{t}" for t in re.findall(r"\bvar_(\w+)\s*=\s*builtin_tid", joined)
+    }
 
     def _flat(arr: str, idx: str) -> str:
         parts = [a.strip() for a in _split_top_level_args(idx)]
@@ -16792,7 +16809,7 @@ def _generate_msl_kernel_uncached(
         extra_input_names.append("__tid4_dim3")
 
     header = _build_kernel_header(source)
-    if "WP_NATIVE_BLOCK_SYNC" in header:
+    if "WP_NATIVE_BLOCK_SYNC" in header or (coop_block_n == 0 and "WP_TILE_" in header):
         header = (_NATIVE_SYNC_COOP if coop_block_n > 0 else _NATIVE_SYNC_SERIAL) + header
     native_lane_dependent = any(
         _native_snippet_lane_dependent(_m.group(1)) for _m in _NATIVE_SNIPPET_REF_PAT.finditer(source)
@@ -16853,7 +16870,15 @@ def _generate_msl_kernel_uncached(
         # ``wp.block_dim()`` buried in a non-inlined wp.func would be
         # missed, but tile/block kernels call it at kernel scope.
         tile_block_fold=(
-            "builtin_block_dim" in "\n".join(adj.blocks[0].body_forward) or "wp_tile_" in source or coop_chol_n > 0
+            "builtin_block_dim" in "\n".join(adj.blocks[0].body_forward)
+            or "wp_tile_" in source
+            or coop_chol_n > 0
+            # A native snippet using ``WP_TILE_*`` has block semantics: run
+            # it one thread per block, as on CPU.
+            or any(
+                "WP_TILE_" in _NATIVE_SNIPPET_DEFS.get(_m.group(1), "")
+                for _m in _NATIVE_SNIPPET_REF_PAT.finditer(source)
+            )
         ),
         header=header,
         native_lane_dependent=native_lane_dependent,
@@ -19816,7 +19841,9 @@ def launch_metal_kernel(
             dims = (dims[0], coop_block_n)
     elif getattr(artifact, "tile_block_fold", True) and len(dims) > 1 and dims[-1] == block_dim and block_dim > 1:
         dims = dims[:-1]
-    elif getattr(artifact, "native_lane_dependent", False) and len(dims) > 1 and dims[-1] == block_dim and block_dim > 1:
+    elif (
+        getattr(artifact, "native_lane_dependent", False) and len(dims) > 1 and dims[-1] == block_dim and block_dim > 1
+    ):
         raise RuntimeError(_native_lane_launch_error(kernel, block_dim))
     grid_x = dims[0]
     grid_y = dims[1] if len(dims) >= 2 else 1

@@ -452,6 +452,75 @@ class TestMetalMismatch(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet)
 
+    def test_func_native_writable_pun_and_name_collision(self):
+        # ``reinterpret_cast<T&>(x) ^= m`` needs a ``thread`` reference, and
+        # two snippets sharing a Python name must get distinct helpers.
+        snippet = textwrap.dedent(
+            '''
+            import numpy as np
+
+            @wp.func_native("""reinterpret_cast<uint32_t&>(f) ^= 0x80000000u; return f;""")
+            def neg_bits(f: float) -> float: ...
+
+            def make(scale):
+                @wp.func_native(f"return x * {scale:.1f}f;")
+                def f(x: float) -> float: ...
+
+                return f
+
+            f2, f3 = make(2.0), make(3.0)
+
+            @wp.kernel
+            def k(x: wp.array[float], o: wp.array[float], o2: wp.array[float]):
+                i = wp.tid()
+                o[i] = neg_bits(x[i])
+                o2[i] = f2(x[i]) + 10.0 * f3(x[i])
+
+            res = {}
+            for d in ("cpu", "metal:0"):
+                x = wp.array([1.0, -2.5, 0.0], dtype=float, device=d)
+                o = wp.zeros(3, dtype=float, device=d)
+                o2 = wp.zeros(3, dtype=float, device=d)
+                wp.launch(k, dim=3, inputs=[x], outputs=[o, o2], device=d)
+                res[d] = (o.numpy(), o2.numpy())
+            for a, b in zip(res["cpu"], res["metal:0"]):
+                np.testing.assert_array_equal(a, b)
+            np.testing.assert_array_equal(res["metal:0"][1], [32.0, -80.0, 0.0])
+            '''
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_func_native_tile_snippet_folds_block(self):
+        # A ``WP_TILE_*`` snippet gives the kernel block semantics even with
+        # no tile op or wp.block_dim() call: like CPU it runs one thread per
+        # block instead of keeping block_dim independent lanes.
+        snippet = textwrap.dedent(
+            '''
+            import numpy as np
+
+            @wp.func_native(snippet="WP_TILE_SYNC();")
+            def sync(): ...
+
+            @wp.func_native(snippet="return WP_TILE_BLOCK_DIM;")
+            def block_width() -> int: ...
+
+            @wp.kernel
+            def k(count: wp.array[float], width: wp.array[int]):
+                w, t = wp.tid()
+                sync()
+                wp.atomic_add(count, w, 1.0)
+                width[w] = block_width()
+
+            for d in ("cpu", "metal:0"):
+                count = wp.zeros(3, dtype=float, device=d)
+                width = wp.zeros(3, dtype=int, device=d)
+                wp.launch_tiled(k, dim=3, inputs=[count, width], block_dim=64, device=d)
+                np.testing.assert_array_equal(count.numpy(), [1.0, 1.0, 1.0])
+                np.testing.assert_array_equal(width.numpy(), [1, 1, 1])
+            '''
+        )
+        _run_with_metal_enabled(self, snippet)
+
     def test_func_native_without_adjoint_has_zero_gradient(self):
         snippet = textwrap.dedent(
             '''
