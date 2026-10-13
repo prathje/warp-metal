@@ -12820,7 +12820,60 @@ def _slot_elem_kind(arg) -> tuple | None:
     if gen == "mat_t":
         rows, cols = dtype._shape_
         return ("mat", int(rows), int(cols))
+    from warp._src.codegen import Struct  # noqa: PLC0415
+
+    if isinstance(dtype, Struct):
+        # Struct arrays live as flat float32 storage (see ``_struct_layout_for``);
+        # ``arr[i].field = x`` resolves to the field's scalar slots.
+        layout = _struct_layout_for(dtype)
+        return ("struct", layout.scalars_per_elem, layout)
     return None
+
+
+_SLOT_FIELD_TOKEN_PAT = re.compile(r"\.(?P<field>[A-Za-z_]\w*)(?![\w(])")
+
+
+def _slot_struct_components(kind: tuple, access: str) -> tuple[int, list[str], str] | None:
+    """Struct-array variant of ``_slot_components``: ``(stride, offsets, scalar_msl)``.
+
+    Walks ``.field`` tokens through nested structs to a leaf, then any
+    vec/mat component accessors on that leaf.
+    """
+    stride, layout = kind[1], kind[2]
+    access = access.strip()
+    base = 0
+    pos = 0
+    finfo = None
+    while pos < len(access):
+        m = _SLOT_FIELD_TOKEN_PAT.match(access, pos)
+        if m is None or m.group("field") in ("p", "q", "component_ref", "element_ref", "row_ref"):
+            break
+        finfo = layout.fields.get(m.group("field"))
+        if finfo is None:
+            return None
+        pos = m.end()
+        base += finfo.offset
+        if finfo.kind == _STRUCT_FIELD_KIND_STRUCT:
+            layout = finfo.sub
+            finfo = None
+            continue
+        break
+    if finfo is None:
+        return None
+    rest = access[pos:]
+    if finfo.kind in (_STRUCT_FIELD_KIND_SCALAR,):
+        if rest.strip():
+            return None
+        return stride, [str(base)], finfo.scalar_msl
+    if finfo.kind == _STRUCT_FIELD_KIND_VEC:
+        sub = _slot_components(("vec", finfo.size), rest)
+    elif finfo.kind == _STRUCT_FIELD_KIND_MAT:
+        sub = _slot_components(("mat", finfo.rows, finfo.cols), rest)
+    else:
+        return None
+    if sub is None:
+        return None
+    return stride, [f"{base} + {off}" for off in sub[1]], finfo.scalar_msl
 
 
 def _slot_components(kind: tuple, access: str) -> tuple[int, list[str]] | None:
@@ -12908,7 +12961,34 @@ def _lower_array_slot_ir(lines: list[str], adj, all_lines: list[str]) -> list[st
             out.append(ln)
             continue
         m = _SLOT_STORE_PAT.match(ln)
-        if m and m.group("arr") in kinds:
+        if m and m.group("arr") in kinds and kinds[m.group("arr")][0] == "struct":
+            arr = m.group("arr")
+            res = _slot_struct_components(kinds[arr], m.group("acc"))
+            if res is not None:
+                stride, offsets, scalar_msl = res
+                flat = _flat(arr, m.group("idx"))
+                op = "store" if scalar_msl == "float" else f"store_bits_{scalar_msl}"
+                for off, val in zip(offsets, _slot_value_components(m.group("val"), len(offsets))):
+                    out.append(
+                        f"{m.group('indent')}wp::__metal_scalar_store__(var_{arr}, {op}, ({flat}) * {stride} + {off}, {val});"
+                    )
+                continue
+        m = _SLOT_ATOMIC_PAT.match(ln)
+        if m and m.group("arr") in kinds and kinds[m.group("arr")][0] == "struct":
+            arr = m.group("arr")
+            res = _slot_struct_components(kinds[arr], m.group("acc"))
+            if res is not None and res[2] == "float" and m.group("op") in ("add", "sub"):
+                stride, offsets, _scalar = res
+                flat = _flat(arr, m.group("idx"))
+                msl = _ATOMIC_SLOT_TO_MSL[m.group("op")]
+                for off, val in zip(offsets, _slot_value_components(m.group("val"), len(offsets))):
+                    out.append(
+                        f"{m.group('indent')}{msl}((device atomic_float*)&{arr}[({flat}) * {stride} + {off}], {val}, "
+                        "memory_order_relaxed);"
+                    )
+                continue
+        m = _SLOT_STORE_PAT.match(ln)
+        if m and m.group("arr") in kinds and kinds[m.group("arr")][0] != "struct":
             arr = m.group("arr")
             res = _slot_components(kinds[arr], m.group("acc"))
             if res is not None:
@@ -12920,7 +13000,7 @@ def _lower_array_slot_ir(lines: list[str], adj, all_lines: list[str]) -> list[st
                     )
                 continue
         m = _SLOT_ATOMIC_PAT.match(ln)
-        if m and m.group("arr") in kinds:
+        if m and m.group("arr") in kinds and kinds[m.group("arr")][0] != "struct":
             arr = m.group("arr")
             if arr in f64_arrays:
                 raise MetalCodegenError(
@@ -12938,7 +13018,7 @@ def _lower_array_slot_ir(lines: list[str], adj, all_lines: list[str]) -> list[st
                     )
                 continue
         m = _SLOT_ADJ_PAT.match(ln)
-        if m and m.group("arr") in kinds:
+        if m and m.group("arr") in kinds and kinds[m.group("arr")][0] != "struct":
             arr = m.group("arr")
             res = _slot_components(kinds[arr], m.group("acc"))
             if res is not None:
@@ -14242,6 +14322,14 @@ def _generate_msl_kernel_uncached(
             body_lines.append(f"    {_cd_ty} var_{var.label} = {_cd_ty}();")
             continue
         ctype = var.ctype()
+        if (
+            ctype.endswith("*")
+            and isinstance(getattr(var.type, "dtype", None) or getattr(var, "type", None), _StructEarly)
+            and not any(f"var_{var.label}" in ln for ln in forward_lines)
+        ):
+            # Pointer to a struct-array element left over from slot lowering
+            # (``arr[i].field = x``): never referenced after the rewrite.
+            continue
         msl_type = _msl_var_type(ctype)
         if var.constant is None:
             # Reverse mode reads primal locals the forward pass only wrote
@@ -15926,7 +16014,7 @@ def _generate_msl_kernel_uncached(
         scalar_store_match = re.match(
             r"^(?P<indent>\s*)wp::__metal_scalar_store__\s*\(\s*var_(?P<arr>\w+)\s*,\s*"
             r"(?P<op>store|assign_inplace|add_inplace|sub_inplace|mul_inplace|div_inplace|"
-            r"bit_or_inplace|bit_and_inplace|bit_xor_inplace)\s*,\s*"
+            r"bit_or_inplace|bit_and_inplace|bit_xor_inplace|store_bits_\w+)\s*,\s*"
             r"(?P<idx>[^,]+(?:,[^,]+)*?)\s*,\s*(?P<val>[^()]+?)\s*\)\s*;\s*$",
             raw,
         )
@@ -15936,6 +16024,10 @@ def _generate_msl_kernel_uncached(
             op_name = scalar_store_match.group("op")
             idx = scalar_store_match.group("idx").strip()
             val = scalar_store_match.group("val").strip()
+            if op_name.startswith("store_bits_"):
+                # Non-float field of flat float32 struct storage: write the bits.
+                op_name = "store"
+                val = f"as_type<float>(({op_name and scalar_store_match.group('op')[len('store_bits_'):]})({val}))"
             output_arg_names = {a.label for a in output_args}
             op_sym = {
                 "store": "=",

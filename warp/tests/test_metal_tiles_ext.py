@@ -456,5 +456,52 @@ class TestMetalMeshWinding(unittest.TestCase):
         )
 
 
+@unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
+@unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
+class TestMetalStructFieldWrite(unittest.TestCase):
+    def test_struct_array_element_field_writes(self):
+        _run(
+            self,
+            """
+            @wp.struct
+            class Inner:
+                w: wp.vec2
+                n: int
+
+            @wp.struct
+            class P:
+                x: wp.vec3
+                m: float
+                k: int
+                inner: Inner
+
+            @wp.kernel
+            def k(a: wp.array[P], v: wp.array[wp.vec3], c: wp.array[float]):
+                i = wp.tid()
+                a[i].x = v[i]
+                a[i].m = float(i) * 0.5
+                a[i].m += 1.0
+                a[i].x[1] = 7.0
+                a[i].k = i * 3
+                a[i].inner.w = wp.vec2(float(i), 2.0)
+                a[i].inner.n = -i
+                wp.atomic_add(c, 0, a[i].m)
+
+            v = np.arange(12, dtype=np.float32).reshape(4, 3)
+            res = {}
+            for dev in ("cpu", "metal:0"):
+                a = wp.zeros(4, dtype=P, device=dev)
+                c = wp.zeros(1, dtype=float, device=dev)
+                wp.launch(k, dim=4, inputs=[a, wp.array(v, dtype=wp.vec3, device=dev), c], device=dev)
+                res[dev] = (a.numpy(), c.numpy())
+            for name in ("x", "m", "k"):
+                np.testing.assert_array_equal(res["metal:0"][0][name], res["cpu"][0][name])
+            np.testing.assert_array_equal(res["metal:0"][0]["inner"]["w"], res["cpu"][0]["inner"]["w"])
+            np.testing.assert_array_equal(res["metal:0"][0]["inner"]["n"], res["cpu"][0]["inner"]["n"])
+            np.testing.assert_allclose(res["metal:0"][1], res["cpu"][1])
+            """,
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
