@@ -286,7 +286,171 @@ class TestMetalMismatch(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet)
 
+    def test_func_native_vector_params(self):
+        snippet = textwrap.dedent(
+            '''
+            import numpy as np
 
+            @wp.func_native("""return v[0] + 2.0f * v[1] + 3.0f * v[2] + q[3];""")
+            def wsum(v: wp.vec3, q: wp.quat) -> float: ...
+
+            @wp.func_native("""return v * 2.0f;""")
+            def dbl(v: wp.vec3) -> wp.vec3: ...
+
+            @wp.kernel
+            def k(a: wp.array[wp.vec3], o: wp.array[float], o2: wp.array[wp.vec3]):
+                t = wp.tid()
+                o[t] = wsum(a[t], wp.quat(0.0, 0.0, 0.0, 1.0))
+                o2[t] = dbl(a[t])
+
+            res = {}
+            for d in ("cpu", "metal:0"):
+                a = wp.array(np.arange(6, dtype=np.float32).reshape(2, 3), dtype=wp.vec3, device=d)
+                o = wp.zeros(2, dtype=float, device=d)
+                o2 = wp.zeros(2, dtype=wp.vec3, device=d)
+                wp.launch(k, dim=2, inputs=[a], outputs=[o, o2], device=d)
+                res[d] = (o.numpy(), o2.numpy())
+            for a, b in zip(res["cpu"], res["metal:0"]):
+                np.testing.assert_array_equal(a, b)
+            '''
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_func_native_barriers(self):
+        # ``WP_TILE_SYNC()`` / ``__syncthreads()`` are no-ops in the serial
+        # model and real threadgroup barriers in distributed-tile kernels.
+        snippet = textwrap.dedent(
+            '''
+            import numpy as np
+
+            @wp.func_native("""
+            #if defined(__CUDA_ARCH__)
+            __syncthreads();
+            #endif
+            """)
+            def sync_threads(): ...
+
+            @wp.func_native(snippet="WP_TILE_SYNC();")
+            def tile_sync(): ...
+
+            @wp.kernel
+            def k_plain(a: wp.array[float], o: wp.array[float]):
+                i = wp.tid()
+                tile_sync()
+                o[i] = a[i]
+
+            @wp.kernel
+            def k_coop(vals: wp.array2d[float], scratch: wp.array2d[float], out: wp.array[float]):
+                w, tid = wp.tid()
+                acc = float(0.0)
+                for i in range(tid, 64, wp.block_dim()):
+                    acc += vals[w, i]
+                scratch[w, tid] = acc
+                sync_threads()
+                tile_sync()
+                tot = wp.tile_reduce(wp.add, wp.tile(acc))
+                if tid == 0:
+                    s = float(0.0)
+                    for j in range(wp.block_dim()):
+                        s += scratch[w, j]
+                    out[w] = tot[0] - s + 1.0
+
+            for d in ("cpu", "metal:0"):
+                a = wp.array(np.arange(8, dtype=np.float32), device=d)
+                o = wp.zeros(8, dtype=float, device=d)
+                wp.launch(k_plain, dim=8, inputs=[a], outputs=[o], device=d)
+                np.testing.assert_array_equal(o.numpy(), np.arange(8, dtype=np.float32))
+                v = wp.array(np.arange(3 * 64, dtype=np.float32).reshape(3, 64), device=d)
+                sc = wp.zeros((3, 32), dtype=float, device=d)
+                out = wp.zeros(3, dtype=float, device=d)
+                wp.launch_tiled(k_coop, dim=3, inputs=[v, sc], outputs=[out], block_dim=32, device=d)
+                np.testing.assert_array_equal(out.numpy(), [1.0, 1.0, 1.0])
+            art = k_coop._metal_artifact
+            assert art.coop_block_n == 32, art.coop_block_n
+            assert "threadgroup_barrier(metal::mem_flags::mem_threadgroup" in art.header
+            '''
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_func_native_lane_primitives_rejected(self):
+        # A CUDA-only shuffle cannot run faithfully when lanes are real
+        # threads: a launch_tiled kernel without tile semantics and a
+        # distributed-tile kernel both raise instead of using the host branch.
+        snippet = textwrap.dedent(
+            '''
+            import numpy as np
+            from warp._src.codegen_metal import MetalCodegenError
+
+            @wp.func_native("""
+            #if defined(__CUDA_ARCH__)
+            return __shfl_sync(0xffffffffu, value, 0, 32);
+            #else
+            return value;
+            #endif
+            """)
+            def bcast(value: float) -> float: ...
+
+            @wp.kernel
+            def k_lanes(a: wp.array[float], o: wp.array[float]):
+                i, lane = wp.tid()
+                o[lane] = bcast(a[lane])
+
+            @wp.kernel
+            def k_coop(vals: wp.array2d[float], out: wp.array[float]):
+                w, tid = wp.tid()
+                acc = bcast(vals[w, tid])
+                tot = wp.tile_reduce(wp.add, wp.tile(acc))
+                if tid == 0:
+                    out[w] = tot[0]
+
+            a = wp.array(np.arange(64, dtype=np.float32), device="metal:0")
+            o = wp.zeros(64, dtype=float, device="metal:0")
+            wp.launch_tiled(k_lanes, dim=[1], inputs=[a], outputs=[o], block_dim=1, device="metal:0")
+            try:
+                wp.launch_tiled(k_lanes, dim=[1], inputs=[a], outputs=[o], block_dim=64, device="metal:0")
+                raise AssertionError("expected RuntimeError")
+            except RuntimeError as e:
+                assert "intra-block primitives" in str(e), e
+            v = wp.zeros((2, 32), dtype=float, device="metal:0")
+            out = wp.zeros(2, dtype=float, device="metal:0")
+            try:
+                wp.launch_tiled(k_coop, dim=2, inputs=[v], outputs=[out], block_dim=32, device="metal:0")
+                raise AssertionError("expected MetalCodegenError")
+            except MetalCodegenError as e:
+                assert "CUDA-only branch" in str(e), e
+            '''
+        )
+        _run_with_metal_enabled(self, snippet)
+
+    def test_func_native_adjoint_raises(self):
+        # Native adjoint snippets are not lowered; raising beats silently
+        # returning zero gradients.
+        snippet = textwrap.dedent(
+            """
+            from warp._src.codegen_metal import MetalCodegenError
+
+            @wp.func_native("return 2.0f * x;", adj_snippet="adj_x += 2.0f * adj_ret;")
+            def dbl(x: float) -> float: ...
+
+            @wp.kernel
+            def k(a: wp.array[float], o: wp.array[float]):
+                t = wp.tid()
+                o[t] = dbl(a[t])
+
+            a = wp.array([1.0, 2.0], dtype=float, device="metal:0", requires_grad=True)
+            o = wp.zeros(2, dtype=float, device="metal:0", requires_grad=True)
+            tape = wp.Tape()
+            with tape:
+                wp.launch(k, dim=2, inputs=[a], outputs=[o], device="metal:0")
+            assert o.numpy().tolist() == [2.0, 4.0]
+            try:
+                tape.backward(grads={o: wp.ones(2, dtype=float, device="metal:0")})
+                raise AssertionError("expected MetalCodegenError")
+            except MetalCodegenError as e:
+                assert "adjoint of a native snippet" in str(e), e
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
 
 
 if __name__ == "__main__":

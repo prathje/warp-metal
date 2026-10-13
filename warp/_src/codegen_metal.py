@@ -11913,26 +11913,74 @@ _NATIVE_SNIPPET_SHIMS = """\
 #define cosf metal::cos
 #define nextafterf metal::nextafter
 #define __builtin_nextafterf metal::nextafter
+#define WP_TILE_SYNC() WP_NATIVE_BLOCK_SYNC()
+#define __syncthreads() WP_NATIVE_BLOCK_SYNC()
+#define __syncwarp(...) WP_NATIVE_WARP_SYNC()
 #endif
 """
+# Block / warp barriers in snippets: real barriers in a kernel whose lanes
+# cooperate (distributed tiles, one threadgroup per block), no-ops in the
+# serial one-thread-per-block model. Prepended to the header per kernel.
+_NATIVE_SYNC_COOP = (
+    "#define WP_NATIVE_BLOCK_SYNC() metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup | "
+    "metal::mem_flags::mem_device)\n"
+    "#define WP_NATIVE_WARP_SYNC() metal::simdgroup_barrier(metal::mem_flags::mem_threadgroup | "
+    "metal::mem_flags::mem_device)\n"
+)
+_NATIVE_SYNC_SERIAL = "#define WP_NATIVE_BLOCK_SYNC() ((void)0)\n#define WP_NATIVE_WARP_SYNC() ((void)0)\n"
+# CUDA intra-block primitives. A snippet using any of them (guarded or not)
+# depends on how lanes are grouped, which Metal reproduces only in the two
+# models above.
+_NATIVE_LANE_PAT = re.compile(
+    r"__shfl\w*|__syncthreads|__syncwarp|WP_TILE_SYNC|__ballot\w*|__activemask|__any_sync|__all_sync|"
+    r"__match_\w+|__reduce_\w+_sync|threadIdx|blockDim|__threadfence\w*"
+)
+# ``#if defined(__CUDA_ARCH__)`` blocks with no ``#else`` that only hold
+# barriers: the host branch is "no barrier", which is right for one lane
+# but not for cooperating lanes, so drop the guard and let the shims pick.
+_NATIVE_GUARDED_SYNC_PAT = re.compile(
+    r"#\s*if\s+defined\s*\(?\s*__CUDA_ARCH__\s*\)?[ \t]*\n"
+    r"(?P<body>(?:\s*(?:__syncthreads\s*\(\s*\)|__syncwarp\s*\([^()]*\)|WP_TILE_SYNC\s*\(\s*\))\s*;)+)\s*"
+    r"#\s*endif"
+)
+
+
+def _native_snippet_lane_dependent(name: str) -> bool:
+    return bool(_NATIVE_LANE_PAT.search(_NATIVE_SNIPPET_DEFS.get(name, "")))
+
+
+def _native_snippet_cuda_only(name: str) -> bool:
+    """A lane-dependent snippet whose CUDA branch is not a plain barrier."""
+    return "__CUDA_ARCH__" in _NATIVE_SNIPPET_DEFS.get(name, "") and _native_snippet_lane_dependent(name)
 # ``reinterpret_cast<T&>(x)`` reads (the type-punning idiom snippets use for
 # bit tricks) become ``as_type<T>(x)``; MSL rejects reference punning.
 _NATIVE_REINTERPRET_REF_PAT = re.compile(r"reinterpret_cast\s*<\s*([\w:]+)\s*&\s*>\s*\(\s*(\w+)\s*\)")
 
 
-def _native_snippet_scalar_type(t, what: str, key: str) -> str:
+def _native_snippet_value_type(t, what: str, key: str) -> str:
+    """MSL type of a native snippet's parameter or return value.
+
+    Scalars and value-typed vectors / matrices / quaternions / transforms
+    are passed by value; arrays, tiles, structs and references raise.
+    """
     from warp._src.codegen import Var  # noqa: PLC0415
     from warp._src.types import float32, int32  # noqa: PLC0415
 
     t = {float: float32, int: int32}.get(t, t)
     ctype = t if isinstance(t, str) else Var.type_to_ctype(t)
     msl = _SCALAR_CTYPE_TO_MSL.get(ctype)
-    if msl is None or msl == "wp_f64":
-        raise MetalCodegenError(
-            f"@wp.func_native {key!r}: {what} of type {ctype!r} is not supported on Metal "
-            "(only scalar parameters and return values can be passed to a native snippet)"
-        )
-    return msl
+    if msl is not None and msl != "wp_f64":
+        return msl
+    composite = re.match(r"^wp::(vec_t|mat_t|quat_t|transform_t)\s*<", ctype)
+    if composite is not None and "float64" not in ctype:
+        try:
+            return _msl_var_type(ctype)
+        except MetalCodegenError:
+            pass
+    raise MetalCodegenError(
+        f"@wp.func_native {key!r}: {what} of type {ctype!r} is not supported on Metal "
+        "(native snippets take scalar or vector/matrix/quaternion/transform values)"
+    )
 
 
 def _native_snippet_call(fn_overload, caller_args, return_value_dst):
@@ -11952,11 +12000,12 @@ def _native_snippet_call(fn_overload, caller_args, return_value_dst):
         )
     params = []
     for a in adj.args:
-        params.append(f"{_native_snippet_scalar_type(a.ctype(), f'parameter {a.label!r}', key)} {a.label}")
+        params.append(f"{_native_snippet_value_type(a.ctype(), f'parameter {a.label!r}', key)} {a.label}")
     ret = adj.arg_types.get("return")
-    ret_msl = "void" if ret is None else _native_snippet_scalar_type(ret, "the return value", key)
+    ret_msl = "void" if ret is None else _native_snippet_value_type(ret, "the return value", key)
     name = f"{_NATIVE_SNIPPET_PREFIX}{fn_overload.native_func}"
     body = _NATIVE_REINTERPRET_REF_PAT.sub(r"as_type<\1>(\2)", fn_overload.native_snippet)
+    body = _NATIVE_GUARDED_SYNC_PAT.sub(lambda m: m.group("body"), body)
     _NATIVE_SNIPPET_DEFS[name] = f"inline {ret_msl} {name}({', '.join(params)}) {{\n{body}\n}}"
     call = f"{name}({', '.join(caller_args)})"
     if return_value_dst is not None:
@@ -12591,6 +12640,11 @@ class MetalKernelArtifact:
     # kernels — and ONLY these: folding a genuine N-wide launch whose last
     # dim happens to equal ``block_dim`` would silently drop N-1 threads.
     tile_block_fold: bool = True
+    # ``True`` when the kernel calls a ``@wp.func_native`` snippet that uses
+    # CUDA intra-block primitives (shuffles, barriers, ...). Those only have
+    # a faithful lowering in the serial (folded) and distributed-tile models;
+    # the launcher rejects any other launch with several lanes per block.
+    native_lane_dependent: bool = False
     # MSL declarations to inject before the kernel function body — used for
     # custom big-vec structs (vec5, vec6 = spatial_vector, vec8) that don't
     # have native MSL ``floatN`` equivalents. Empty for kernels that only
@@ -13496,7 +13550,7 @@ def _generate_msl_kernel_uncached(
         # would silently become no-ops.
         for _ln in forward_lines:
             for _m in _NATIVE_SNIPPET_REF_PAT.finditer(_ln):
-                if "__CUDA_ARCH__" in _NATIVE_SNIPPET_DEFS.get(_m.group(1), ""):
+                if _native_snippet_cuda_only(_m.group(1)):
                     raise MetalCodegenError(
                         f"Kernel {adj.fun_name!r}: @wp.func_native {_m.group(1)[len(_NATIVE_SNIPPET_PREFIX) :]!r} "
                         "has a CUDA-only branch, which cannot run with cooperating threads on Metal"
@@ -16738,6 +16792,11 @@ def _generate_msl_kernel_uncached(
         extra_input_names.append("__tid4_dim3")
 
     header = _build_kernel_header(source)
+    if "WP_NATIVE_BLOCK_SYNC" in header:
+        header = (_NATIVE_SYNC_COOP if coop_block_n > 0 else _NATIVE_SYNC_SERIAL) + header
+    native_lane_dependent = any(
+        _native_snippet_lane_dependent(_m.group(1)) for _m in _NATIVE_SNIPPET_REF_PAT.finditer(source)
+    )
 
     # Struct-arg array-field args that survived the unused-arg prune —
     # recorded on the artifact so launch paths (and cache reload) can
@@ -16797,6 +16856,7 @@ def _generate_msl_kernel_uncached(
             "builtin_block_dim" in "\n".join(adj.blocks[0].body_forward) or "wp_tile_" in source or coop_chol_n > 0
         ),
         header=header,
+        native_lane_dependent=native_lane_dependent,
         tid4=uses_tid4,
         struct_array_args=struct_array_args_final,
     )
@@ -18449,6 +18509,17 @@ def _normalize_none_array_args(kernel, fwd_args: list, device) -> None:
         fwd_args[i] = placeholder
 
 
+def _native_lane_launch_error(kernel, block_dim: int) -> str:
+    # ``launch_tiled`` without tile semantics keeps its lanes as independent
+    # Metal threads, so a snippet's warp shuffles / barriers would silently
+    # run the host branch instead of cooperating.
+    return (
+        f"Kernel '{kernel.key}' calls a @wp.func_native snippet with CUDA intra-block primitives and was "
+        f"launched with block_dim={block_dim}; Metal cannot give its lanes CUDA block semantics. "
+        "Launch it with block_dim=1 on Metal."
+    )
+
+
 def launch_metal_kernel_native(
     kernel,
     dim,
@@ -19073,6 +19144,8 @@ def launch_metal_kernel_native(
     else:
         if getattr(artifact, "tile_block_fold", True) and len(dims) > 1 and dims[-1] == block_dim and block_dim > 1:
             dims = dims[:-1]
+        elif artifact.native_lane_dependent and len(dims) > 1 and dims[-1] == block_dim and block_dim > 1:
+            raise RuntimeError(_native_lane_launch_error(kernel, block_dim))
         grid_x = dims[0]
         grid_y = dims[1] if len(dims) >= 2 else 1
         grid_z = dims[2] if len(dims) >= 3 else 1
@@ -19743,6 +19816,8 @@ def launch_metal_kernel(
             dims = (dims[0], coop_block_n)
     elif getattr(artifact, "tile_block_fold", True) and len(dims) > 1 and dims[-1] == block_dim and block_dim > 1:
         dims = dims[:-1]
+    elif getattr(artifact, "native_lane_dependent", False) and len(dims) > 1 and dims[-1] == block_dim and block_dim > 1:
+        raise RuntimeError(_native_lane_launch_error(kernel, block_dim))
     grid_x = dims[0]
     grid_y = dims[1] if len(dims) >= 2 else 1
     grid_z = dims[2] if len(dims) >= 3 else 1
