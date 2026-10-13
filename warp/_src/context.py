@@ -4979,6 +4979,13 @@ class Module:
     ) -> ModuleExec | None:
         device = runtime.get_device(device)
 
+        if device.is_metal:
+            # Metal kernels are translated to MSL and compiled lazily at
+            # launch (see ``warp._src.codegen_metal``); there is no native
+            # module to build, so preloading (``wp.load_module`` /
+            # ``wp.force_load``) is a no-op.
+            return None
+
         # Resolve the active block_dim without mutating self.options.
         # Module.options["block_dim"] is the documented per-module default
         # (settable via wp.set_module_options); per-load variants flow
