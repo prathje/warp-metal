@@ -3779,10 +3779,58 @@ def _bsr_mm_compute_values(
     y_values: wp.array(dtype=Any),
     mm_row_min: wp.array(dtype=int),
     summed_triplet_offsets: wp.array(dtype=int),
-    # Source-block gather, as two plain arrays rather than the equivalent
-    # ``mm_src_blocks[summed_triplet_indices]`` indexed array — indexed
-    # arrays are not supported by every backend (notably Metal), and the
-    # memory accesses are identical either way.
+    summed_triplet_src_blocks: wp.indexedarray(dtype=int),
+    mm_row_count: int,
+    mm_offsets: wp.array(dtype=int),
+    mm_row_counts: wp.array(dtype=int),
+    mm_cols: wp.array(dtype=int),
+    mm_values: wp.array(dtype=Any),
+):
+    mm_block = wp.tid()
+
+    row = bsr_row_index(mm_offsets, mm_row_count, mm_block, mm_row_counts)
+    if row == -1:
+        return
+
+    use_triplets, block_beg, block_end = _bsr_mm_use_triplets(
+        row, mm_block, mm_row_min, x_offsets, x_row_counts, summed_triplet_offsets
+    )
+
+    mm_val = mm_values.dtype(type(alpha)(0.0))
+    col = mm_cols[mm_block]
+    if use_triplets:
+        for tpl_idx in range(block_beg, block_end):
+            x_block = summed_triplet_src_blocks[tpl_idx]
+            x_col = x_columns[x_block]
+            if x_block != -1:
+                y_block = bsr_block_index(x_col, col, y_offsets, y_columns, y_row_counts)
+                mm_val += x_values[x_block] * y_values[y_block]
+    else:
+        for x_block in range(block_beg, block_end):
+            x_col = x_columns[x_block]
+            y_block = bsr_block_index(x_col, col, y_offsets, y_columns, y_row_counts)
+            if y_block != -1:
+                mm_val += x_values[x_block] * y_values[y_block]
+
+    mm_values[mm_block] += alpha * mm_val
+
+
+@wp.kernel(enable_backward=False, module="unique")
+def _bsr_mm_compute_values_metal(
+    alpha: Any,
+    x_offsets: wp.array(dtype=int),
+    x_row_counts: wp.array(dtype=int),
+    x_columns: wp.array(dtype=int),
+    x_values: wp.array(dtype=Any),
+    y_offsets: wp.array(dtype=int),
+    y_row_counts: wp.array(dtype=int),
+    y_columns: wp.array(dtype=int),
+    y_values: wp.array(dtype=Any),
+    mm_row_min: wp.array(dtype=int),
+    summed_triplet_offsets: wp.array(dtype=int),
+    # Source-block gather as two plain arrays instead of the equivalent
+    # ``mm_src_blocks[summed_triplet_indices]`` indexed array, which the Metal
+    # backend does not support as a kernel argument. Same memory accesses.
     mm_src_blocks: wp.array(dtype=int),
     summed_triplet_indices: wp.array(dtype=int),
     mm_row_count: int,
@@ -4183,6 +4231,40 @@ def _bsr_mm_compute_values_dispatch(
         mm_values = z.values.view(wp.types.matrix(shape=(1, 1), dtype=z.scalar_type))
     else:
         mm_values = z.values
+
+    if getattr(device, "is_metal", False):
+        # Metal kernels cannot take ``wp.indexedarray`` arguments: pass the
+        # gather's base array and index array separately.
+        if summed_triplet_src_blocks is None:
+            src_blocks, src_indices = None, None
+        else:
+            src_blocks, src_indices = summed_triplet_src_blocks.data, summed_triplet_src_blocks.indices[0]
+        wp.launch(
+            kernel=_bsr_mm_compute_values_metal,
+            device=device,
+            dim=z.nnz,
+            inputs=[
+                alpha,
+                x_offsets,
+                x_row_counts,
+                x_columns,
+                x_values,
+                y_offsets,
+                y_row_counts,
+                y_columns,
+                y_values,
+                mm_row_min,
+                summed_triplet_offsets,
+                src_blocks,
+                src_indices,
+                z.nrow,
+                z.offsets,
+                z.row_counts,
+                z.columns,
+                mm_values,
+            ],
+        )
+        return
 
     wp.launch(
         kernel=_bsr_mm_compute_values,
