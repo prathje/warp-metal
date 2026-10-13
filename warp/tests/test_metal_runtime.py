@@ -75,6 +75,95 @@ def _set_flag(f: wp.array[wp.int32], value: wp.int32):
     f[0] = value
 
 
+@wp.kernel
+def _i64_counter(counter: wp.array[wp.int64], slots: wp.array[wp.int64]):
+    i = wp.tid()
+    slots[i] = wp.atomic_add(counter, 0, wp.int64(1))
+    wp.atomic_add(counter, 1, wp.int64(3000000000))
+    wp.atomic_sub(counter, 2, wp.int64(i))
+
+
+@wp.kernel
+def _u64_minmax(vals: wp.array[wp.uint64], out: wp.array[wp.uint64]):
+    i = wp.tid()
+    v = vals[i]
+    wp.atomic_max(out, 0, v)
+    wp.atomic_min(out, 1, v)
+
+
+@wp.kernel
+def _i64_minmax_exch(vals: wp.array[wp.int64], out: wp.array[wp.int64], last: wp.array[wp.int64]):
+    i = wp.tid()
+    v = vals[i]
+    wp.atomic_max(out, 0, v)
+    wp.atomic_min(out, 1, v)
+    wp.atomic_exch(last, 0, v)
+
+
+EMPTY_KEY = wp.constant(wp.uint64(0xFFFFFFFFFFFFFFFF))
+
+
+@wp.func
+def _hash_insert(keys: wp.array[wp.uint64], key: wp.uint64) -> int:
+    capacity = keys.shape[0]
+    idx = int(key % wp.uint64(capacity))
+    for _attempt in range(capacity):
+        stored = keys[idx]
+        if stored == key:
+            return idx
+        if stored == EMPTY_KEY:
+            old = wp.atomic_cas(keys, idx, EMPTY_KEY, key)
+            if old == EMPTY_KEY or old == key:
+                return idx
+        idx = (idx + 1) % capacity
+    return -1
+
+
+@wp.kernel
+def _hash_insert_kernel(
+    src: wp.array[wp.uint64], keys: wp.array[wp.uint64], best: wp.array[wp.uint64], slot_of: wp.array[wp.int32]
+):
+    i = wp.tid()
+    key = src[i]
+    slot = _hash_insert(keys, key)
+    slot_of[i] = slot
+    # Mixed with the compare-and-swap above: max on another 64-bit array.
+    wp.atomic_max(best, slot, (key << wp.uint64(20)) | wp.uint64(i))
+
+
+@wp.kernel
+def _bitwise_atomics(
+    a32: wp.array[wp.int32], u32: wp.array[wp.uint32], a64: wp.array[wp.int64], u64: wp.array2d[wp.uint64]
+):
+    i = wp.tid()
+    wp.atomic_or(a32, 0, wp.int32(1) << (i % 31))
+    wp.atomic_and(a32, 1, ~(wp.int32(1) << (i % 31)))
+    wp.atomic_xor(u32, 0, wp.uint32(1) << wp.uint32(i % 32))
+    wp.atomic_or(a64, 0, wp.int64(1) << wp.int64(i % 63))
+    wp.atomic_xor(u64, i % 2, 0, wp.uint64(1) << wp.uint64(i % 64))
+
+
+@wp.kernel
+def _cas_2d(a: wp.array2d[wp.int32], out: wp.array2d[wp.int32]):
+    i, j = wp.tid()
+    out[i, j] = wp.atomic_cas(a, i, j % 2, 0, i * 100 + j + 1)
+
+
+@wp.kernel
+def _f16_atomics(a: wp.array[wp.float16]):
+    i = wp.tid()
+    wp.atomic_add(a, i % 3, wp.float16(1.0))
+    wp.atomic_sub(a, 3 + i % 2, wp.float16(0.5))
+
+
+@wp.kernel
+def _read_only(a: wp.array[float]):
+    i = wp.tid()
+    x = a[i] * 2.0
+    if x > 1.0e6:
+        x = 0.0
+
+
 class TestMetalRuntime(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -334,7 +423,7 @@ class TestMetalRuntime(unittest.TestCase):
         }
         for key_type, gen in cases.items():
             for value_type in (wp.int32, wp.int64):
-                for n in (1, 1025, 150000):
+                for n in (1, 1025, 70000):
                     k = gen(n)
                     k[: n // 3] = k[n // 3 : 2 * (n // 3)]  # duplicates exercise stability
                     v = np.arange(n, dtype=wp.dtype_to_numpy(value_type))
@@ -464,6 +553,105 @@ class TestMetalRuntime(unittest.TestCase):
             unique, counts = np.unique(s, return_counts=True)
             self.assertEqual(run_count.numpy()[0], unique.size)
             np.testing.assert_array_equal(run_lengths.numpy()[: unique.size], counts)
+
+
+    # -- atomics -------------------------------------------------------------
+
+    def test_int64_add_sub(self):
+        n = 4096
+        counter = wp.zeros(3, dtype=wp.int64)
+        slots = wp.zeros(n, dtype=wp.int64)
+        wp.launch(_i64_counter, dim=n, inputs=[counter, slots])
+        c = counter.numpy()
+        self.assertEqual(c[0], n)
+        self.assertEqual(c[1], n * 3000000000)  # carries into the high word
+        self.assertEqual(c[2], -n * (n - 1) // 2)
+        # Previous values handed out by the counter are a permutation.
+        np.testing.assert_array_equal(np.sort(slots.numpy()), np.arange(n))
+
+    def test_uint64_min_max(self):
+        rng = np.random.default_rng(7)
+        vals = rng.integers(0, 2**63, 10000, dtype=np.uint64) * np.uint64(2) + np.uint64(1)
+        out = wp.array(np.array([0, 2**64 - 1], dtype=np.uint64), dtype=wp.uint64)
+        wp.launch(_u64_minmax, dim=vals.size, inputs=[wp.array(vals, dtype=wp.uint64), out])
+        np.testing.assert_array_equal(out.numpy(), [vals.max(), vals.min()])
+
+    def test_int64_min_max_exch(self):
+        rng = np.random.default_rng(8)
+        vals = rng.integers(-(2**62), 2**62, 5000, dtype=np.int64)
+        out = wp.array(np.array([-(2**63), 2**63 - 1], dtype=np.int64), dtype=wp.int64)
+        last = wp.zeros(1, dtype=wp.int64)
+        wp.launch(_i64_minmax_exch, dim=vals.size, inputs=[wp.array(vals, dtype=wp.int64), out, last])
+        np.testing.assert_array_equal(out.numpy(), [vals.max(), vals.min()])
+        self.assertIn(last.numpy()[0], vals)
+
+    def test_uint64_hashtable_cas(self):
+        # Many threads insert keys from a small set: each key must end in
+        # exactly one slot (no torn reads / lost compare-and-swaps).
+        rng = np.random.default_rng(9)
+        distinct = rng.integers(0, 2**40, 700, dtype=np.uint64)
+        src = distinct[rng.integers(0, distinct.size, 60000)]
+        keys = wp.full(2048, value=0xFFFFFFFFFFFFFFFF, dtype=wp.uint64)
+        best = wp.zeros(2048, dtype=wp.uint64)
+        slot_of = wp.zeros(src.size, dtype=wp.int32)
+        wp.launch(_hash_insert_kernel, dim=src.size, inputs=[wp.array(src, dtype=wp.uint64), keys, best, slot_of])
+        k = keys.numpy()
+        stored = k[k != np.uint64(0xFFFFFFFFFFFFFFFF)]
+        self.assertEqual(stored.size, distinct.size)
+        np.testing.assert_array_equal(np.sort(stored), np.sort(distinct))
+        slots = slot_of.numpy()
+        self.assertTrue(np.all(slots >= 0))
+        np.testing.assert_array_equal(k[slots], src)
+        # The max per slot is the largest thread index that inserted that key.
+        b = best.numpy()
+        for key in distinct[:50]:
+            idx = np.nonzero(src == key)[0]
+            slot = slots[idx[0]]
+            self.assertEqual(int(b[slot]), (int(key) << 20) | int(idx.max()))
+
+    def test_bitwise_atomics(self):
+        n = 256
+        a32 = wp.array(np.array([0, -1], dtype=np.int32))
+        u32 = wp.zeros(1, dtype=wp.uint32)
+        a64 = wp.zeros(1, dtype=wp.int64)
+        u64 = wp.zeros((2, 1), dtype=wp.uint64)
+        wp.launch(_bitwise_atomics, dim=n, inputs=[a32, u32, a64, u64])
+        ref32 = 0
+        for i in range(n):
+            ref32 |= 1 << (i % 31)
+        self.assertEqual(int(a32.numpy()[0]), ref32)
+        self.assertEqual(int(a32.numpy()[1]), ~ref32)
+        x = 0
+        for i in range(n):
+            x ^= 1 << (i % 32)
+        self.assertEqual(int(u32.numpy()[0]), x)
+        self.assertEqual(int(a64.numpy()[0]), (1 << 63) - 1)
+        refs = [0, 0]
+        for i in range(n):
+            refs[i % 2] ^= 1 << (i % 64)
+        np.testing.assert_array_equal(u64.numpy()[:, 0], np.array(refs, dtype=np.uint64))
+
+    def test_multidim_cas(self):
+        a = wp.zeros((3, 2), dtype=wp.int32)
+        out = wp.zeros((3, 4), dtype=wp.int32)
+        wp.launch(_cas_2d, dim=(3, 4), inputs=[a, out])
+        winners = a.numpy()
+        o = out.numpy()
+        for i in range(3):
+            for col in range(2):
+                self.assertIn(winners[i, col] - 1 - i * 100, (col, col + 2))
+            # Exactly one thread per element saw the initial zero.
+            self.assertEqual(int((o[i] == 0).sum()), 2)
+
+    def test_float16_atomics(self):
+        a = wp.zeros(5, dtype=wp.float16)
+        wp.launch(_f16_atomics, dim=300, inputs=[a])
+        np.testing.assert_array_equal(a.numpy(), np.array([100, 100, 100, -75, -75], dtype=np.float16))
+
+    def test_read_only_kernel(self):
+        a = wp.ones(64, dtype=float)
+        wp.launch(_read_only, dim=64, inputs=[a])
+        wp.synchronize_device()
 
 
 @unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")

@@ -3948,7 +3948,10 @@ _ATOMIC_OPS = ("atomic_add", "atomic_sub", "atomic_min", "atomic_max")
 # multi-dim fold below deliberately does NOT cover cas/exch: a multi-dim
 # call falls through to the unsupported-intrinsic guard with a clear error
 # rather than silently emitting an MSL call with the wrong arity.
-_ATOMIC_VIEW_OPS = (*_ATOMIC_OPS, "atomic_cas", "atomic_exch")
+_ATOMIC_VIEW_OPS = (*_ATOMIC_OPS, "atomic_cas", "atomic_exch", "atomic_and", "atomic_or", "atomic_xor")
+# Scalar-only atomics folded from multi-dim to flat-index form, with the
+# number of trailing value operands each carries.
+_SCALAR_ATOMIC_VALUE_COUNTS = {"atomic_cas": 2, "atomic_exch": 1, "atomic_and": 1, "atomic_or": 1, "atomic_xor": 1}
 # Reverse-mode counterparts that carry an array as their first argument, so
 # they participate in the view/struct-field alias rewrite.
 _ADJ_ARRAY_VIEW_OPS = (
@@ -4118,6 +4121,49 @@ def _apply_multidim_atomics(
                         n.expr.args[2],
                         rows,
                         cols,
+                    )
+                )
+                continue
+
+        if (
+            isinstance(n, Assign)
+            and isinstance(n.expr, Builtin)
+            and n.expr.name in _SCALAR_ATOMIC_VALUE_COUNTS
+            and len(n.expr.args) > 2 + _SCALAR_ATOMIC_VALUE_COUNTS[n.expr.name]
+        ):
+            # Multi-dim ``wp::atomic_<cas|exch|and|or|xor>(arr, i, j, ..., vals)``
+            # on a scalar array: collapse to the flat-index form the
+            # intrinsic patterns lower.
+            nvals = _SCALAR_ATOMIC_VALUE_COUNTS[n.expr.name]
+            args = n.expr.args
+            arr_label = _strip_var_prefix(args[0])
+            if (
+                arr_label is not None
+                and arr_label in arg_label_set
+                and arr_label not in vec_arr_info
+                and arr_label not in mat_arr_info
+            ):
+                indices = list(args[1:-nvals])
+                values = list(args[-nvals:])
+                n_idx = len(indices)
+                terms = []
+                for k, idx in enumerate(indices):
+                    if k == n_idx - 1:
+                        terms.append(idx)
+                    else:
+                        stride = " * ".join(f"{arr_label}_shape[{j}]" for j in range(k + 1, n_idx))
+                        terms.append(f"{idx} * {stride}")
+                flat_idx = " + ".join(terms)
+                call_args = ", ".join((f"var_{arr_label}", flat_idx, *values))
+                out.append(
+                    Assign(
+                        raw=f"{_leading_indent(n.raw)}var_{n.lhs} = wp::{n.expr.name}({call_args});",
+                        lhs=n.lhs,
+                        expr=Builtin(
+                            raw=f"wp::{n.expr.name}({call_args})",
+                            name=n.expr.name,
+                            args=(f"var_{arr_label}", flat_idx, *values),
+                        ),
                     )
                 )
                 continue

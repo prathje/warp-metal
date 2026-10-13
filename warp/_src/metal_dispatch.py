@@ -588,7 +588,26 @@ class MetalDispatcher:
                 if lib is None:
                     raise MetalDispatchError(f"MSL compilation failed for entry point {entry_point!r}: {err}")
                 self._library_cache[key[0]] = lib
-            fn = lib.newFunctionWithName_(entry_point)
+            if "wp_a64_lock_lo" in source:
+                # Kernels with lock-emulated 64-bit atomics reach the lock
+                # table through its GPU address, passed as two function
+                # constants (see ``codegen_metal._wide_atomic_helpers``).
+                from warp._src.codegen_metal import (  # noqa: PLC0415
+                    WIDE_ATOMIC_LOCK_FC_HI,
+                    WIDE_ATOMIC_LOCK_FC_LO,
+                )
+
+                addr = self.wide_atomic_lock_table().gpuAddress()
+                lo = ctypes.c_uint32(addr & 0xFFFFFFFF)
+                hi = ctypes.c_uint32(addr >> 32)
+                fcv = Metal.MTLFunctionConstantValues.alloc().init()
+                fcv.setConstantValue_type_atIndex_(ctypes.addressof(lo), Metal.MTLDataTypeUInt, WIDE_ATOMIC_LOCK_FC_LO)
+                fcv.setConstantValue_type_atIndex_(ctypes.addressof(hi), Metal.MTLDataTypeUInt, WIDE_ATOMIC_LOCK_FC_HI)
+                fn, err = lib.newFunctionWithName_constantValues_error_(entry_point, fcv, None)
+                if fn is None:
+                    raise MetalDispatchError(f"Failed to specialize {entry_point!r}: {err}")
+            else:
+                fn = lib.newFunctionWithName_(entry_point)
             if fn is None:
                 raise MetalDispatchError(f"MSL library has no function named {entry_point!r}")
             pso_desc = Metal.MTLComputePipelineDescriptor.alloc().init()
@@ -620,6 +639,21 @@ class MetalDispatcher:
             self._pipeline_cache[key] = pso
             self._pso_name[id(pso)] = entry_point
             return pso
+
+    def wide_atomic_lock_table(self):
+        """Zeroed table of 32-bit lock words for lock-emulated 64-bit
+        atomics, resident in every encoder (kernels address it through
+        its ``gpuAddress``). Created on first use."""
+        table = getattr(self, "_wide_atomic_locks", None)
+        if table is None:
+            from warp._src.codegen_metal import WIDE_ATOMIC_LOCK_COUNT  # noqa: PLC0415
+
+            nbytes = 4 * WIDE_ATOMIC_LOCK_COUNT
+            table, addr = self.alloc(nbytes)
+            ctypes.memset(addr, 0, nbytes)
+            self.add_resident_resource(table)
+            self._wide_atomic_locks = table
+        return table
 
     # ------------------------------------------------------------------
     # MTLBinaryArchive helpers
