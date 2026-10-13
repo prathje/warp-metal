@@ -18156,6 +18156,7 @@ def _wrap_msl_for_native_dispatch(artifact) -> str:
     # type (``y[i] = x[i]``) still needs the ``wp_f64`` definition.
     if ("wp_f64" in signature or "wp_f64" in prologue) and "struct wp_f64 {" not in header:
         header = _f64_emulate_helpers() + "\n" + header
+    header = _force_inline_helpers(header)
     return (
         "#include <metal_stdlib>\n"
         "#include <metal_atomic>\n"
@@ -18165,6 +18166,20 @@ def _wrap_msl_for_native_dispatch(artifact) -> str:
         f"{prologue}{body}\n"
         "}\n"
     )
+
+
+# Apple's Metal compiler (verified on macOS 26.6) miscompiles a call that
+# passes a struct larger than ~144 bytes BY VALUE to a helper it chooses not
+# to inline: stores made through the callee's result are partly lost, with
+# no diagnostic. Every ``wp_matRxC`` / big-vec / tile helper here takes its
+# struct arguments by value, so e.g. ``wp_transpose`` of an 8x8 matrix
+# returned stale elements (Newton's one-sided Jacobi SVD went wrong from 7x7
+# up). Forcing every helper inline removes the by-value call boundary.
+_INLINE_HELPER_PAT = re.compile(r"(?m)^(\s*)inline\b(?!\s+__attribute__)")
+
+
+def _force_inline_helpers(header: str) -> str:
+    return _INLINE_HELPER_PAT.sub(r"\1inline __attribute__((always_inline))", header)
 
 
 _PROLOGUE_START = "    // -- Output init prologue (seed from user wp.array data) --"

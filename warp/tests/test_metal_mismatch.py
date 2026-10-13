@@ -146,5 +146,46 @@ class TestMetalMismatch(unittest.TestCase):
         _run_with_metal_enabled(self, snippet)
 
 
+    def test_large_struct_helpers_stay_correct(self):
+        # Apple's Metal compiler drops stores when a struct over ~144 bytes
+        # (wp_mat7x7 and up) is passed by value to a helper it does not
+        # inline; all helpers are now forced inline.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+            N = 8
+            M = wp.types.matrix(shape=(N, N), dtype=wp.float32)
+
+
+            @wp.func
+            def f(A: M, n: int):
+                at = wp.transpose(A)
+                vt = wp.identity(n=N, dtype=float)
+                ut = wp.identity(n=N, dtype=float)
+                for i in range(n):
+                    ut[i] = at[i] / wp.length(at[i])
+                return wp.transpose(ut), wp.transpose(vt)
+
+
+            @wp.kernel
+            def k(a: wp.array[M], n: int, u: wp.array[M], v: wp.array[M]):
+                uu, vv = f(a[0], n)
+                u[0] = uu
+                v[0] = vv
+
+
+            a_np = np.random.default_rng(32).normal(size=(1, N, N)).astype(np.float32)
+            ref = a_np[0] / np.linalg.norm(a_np[0], axis=0, keepdims=True)
+            for dev in ("cpu", "metal:0"):
+                u = wp.zeros(1, dtype=M, device=dev)
+                v = wp.zeros(1, dtype=M, device=dev)
+                wp.launch(k, dim=1, inputs=[wp.array(a_np, dtype=M, device=dev), N], outputs=[u, v], device=dev)
+                np.testing.assert_allclose(u.numpy()[0], ref, atol=1e-5)
+                np.testing.assert_allclose(v.numpy()[0], np.eye(N))
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
