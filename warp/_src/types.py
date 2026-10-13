@@ -32,7 +32,7 @@ import numpy as np
 
 import warp
 import warp.config
-from warp._src.logger import log_warning
+from warp._src.logger import log_debug, log_warning
 
 # NumPy versions before 2.4 incorrectly take an undocumented scalar path when
 # ``__array_interface__`` exposes a NULL data pointer. Keep a valid byte alive
@@ -6015,12 +6015,13 @@ class Bvh:
             from warp._src.metal_bvh import MetalBvh  # noqa: PLC0415
 
             if constructor == BvhConstructor.LBVH:
-                log_warning(
-                    "LBVH constructor is not available for a Metal tree. Falling back to SAH constructor.",
-                    stacklevel=2,
-                )
+                # The Metal builder is host-side; SAH is the closest match.
+                # Debug-only: LBVH is a GPU build-speed hint, not a semantic
+                # choice, and callers pass it unconditionally for GPU devices.
+                log_debug("LBVH constructor is not available for a Metal tree. Falling back to SAH constructor.")
                 constructor = BvhConstructor.SAH
             self._metal = MetalBvh(lowers, uppers, int(constructor), groups, leaf_size)
+            self._constructor = constructor
             self.id = self._metal.id
             return
 
@@ -6152,10 +6153,10 @@ class Bvh:
 
         if getattr(self, "_metal", None) is not None:
             if constructor == BvhConstructor.LBVH:
-                log_warning(
-                    "LBVH constructor is not available for a Metal tree. Falling back to SAH constructor.",
-                    stacklevel=2,
-                )
+                # The Metal builder is host-side; SAH is the closest match.
+                # Debug-only: LBVH is a GPU build-speed hint, not a semantic
+                # choice, and callers pass it unconditionally for GPU devices.
+                log_debug("LBVH constructor is not available for a Metal tree. Falling back to SAH constructor.")
                 constructor = BvhConstructor.SAH
             # NB: unlike CUDA, the Metal rebuild reallocates node storage —
             # graphs captured before the rebuild must be re-captured.
@@ -6299,10 +6300,9 @@ class Mesh:
             if support_winding_number:
                 raise RuntimeError("support_winding_number=True is not supported for wp.Mesh on Metal")
             if bvh_constructor in (BvhConstructor.LBVH, BvhConstructor.CUBQL):
-                log_warning(
+                log_debug(
                     f"{BvhConstructor(bvh_constructor).name} constructor is not available for a Metal mesh. "
-                    "Falling back to SAH constructor.",
-                    stacklevel=2,
+                    "Falling back to SAH constructor."
                 )
                 bvh_constructor = BvhConstructor.SAH
                 if bvh_leaf_size < 1:  # cubql default resolved to 0 above

@@ -260,6 +260,26 @@ class TestMetalRuntime(unittest.TestCase):
                 wp.capture_if(flag, sub.graph)
 
 
+    # -- BVH constructor fallback -----------------------------------------
+
+    def test_lbvh_fallback_is_silent(self):
+        import warnings  # noqa: PLC0415
+
+        points = wp.array(np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]], dtype=np.float32), dtype=wp.vec3)
+        indices = wp.array(np.array([0, 1, 2, 0, 1, 3], dtype=np.int32), dtype=wp.int32)
+        lowers = wp.array(np.zeros((4, 3), dtype=np.float32), dtype=wp.vec3)
+        uppers = wp.array(np.ones((4, 3), dtype=np.float32), dtype=wp.vec3)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            mesh = wp.Mesh(points=points, indices=indices, bvh_constructor="lbvh")
+            bvh = wp.Bvh(lowers, uppers, constructor="lbvh")
+            bvh.rebuild("lbvh")
+        self.assertNotEqual(mesh.id, 0)
+        self.assertNotEqual(bvh.id, 0)
+        messages = [str(w.message) for w in caught if "constructor" in str(w.message)]
+        self.assertEqual(messages, [])
+
+
 @unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
 @unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
 class TestMetalRuntimeSubprocess(unittest.TestCase):
