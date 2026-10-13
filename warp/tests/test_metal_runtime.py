@@ -18,6 +18,8 @@ import subprocess
 import sys
 import unittest
 
+from typing import Any
+
 import numpy as np
 
 import warp as wp
@@ -162,6 +164,30 @@ def _read_only(a: wp.array[float]):
     x = a[i] * 2.0
     if x > 1.0e6:
         x = 0.0
+
+
+@wp.kernel
+def _scale_indexed(a: wp.indexedarray[float], out: wp.array[float]):
+    i = wp.tid()
+    out[i] = a[i] * 2.0
+
+
+@wp.kernel
+def _incr_indexed_vec(a: wp.indexedarray[wp.vec3]):
+    i = wp.tid()
+    a[i] = a[i] + wp.vec3(1.0, 2.0, 3.0)
+
+
+@wp.kernel
+def _incr_2d(a: wp.array2d[float]):
+    i, j = wp.tid()
+    a[i, j] = a[i, j] + float(i * 10 + j)
+
+
+@wp.kernel
+def _generic_copy(src: Any, dst: Any):
+    i = wp.tid()
+    dst[i] = src[i]
 
 
 class TestMetalRuntime(unittest.TestCase):
@@ -710,6 +736,59 @@ class TestMetalRuntime(unittest.TestCase):
         a = wp.ones(64, dtype=float)
         wp.launch(_read_only, dim=64, inputs=[a])
         wp.synchronize_device()
+
+
+    # -- strided / indexed kernel arguments -----------------------------------
+
+    def test_indexed_array_args(self):
+        data = wp.array(np.arange(10, dtype=np.float32))
+        idx = wp.array([1, 3, 5], dtype=wp.int32)
+        out = wp.zeros(3, dtype=float)
+        wp.launch(_scale_indexed, dim=3, inputs=[wp.indexedarray(data, idx)], outputs=[out])
+        np.testing.assert_array_equal(out.numpy(), [2.0, 6.0, 10.0])
+        # Writes through an indexed view land in the source array only.
+        v = wp.zeros(6, dtype=wp.vec3)
+        wp.launch(_incr_indexed_vec, dim=2, inputs=[wp.indexedarray(v, wp.array([0, 4], dtype=wp.int32))])
+        expected = np.zeros((6, 3), dtype=np.float32)
+        expected[[0, 4]] = [1.0, 2.0, 3.0]
+        np.testing.assert_array_equal(v.numpy(), expected)
+        # Generic kernel specialized on indexed arrays.
+        src = wp.array(np.arange(12, dtype=np.float32))
+        dst = wp.zeros(12, dtype=float)
+        wp.launch(
+            _generic_copy,
+            dim=2,
+            inputs=[
+                wp.indexedarray(src, wp.array([11, 0], dtype=wp.int32)),
+                wp.indexedarray(dst, wp.array([1, 3], dtype=wp.int32)),
+            ],
+        )
+        np.testing.assert_array_equal(dst.numpy()[[1, 3]], [11.0, 0.0])
+
+    def test_strided_array_args(self):
+        big = wp.zeros((4, 6), dtype=float)
+        view = big[:, 1::2]
+        self.assertFalse(view.is_contiguous)
+        wp.launch(_incr_2d, dim=view.shape, inputs=[view])
+        expected = np.zeros((4, 6), dtype=np.float32)
+        expected[:, 1::2] = np.arange(4)[:, None] * 10 + np.arange(3)[None, :]
+        np.testing.assert_array_equal(big.numpy(), expected)
+        src = wp.array(np.arange(12, dtype=np.float32))
+        dst = wp.zeros(12, dtype=float)
+        wp.launch(_generic_copy, dim=6, inputs=[src[::2], dst[1::2]])
+        expected = np.zeros(12, dtype=np.float32)
+        expected[1::2] = np.arange(0, 12, 2)
+        np.testing.assert_array_equal(dst.numpy(), expected)
+
+    def test_indexed_args_in_capture(self):
+        data = wp.array(np.arange(10, dtype=np.float32))
+        idx = wp.array([1, 3, 5], dtype=wp.int32)
+        out = wp.zeros(3, dtype=float)
+        with wp.ScopedCapture() as capture:
+            wp.launch(_scale_indexed, dim=3, inputs=[wp.indexedarray(data, idx)], outputs=[out])
+        data.assign(np.arange(10, dtype=np.float32) * 10.0)
+        wp.capture_launch(capture.graph)
+        np.testing.assert_array_equal(out.numpy(), [20.0, 60.0, 100.0])
 
 
 @unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")

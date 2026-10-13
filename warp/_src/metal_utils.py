@@ -542,8 +542,8 @@ def _dispatcher():
     return get_dispatcher()
 
 
-def _pso(entry: str):
-    return _dispatcher().compile(_MSL_SOURCE, entry)
+def _pso(entry: str, source: str | None = None):
+    return _dispatcher().compile(_MSL_SOURCE if source is None else source, entry)
 
 
 def _slice(arr, byte_offset: int = 0):
@@ -564,8 +564,8 @@ def _bytes(fmt: str, *values) -> tuple[bytes, int]:
     return (data, len(data))
 
 
-def _dispatch(entry: str, bindings: list, modes: list, grid: tuple, tg: tuple) -> None:
-    _dispatcher().dispatch(_pso(entry), bindings, grid, tg, binding_modes=modes)
+def _dispatch(entry: str, bindings: list, modes: list, grid: tuple, tg: tuple, source: str | None = None) -> None:
+    _dispatcher().dispatch(_pso(entry, source), bindings, grid, tg, binding_modes=modes)
 
 
 def _ceil_div(a: int, b: int) -> int:

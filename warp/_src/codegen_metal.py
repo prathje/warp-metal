@@ -18534,6 +18534,17 @@ def _normalize_none_array_args(kernel, fwd_args: list, device) -> None:
         fwd_args[i] = placeholder
 
 
+from warp._src.types import array as _WpArrayType  # noqa: E402
+
+
+def _maybe_staged_arg(value) -> bool:
+    """Cheap pre-check for ``metal_array_args``: an indexed array, or a
+    ``wp.array`` that is not contiguous."""
+    if isinstance(value, _WpArrayType):
+        return not value.is_contiguous
+    return type(value).__name__ == "indexedarray"
+
+
 def launch_metal_kernel_native(
     kernel,
     dim,
@@ -18578,6 +18589,19 @@ def launch_metal_kernel_native(
         dims_check = tuple(dim)
     if any(d <= 0 for d in dims_check):
         return
+
+    # Strided / indexed array arguments run through contiguous staging
+    # copies (see ``warp._src.metal_array_args``).
+    if any(_maybe_staged_arg(v) for v in (*inputs, *outputs)):
+        from warp._src.metal_array_args import stage_launch_args  # noqa: PLC0415
+
+        staged = stage_launch_args(kernel, inputs, outputs, device, adjoint)
+        if staged is not None:
+            return staged.run(
+                lambda k, i, o: launch_metal_kernel_native(
+                    k, dim, i, o, device, block_dim=block_dim, adjoint=adjoint, adj_inputs=adj_inputs, adj_outputs=adj_outputs
+                )
+            )
 
     _reject_unsupported_launch_args(kernel, [*inputs, *outputs])
 
