@@ -1969,7 +1969,7 @@ def integrate(
         and getattr(wp.get_device(device), "is_metal", False)
         and wp.config.metal_fp64 != "emulate"
     ):
-        from warp._src.utils import warn  # noqa: PLC0415
+        from warp._src.logger import log_warning as warn  # noqa: PLC0415
 
         warn(
             "wp.fem.integrate: accumulate_dtype=wp.float64 is not supported on Metal devices; "

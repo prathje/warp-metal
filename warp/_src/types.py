@@ -6015,7 +6015,7 @@ class Bvh:
             from warp._src.metal_bvh import MetalBvh  # noqa: PLC0415
 
             if constructor == BvhConstructor.LBVH:
-                warp._src.utils.warn(
+                log_warning(
                     "LBVH constructor is not available for a Metal tree. Falling back to SAH constructor.",
                     stacklevel=2,
                 )
@@ -6152,7 +6152,7 @@ class Bvh:
 
         if getattr(self, "_metal", None) is not None:
             if constructor == BvhConstructor.LBVH:
-                warp._src.utils.warn(
+                log_warning(
                     "LBVH constructor is not available for a Metal tree. Falling back to SAH constructor.",
                     stacklevel=2,
                 )
@@ -6299,7 +6299,7 @@ class Mesh:
             if support_winding_number:
                 raise RuntimeError("support_winding_number=True is not supported for wp.Mesh on Metal")
             if bvh_constructor in (BvhConstructor.LBVH, BvhConstructor.CUBQL):
-                warp._src.utils.warn(
+                log_warning(
                     f"{BvhConstructor(bvh_constructor).name} constructor is not available for a Metal mesh. "
                     "Falling back to SAH constructor.",
                     stacklevel=2,

@@ -368,6 +368,7 @@ class RawExpr(Expr):
 # leading indentation). Patterns are checked in order — the first match
 # wins. The order is important: more specific patterns must come first.
 
+_SYNTH_TMP_PAT = re.compile(r"\bvar_(mtp\d+)\b")
 _RE_EMPTY = re.compile(r"^\s*$")
 _RE_COMMENT = re.compile(r"^\s*//")
 _RE_PRAGMA = re.compile(r"^\s*#")
@@ -1688,6 +1689,9 @@ def _inline_one_call(
 
     # Same value-level fp32 demotion the kernel body received (no-op unless
     # ``metal_demote_fp64`` is set).
+    from warp._src.codegen_metal import _normalize_adj_ir  # noqa: PLC0415
+
+    _normalize_adj_ir(fn_overload.adj)
     fn_lines = [_demote_f64_value_tokens(ln) for ln in fn_overload.adj.blocks[0].body_forward]
 
     # Build the substitution map.
@@ -1761,6 +1765,10 @@ def _inline_one_call(
         if var.label in fn_param_set:
             continue
         subs[f"var_{var.label}"] = f"var_{inline_id}__{var.label}"
+    # Synthetic pointer temps from ``codegen_metal._normalize_ir_lines`` are
+    # not in ``adj.variables``; mangle them too so inlined copies stay apart.
+    for tmp in set(_SYNTH_TMP_PAT.findall("\n".join(fn_lines))):
+        subs[f"var_{tmp}"] = f"var_{inline_id}__{tmp}"
 
     substituted_lines = [_substitute_var_refs(line, subs) for line in fn_lines]
 
@@ -2271,6 +2279,9 @@ def _inline_one_adj_call(
         out = (_rewrite_adj_aggregate_init(line, zero_by_label) for line in lines)
         return [line for line in out if line is not None]
 
+    from warp._src.codegen_metal import _normalize_adj_ir  # noqa: PLC0415
+
+    _normalize_adj_ir(adj)
     replay_lines = _rewrite(block.body_replay)
     reverse_lines = _rewrite(reversed(block.body_reverse))
 
@@ -2302,6 +2313,8 @@ def _inline_one_adj_call(
             continue
         subs[f"var_{var.label}"] = f"var_{inline_id}__{var.label}"
         subs[f"adj_{var.label}"] = f"adj_{inline_id}__{var.label}"
+    for tmp in set(_SYNTH_TMP_PAT.findall("\n".join([*replay_lines, *reverse_lines]))):
+        subs[f"var_{tmp}"] = f"var_{inline_id}__{tmp}"
 
     replay_lines = [_substitute_var_refs(line, subs) for line in replay_lines]
     reverse_lines = [_substitute_var_refs(line, subs) for line in reverse_lines]
@@ -3045,11 +3058,22 @@ def _collect_slice_aliases(
             _collect_slice_aliases(n.body, out, const_int_vars, load_equiv)
 
 
+def _collect_slice_defs(nodes: tuple[Node, ...] | list[Node], out: set[str]) -> set[str]:
+    """Labels assigned by any ``wp::slice_t(...)`` call, supported or not."""
+    for n in nodes:
+        if isinstance(n, Assign) and isinstance(n.expr, Builtin) and n.expr.name == "slice_t":
+            out.add(n.lhs)
+        elif isinstance(n, (If, For, While, _DoWhileZero)):
+            _collect_slice_defs(n.body, out)
+    return out
+
+
 def _collect_view_aliases(
     nodes: tuple[Node, ...] | list[Node],
     out: dict[str, tuple[str, list[str]]],
     slice_aliases: dict[str, str],
     arg_label_set: set[str],
+    slice_defs: set[str] | None = None,
 ) -> None:
     """Walk the tree, recording every supported ``wp::view(arr, slice...)``.
 
@@ -3059,21 +3083,36 @@ def _collect_view_aliases(
     cases the index lists compose: the base array's leading indices come
     first, then this view's.
     """
+    # Warp >= 1.18 indexes a view with a plain integer (``wp::view(arr, var_i)``)
+    # instead of going through a ``wp::slice_t(i, i, 0)`` local; any argument
+    # not defined by a ``slice_t`` call is such an integer index.
+    if slice_defs is None:
+        slice_defs = _collect_slice_defs(nodes, set())
+
+    def _view_index(label):
+        if label is None:
+            return None
+        if label in slice_aliases:
+            return slice_aliases[label]
+        if label not in slice_defs:
+            return label
+        return None
+
     for n in nodes:
         if isinstance(n, Assign) and isinstance(n.expr, Builtin) and n.expr.name == "view":
             args = n.expr.args
             if len(args) >= 2:
                 arr_l = _strip_var_prefix(args[0])
                 slice_labels = [_strip_var_prefix(a) for a in args[1:]]
-                if arr_l is not None and all(s is not None and s in slice_aliases for s in slice_labels):
-                    idx = [slice_aliases[s] for s in slice_labels]
+                if arr_l is not None and all(_view_index(s) is not None for s in slice_labels):
+                    idx = [_view_index(s) for s in slice_labels]
                     if arr_l in arg_label_set:
                         out[n.lhs] = (arr_l, idx)
                     elif arr_l in out:
                         base_arr, base_idx = out[arr_l]
                         out[n.lhs] = (base_arr, [*base_idx, *idx])
         elif isinstance(n, (If, For, While, _DoWhileZero)):
-            _collect_view_aliases(n.body, out, slice_aliases, arg_label_set)
+            _collect_view_aliases(n.body, out, slice_aliases, arg_label_set, slice_defs)
 
 
 def _collect_field_array_aliases(

@@ -6295,7 +6295,7 @@ class Device:
                 try:
                     import Metal  # noqa: PLC0415,F401
                 except ImportError:
-                    from warp._src.utils import warn  # noqa: PLC0415
+                    from warp._src.logger import log_warning as warn  # noqa: PLC0415
 
                     warn(
                         "wp.config.metal_native_dispatch is enabled but 'pyobjc-framework-metal' is not "

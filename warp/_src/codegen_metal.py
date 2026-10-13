@@ -160,6 +160,7 @@ from warp._src.codegen_metal_ast import inline_user_calls as _ast_inline
 from warp._src.codegen_metal_ast import lower_reverse_ranges as _ast_lower_reverse_ranges
 from warp._src.codegen_metal_ast import parse as _ast_parse
 from warp._src.codegen_metal_ast import query_iterator_vars as _ast_query_iterator_vars
+from warp.config import DeterministicMode
 
 if TYPE_CHECKING:
     pass
@@ -2256,6 +2257,10 @@ _ADJ_ARRAY_PAT = re.compile(
 # flat-index machinery as ``_ADJ_ARRAY_PAT`` (and are lowered next to it
 # rather than in ``_translate_tile_intrinsics``, which has no view of the
 # gradient buffers).
+_METAL_ADJ_SLOT_PAT = re.compile(
+    r"^(?P<indent>\s*)wp::__metal_adj_slot__\s*\(\s*var_(?P<arr>\w+)\s*,\s*(?P<op>store|add|sub)\s*,\s*"
+    r"(?P<idx>.+)\s*,\s*(?P<val>[\w\[\]\.]+)\s*\)\s*;\s*$"
+)
 _ADJ_TILE_ARRAY_PAT = re.compile(
     r"^(?P<indent>\s*)wp::adj_(?P<op>tile_load|tile_store|tile_atomic_add)\s*(?:<[^()]*>)?\s*\((?P<args>.*)\)\s*;\s*$"
 )
@@ -2284,6 +2289,12 @@ _ADJ_STRUCT_FIELD_STORE_PAT = re.compile(
 # ``wp::adj_extract(var_S, k, adj_S, adj_k, adj_ret);`` — matched to identify
 # extracts whose source is an array *shape* descriptor, which carries no
 # gradient. Only the source operand is needed to make that call.
+_ADJ_STRUCT_FIELD_READ_PAT = re.compile(
+    r"^(?P<indent>\s*)adj_(?P<dst>\w+)\s*(?P<op>\+=|-=|=)\s*adj_(?P<root>\w+)(?P<path>(?:\.\w+)+)\s*;\s*$"
+)
+_STRUCT_FIELD_DUAL_ZERO_PAT = re.compile(
+    r"^(?P<indent>\s*)wp::__metal_struct_field_dual_zero\s*\(\s*adj_(?P<root>\w+)\s*,\s*(?P<path>[\w.]+)\s*\)\s*;\s*$"
+)
 _ADJ_EXTRACT_SRC_PAT = re.compile(r"^\s*wp::adj_extract\s*\(\s*var_(?P<src>\w+)\s*,")
 
 # ``adj_A += adj_B;`` — whole-struct dual accumulation, emitted for the
@@ -9104,7 +9115,7 @@ def _serialize_spin_locks(source: str, kernel_name: str) -> str:
         loop_end, lock_arr = matched
         bail = _spin_region_bail_reason(lines, i, loop_end, lock_arr)
         if isinstance(bail, str):
-            from warp._src.utils import warn  # noqa: PLC0415
+            from warp._src.logger import log_warning as warn  # noqa: PLC0415
 
             warn(
                 f"Kernel {kernel_name!r}: a spin-wait loop on array {lock_arr!r} could not be "
@@ -9558,6 +9569,12 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bwp::bvh_query_aabb\b"), "wp_bvh_query_aabb"),
     (re.compile(r"\bwp::bvh_query_ray\b"), "wp_bvh_query_ray"),
     (re.compile(r"\bwp::bvh_query_next\b"), "wp_bvh_query_next"),
+    # Warp >= 1.18 types BVH queries by kind and emits a per-kind iterator;
+    # the MSL query keeps its kind (``is_ray``) at runtime, so the ray and
+    # kind-erased iterators share ``wp_bvh_query_next``. Capsule and sphere
+    # queries have no MSL port and fall through to the unsupported guard.
+    (re.compile(r"\bwp::bvh_query_ray_next\b"), "wp_bvh_query_next"),
+    (re.compile(r"\bwp::bvh_query_next_dynamic\b"), "wp_bvh_query_next"),
     (re.compile(r"\bwp::bvh_get_group_root\b"), "wp_bvh_get_group_root"),
     (re.compile(r"\bwp::mesh_query_ray_anyhit\b"), "wp_mesh_query_ray_anyhit"),
     # Reverse mode for the ray query: differentiates the hit distance and
@@ -12580,6 +12597,411 @@ def _strip_comments_and_directives(line: str) -> str | None:
     return line
 
 
+# ---------------------------------------------------------------------------
+# Warp >= 1.18 composite "array slot" IR
+# ---------------------------------------------------------------------------
+# Upstream lowers stores/atomics into a component of an array element
+# (``v[i][k] = x``, ``v[i].y += x``, ``m[i][r, c] = x``, ``m[i][r] = row``,
+# ``t[i].p = p``) to slot expressions instead of the older
+# ``address -> indexref -> store`` chain:
+#
+#   var_R = &(wp::index(var_A, i..){access});                 (slot reference)
+#   wp::store(&(wp::index(var_A, i..){access}), var_V);         (store)
+#   wp::array_atomic_<op>_slot(var_A, var_V, [&](auto& _e) -> auto& { return _e{access}; }, i..);
+#   wp::adj_array_<store|atomic_add|atomic_sub>_slot(var_A, adj_A, adj_V, <lambda>, i..);
+#
+# ``_lower_array_slot_ir`` rewrites these, for kernel array arguments with
+# vec/quat/transform/matrix elements, onto constructs the translator already
+# lowers: the ``__metal_scalar_store__`` token (stores), raw per-component
+# ``atomic_fetch_*`` lines (atomics) and the ``__metal_adj_slot__`` token
+# (reverse mode, handled next to ``adj_array_store``).
+
+_SLOT_INDEX_PREFIX = r"wp::index\(\s*var_(?P<arr>\w+)\s*,\s*(?P<idx>[^()]*?)\s*\)"
+_SLOT_REF_PAT = re.compile(r"^(?P<indent>\s*)var_(?P<lhs>\w+)\s*=\s*&\(\s*" + _SLOT_INDEX_PREFIX + r"(?P<acc>[^;]*?)\)\s*;\s*$")
+_SLOT_STORE_PAT = re.compile(
+    r"^(?P<indent>\s*)wp::store\(\s*&\(\s*" + _SLOT_INDEX_PREFIX + r"(?P<acc>.*?)\)\s*,\s*(?P<val>[\w\[\]\.]+)\s*\)\s*;\s*$"
+)
+_SLOT_LAMBDA = r"\[&\]\(auto& _e\) -> auto& \{ return _e(?P<acc>.*?); \}"
+_SLOT_ATOMIC_PAT = re.compile(
+    r"^(?P<indent>\s*)wp::array_atomic_(?P<op>add|sub|min|max)_slot\(\s*var_(?P<arr>\w+)\s*,\s*(?P<val>[\w\[\]\.]+)\s*,\s*"
+    + _SLOT_LAMBDA
+    + r"\s*,\s*(?P<idx>[^;]*?)\)\s*;\s*$"
+)
+_SLOT_ADJ_PAT = re.compile(
+    r"^(?P<indent>\s*)wp::adj_array_(?P<op>store|atomic_add|atomic_sub)_slot\(\s*var_(?P<arr>\w+)\s*,\s*(?P<adjarr>[\w\.]+)\s*,"
+    r"\s*(?P<adjval>[\w\[\]\.]+)\s*,\s*" + _SLOT_LAMBDA + r"\s*,\s*(?P<idx>[^;]*?)\)\s*;\s*$"
+)
+_SLOT_ACCESS_TOKEN_PAT = re.compile(r"\.(?P<fn>component_ref|element_ref|row_ref)\((?P<args>[^()]*)\)|\.(?P<tf>p|q)\b")
+_ATOMIC_SLOT_TO_MSL = {
+    "add": "atomic_fetch_add_explicit",
+    "sub": "atomic_fetch_sub_explicit",
+    "min": "wp_atomic_min",
+    "max": "wp_atomic_max",
+}
+
+
+def _slot_elem_kind(arg) -> tuple | None:
+    """Element layout of a kernel array arg for slot lowering, or ``None``."""
+    dtype = getattr(arg.type, "dtype", None)
+    gen = getattr(dtype, "_wp_generic_type_str_", None)
+    if gen in ("vec_t", "quat_t"):
+        return ("vec", int(dtype._length_))
+    if gen == "transform_t":
+        return ("tf", 7)
+    if gen == "mat_t":
+        rows, cols = dtype._shape_
+        return ("mat", int(rows), int(cols))
+    return None
+
+
+def _slot_components(kind: tuple, access: str) -> tuple[int, list[str]] | None:
+    """Resolve an accessor chain to ``(element_stride, [offset_expr, ...])``.
+
+    One offset per scalar component written; ``None`` if the chain is not
+    supported.
+    """
+    stride = kind[1] if kind[0] != "mat" else kind[1] * kind[2]
+    offset = "0"
+    cur = kind
+    pos = 0
+    access = access.strip()
+    while pos < len(access):
+        m = _SLOT_ACCESS_TOKEN_PAT.match(access, pos)
+        if m is None:
+            return None
+        pos = m.end()
+        fn, args, tf = m.group("fn"), m.group("args"), m.group("tf")
+        if tf is not None:
+            if cur[0] != "tf":
+                return None
+            offset = f"{offset} + {0 if tf == 'p' else 3}"
+            cur = ("vec", 3 if tf == "p" else 4)
+        elif fn == "component_ref" and cur[0] == "vec":
+            j = args.strip()
+            n = cur[1]
+            offset = f"{offset} + (({j}) < 0 ? ({j}) + {n} : ({j}))"
+            cur = ("scalar",)
+        elif fn == "element_ref" and cur[0] == "mat":
+            r, c = (a.strip() for a in args.split(","))
+            rows, cols = cur[1], cur[2]
+            offset = f"{offset} + (({r}) < 0 ? ({r}) + {rows} : ({r})) * {cols} + (({c}) < 0 ? ({c}) + {cols} : ({c}))"
+            cur = ("scalar",)
+        elif fn == "row_ref" and cur[0] == "mat":
+            r = args.strip()
+            rows, cols = cur[1], cur[2]
+            offset = f"{offset} + (({r}) < 0 ? ({r}) + {rows} : ({r})) * {cols}"
+            cur = ("vec", cols)
+        else:
+            return None
+    if cur[0] == "scalar":
+        return stride, [offset]
+    if cur[0] == "vec":
+        return stride, [f"{offset} + {k}" for k in range(cur[1])]
+    return None
+
+
+def _slot_value_components(val: str, count: int) -> list[str]:
+    return [val] if count == 1 else [f"{val}[{k}]" for k in range(count)]
+
+
+def _lower_array_slot_ir(lines: list[str], adj, all_lines: list[str]) -> list[str]:
+    """Rewrite Warp >= 1.18 array-slot IR (see above) for the Metal translator."""
+    if not any("wp::index(" in ln or "_slot(" in ln for ln in lines):
+        return lines
+    kinds: dict[str, tuple] = {}
+    f64_arrays: set[str] = set()
+    for arg in adj.args:
+        if not _is_array_arg(arg):
+            continue
+        kind = _slot_elem_kind(arg)
+        if kind is not None:
+            kinds[arg.label] = kind
+            if getattr(getattr(arg.type.dtype, "_wp_scalar_type_", None), "__name__", None) == "float64":
+                f64_arrays.add(arg.label)
+    joined = "\n".join(all_lines)
+
+    def _flat(arr: str, idx: str) -> str:
+        return _flat_index_expr(arr, [a.strip() for a in _split_top_level_args(idx)])
+
+    out: list[str] = []
+    for ln in lines:
+        m = _SLOT_REF_PAT.match(ln)
+        if m:
+            lhs = m.group("lhs")
+            # Slot references are materialised for every composite store
+            # target but usually never read; drop those, and spell a whole-
+            # element reference the way older Warp did.
+            if len(re.findall(rf"\bvar_{lhs}\b", joined)) <= 2:  # def in forward + replay
+                continue
+            if not m.group("acc").strip():
+                out.append(f"{m.group('indent')}var_{lhs} = wp::address(var_{m.group('arr')}, {m.group('idx')});")
+                continue
+            out.append(ln)
+            continue
+        m = _SLOT_STORE_PAT.match(ln)
+        if m and m.group("arr") in kinds:
+            arr = m.group("arr")
+            res = _slot_components(kinds[arr], m.group("acc"))
+            if res is not None:
+                stride, offsets = res
+                flat = _flat(arr, m.group("idx"))
+                for off, val in zip(offsets, _slot_value_components(m.group("val"), len(offsets))):
+                    out.append(
+                        f"{m.group('indent')}wp::__metal_scalar_store__(var_{arr}, store, ({flat}) * {stride} + {off}, {val});"
+                    )
+                continue
+        m = _SLOT_ATOMIC_PAT.match(ln)
+        if m and m.group("arr") in kinds:
+            arr = m.group("arr")
+            if arr in f64_arrays:
+                raise MetalCodegenError(
+                    f"Kernel {adj.fun_name!r}: atomic update of a component of float64 array {arr!r} "
+                    "is not supported on Metal"
+                )
+            res = _slot_components(kinds[arr], m.group("acc"))
+            if res is not None:
+                stride, offsets = res
+                flat = _flat(arr, m.group("idx"))
+                msl = _ATOMIC_SLOT_TO_MSL[m.group("op")]
+                for off, val in zip(offsets, _slot_value_components(m.group("val"), len(offsets))):
+                    out.append(
+                        f"{m.group('indent')}{msl}(&{arr}[({flat}) * {stride} + {off}], {val}, memory_order_relaxed);"
+                    )
+                continue
+        m = _SLOT_ADJ_PAT.match(ln)
+        if m and m.group("arr") in kinds:
+            arr = m.group("arr")
+            res = _slot_components(kinds[arr], m.group("acc"))
+            if res is not None:
+                stride, offsets = res
+                flat = _flat(arr, m.group("idx"))
+                op = {"store": "store", "atomic_add": "add", "atomic_sub": "sub"}[m.group("op")]
+                for off, val in zip(offsets, _slot_value_components(m.group("adjval"), len(offsets))):
+                    out.append(
+                        f"{m.group('indent')}wp::__metal_adj_slot__(var_{arr}, {op}, ({flat}) * {stride} + {off}, {val});"
+                    )
+                continue
+        if (
+            _SLOT_STORE_PAT.match(ln)
+            or _SLOT_ATOMIC_PAT.match(ln)
+            or _SLOT_ADJ_PAT.match(ln)
+            or "wp::array_atomic_" in ln
+            or re.search(r"\bwp::adj_array_\w+_slot\(", ln)
+        ):
+            m_any = re.search(r"var_(\w+)", ln.split("(", 1)[1] if "(" in ln else ln)
+            what = f"array {m_any.group(1)!r}" if m_any else "an array"
+            raise MetalCodegenError(
+                f"Kernel {adj.fun_name!r}: assigning to or atomically updating a component/field of an element "
+                f"of {what} (e.g. ``arr[i].field = x`` / ``arr[i][k] += x``) is only supported on Metal for "
+                "vector, quaternion, transform and matrix arrays passed directly as kernel arguments. "
+                "Load the element into a local, modify it, and store it back instead."
+            )
+        out.append(ln)
+    return out
+
+
+
+# Warp >= 1.18 spells field lvalues through its lvalue-origin system as
+# ``(base).field`` (``&((var_p).scale)``, ``&(((var_p).a).b)``); older Warp
+# emitted ``&(var_p.scale)``, which is what the regex translator matches.
+# Collapse the parentheses around plain ``var_X[.field...]`` chains.
+_PAREN_FIELD_CHAIN_PAT = re.compile(r"\(\s*((?:var|adj)_\w+(?:\.\w+)*)\s*\)\.")
+
+
+def _normalize_ir_line(line: str) -> str:
+    if ")." not in line:
+        return line
+    prev = None
+    while prev != line:
+        prev = line
+        line = _PAREN_FIELD_CHAIN_PAT.sub(r"\1.", line)
+    return line
+
+
+_FIELD_ASSIGN_PAT = re.compile(r"^(?P<indent>\s*)var_(?P<root>\w+)(?P<path>(?:\.\w+)+)\s*=\s*(?P<rhs>[^=;][^;]*?)\s*;\s*$")
+_FIELD_ADDR_CHAIN_PAT = re.compile(r"^(?P<indent>\s*)var_(?P<lhs>\w+)\s*=\s*&\(\s*var_(?P<root>\w+)(?P<path>(?:\.\w+){2,})\s*\)\s*;\s*$")
+_FIELD_ADDR_ONE_PAT = re.compile(r"^\s*var_(?P<lhs>\w+)\s*=\s*&\(\s*var_(?P<root>\w+)\.(?P<field>\w+)\s*\)\s*;\s*$")
+# ``&(((*wp::address(var_A, i..))).f.g)`` — a field of an array element
+# (Warp >= 1.18); older Warp emitted ``var_E = wp::address(var_A, i..);
+# var_P = &(var_E->f);``.
+_ELEM_FIELD_ADDR_PAT = re.compile(
+    r"^(?P<indent>\s*)var_(?P<lhs>\w+)\s*=\s*&\(\(*\*wp::(?P<fn>address|index)\((?P<args>[^()]*)\)\)*(?P<path>(?:\)*\.\w+)+)\)\s*;\s*$"
+)
+_ADJ_FIELD_ZERO_PAT = re.compile(r"^(?P<indent>\s*)adj_(?P<root>\w+)(?P<path>(?:\.\w+)+)\s*=\s*\{\s*\}\s*;\s*$")
+_STRUCT_FIELD_DUAL_ZERO_CALL = "wp::__metal_struct_field_dual_zero"
+_METAL_TMP_COUNTER = [0]
+
+
+def _metal_tmp_label() -> str:
+    _METAL_TMP_COUNTER[0] += 1
+    return f"mtp{_METAL_TMP_COUNTER[0]}"
+
+
+def _normalize_ir_lines(lines: list[str]) -> list[str]:
+    """Rewrite Warp >= 1.18 struct-field IR into the shapes the translator matches.
+
+    * ``(var_S).f`` -> ``var_S.f`` (see ``_normalize_ir_line``);
+    * ``var_P = &(var_S.a.b);`` -> a ``&(var_S.a)`` / ``&(var_T->b)`` pointer
+      chain, reusing an earlier pointer to the prefix when there is one;
+    * ``var_S.a = rhs;`` (direct field assignment) -> ``var_T = &(var_S.a);
+      wp::store(var_T, rhs);``;
+    * ``adj_S.a = {};`` (field-dual reset) -> a sentinel call lowered by the
+      emitter against the struct-dual layout.
+
+    Synthetic pointer temps (``var_mtp<n>``) are only ever aliased away by the
+    struct-field folds, so they need no declaration.
+    """
+    if not any(")." in ln or "." in ln for ln in lines):
+        return lines
+    out: list[str] = []
+    prefix_ptrs: dict[str, str] = {}  # "root.a" -> pointer label
+
+    def _chain(indent: str, root: str, parts: list[str], final_lhs: str | None) -> tuple[list[str], str]:
+        emitted: list[str] = []
+        ptr = None
+        start = 0
+        # Reuse the longest already-materialised prefix pointer.
+        for k in range(len(parts) - 1, 0, -1):
+            key = root + "." + ".".join(parts[:k])
+            if key in prefix_ptrs:
+                ptr, start = prefix_ptrs[key], k
+                break
+        for k in range(start, len(parts)):
+            last = k == len(parts) - 1
+            label = final_lhs if (last and final_lhs is not None) else _metal_tmp_label()
+            if ptr is None:
+                emitted.append(f"{indent}var_{label} = &(var_{root}.{parts[k]});")
+            else:
+                emitted.append(f"{indent}var_{label} = &(var_{ptr}->{parts[k]});")
+            ptr = label
+            prefix_ptrs[root + "." + ".".join(parts[: k + 1])] = label
+        return emitted, ptr
+
+    for ln in lines:
+        ln = _normalize_ir_line(ln)
+        stripped = ln.lstrip()
+        if stripped.startswith("//"):
+            out.append(ln)
+            continue
+        m = _ADJ_FIELD_ZERO_PAT.match(ln)
+        if m:
+            out.append(f"{m.group('indent')}{_STRUCT_FIELD_DUAL_ZERO_CALL}(adj_{m.group('root')}, {m.group('path')[1:]});")
+            continue
+        m = _ELEM_FIELD_ADDR_PAT.match(ln)
+        if m:
+            parts = re.findall(r"\.(\w+)", m.group("path"))
+            elem = _metal_tmp_label()
+            out.append(f"{m.group('indent')}var_{elem} = wp::address({m.group('args')});")
+            ptr = elem
+            for k, part in enumerate(parts):
+                label = m.group("lhs") if k == len(parts) - 1 else _metal_tmp_label()
+                out.append(f"{m.group('indent')}var_{label} = &(var_{ptr}->{part});")
+                ptr = label
+            continue
+        m = _FIELD_ADDR_ONE_PAT.match(ln)
+        if m:
+            prefix_ptrs[m.group("root") + "." + m.group("field")] = m.group("lhs")
+            out.append(ln)
+            continue
+        m = _FIELD_ADDR_CHAIN_PAT.match(ln)
+        if m:
+            parts = m.group("path")[1:].split(".")
+            emitted, _ptr = _chain(m.group("indent"), m.group("root"), parts, m.group("lhs"))
+            out.extend(emitted)
+            continue
+        m = _FIELD_ASSIGN_PAT.match(ln)
+        if m and not m.group("rhs").strip().startswith("{"):
+            parts = m.group("path")[1:].split(".")
+            emitted, ptr = _chain(m.group("indent"), m.group("root"), parts, None)
+            out.extend(emitted)
+            out.append(f"{m.group('indent')}wp::store(var_{ptr}, {m.group('rhs').strip()});")
+            continue
+        out.append(ln)
+    return out
+
+
+def _normalize_adj_ir(adj, seen=None) -> None:
+    """Normalise the IR of ``adj`` and every user function it calls, in place."""
+    if seen is None:
+        seen = set()
+    if id(adj) in seen:
+        return
+    seen.add(id(adj))
+    # Idempotent, so re-running it on already-normalised IR is harmless.
+    for block in getattr(adj, "blocks", None) or ():
+        for attr in ("body_forward", "body_replay", "body_reverse"):
+            lines = getattr(block, attr, None)
+            if lines:
+                lines[:] = _normalize_ir_lines(list(lines))
+    for func in getattr(adj, "called_user_functions", None) or ():
+        func_adj = getattr(func, "adj", None)
+        if func_adj is not None:
+            _normalize_adj_ir(func_adj, seen)
+
+
+_ATOMIC_IR_RE = re.compile(r"\bwp::(?:tile_)?atomic_\w+\s*\(|\b(?:tile_)?atomic_(?:add|sub|min|max|and|or|xor|cas|exch)\w*\s*\(")
+
+
+def _requested_deterministic_mode(kernel):
+    """Return the ``wp.DeterministicMode`` the kernel's module asks for."""
+    module = getattr(kernel, "module", None)
+    mode = None
+    if module is not None:
+        mode = getattr(module, "options", {}).get("deterministic")
+    if mode is None:
+        import warp.config as _wp_cfg  # noqa: PLC0415
+
+        mode = _wp_cfg.deterministic
+    return mode
+
+
+_TILE_STACK_IR_RE = re.compile(r"\bwp::tile_stack_(?:alloc|init|push|pop|clear|count)\b|\btile_stack_t<")
+
+
+def _ir_matches(adj, pattern, seen=None) -> bool:
+    """Whether the built IR of ``adj`` or any user function it calls matches ``pattern``."""
+    if seen is None:
+        seen = set()
+    if id(adj) in seen:
+        return False
+    seen.add(id(adj))
+    for block in getattr(adj, "blocks", None) or ():
+        if any(pattern.search(line) for line in block.body_forward):
+            return True
+    for func in getattr(adj, "called_user_functions", None) or ():
+        func_adj = getattr(func, "adj", None)
+        if func_adj is not None and _ir_matches(func_adj, pattern, seen):
+            return True
+    return False
+
+
+def _check_tile_stack_unsupported(adj) -> None:
+    """Reject ``wp.tile_stack()`` (Warp 1.18) with a clear error on Metal."""
+    if _ir_matches(adj, _TILE_STACK_IR_RE):
+        raise MetalCodegenError(
+            f"Kernel {adj.fun_name!r}: wp.tile_stack() and wp.tile_stack_push()/pop()/count()/clear() "
+            "are not supported on Metal devices yet. Run the kernel on a CPU or CUDA device."
+        )
+
+
+def _check_deterministic_mode_supported(kernel, adj) -> None:
+    """Reject ``wp.DeterministicMode`` other than ``NOT_GUARANTEED`` for kernels with atomics.
+
+    Kernels without atomics are deterministic on Metal by construction, so
+    they run unchanged under any mode.
+    """
+    mode = _requested_deterministic_mode(kernel)
+    if mode == DeterministicMode.NOT_GUARANTEED or mode is None:
+        return
+    if _ir_matches(adj, _ATOMIC_IR_RE):
+        raise MetalCodegenError(
+            f"Kernel {adj.fun_name!r} uses atomic operations, and deterministic execution "
+            f"(warp.config.deterministic / module option 'deterministic' = {mode!r}) is not supported "
+            "on Metal devices. Set it to wp.DeterministicMode.NOT_GUARANTEED for this module, or run "
+            "the kernel on a CPU or CUDA device."
+        )
+
+
 def _ensure_adj_built(kernel, block_dim: int | None = None, enable_backward: bool = False):
     """Build the kernel's forward IR if it hasn't been already; return the adj.
 
@@ -12618,8 +13040,17 @@ def _ensure_adj_built(kernel, block_dim: int | None = None, enable_backward: boo
                 "output_arch": None,
                 "block_dim": bd,
                 "metal_backend": True,
+                # Deterministic atomics (``wp.DeterministicMode``) need launch-side
+                # scatter/sort-reduce buffers the Metal launcher does not provide,
+                # so the IR is always built with ordinary atomics; a requested
+                # deterministic mode is rejected below if the kernel uses atomics.
+                "deterministic": DeterministicMode.NOT_GUARANTEED,
+                "deterministic_max_records": 0,
             },
         )
+        _normalize_adj_ir(adj)
+        _check_deterministic_mode_supported(kernel, adj)
+        _check_tile_stack_unsupported(adj)
         adj._metal_built_backward = backward
         adj._metal_ir_ok = True
 
@@ -12781,6 +13212,12 @@ def _generate_msl_kernel_uncached(
     # fp32 demotion: value-level float64 becomes float32 before any pass
     # looks at the text (see ``_demote_f64_value_tokens``).
     _ir_lines = [_demote_f64_value_tokens(ln) for ln in _ir_lines]
+    # Warp >= 1.18 composite array-slot stores/atomics/adjoints.
+    _slot_all_lines = (
+        list(adj.blocks[0].body_forward) + list(adj.blocks[0].body_replay) + list(adj.blocks[0].body_reverse)
+    )
+    _ir_lines = _lower_array_slot_ir(_ir_lines, adj, _slot_all_lines)
+    _replay_lines = _lower_array_slot_ir(_replay_lines, adj, _slot_all_lines)
     # Warp resets a dual var with C++ aggregate init (``adj_15 = {};``), which
     # MSL has no equivalent for. Rewrite to the typed zero the declaration
     # used; the type comes from the variable's value type. Forward bodies need
@@ -14368,6 +14805,71 @@ def _generate_msl_kernel_uncached(
         # Lowered against the per-field split declared above. Every shape
         # Warp emits is handled explicitly; anything else raises rather
         # than silently dropping a gradient.
+        # Warp >= 1.18: ``adj_S.a = {};`` (normalised to a sentinel call) resets
+        # a field dual after a field overwrite, and ``adj_X += adj_S.a;``
+        # reads a field dual into the dual of the stored value.
+        m_fzero = _STRUCT_FIELD_DUAL_ZERO_PAT.match(line)
+        if m_fzero:
+            root = m_fzero.group("root")
+            parts = m_fzero.group("path").split(".")
+            indent = m_fzero.group("indent")
+            if root in builtin_struct_locals and len(parts) == 1:
+                body_lines.append(_finalize(f"{indent}adj_{root}.{parts[0]} = {{}};"))
+                continue
+            resolved = _resolve_struct_dual_field(root, parts)
+            if resolved is None:
+                raise MetalCodegenError(
+                    f"Kernel {adj.fun_name!r}: reverse mode through a field of the struct value "
+                    f"'var_{root}' is not supported yet (line: {line.strip()})"
+                )
+            kind, info = resolved
+            path = "__".join(parts)
+            if kind == "array":
+                continue
+            if kind == "leaf":
+                body_lines.append(
+                    _finalize(f"{indent}{_per_field_dual(root, path)} = {_msl_zero_init(info.msl_type)};")
+                )
+                continue
+            for fpath, _off, finfo in _iter_scalar_leaves(info):
+                body_lines.append(
+                    _finalize(f"{indent}{_per_field_dual(root, f'{path}__{fpath}')} = {_msl_zero_init(finfo.msl_type)};")
+                )
+            continue
+        m_fread = _ADJ_STRUCT_FIELD_READ_PAT.match(line)
+        if m_fread and (
+            m_fread.group("root") in struct_dual_layouts or m_fread.group("root") in builtin_struct_locals
+        ):
+            root = m_fread.group("root")
+            parts = m_fread.group("path").lstrip(".").split(".")
+            indent = m_fread.group("indent")
+            dst = m_fread.group("dst")
+            op = m_fread.group("op")
+            if root in builtin_struct_locals:
+                body_lines.append(_finalize(line))
+                continue
+            resolved = _resolve_struct_dual_field(root, parts)
+            if resolved is None:
+                raise MetalCodegenError(
+                    f"Kernel {adj.fun_name!r}: reverse mode through a field of the struct value "
+                    f"'var_{root}' is not supported yet (line: {line.strip()})"
+                )
+            kind, info = resolved
+            path = "__".join(parts)
+            if kind == "array":
+                continue
+            if kind == "leaf":
+                body_lines.append(_finalize(f"{indent}adj_{dst} {op} {_per_field_dual(root, path)};"))
+                continue
+            if dst not in struct_dual_layouts:
+                raise MetalCodegenError(
+                    f"Kernel {adj.fun_name!r}: expected a struct dual on the left of {line.strip()!r}"
+                )
+            for fpath, _off, _finfo in _iter_scalar_leaves(info):
+                body_lines.append(
+                    _finalize(f"{indent}{_per_field_dual(dst, fpath)} {op} {_per_field_dual(root, f'{path}__{fpath}')};")
+                )
+            continue
         m_adj_field = _ADJ_STRUCT_FIELD_STORE_PAT.match(line)
         if m_adj_field:
             root = m_adj_field.group("root")
@@ -14541,6 +15043,28 @@ def _generate_msl_kernel_uncached(
         # array with no launch-time ``.grad`` has no gradient sink, so its
         # statements lower to nothing at all.
         if adjoint:
+            m_adj_slot = _METAL_ADJ_SLOT_PAT.match(raw)
+            if m_adj_slot:
+                arr = m_adj_slot.group("arr")
+                grad_name = grad_arg_of.get(arr)
+                if grad_name is None:
+                    continue
+                if arr in f64_arr_names or arr in f64_emu_arr_names:
+                    raise MetalCodegenError(
+                        f"Kernel {adj.fun_name!r}: reverse mode through a component store into float64 "
+                        f"array {arr!r} is not supported on Metal"
+                    )
+                indent = m_adj_slot.group("indent")
+                tgt = f"{grad_name}[{m_adj_slot.group('idx').strip()}]"
+                val = m_adj_slot.group("val").strip()
+                slot_op = m_adj_slot.group("op")
+                if slot_op == "sub":
+                    body_lines.append(_finalize(f"{indent}{val} -= {tgt};"))
+                else:
+                    body_lines.append(_finalize(f"{indent}{val} += {tgt};"))
+                if slot_op == "store":  # an overwrite consumes the incoming gradient
+                    body_lines.append(_finalize(f"{indent}{tgt} = 0.0f;"))
+                continue
             m_adj_arr = _ADJ_ARRAY_PAT.match(raw)
             if m_adj_arr:
                 op = m_adj_arr.group("op")
@@ -15781,6 +16305,25 @@ def _generate_msl_kernel_uncached(
         # index — every thread in the threadgroup gets the same
         # worldid and the cooperative helpers stay in lockstep.
         body_lines = [ln.replace("thread_position_in_grid.x", "threadgroup_position_in_grid.x") for ln in body_lines]
+
+    # ``bool_local = arr;`` — Warp >= 1.18 lowers short-circuit ``and``/``or``
+    # (e.g. ``if row_counts and row >= 0:`` in ``warp.sparse.bsr_row_index``)
+    # to an assignment of the array operand to a ``bool`` local, which may
+    # also come from an inlined ``@wp.func``. As with ``if arr:`` above, the
+    # pointer test is always true on Metal (``None`` binds a placeholder
+    # buffer), so test the packed shape the launcher zeroes for ``None``.
+    _array_arg_labels = {a.label for a in adj.args if _is_array_arg(a)}
+    if _array_arg_labels:
+        _bool_locals = set(re.findall(r"\bbool\s+(var_\w+)\b", "\n".join(body_lines)))
+        _bool_from_arr_pat = re.compile(r"^(?P<indent>\s*)(?P<lhs>var_\w+)\s*=\s*(?:var_)?(?P<arr>\w+)\s*;\s*$")
+
+        def _rewrite_bool_from_array(ln: str) -> str:
+            m = _bool_from_arr_pat.match(ln)
+            if m and m.group("lhs") in _bool_locals and m.group("arr") in _array_arg_labels:
+                return f"{m.group('indent')}{m.group('lhs')} = ({m.group('arr')}_shape[0] != 0);"
+            return ln
+
+        body_lines = [_rewrite_bool_from_array(ln) for ln in body_lines]
 
     source = "\n".join(body_lines) + "\n"
 
@@ -17206,7 +17749,7 @@ def _warn_fp64_demoted(kernel_name: str, arr_names: list[str]) -> None:
     if _fp64_demote_warned:
         return
     _fp64_demote_warned = True
-    from warp._src.utils import warn  # noqa: PLC0415
+    from warp._src.logger import log_warning as warn  # noqa: PLC0415
 
     warn(
         f"warp.config.metal_demote_fp64 is set: float64 arrays on Metal devices are stored as "
@@ -19036,7 +19579,7 @@ def launch_metal_kernel(
         if grid_y * grid_z <= 1024:
             tg = (1, grid_y, grid_z)
         else:
-            from warp._src.utils import warn  # noqa: PLC0415
+            from warp._src.logger import log_warning as warn  # noqa: PLC0415
 
             warn(
                 f"Kernel '{kernel.key}' needs an init barrier but grid_y*grid_z="

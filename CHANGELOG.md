@@ -191,6 +191,13 @@
 
 ### Changed
 
+- Rebase the Metal backend onto Warp 1.18.0. The MSL translator now understands the 1.18 IR: composite array-slot
+  stores and atomics (`v[i][k] = x`, `v[i].y += x`, `m[i][r, c] = x`, `t[i].p = p`, including reverse mode),
+  direct struct-field assignment and nested field addresses, integer-indexed array views, short-circuit
+  `and`/`or` on array operands, and the per-kind BVH ray iterator. `wp.tile_stack()` and
+  `wp.DeterministicMode` (for kernels with atomics) raise a clear error on Metal; `@wp.kernel(grid_stride=...)`,
+  `default_grid_stride`, `wp.config.log_level`, `wp.quat_twist_angle_signed()` and `wp.array[dtype]` annotations
+  work unchanged.
 - Support `wp.tile_map()` with a user `@wp.func` on Metal devices, for scalar- and vector-element tiles. The
   mapped function may itself call other `@wp.func`s, loop, and `return` from inside a loop.
 - Build `wp.HashGrid` cell tables on the GPU on Metal devices instead of sorting on the host. `HashGrid.build()`
