@@ -280,6 +280,31 @@ class TestMetalTilesExt(unittest.TestCase):
             """,
         )
 
+    def test_func_native_snippet_is_not_dropped(self):
+        # Native snippets used to be "inlined" from their empty Warp body,
+        # silently dropping the call (results stayed zero).
+        _run(
+            self,
+            """
+            @wp.func_native(\"\"\"
+            #if defined(__CUDA_ARCH__)
+            return __frsqrt_rn(value);
+            #else
+            return 1.0f / sqrtf(value) + offset;
+            #endif
+            \"\"\")
+            def rs(value: float, offset: float) -> float: ...
+
+            @wp.kernel
+            def k(v: wp.array[float], o: wp.array[float]):
+                i = wp.tid()
+                o[i] = rs(v[i], 0.0)
+
+            compare(k, 5, lambda d: [wp.array([0.25, 1.0, 2.0, 4.0, 100.0], dtype=float, device=d),
+                                     wp.zeros(5, dtype=float, device=d)], [1], tiled=False)
+            """,
+        )
+
     def test_tile_map_builtin_adjoint(self):
         _run(
             self,

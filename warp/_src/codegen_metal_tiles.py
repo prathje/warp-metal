@@ -786,6 +786,9 @@ inline bool wp_bvh_tile_query_valid(thread const wp_bvh_tile_query_t& t) { retur
 
 def emit_helpers(source: str) -> str:
     parts = []
+    native = emit_native_funcs(source)
+    if native:
+        parts.append(native)
     if "wp_tile_stack" in source:
         parts.append(_STACK_HELPERS)
     if "wp_bvh_tile_" in source:
@@ -826,3 +829,85 @@ def kernel_uses_tiles(adj, seen: set[int] | None = None) -> bool:
         if func_adj is not None and kernel_uses_tiles(func_adj, seen):
             return True
     return False
+
+
+# --------------------------------------------------------------------------
+# ``@wp.func_native`` snippets
+# --------------------------------------------------------------------------
+# The inliner splices ``@wp.func`` bodies, but a native function has no Warp
+# body to splice; inlining its (empty) IR silently dropped the call. Native
+# calls are instead renamed to a per-snippet MSL helper whose body is the
+# snippet itself (compiled by the Metal compiler, so ``#if
+# defined(__CUDA_ARCH__)`` takes the host branch, like on CPU), with a small
+# compat prelude for the C math names CPU snippets use. Snippets that need
+# C++-only Warp types fail to compile loudly instead of being dropped.
+
+_NATIVE_FUNC_DEFS: dict[str, str] = {}
+
+_NATIVE_PRELUDE = """
+#ifndef WP_METAL_NATIVE_COMPAT
+#define WP_METAL_NATIVE_COMPAT
+inline float sqrtf(float x) { return metal::precise::sqrt(x); }
+inline float rsqrtf(float x) { return metal::precise::rsqrt(x); }
+inline float fabsf(float x) { return metal::fabs(x); }
+inline float floorf(float x) { return metal::floor(x); }
+inline float ceilf(float x) { return metal::ceil(x); }
+inline float fminf(float a, float b) { return metal::fmin(a, b); }
+inline float fmaxf(float a, float b) { return metal::fmax(a, b); }
+inline float expf(float x) { return metal::precise::exp(x); }
+inline float logf(float x) { return metal::precise::log(x); }
+inline float sinf(float x) { return metal::precise::sin(x); }
+inline float cosf(float x) { return metal::precise::cos(x); }
+inline float tanf(float x) { return metal::precise::tan(x); }
+inline float atan2f(float y, float x) { return metal::precise::atan2(y, x); }
+inline float powf(float x, float y) { return metal::precise::pow(x, y); }
+#define WP_TILE_SYNC() threadgroup_barrier(metal::mem_flags::mem_threadgroup)
+#define WP_TILE_THREAD_IDX 0
+#define WP_TILE_BLOCK_DIM 1
+#define CUDA_CALLABLE
+#endif
+"""
+
+
+def native_func_call_name(fn_overload) -> str | None:
+    """MSL helper name for a ``@wp.func_native`` overload (None if not native).
+
+    Registers the helper's definition for :func:`emit_helpers`.
+    """
+    import hashlib  # noqa: PLC0415
+
+    snippet = getattr(fn_overload, "native_snippet", None)
+    if snippet is None:
+        return None
+    from warp._src.codegen import is_tile  # noqa: PLC0415
+    from warp._src.codegen_metal import MetalCodegenError, _is_array_arg_type, _msl_var_type  # noqa: PLC0415
+
+    adj = fn_overload.adj
+    params = []
+    for arg in adj.args:
+        if is_tile(arg.type) or _is_array_arg_type(arg.type):
+            raise MetalCodegenError(
+                f"@wp.func_native {fn_overload.key!r}: native snippets taking tile or array parameters "
+                "are not supported on Metal (the snippet is C++/CUDA code operating on Warp's native types)"
+            )
+        params.append(f"{_msl_var_type(arg.ctype())} {arg.label}")
+    ret_type = "void"
+    rv = getattr(adj, "return_var", None)
+    if rv is not None and len(rv) == 1:
+        ret_type = _msl_var_type(rv[0].ctype())
+    elif getattr(fn_overload, "value_type", None) is not None:
+        from warp._src.codegen import Var  # noqa: PLC0415
+
+        ret_type = _msl_var_type(Var.type_to_ctype(fn_overload.value_type))
+    digest = hashlib.sha1((snippet + "|" + ",".join(params) + ret_type).encode()).hexdigest()[:10]
+    name = f"wpn_{fn_overload.native_func}_{digest}"
+    if name not in _NATIVE_FUNC_DEFS:
+        _NATIVE_FUNC_DEFS[name] = f"inline {ret_type} {name}({', '.join(params)}) {{\n{snippet}\n}}\n"
+    return name
+
+
+def emit_native_funcs(source: str) -> str:
+    used = [n for n in _NATIVE_FUNC_DEFS if n in source]
+    if not used:
+        return ""
+    return _NATIVE_PRELUDE + "\n".join(_NATIVE_FUNC_DEFS[n] for n in sorted(used))

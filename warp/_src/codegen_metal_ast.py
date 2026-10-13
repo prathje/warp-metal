@@ -2412,6 +2412,12 @@ def _inline_one_adj_call(
     return [*decls, *replay_nodes, *reverse_nodes]
 
 
+def _native_call_name(fn_overload) -> str | None:
+    from warp._src.codegen_metal_tiles import native_func_call_name  # noqa: PLC0415
+
+    return native_func_call_name(fn_overload)
+
+
 def _inline_walk(
     nodes: tuple[Node, ...] | list[Node],
     fn_map: dict[str, list[Any]],
@@ -2439,6 +2445,33 @@ def _inline_walk(
                         const_ints_out,
                         struct_locals_out,
                         var_types,
+                    )
+                )
+                continue
+
+        # ``@wp.func_native``: keep the call, renamed to its MSL helper (there
+        # is no Warp body to splice). See ``codegen_metal_tiles``.
+        if isinstance(n, VoidCall) and n.op == "user_call" and dict(n.extra).get("name") in fn_map:
+            name = dict(n.extra).get("name")
+            ovl = _pick_overload(fn_map[name], n.args, var_types)
+            native_name = _native_call_name(ovl)
+            if native_name is not None:
+                out.append(
+                    VoidCall(raw=re.sub(rf"\b{re.escape(name)}\s*\(", f"{native_name}(", n.raw, count=1),
+                             op=n.op, args=n.args, extra=n.extra)
+                )
+                continue
+        if isinstance(n, Assign) and isinstance(n.expr, UserCall) and n.expr.name in fn_map:
+            ovl = _pick_overload(fn_map[n.expr.name], n.expr.args, var_types)
+            native_name = _native_call_name(ovl)
+            if native_name is not None:
+                pat = rf"\b{re.escape(n.expr.name)}\s*\("
+                out.append(
+                    Assign(
+                        raw=re.sub(pat, f"{native_name}(", n.raw, count=1),
+                        lhs=n.lhs,
+                        expr=UserCall(raw=re.sub(pat, f"{native_name}(", n.expr.raw, count=1),
+                                      name=native_name, args=n.expr.args),
                     )
                 )
                 continue
