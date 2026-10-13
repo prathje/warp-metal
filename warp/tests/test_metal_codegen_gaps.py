@@ -659,6 +659,37 @@ class TestMetalCodegenGaps(unittest.TestCase):
             """,
         )
 
+    def test_loop_var_after_loop_keeps_last_value(self):
+        _run(
+            self,
+            """
+            @wp.kernel
+            def k(n: int, o: wp.array[int], o2: wp.array[int]):
+                t = wp.tid()
+                kk = int(-7)
+                for kk in range(t, n):
+                    o[t] += 0
+                o[t] = kk
+                jj = int(-7)
+                s = int(0)
+                for jj in range(n - 1, t - 1, -1):
+                    s += jj
+                o2[t] = s * 100 + jj
+
+            def launch(dev):
+                # Every thread's loop runs at least once: a loop that never
+                # runs leaves the variable unassigned in Warp's IR.
+                o = wp.zeros(4, dtype=int, device=dev)
+                o2 = wp.zeros(4, dtype=int, device=dev)
+                wp.launch(k, 4, [6, o, o2], device=dev)
+                return o.numpy(), o2.numpy()
+
+            cpu, metal = both(launch)
+            assert cpu[0].tolist() == [5, 5, 5, 5]
+            assert_same(cpu, metal)
+            """,
+        )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

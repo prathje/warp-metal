@@ -13723,7 +13723,7 @@ class MetalKernelArtifact:
 # capture handles both ``++var_X`` (step 1) and ``var_X += <step>`` forms.
 _FOR_LOOP_LINE_PAT = re.compile(
     r"^(?P<indent>\s*)for \(var_(?P<iv>\w+) = (?P<start>[^;]+); "
-    r"var_(?P=iv) < (?P<stop>[^;]+); "
+    r"var_(?P=iv) [<>] (?P<stop>[^;]+); "
     r"(?P<inc>(?:\+\+var_(?P=iv))|(?:var_(?P=iv) \+= (?P<step>[^)]+)))\) \{$"
 )
 # Matches lines that introduce a compile-time int constant — used to
@@ -13791,6 +13791,48 @@ def _fix_negative_step_for_loops(
         stop = m.group("stop")
         inc = m.group("inc")
         out.append(f"{indent}for (var_{iv} = {start}; var_{iv} > {stop}; {inc}) {{")
+    return out
+
+
+def _materialize_for_loop_vars(lines: list[str]) -> list[str]:
+    """Give AST-emitted ``for`` loops a private counter when their iteration
+    variable is read after the loop.
+
+    Warp's IR draws each iteration value from a ``range_t`` iterator, so
+    after a loop that ran to completion the variable holds the *last*
+    value (``stop - step``), not ``stop``. Driving the C loop with the
+    variable itself would leave ``stop`` behind (and a never-entered loop
+    would hold ``start``). The counter keeps the variable's value the last
+    one assigned, as on CPU; loops whose variable dies with the loop are
+    left alone.
+    """
+    out = list(lines)
+    n_it = 0
+    i = 0
+    while i < len(out):
+        m = _FOR_LOOP_LINE_PAT.match(out[i])
+        if m is None:
+            i += 1
+            continue
+        depth = 0
+        close = None
+        for j in range(i, len(out)):
+            depth += out[j].count("{") - out[j].count("}")
+            if depth <= 0:
+                close = j
+                break
+        iv = m.group("iv")
+        if close is None or not any(re.search(rf"\bvar_{iv}\b", ln) for ln in out[close + 1 :]):
+            i += 1
+            continue
+        it = f"wp_for_it{n_it}"
+        n_it += 1
+        cmp_op = ">" if re.search(rf"var_{iv} > ", out[i]) else "<"
+        step = m.group("step")
+        inc = f"++{it}" if step is None else f"{it} += {step}"
+        out[i] = f"{m.group('indent')}for (int {it} = {m.group('start')}; {it} {cmp_op} {m.group('stop')}; {inc}) {{"
+        out.insert(i + 1, f"{m.group('indent')}var_{iv} = {it};")
+        i += 2
     return out
 
 
@@ -14725,6 +14767,8 @@ def _generate_msl_kernel_uncached(
     # here; constant steps resolve from ``adj.variables`` and the
     # inliner's surfaced constants.
     forward_lines = _fix_negative_step_for_loops(forward_lines, adj=adj, extra_const_ints=_inlined_const_ints)
+    # A loop variable read after its loop keeps its last iteration value.
+    forward_lines = _materialize_for_loop_vars(forward_lines)
 
     if os.environ.get("WARP_METAL_DUMP_IR"):
         _dump = os.path.join(os.environ["WARP_METAL_DUMP_IR"], f"{adj.fun_name}{'__adj' if adjoint else ''}.ir")
