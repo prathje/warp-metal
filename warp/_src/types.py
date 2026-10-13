@@ -3974,22 +3974,24 @@ class array(Array[DType, NDim]):
             # Suppress TypeError and AttributeError when callables become None during shutdown
             pass
 
-    def __array__(self, dtype=None):
+    @property
+    def __array__(self):
         # NumPy prefers ``__array_interface__`` (zero-copy, CPU arrays) over
-        # this hook, so ``__array__`` is only consulted for GPU arrays. Metal
-        # arrays live in unified memory — ``numpy()`` syncs and copies, which
-        # is what an explicit ``np.asarray(a)`` asks for. Anything else keeps
-        # failing, but with a clear message instead of NumPy's fallback
-        # iteration error ("Item indexing is not supported").
+        # this hook, so ``__array__`` is only consulted for Metal arrays, which
+        # live in unified memory — ``numpy()`` syncs and copies, which is what
+        # an explicit ``np.asarray(a)`` asks for. Raising AttributeError for
+        # every other device keeps ``hasattr(a, "__array__")`` false there,
+        # exactly as upstream (mirrors ``__array_interface__``).
         if self.device is None or not (self.device.is_cpu or getattr(self.device, "is_metal", False)):
-            raise TypeError(
-                f"Implicit conversion to a NumPy array is not supported for arrays on device "
-                f"{self.device} — copy to the host first with .numpy()"
-            )
-        result = self.numpy()
-        if dtype is not None and result.dtype != np.dtype(dtype):
-            result = result.astype(dtype)
-        return result
+            raise AttributeError(f"__array__ not supported because device is {self.device}")
+
+        def _to_numpy(dtype=None, copy=None):
+            result = self.numpy()
+            if dtype is not None and result.dtype != np.dtype(dtype):
+                result = result.astype(dtype)
+            return result
+
+        return _to_numpy
 
     @property
     def __array_interface__(self):
