@@ -2681,7 +2681,14 @@ _A64_OPS = {"add": 0, "sub": 1, "or": 2, "and": 3, "xor": 4, "smin": 5, "umin": 
 def _wide_atomic_helpers(source: str) -> str:
     """Emit the helpers ``source`` uses, with the per-kernel strategy."""
     ops = set(re.findall(r"\bwp_a64_(\w+?)\s*\(", source))
-    if ops <= {"umin", "umax"}:
+    # MSL's ``atomic_min/max_explicit`` on ``atomic<ulong>`` return nothing,
+    # so the native path cannot report the previous value; use it only when
+    # every result is discarded (the IR still assigns it to a dead local).
+    minmax_results_used = any(
+        len(re.findall(rf"\b{re.escape(m.group(1))}\b", source)) > 2
+        for m in re.finditer(r"\b(\w+)\s*=\s*wp_a64_u(?:min|max)\s*\(", source)
+    )
+    if ops <= {"umin", "umax"} and not minmax_results_used:
         mode = "native"
     elif ops <= {"add", "sub"} or ops <= {"or", "and", "xor"}:
         mode = "split"

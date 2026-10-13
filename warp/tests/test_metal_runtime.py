@@ -102,6 +102,12 @@ def _i64_minmax_exch(vals: wp.array[wp.int64], out: wp.array[wp.int64], last: wp
     wp.atomic_exch(last, 0, v)
 
 
+@wp.kernel
+def _u64_max_old(vals: wp.array[wp.uint64], out: wp.array[wp.uint64], old: wp.array[wp.uint64]):
+    i = wp.tid()
+    old[i] = wp.atomic_max(out, 0, vals[i])
+
+
 EMPTY_KEY = wp.constant(wp.uint64(0xFFFFFFFFFFFFFFFF))
 
 
@@ -659,6 +665,19 @@ class TestMetalRuntime(unittest.TestCase):
         out = wp.array(np.array([0, 2**64 - 1], dtype=np.uint64), dtype=wp.uint64)
         wp.launch(_u64_minmax, dim=vals.size, inputs=[wp.array(vals, dtype=wp.uint64), out])
         np.testing.assert_array_equal(out.numpy(), [vals.max(), vals.min()])
+
+    def test_uint64_max_previous_value(self):
+        # The previous value returned by atomic_max must be exact: exactly
+        # one thread observes the initial zero.
+        rng = np.random.default_rng(10)
+        vals = rng.permutation(np.arange(1, 20001, dtype=np.uint64))
+        out = wp.zeros(1, dtype=wp.uint64)
+        old = wp.zeros(vals.size, dtype=wp.uint64)
+        wp.launch(_u64_max_old, dim=vals.size, inputs=[wp.array(vals, dtype=wp.uint64), out, old])
+        self.assertEqual(int(out.numpy()[0]), 20000)
+        o = old.numpy()
+        self.assertEqual(int((o == 0).sum()), 1)
+        self.assertTrue(np.all(np.isin(o[o != 0], vals)))
 
     def test_int64_min_max_exch(self):
         rng = np.random.default_rng(8)

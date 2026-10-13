@@ -869,8 +869,11 @@ HOST_FALLBACK_MAX_ELEMENTS = 32768
 def _queue_idle(disp) -> bool:
     if disp._cmd_buf is not None:
         return False
-    # MTLCommandBufferStatus: 4 = Completed, 5 = Error.
-    return all(cb.status() >= 4 for cb in disp._pending_commits)
+    # MTLCommandBufferStatus: 4 = Completed, 5 = Error. Checking the newest
+    # commit is enough for this heuristic (one queue, in-order completion)
+    # and keeps it O(1) however many commits await the next sync.
+    pending = disp._pending_commits
+    return not pending or pending[-1].status() >= 4
 
 
 def use_device_path(device, scalar_type=None, count: int | None = None) -> bool:
