@@ -2323,6 +2323,7 @@ _ADJ_SUPPORTED = frozenset(
         "transform_point",
         "transform_multiply",
         "transform_inverse",
+        "quat_from_axis_angle",
         # spatial_vector family (``_emit_spatial_helpers``).
         "spatial_top",
         "spatial_bottom",
@@ -2928,6 +2929,14 @@ inline wp_vec7_float wp_transform_inverse(wp_vec7_float t) {
 # transform component is a plain ``wp_vec7_float`` element access, already
 # covered by the big-vec helpers.
 _ADJ_QUAT_HELPERS = """\
+inline void wp_adj_quat_from_axis_angle(float3 axis, float angle, thread float3& adj_axis, thread float& adj_angle,
+                                       float4 adj_ret) {
+    float s = metal::sin(angle * 0.5f);
+    float c = metal::cos(angle * 0.5f);
+    float4 dqda = float4(axis[0] * c, axis[1] * c, axis[2] * c, -s) * 0.5f;
+    adj_axis += adj_ret.xyz * s;
+    adj_angle += metal::dot(dqda, adj_ret);
+}
 inline void wp_adj_quat_rotate(float4 q, float3 p, thread float4& aq, thread float3& ap, float3 r) {
     {
         float t2 = p[2] * q.z * 2.0f;
