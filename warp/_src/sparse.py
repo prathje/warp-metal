@@ -4187,6 +4187,11 @@ def _bsr_mm_compute_values_dispatch(
             or z.nnz < max_tiles_per_sm * device.sm_count
         )
 
+    if getattr(device, "is_metal", False):
+        # The tiled kernel takes the triplet gather as a ``wp.indexedarray``,
+        # which Metal kernels cannot bind; use the per-block Metal kernel below.
+        use_tiles = False
+
     if use_tiles:
         subblock_rows = min(max_subblock_dim, z.block_shape[0])
         subblock_cols = min(max_subblock_dim, z.block_shape[1])
