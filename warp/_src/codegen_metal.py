@@ -12796,6 +12796,9 @@ class MetalKernelArtifact:
     # ``codegen_metal_ast.fold_struct_array_array_fields``); the launcher
     # refuses a launch where such an arg is non-empty.
     struct_array_field_reads: tuple[str, ...] = ()
+    # Native dispatch: binding slots (pre-spill order) moved into the
+    # ``__spill_ptrs`` table. Set by ``_wrap_msl_for_native_dispatch``.
+    native_spill_slots: tuple[int, ...] = ()
     # Per-array shape slot size in ``__shapes_packed`` (each array gets
     # ``shape_packed_slot`` int32s, padded with zeros). Warp arrays cap
     # at 4 dims so 4 is plenty.
@@ -14872,6 +14875,17 @@ def _generate_msl_kernel_uncached(
     # ``atomic<ulong>`` worth the name in MSL, so they stay plain and their
     # ``wp.atomic_*`` calls go through ``wp_f64_atomic_*`` (see
     # ``_rewrite_f64_atomics``).
+    # 64-bit integer outputs that are only stored to (never an atomic
+    # target) stay plain too: MSL has no ``atomic_store`` on ``long``, and a
+    # kernel that is atomic for other outputs would otherwise route their
+    # plain stores through ``atomic_store_explicit``.
+    _fwd_text = "\n".join(forward_lines)
+    narrow_output_labels |= {
+        a.label
+        for a in output_args
+        if _array_scalar_type_name(a) in ("int64", "uint64")
+        and not re.search(rf"\batomic_\w+\s*(?:<[^()]*>)?\s*\(\s*(?:var_)?{re.escape(a.label)}\b", _fwd_text)
+    }
     nonatomic_label_set = grad_label_set | narrow_output_labels | f64_arr_names | f64_emu_arr_names
     atomic_output_names: set[str] = (
         {a.label for a in output_args if a.label not in nonatomic_label_set} if has_atomic else set()
@@ -18395,6 +18409,9 @@ def _native_scalar_param_msl(arg_var) -> str:
     return _native_scalar_msl_type(scalar_ctype)
 
 
+_METAL_MAX_BUFFER_ARGS = 31
+
+
 def _wrap_msl_for_native_dispatch(artifact) -> str:
     """Build the full MSL kernel function string for native dispatch.
 
@@ -18417,12 +18434,13 @@ def _wrap_msl_for_native_dispatch(artifact) -> str:
     out_by_name = {a.label: a for a in artifact.output_args}
 
     params: list[str] = []
-    slot = 0
+    # Buffer parameters in slot order: ``(decl, spill)`` where ``spill`` is
+    # ``(name, pointer_type)`` for array params that may move into the
+    # ``__spill_ptrs`` table when the kernel exceeds Metal's 31 buffer slots.
+    pending: list[tuple[str, tuple[str, str] | None]] = []
 
-    def add_buffer(decl: str) -> None:
-        nonlocal slot
-        params.append(f"  {decl} [[buffer({slot})]]")
-        slot += 1
+    def add_buffer(decl: str, spill: tuple[str, str] | None = None) -> None:
+        pending.append((decl, spill))
 
     # Lines inserted at the top of the kernel body — reconstruct typed
     # locals for by-value vec/mat params bound as raw scalar blobs.
@@ -18450,7 +18468,7 @@ def _wrap_msl_for_native_dispatch(artifact) -> str:
             arg_var = arg_by_name[name]
             if _is_array_arg(arg_var):
                 inner = _native_array_inner_msl(arg_var)
-                add_buffer(f"const constant {inner}* {name}")
+                add_buffer(f"const constant {inner}* {name}", spill=(name, f"const device {inner}*"))
             elif isinstance(arg_var.type, Struct):
                 # Struct arg is serialised as flat float32 storage.
                 add_buffer(f"const constant float* {name}")
@@ -18608,7 +18626,42 @@ def _wrap_msl_for_native_dispatch(artifact) -> str:
         inner = _native_array_inner_msl(arg_var)
         atomic_ok = artifact.atomic_outputs and name not in artifact.nonatomic_outputs
         qual = f"device atomic<{inner}>*" if atomic_ok else f"device {inner}*"
-        add_buffer(f"{qual} {name}")
+        add_buffer(f"{qual} {name}", spill=(name, qual))
+
+    # Metal caps a kernel at 31 buffer arguments (slots 0..30). Past that,
+    # move array params — outputs first, then inputs, from the end of the
+    # slot list — into one ``__spill_ptrs`` table of ``gpuAddress`` values;
+    # the prologue rebinds each address to a typed device pointer under the
+    # param's name, so the body is unchanged. The launcher removes the
+    # spilled bindings (``artifact.native_spill_slots``), builds the table
+    # and declares the buffers via ``useResource`` (also under ICB capture).
+    spill_slots: list[int] = []
+    if len(pending) > _METAL_MAX_BUFFER_ARGS:
+        need = len(pending) - (_METAL_MAX_BUFFER_ARGS - 1)
+        for i in range(len(pending) - 1, -1, -1):
+            if len(spill_slots) == need:
+                break
+            if pending[i][1] is not None:
+                spill_slots.append(i)
+        if len(spill_slots) < need:
+            raise MetalCodegenError(
+                f"Kernel {artifact.name!r} needs {len(pending)} Metal buffer arguments and only "
+                f"{len(spill_slots)} array arguments can be moved out of the 31-slot limit"
+            )
+        spill_slots.sort()
+    spill_set = set(spill_slots)
+    for k, i in enumerate(spill_slots):
+        sname, ptype = pending[i][1]
+        value_prologue.append(f"    {ptype} {sname} = reinterpret_cast<{ptype}>(__spill_ptrs[{k}]);")
+    slot = 0
+    for i, (decl, _spill) in enumerate(pending):
+        if i in spill_set:
+            continue
+        params.append(f"  {decl} [[buffer({slot})]]")
+        slot += 1
+    if spill_slots:
+        params.append(f"  const constant ulong* __spill_ptrs [[buffer({slot})]]")
+    artifact.native_spill_slots = tuple(spill_slots)
 
     # Builtins — always include the full set so the body's references
     # resolve regardless of whether it actually uses them. Apple's
@@ -19445,10 +19498,15 @@ def launch_metal_kernel_native(
             # would run off the end of it.
             value = _struct_field_launch_value(fwd_args, arg_by_name, sfa[0], sfa[1])
             if value is None:
-                raise RuntimeError(
-                    f"Kernel '{kernel.key}' writes through struct arg {sfa[0]!r} field "
-                    f"{'.'.join(sfa[1])!r}, which is unset; assign a wp.array to it before launching"
-                )
+                # Unset field: CUDA passes a null array whose shape reads as 0,
+                # so a write is only reachable behind a ``shape[0] > 0`` guard
+                # (Newton's optional contact writer outputs). Bind a scratch
+                # buffer; its packed shape is 0 like the CUDA null array.
+                buf, _ = dispatcher.alloc(16)
+                transient_refs.append(buf)
+                bindings.append(buf)
+                binding_modes.append("rw")
+                continue
             arg_var = out_var_by_name[name]
         else:
             idx, arg_var = arg_by_name[name]
@@ -19545,6 +19603,23 @@ def launch_metal_kernel_native(
             if grid_y * grid_z <= 1024:
                 tg = (1, grid_y, grid_z)
             # else: keep default tg and accept potential race (matches MLX path's behaviour).
+
+    # ---- Spilled array params (see ``_wrap_msl_for_native_dispatch``) ----
+    spill_slots = getattr(artifact, "native_spill_slots", ())
+    if spill_slots:
+        table = np.empty(len(spill_slots), dtype=np.uint64)
+        if extra_resources is None:
+            extra_resources = []
+        for k, i in enumerate(spill_slots):
+            mtl, view_off = _split_buffer_slice(bindings[i])
+            table[k] = int(mtl.gpuAddress()) + view_off
+            extra_resources.append((mtl, binding_modes[i] or "rw"))
+        spill_set = set(spill_slots)
+        bindings = [b for i, b in enumerate(bindings) if i not in spill_set]
+        binding_modes = [m for i, m in enumerate(binding_modes) if i not in spill_set]
+        data = table.tobytes()
+        bindings.append((data, len(data)))
+        binding_modes.append(None)
 
     # ---- Dispatch (fire and forget) ----
     try:

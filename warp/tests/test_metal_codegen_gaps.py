@@ -237,6 +237,56 @@ class TestMetalCodegenGaps(unittest.TestCase):
             """,
         )
 
+    def test_more_than_31_buffers(self):
+        # Outputs are never packed, so 34 outputs force the ``__spill_ptrs``
+        # table; replay it under graph capture too.
+        _run(
+            self,
+            """
+            import importlib.util, os, tempfile
+            n_out = 34
+            outs = ", ".join(f"o{i}: wp.array[float]" for i in range(n_out))
+            body = "\\n".join(f"    o{i}[t] = o{i}[t] + a[t] * {float(i + 1)}" for i in range(n_out - 2))
+            src = (
+                "import warp as wp\\n"
+                "@wp.kernel(module='unique')\\n"
+                f"def k(a: wp.array[wp.vec3], {outs}):\\n"
+                "    t = wp.tid()\\n"
+                + body.replace("a[t] *", "a[t][0] *") + "\\n"
+                f"    wp.atomic_add(o{n_out - 2}, 0, a[t][1])\\n"
+                f"    o{n_out - 1}[t] = float(t)\\n"
+            )
+            path = os.path.join(tempfile.mkdtemp(), "many_bufs.py")
+            open(path, "w").write(src)
+            spec = importlib.util.spec_from_file_location("many_bufs", path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+
+            an = np.random.default_rng(0).standard_normal((8, 3)).astype(np.float32)
+
+            def launch(dev, capture=False):
+                a = wp.array(an, dtype=wp.vec3, device=dev)
+                o = [wp.zeros(8, dtype=float, device=dev) for _ in range(n_out)]
+                go = lambda: wp.launch(mod.k, 8, [a], o, device=dev)
+                if capture:
+                    with wp.ScopedCapture(device=dev) as cap:
+                        go()
+                    for _ in range(3):
+                        wp.capture_launch(cap.graph)
+                else:
+                    for _ in range(3):
+                        go()
+                return [x.numpy() for x in o]
+
+            cpu = launch("cpu")
+            metal = launch("metal:0")
+            captured = launch("metal:0", capture=True)
+            assert len(mod.k._metal_artifact.native_spill_slots) > 0
+            assert_same(cpu, metal, rtol=1e-6)
+            assert_same(cpu, captured, rtol=1e-6)
+            """,
+        )
+
     def test_shape_suffixed_array_args(self):
         _run(
             self,
