@@ -12928,11 +12928,17 @@ def _normalize_adj_ir(adj, seen=None) -> None:
         return
     seen.add(id(adj))
     # Idempotent, so re-running it on already-normalised IR is harmless.
+    # ``body_reverse`` is stored in forward order but consumed reversed (and
+    # loop recompute blocks are spliced in pre-reversed), so normalise it in
+    # consumption order to keep multi-line expansions correctly ordered.
     for block in getattr(adj, "blocks", None) or ():
-        for attr in ("body_forward", "body_replay", "body_reverse"):
+        for attr in ("body_forward", "body_replay"):
             lines = getattr(block, attr, None)
             if lines:
                 lines[:] = _normalize_ir_lines(list(lines))
+        lines = getattr(block, "body_reverse", None)
+        if lines:
+            lines[:] = list(reversed(_normalize_ir_lines(list(reversed(lines)))))
     for func in getattr(adj, "called_user_functions", None) or ():
         func_adj = getattr(func, "adj", None)
         if func_adj is not None:

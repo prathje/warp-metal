@@ -6672,7 +6672,7 @@ class Volume:
         lower_count = ctypes.c_uint32(0)
         upper_count = ctypes.c_uint32(0)
         self.runtime.core.wp_volume_get_active_stats(
-            self.id,
+            self._native_id,
             ctypes.byref(voxel_count),
             ctypes.byref(leaf_count),
             ctypes.byref(lower_count),
@@ -7733,18 +7733,20 @@ class Volume:
                 or max_leaf_nodes is not None
                 or max_lower_nodes is not None
                 or max_upper_nodes is not None
-                or status is not None
-                or point_mask is not None
             ):
                 raise NotImplementedError(
-                    "Volume.allocate_by_voxels() on Metal devices does not support rebuildable volumes, "
-                    "rebuild capacities, status, or point_mask yet."
+                    "Volume.allocate_by_voxels() on Metal devices does not support rebuildable volumes "
+                    "or rebuild capacities yet."
                 )
+            # ``status`` is only written for rebuildable volumes (as on CPU/CUDA).
             from warp._src.nanovdb_builder import build_onindex_grid  # noqa: PLC0415
 
             in_world_space = type_scalar_type(voxel_points.dtype) is float32
             transform_buf, translation_buf = Volume._fill_transform_buffers(voxel_size, translation, transform)
             pts = voxel_points.numpy().reshape(-1, 3)
+            point_mask = _volume_point_mask_array(point_mask, pts.shape[0], device)
+            if point_mask is not None:
+                pts = pts[point_mask.numpy()[: pts.shape[0]] != 0]
             mat = np.frombuffer(transform_buf, dtype=np.float32).reshape(3, 3).astype(np.float64)
             trans = np.frombuffer(translation_buf, dtype=np.float32).astype(np.float64)
             if in_world_space:
