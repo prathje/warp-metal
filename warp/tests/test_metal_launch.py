@@ -9503,10 +9503,10 @@ class TestMetalVolume(unittest.TestCase):
         _run_with_metal_enabled(self, snippet, timeout=300)
 
     def test_allocate_by_voxels_matches_cpu(self):
-        # ``Volume.allocate_by_voxels`` has no native builder outside CUDA; the
-        # NumPy NanoVDB builder (warp/_src/nanovdb_builder.py) must give the
-        # same index grid on CPU and Metal, from world-space or index-space
-        # points, and index-grid sampling must read through it.
+        # Metal builds ``Volume.allocate_by_voxels`` grids with the NumPy NanoVDB
+        # builder (warp/_src/nanovdb_builder.py); it must give the same voxel set
+        # as Warp's native CPU builder, from world-space or index-space points,
+        # and index-grid sampling must read through it.
         snippet = textwrap.dedent(
             """
             import numpy as np
@@ -9537,7 +9537,11 @@ class TestMetalVolume(unittest.TestCase):
                     n = v1.get_voxel_count()
                     assert n == v2.get_voxel_count() == len(np.unique(ijk, axis=0))
                     np.testing.assert_array_equal(v1.get_voxels().numpy(), v2.get_voxels().numpy())
-                    data = wp.array(np.arange(n, dtype=np.float32), dtype=float)
+                    # Sample data defined from the voxel coordinates, so results do not
+                    # depend on the builder's voxel order (CPU uses Warp's native builder,
+                    # Metal the NumPy one; both are valid NanoVDB index orders).
+                    vox_np = v1.get_voxels().numpy()
+                    data = wp.array((vox_np @ np.array([1.0, 7.0, 49.0])).astype(np.float32), dtype=float)
                     pts = wp.array(world, dtype=wp.vec3)
                     idx = wp.zeros(len(world), dtype=int)
                     s = wp.zeros(len(world), dtype=float)
@@ -9549,8 +9553,9 @@ class TestMetalVolume(unittest.TestCase):
                     np.testing.assert_array_equal(vox[idx.numpy()], ijk)  # index maps back to the generating voxel
                     res[dev] = (vox, v1.get_tiles().numpy(), idx.numpy(), s.numpy(), w.numpy())
             c, m = res["cpu"], res["metal:0"]
-            for a, b in zip(c[:3], m[:3]):
-                np.testing.assert_array_equal(b, a)
+            for a, b in zip(c[:2], m[:2]):
+                np.testing.assert_array_equal(np.unique(b, axis=0), np.unique(a, axis=0))
+            np.testing.assert_array_equal(m[0][m[2]], c[0][c[2]])
             np.testing.assert_allclose(m[3], c[3], rtol=1e-5, atol=1e-3)
             np.testing.assert_allclose(m[4], c[4], rtol=1e-6, atol=1e-6)
             """

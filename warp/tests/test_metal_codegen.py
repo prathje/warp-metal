@@ -233,8 +233,13 @@ class TestMetalSpinLockSerialization(unittest.TestCase):
         import contextlib  # noqa: PLC0415
         import io  # noqa: PLC0415
 
+        import warnings  # noqa: PLC0415
+
+        # Warp's logger routes warnings to stderr; capture both streams and
+        # disable the warnings registry dedup so each test sees its warning.
         out = io.StringIO()
-        with contextlib.redirect_stdout(out):
+        with warnings.catch_warnings(), contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            warnings.simplefilter("always")
             src = generate_msl_kernel(kernel).source
         return src, out.getvalue()
 
