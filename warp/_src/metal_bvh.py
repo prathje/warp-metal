@@ -170,9 +170,10 @@ def _gpu_address(arr) -> tuple[int, object]:
 _BVH_DESC_FMT = "<7Q6i"  # 7 gpu addresses + root/num_nodes/num_leaf_nodes/num_items/leaf_size/pad
 _BVH_DESC_NBYTES = 80
 # Appended to the bvh desc: points/indices/velocities addresses +
-# num_points/num_tris + average_edge_length (sign_normal epsilon scale) + pad.
-_MESH_DESC_FMT = "<3Q2if4x"
-_MESH_DESC_NBYTES = 120
+# num_points/num_tris + average_edge_length (sign_normal epsilon scale) + pad
+# + the solid-angle node data address (0 unless support_winding_number).
+_MESH_DESC_FMT = "<3Q2ifiQ"
+_MESH_DESC_NBYTES = 128
 
 
 class MetalBvh:
@@ -399,8 +400,12 @@ class MetalMesh:
     """Metal-side ``wp.Mesh``: a MetalBvh over per-triangle AABBs plus a
     mesh descriptor extending the BVH descriptor with points/indices."""
 
-    def __init__(self, points, indices, constructor: int, leaf_size: int, groups, velocities=None):
+    def __init__(
+        self, points, indices, constructor: int, leaf_size: int, groups, velocities=None, support_winding_number=False
+    ):
         _require_native_dispatch("wp.Mesh")
+        self.support_winding_number = bool(support_winding_number)
+        self.solid_angle_props = None
         self.device = points.device
         self.points = points
         self.indices = indices
@@ -427,8 +432,22 @@ class MetalMesh:
             desc_reserve=_MESH_DESC_NBYTES - _BVH_DESC_NBYTES,
         )
         self.id = self.bvh.id
+        self._update_solid_angle_props()
         self._write_mesh_fields()
         self.bvh._dispatcher.sync()
+
+    def _update_solid_angle_props(self) -> None:
+        """(Re)compute the winding-number node data (host work, not capturable)."""
+        if not self.support_winding_number:
+            return
+        from warp._src.metal_winding import compute_solid_angle_props  # noqa: PLC0415
+
+        self.bvh._dispatcher.sync()
+        props = compute_solid_angle_props(self.bvh, self.points, self.indices)
+        if self.solid_angle_props is not None and self.solid_angle_props.shape == props.shape:
+            ctypes.memmove(self.solid_angle_props.ptr, props.ctypes.data, props.nbytes)
+        else:
+            self.solid_angle_props = warp.array(props, dtype=warp.float32, device=self.device)
 
     def _compute_average_edge_length(self) -> float:
         """Mean edge length over all triangle edges, matching the native
@@ -466,6 +485,10 @@ class MetalMesh:
         if self.velocities is not None:
             velocities_ga, velocities_buf = _gpu_address(self.velocities)
             self.bvh._register(velocities_buf)
+        props_ga = 0
+        if self.solid_angle_props is not None:
+            props_ga, props_buf = _gpu_address(self.solid_angle_props)
+            self.bvh._register(props_buf)
         tail = struct.pack(
             _MESH_DESC_FMT,
             points_ga,
@@ -474,6 +497,8 @@ class MetalMesh:
             self.num_points,
             self.num_tris,
             self.average_edge_length,
+            0,
+            props_ga,
         )
         ctypes.memmove(self.bvh._desc_ptr + _BVH_DESC_NBYTES, tail, len(tail))
 
@@ -499,6 +524,14 @@ class MetalMesh:
             self._write_mesh_fields()
         self._compute_tri_aabbs()
         self.bvh.refit()
+        if self.support_winding_number:
+            if getattr(self.bvh._dispatcher, "_record_state", None) is not None:
+                raise RuntimeError(
+                    "Mesh.refit() of a support_winding_number=True mesh cannot be captured on Metal: "
+                    "the solid-angle node data is rebuilt on the host"
+                )
+            self._update_solid_angle_props()
+            self._write_mesh_fields()
 
     def release(self) -> None:
         self.bvh.release()

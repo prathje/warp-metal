@@ -360,5 +360,59 @@ class TestMetalTextures(unittest.TestCase):
         )
 
 
+@unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
+@unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
+class TestMetalMeshWinding(unittest.TestCase):
+    def test_sign_winding_number_matches_cpu(self):
+        _run(
+            self,
+            """
+            @wp.kernel
+            def k(mesh: wp.uint64, pts: wp.array[wp.vec3], s1: wp.array[float], s2: wp.array[float]):
+                i = wp.tid()
+                s1[i] = wp.mesh_query_point_sign_winding_number(mesh, pts[i], 10.0, 2.0, 0.5).sign
+                s2[i] = wp.mesh_query_point_sign_winding_number(mesh, pts[i], 10.0, 2.0, 0.25).sign
+
+            nu, nv = 24, 16
+            verts = [(0, 0, 1)]
+            for j in range(1, nv):
+                th = np.pi * j / nv
+                for i in range(nu):
+                    ph = 2 * np.pi * i / nu
+                    verts.append((np.sin(th) * np.cos(ph), np.sin(th) * np.sin(ph), np.cos(th)))
+            verts.append((0, 0, -1))
+            tris = [(0, 1 + i, 1 + (i + 1) % nu) for i in range(nu)]
+            for j in range(nv - 2):
+                for i in range(nu):
+                    a = 1 + j * nu + i
+                    b = 1 + j * nu + (i + 1) % nu
+                    tris += [(a, a + nu, b), (b, a + nu, b + nu)]
+            last, base = len(verts) - 1, 1 + (nv - 2) * nu
+            tris += [(last, base + (i + 1) % nu, base + i) for i in range(nu)]
+            v = np.array(verts, np.float32)
+            t = np.array(tris, np.int32).reshape(-1)
+            # Drop a cap so the mesh is open: winding numbers then differ from parity.
+            t = t[nu * 3:]
+            p = (np.random.default_rng(0).random((400, 3)) * 3 - 1.5).astype(np.float32)
+            res = {}
+            for dev in ("cpu", "metal:0"):
+                m = wp.Mesh(wp.array(v, dtype=wp.vec3, device=dev), wp.array(t, dtype=int, device=dev),
+                            support_winding_number=True)
+                pa = wp.array(p, dtype=wp.vec3, device=dev)
+                outs = []
+                for scale in (1.0, 1.3):
+                    m.points.assign(wp.array(v * scale, dtype=wp.vec3, device=dev))
+                    m.refit()
+                    s1 = wp.zeros(400, dtype=float, device=dev)
+                    s2 = wp.zeros(400, dtype=float, device=dev)
+                    wp.launch(k, dim=400, inputs=[m.id, pa, s1, s2], device=dev)
+                    outs += [s1.numpy(), s2.numpy()]
+                res[dev] = outs
+            for a, b in zip(res["cpu"], res["metal:0"]):
+                np.testing.assert_array_equal(b, a)
+            """,
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

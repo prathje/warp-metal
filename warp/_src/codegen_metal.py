@@ -3734,6 +3734,7 @@ struct wp_mesh_desc_t {
     int num_tris;
     float average_edge_length;
     int pad1;
+    ulong solid_angle_props;
 };
 inline const device wp_bvh_node_t* wp_bvh_node_ptr(ulong a) { return reinterpret_cast<const device wp_bvh_node_t*>(a); }
 inline const device int* wp_bvh_int_ptr(ulong a) { return reinterpret_cast<const device int*>(a); }
@@ -4894,6 +4895,139 @@ inline wp_mesh_query_point_t wp_mesh_query_point_sign_normal(
     query.v = 0.0f;
     query.result = wp_mesh_query_point_sign_normal(
         id, point, max_dist, query.sign, query.face, query.u, query.v, epsilon);
+    return query;
+}
+// Winding numbers (``support_winding_number=True``): a port of
+// solid_angle_iterative / evaluate_node_solid_angle / robust_solid_angle in
+// warp/native/{mesh,solid_angle}.h. Node data layout: see metal_winding.py.
+struct wp_solid_angle_props_t {
+    packed_float3 average_p; packed_float3 normal; packed_float3 n_ij_diag; packed_float3 n_ijk_diag;
+    float sum_permute_n_xyz; float two_n_xxy_n_yxx; float two_n_xxz_n_zxx; float two_n_yyz_n_zyy;
+    float two_n_yyx_n_xyy; float two_n_zzx_n_xzz; float two_n_zzy_n_yzz;
+    float n_xy; float n_yx; float n_yz; float n_zy; float n_zx; float n_xz;
+    packed_float3 box_lower; packed_float3 box_upper; packed_float3 area_p; float area; float max_p_dist_sq;
+};
+inline bool wp_evaluate_node_solid_angle(float3 query_point, const device wp_solid_angle_props_t& data,
+                                          thread float& solid_angle, float accuracy_scale_sq) {
+    float max_p_sq = data.max_p_dist_sq;
+    float3 q = query_point - float3(data.average_p);
+    float qlength2 = wp_bvh_dot3(q, q);
+    if (qlength2 <= max_p_sq * accuracy_scale_sq) { solid_angle = 0.0f; return true; }
+    float qlength_m2 = 1.0f / qlength2;
+    float qlength_m1 = metal::precise::sqrt(qlength_m2);
+    q = q * qlength_m1;
+    float3 nrm = float3(data.normal);
+    float3 nij = float3(data.n_ij_diag);
+    float3 nijk = float3(data.n_ijk_diag);
+    float omega_approx = -qlength_m2 * wp_bvh_dot3(q, nrm);
+    float3 q2 = q * q;
+    float qlength_m3 = qlength_m2 * qlength_m1;
+    float omega_1 = qlength_m3 * (nij.x + nij.y + nij.z
+        - 3.0f * (wp_bvh_dot3(q2, nij) + q.x * q.y * (data.n_xy + data.n_yx)
+                  + q.x * q.z * (data.n_zx + data.n_xz) + q.y * q.z * (data.n_yz + data.n_zy)));
+    omega_approx += omega_1;
+    float3 q3 = q2 * q;
+    float qlength_m4 = qlength_m2 * qlength_m2;
+    float3 temp0 = float3(data.two_n_yyx_n_xyy + data.two_n_zzx_n_xzz, data.two_n_zzy_n_yzz + data.two_n_xxy_n_yxx,
+                          data.two_n_xxz_n_zxx + data.two_n_yyz_n_zyy);
+    float3 temp1 = float3(q.y * data.two_n_xxy_n_yxx + q.z * data.two_n_xxz_n_zxx,
+                          q.z * data.two_n_yyz_n_zyy + q.x * data.two_n_yyx_n_xyy,
+                          q.x * data.two_n_zzx_n_xzz + q.y * data.two_n_zzy_n_yzz);
+    float omega_2 = qlength_m4 * (1.5f * wp_bvh_dot3(q, 3.0f * nijk + temp0)
+        - 7.5f * (wp_bvh_dot3(q3, nijk) + q.x * q.y * q.z * data.sum_permute_n_xyz + wp_bvh_dot3(q2, temp1)));
+    omega_approx += omega_2;
+    if (!metal::isfinite(omega_approx)) { solid_angle = 0.0f; return true; }
+    solid_angle = omega_approx;
+    return false;
+}
+inline float wp_robust_solid_angle(float3 a, float3 b, float3 c, float3 p) {
+    float3 qa = a - p; float3 qb = b - p; float3 qc = c - p;
+    const float a_length = metal::length(qa);
+    const float b_length = metal::length(qb);
+    const float c_length = metal::length(qc);
+    if (a_length == 0.0f || b_length == 0.0f || c_length == 0.0f) return 0.0f;
+    qa = qa / a_length; qb = qb / b_length; qc = qc / c_length;
+    const float numerator = wp_bvh_dot3(qa, metal::cross(qb - qa, qc - qa));
+    if (numerator == 0.0f) return 0.0f;
+    const float denominator = 1.0f + wp_bvh_dot3(qa, qb) + wp_bvh_dot3(qa, qc) + wp_bvh_dot3(qb, qc);
+    return 2.0f * metal::precise::atan2(numerator, denominator);
+}
+inline float wp_mesh_solid_angle_iterative(const thread wp_mesh_desc_t& mesh, float3 p, float accuracy_sq) {
+    const device wp_bvh_node_t* lowers = wp_bvh_node_ptr(mesh.bvh.node_lowers);
+    const device wp_bvh_node_t* uppers = wp_bvh_node_ptr(mesh.bvh.node_uppers);
+    const device int* prims = wp_bvh_int_ptr(mesh.bvh.primitive_indices);
+    const device int* tri_indices = wp_bvh_int_ptr(mesh.indices);
+    const device wp_solid_angle_props_t* props =
+        reinterpret_cast<const device wp_solid_angle_props_t*>(mesh.solid_angle_props);
+    int stack[32]; int at_child[32]; float angle[32];
+    stack[0] = mesh.bvh.root; at_child[0] = 0; angle[0] = 0.0f;
+    int count = 1;
+    while (count) {
+        const int node_index = stack[count - 1];
+        wp_bvh_node_t lower = lowers[node_index];
+        wp_bvh_node_t upper = uppers[node_index];
+        const int left_index = int(lower.bits & 0x7fffffffu);
+        const int right_index = int(upper.bits & 0x7fffffffu);
+        if (lower.bits & 0x80000000u) {
+            angle[count - 1] = 0.0f;
+            for (int pc = left_index; pc < right_index; ++pc) {
+                int primitive_index = prims[pc];
+                float3 a = wp_bvh_load_v3(mesh.points, tri_indices[primitive_index * 3 + 0]);
+                float3 b = wp_bvh_load_v3(mesh.points, tri_indices[primitive_index * 3 + 1]);
+                float3 c = wp_bvh_load_v3(mesh.points, tri_indices[primitive_index * 3 + 2]);
+                angle[count - 1] += wp_robust_solid_angle(a, b, c, p);
+            }
+            count--;
+        } else if (at_child[count - 1] == 0) {
+            float a = 0.0f;
+            bool des = wp_evaluate_node_solid_angle(p, props[node_index], a, accuracy_sq);
+            angle[count - 1] = a;
+            if (des) {
+                stack[count] = left_index; at_child[count - 1] = 1; angle[count] = 0.0f; at_child[count] = 0; count++;
+            } else {
+                count--;
+            }
+        } else if (at_child[count - 1] == 1) {
+            angle[count - 1] += angle[count];
+            stack[count] = right_index; at_child[count - 1] = 2; angle[count] = 0.0f; at_child[count] = 0; count++;
+        } else {
+            angle[count - 1] += angle[count];
+            count--;
+        }
+    }
+    return angle[0];
+}
+inline float wp_mesh_query_winding_number(ulong id, float3 p, float accuracy) {
+    wp_mesh_desc_t mesh = wp_mesh_get_desc(id);
+    if (mesh.solid_angle_props == 0ul) return 0.0f;
+    return wp_mesh_solid_angle_iterative(mesh, p, accuracy * accuracy) * 0.07957747154f;
+}
+inline bool wp_mesh_query_point_sign_winding_number(
+    ulong id, float3 point, float max_dist,
+    thread float& inside, thread int& face, thread float& u, thread float& v,
+    float accuracy, float winding_number_threshold)
+{
+    wp_mesh_desc_t mesh = wp_mesh_get_desc(id);
+    if (!wp_mesh_closest_point_impl(mesh, point, max_dist, face, u, v)) { return false; }
+    if (mesh.solid_angle_props == 0ul) {
+        inside = wp_mesh_query_inside_ray_tracing(id, point);
+    } else {
+        float w = wp_mesh_solid_angle_iterative(mesh, point, accuracy * accuracy) * 0.07957747154f;
+        inside = (w > winding_number_threshold) ? -1.0f : 1.0f;
+    }
+    return true;
+}
+inline wp_mesh_query_point_t wp_mesh_query_point_sign_winding_number(
+    ulong id, float3 point, float max_dist, float accuracy, float winding_number_threshold)
+{
+    wp_mesh_query_point_t query;
+    query.result = false;
+    query.sign = 0.0f;
+    query.face = 0;
+    query.u = 0.0f;
+    query.v = 0.0f;
+    query.result = wp_mesh_query_point_sign_winding_number(
+        id, point, max_dist, query.sign, query.face, query.u, query.v, accuracy, winding_number_threshold);
     return query;
 }
 // A mesh descriptor starts with its BVH descriptor, so the generic bvh
@@ -9600,6 +9734,8 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bwp::mesh_query_point_t\b"), "wp_mesh_query_point_t"),
     (re.compile(r"\bwp::mesh_query_point_sign_parity\b"), "wp_mesh_query_point_sign_parity"),
     (re.compile(r"\bwp::mesh_query_point_sign_normal\b"), "wp_mesh_query_point_sign_normal"),
+    (re.compile(r"\bwp::mesh_query_point_sign_winding_number\b"), "wp_mesh_query_point_sign_winding_number"),
+    (re.compile(r"\bwp::mesh_query_winding_number\b"), "wp_mesh_query_winding_number"),
     (re.compile(r"\bwp::mesh_query_point_no_sign\b"), "wp_mesh_query_point_no_sign"),
     (re.compile(r"\bwp::mesh_query_furthest_point_no_sign\b"), "wp_mesh_query_furthest_point_no_sign"),
     (re.compile(r"\bwp::mesh_query_point\b"), "wp_mesh_query_point"),
