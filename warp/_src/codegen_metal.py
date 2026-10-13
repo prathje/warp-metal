@@ -155,12 +155,12 @@ from warp._src.codegen_metal_ast import fold_const_branches as _ast_fold_const_b
 from warp._src.codegen_metal_ast import fold_drop_unsupported_locals as _ast_fold_drop
 from warp._src.codegen_metal_ast import fold_indexref_writes as _ast_fold_indexref
 from warp._src.codegen_metal_ast import fold_multidim_atomics as _ast_fold_multidim_atomics
-from warp._src.codegen_metal_ast import wrap_negative_array_indices as _ast_wrap_negative_array_indices
 from warp._src.codegen_metal_ast import fold_views as _ast_fold_views
 from warp._src.codegen_metal_ast import inline_user_calls as _ast_inline
 from warp._src.codegen_metal_ast import lower_reverse_ranges as _ast_lower_reverse_ranges
 from warp._src.codegen_metal_ast import parse as _ast_parse
 from warp._src.codegen_metal_ast import query_iterator_vars as _ast_query_iterator_vars
+from warp._src.codegen_metal_ast import wrap_negative_array_indices as _ast_wrap_negative_array_indices
 from warp.config import DeterministicMode
 
 if TYPE_CHECKING:
@@ -11914,7 +11914,6 @@ _NATIVE_REINTERPRET_REF_PAT = re.compile(r"reinterpret_cast\s*<\s*([\w:]+)\s*&\s
 
 def _native_snippet_scalar_type(t, what: str, key: str) -> str:
     from warp._src.codegen import Var  # noqa: PLC0415
-
     from warp._src.types import float32, int32  # noqa: PLC0415
 
     t = {float: float32, int: int32}.get(t, t)

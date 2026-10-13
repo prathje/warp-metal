@@ -145,7 +145,6 @@ class TestMetalMismatch(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet)
 
-
     def test_large_struct_helpers_stay_correct(self):
         # Apple's Metal compiler drops stores when a struct over ~144 bytes
         # (wp_mat7x7 and up) is passed by value to a helper it does not
