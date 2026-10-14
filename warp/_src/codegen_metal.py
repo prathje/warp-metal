@@ -17294,6 +17294,18 @@ def _generate_msl_kernel_uncached(
                     )
                 body_lines.extend(_finalize(w) for w in writes)
                 continue
+            _val_label = value[len("var_") :] if value.startswith("var_") else None
+            if addr in struct_ptr_locals and op == "=" and _val_label in struct_local_layouts:
+                # ``s.inner = t`` with ``s`` and ``t`` struct locals: copy
+                # leaf by leaf into the nested field's per-field locals.
+                prefix, dst_layout = struct_ptr_locals[addr]
+                src_leaves = {p for p, _o, _f in _iter_scalar_leaves(struct_local_layouts[_val_label])}
+                for fpath, _off, _finfo in _iter_scalar_leaves(dst_layout):
+                    if fpath in src_leaves:
+                        body_lines.append(
+                            f"{indent}{_per_field_local(prefix, fpath)} = {_per_field_local(_val_label, fpath)};"
+                        )
+                continue
             if addr in subscript_map:
                 lhs = subscript_map[addr]
                 if addr in f64_scalar_alias:
