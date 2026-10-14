@@ -169,6 +169,7 @@ from warp._src.codegen_metal_ast import query_iterator_vars as _ast_query_iterat
 from warp._src.codegen_metal_ast import wrap_negative_array_indices as _ast_wrap_negative_array_indices
 from warp._src.codegen_metal_locals import fold_arg_slice_views as _fold_arg_slice_views
 from warp._src.codegen_metal_locals import fold_dynamic_array_locals as _fold_dynamic_array_locals
+from warp._src.codegen_metal_locals import fold_empty_struct_array_fields as _fold_empty_struct_array_fields
 from warp._src.codegen_metal_locals import fold_local_arrays as _fold_local_arrays
 from warp._src.codegen_metal_locals import lower_inlined_array_slots as _lower_inlined_array_slots
 from warp.config import DeterministicMode
@@ -14815,6 +14816,14 @@ def _generate_msl_kernel_uncached(
         _ast_nodes, adj, {**{str(_v.label): _v.ctype() for _v in adj.variables}, **_inlined_var_ctypes}
     )
     _local_arr_skip = _local_arr_skip | _dyn_arr_skip
+    # Array fields of default-constructed struct locals (empty arrays).
+    _ast_nodes, _empty_field_skip = _fold_empty_struct_array_fields(
+        _ast_nodes,
+        adj,
+        _inlined_struct_locals,
+        {**{str(_v.label): _v.ctype() for _v in adj.variables}, **_inlined_var_ctypes},
+    )
+    _local_arr_skip = _local_arr_skip | _empty_field_skip
     # Range-slice views of array arguments (``arr[a:b]``).
     _ast_nodes, _slice_view_skip = _fold_arg_slice_views(_ast_nodes, adj, {**_const_ints, **_inlined_const_ints})
     _local_arr_skip = _local_arr_skip | _slice_view_skip

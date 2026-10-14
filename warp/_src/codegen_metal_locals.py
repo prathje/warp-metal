@@ -1259,6 +1259,174 @@ def fold_dynamic_array_locals(nodes: list[Node], adj, var_ctypes: dict[str, str]
     return [*decls, *new_nodes], skip
 
 
+# ---------------------------------------------------------------------------
+# Array fields of default-constructed struct locals
+# ---------------------------------------------------------------------------
+# ``provider = SupportMapDataProvider()`` leaves its array fields as empty
+# arrays (null data, shape 0); Newton's support functions guard every element
+# read with ``index < provider.field.shape[0]``. With no assignment there is
+# no buffer to alias, so the reads lower to the empty array's values: shape
+# 0 and (unreachable) zero elements.
+
+_STRUCT_CTOR_PAT = re.compile(r"^\s*var_(?P<lhs>\w+)\s*=\s*(?P<name>[A-Za-z_]\w*)\s*\(\s*\)\s*;\s*$")
+_FIELD_PTR_PAT = re.compile(
+    r"^\s*var_(?P<lhs>\w+)\s*=\s*&\s*\(\s*var_(?P<root>\w+)\s*(?:\.|->)\s*(?P<field>\w+)\s*\)\s*;\s*$"
+)
+_STRUCT_ASSIGN_PAT = re.compile(r"^\s*var_(?P<lhs>\w+)\s*=\s*(?P<rhs>.+?)\s*;\s*$")
+
+
+def fold_empty_struct_array_fields(
+    nodes: list[Node], adj, struct_locals: dict[str, object], var_ctypes: dict[str, str]
+) -> tuple[list[Node], set[str]]:
+    """Lower reads of never-assigned array fields of struct locals; see above."""
+    from warp._src.codegen import Struct  # noqa: PLC0415
+    from warp._src.codegen_metal import _is_array_arg_type, _msl_var_type, _msl_zero_init  # noqa: PLC0415
+
+    types: dict[str, object] = {str(v.label): v.type for v in adj.variables if isinstance(v.type, Struct)}
+    types.update({k: v for k, v in struct_locals.items() if isinstance(v, Struct)})
+    if not types:
+        return nodes, set()
+
+    def array_fields(st) -> set[str]:
+        return {f for f, v in st.vars.items() if _is_array_arg_type(v.type)}
+
+    candidates = {lbl for lbl, st in types.items() if array_fields(st)}
+    if not candidates:
+        return nodes, set()
+    leaves = [n for n in _iter_leaves(nodes) if not isinstance(n, (Comment, Empty, Pragma))]
+    # Definitions of each candidate: a no-arg constructor, or a copy of
+    # another struct local; anything else (a function result, a load from
+    # an array, a struct argument) disqualifies it.
+    sources: dict[str, set[str]] = {}
+    bad: set[str] = set()
+    field_ptr: dict[str, tuple[str, str]] = {}
+    for n in leaves:
+        raw = n.raw
+        m = _FIELD_PTR_PAT.match(raw)
+        if m and m.group("root") in candidates:
+            field_ptr[m.group("lhs")] = (m.group("root"), m.group("field"))
+            continue
+        m = _STRUCT_CTOR_PAT.match(raw)
+        if m and m.group("lhs") in candidates:
+            continue
+        m = _STRUCT_ASSIGN_PAT.match(raw)
+        if m and m.group("lhs") in candidates:
+            rhs = m.group("rhs").strip()
+            mm = re.fullmatch(r"(?:wp::copy\s*\(\s*)?var_(\w+)\s*\)?", rhs)
+            if mm and mm.group(1) in candidates:
+                sources.setdefault(m.group("lhs"), set()).add(mm.group(1))
+            else:
+                bad.add(m.group("lhs"))
+            continue
+        m = _ASSIGN_VOID_PAT.match(raw)
+        if m and m.group("dst") in candidates:
+            if m.group("src") in candidates:
+                sources.setdefault(m.group("dst"), set()).add(m.group("src"))
+            else:
+                bad.add(m.group("dst"))
+    # Any write through a pointer to one of its array fields disqualifies it.
+    for n in leaves:
+        for mm in re.finditer(r"\bwp::(?:store|assign|copy_into)\s*\(\s*var_(\w+)", n.raw):
+            if mm.group(1) in field_ptr:
+                bad.add(field_ptr[mm.group(1)][0])
+    changed = True
+    while changed:
+        changed = False
+        for lbl, srcs in sources.items():
+            if lbl not in bad and srcs & bad:
+                bad.add(lbl)
+                changed = True
+    empty_roots = candidates - bad
+    if not empty_roots:
+        return nodes, set()
+
+    eptr: set[str] = set()  # pointers to empty array fields
+    earr: set[str] = set()  # loaded empty arrays
+    shape_p: set[str] = set()
+    shape_v: set[str] = set()
+    elem_p: set[str] = set()
+    skip: set[str] = set()
+
+    def zero_of(label: str) -> str | None:
+        ct = var_ctypes.get(label)
+        if not ct:
+            return None
+        try:
+            return _msl_zero_init(_msl_var_type(ct))
+        except Exception:
+            return None
+
+    def rewrite(n: Node) -> list[Node]:
+        if isinstance(n, (Comment, Empty, Pragma, _RawLine)):
+            return [n]
+        raw = n.raw
+        m = _FIELD_PTR_PAT.match(raw)
+        if m:
+            root, field = m.group("root"), m.group("field")
+            if root in empty_roots and field in array_fields(types[root]):
+                eptr.add(m.group("lhs"))
+                skip.add(m.group("lhs"))
+                return []
+            if (root in eptr or root in earr) and field == "shape":
+                shape_p.add(m.group("lhs"))
+                skip.add(m.group("lhs"))
+                return []
+        m = _ASSIGN_CALL_PAT.match(raw)
+        if m:
+            fn, lhs, indent = m.group("fn"), m.group("lhs"), m.group("indent")
+            args = [x.strip() for x in _split_top_level_args(m.group("args"))]
+            first = args[0][4:] if args and args[0].startswith("var_") else ""
+            if fn == "load" and first in eptr:
+                earr.add(lhs)
+                skip.add(lhs)
+                return []
+            if fn == "load" and first in shape_p:
+                shape_v.add(lhs)
+                skip.add(lhs)
+                return []
+            if fn == "extract" and first in shape_v:
+                return _to_nodes([f"{indent}var_{lhs} = 0;"])
+            if fn == "len" and first in earr:
+                return _to_nodes([f"{indent}var_{lhs} = 0;"])
+            if fn in ("address", "view") and first in earr:
+                (elem_p if fn == "address" else earr).add(lhs)
+                skip.add(lhs)
+                return []
+            if (fn == "load" and first in elem_p) or (fn.startswith("atomic_") and first in earr):
+                z = zero_of(lhs)
+                if z is None:
+                    return [n]
+                return _to_nodes([f"{indent}var_{lhs} = {z};"])
+        m = _COPY_ANY_PAT.match(raw)
+        if m and m.group("src") in earr:
+            earr.add(m.group("lhs"))
+            skip.add(m.group("lhs"))
+            return []
+        m = _VOID_CALL_PAT.match(raw)
+        if m:
+            args = [x.strip() for x in _split_top_level_args(m.group("args"))]
+            first = args[0][4:] if args and args[0].startswith("var_") else ""
+            if (m.group("fn") in ("array_store", "store") or m.group("fn").startswith("atomic_")) and (
+                first in earr or first in elem_p
+            ):
+                # A write into an empty array: out of bounds natively, so
+                # only reachable behind a failed guard; nothing to store.
+                return []
+        if shape_v:
+            new = re.sub(
+                r"\bwp::extract\s*\(\s*var_(\w+)\s*,\s*[^(),]+?\s*\)",
+                lambda mm: "0" if mm.group(1) in shape_v else mm.group(0),
+                raw,
+            )
+            if new != raw:
+                return _to_nodes([new])
+        return [n]
+
+    new_nodes = _map_leaves(nodes, rewrite)
+    new_nodes = _map_leaves(new_nodes, lambda n: _drop_decl(n, skip))
+    return new_nodes, skip
+
+
 def _to_nodes(lines: list[str]) -> list[Node]:
     out: list[Node] = []
     for ln in lines:
@@ -1330,4 +1498,10 @@ def _ctype_size(ctype: str) -> int:
     raise MetalCodegenError(f"MSL codegen: cannot size thread-local array element type {ctype!r}")
 
 
-__all__ = ["fold_arg_slice_views", "fold_dynamic_array_locals", "fold_local_arrays", "lower_inlined_array_slots"]
+__all__ = [
+    "fold_arg_slice_views",
+    "fold_dynamic_array_locals",
+    "fold_empty_struct_array_fields",
+    "fold_local_arrays",
+    "lower_inlined_array_slots",
+]

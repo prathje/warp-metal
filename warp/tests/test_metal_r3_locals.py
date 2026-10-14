@@ -643,6 +643,51 @@ class TestMetalR3Locals(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet, timeout=120)
 
+    def test_default_struct_array_fields_are_empty(self):
+        # ``p = Provider()`` leaves its array fields empty; Newton's support
+        # functions guard each read with ``idx < p.data.shape[0]``.
+        snippet = _snippet(
+            """
+            @wp.struct
+            class Provider:
+                data: wp.array[wp.vec4i]
+                lut: wp.array[int]
+
+            @wp.func
+            def has_hull(p: Provider, idx: int) -> bool:
+                if idx < 0 or idx >= p.data.shape[0]:
+                    return False
+                packed = p.data[idx][3]
+                return packed > 0
+
+            @wp.func
+            def pick(p: Provider, idx: int, fallback: float) -> float:
+                if has_hull(p, idx):
+                    return float(p.lut[idx])
+                return fallback
+
+            @wp.kernel
+            def k(x: wp.array[float], provided: wp.array[wp.vec4i], out: wp.array[float]):
+                t = wp.tid()
+                p = Provider()
+                q = p
+                full = Provider()
+                full.data = provided
+                out[t] = pick(q, t, x[t]) + float(full.data.shape[0]) + float(len(p.lut))
+
+            def run(dev):
+                x = wp.array([1.0, 2.0], dtype=float, device=dev)
+                pv = wp.zeros(3, dtype=wp.vec4i, device=dev)
+                o = wp.zeros(2, dtype=float, device=dev)
+                wp.launch(k, 2, [x, pv, o], device=dev)
+                return (o.numpy(),)
+
+            res = compare(run)
+            np.testing.assert_allclose(res["metal:0"][0], [4.0, 5.0])
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
