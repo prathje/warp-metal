@@ -13111,6 +13111,80 @@ def _native_snippet_value_type(t, what: str, key: str) -> str:
     )
 
 
+# ``(float*)`` / ``(const int *)`` C-style pointer casts in a native snippet.
+_NATIVE_PTR_CAST_PAT = re.compile(r"\(\s*((?:const\s+)?[A-Za-z_][\w:]*)\s*\*\s*\)")
+# ``float* p = ...`` / ``const int *q;`` pointer declarations of builtin
+# scalar types (keywords only, so ``a * b`` products never match).
+_NATIVE_PTR_DECL_PAT = re.compile(
+    r"(?<![\w:])(?<!device )(?<!thread )(?<!constant )((?:const\s+)?"
+    r"(?:float|double|half|int|unsigned|uint|short|ushort|char|uchar|long|ulong|bool|"
+    r"u?int(?:8|16|32|64)_t))\s*\*\s*(?=[A-Za-z_]\w*\s*[=;,)\[])"
+)
+# MSL view of a ``wp.array`` handed to a native snippet (see
+# ``_native_snippet_call``). Strides are in bytes, as in ``wp::array_t``;
+# Metal binds arrays densely, so they follow from the shape.
+_NATIVE_ARRAY_VIEW_MSL = """\
+#ifndef WP_METAL_NATIVE_ARRAY_VIEW
+#define WP_METAL_NATIVE_ARRAY_VIEW
+template <typename T>
+struct wp_native_array {
+    device T* data;
+    int shape[4];
+    int strides[4];
+    int ndim;
+    static wp_native_array make(ulong addr, int nd, int s0, int s1, int s2, int s3) {
+        wp_native_array a;
+        a.data = reinterpret_cast<device T*>(addr);
+        a.ndim = nd;
+        a.shape[0] = s0; a.shape[1] = s1; a.shape[2] = s2; a.shape[3] = s3;
+        int stride = int(sizeof(T));
+        for (int d = 3; d >= 0; --d) {
+            a.strides[d] = d < nd ? stride : 0;
+            if (d < nd) stride *= a.shape[d];
+        }
+        return a;
+    }
+};
+#endif
+"""
+# Caller-side construction of the view; the launcher binds the array named
+# here read-write (a raw pointer may be written through).
+_NATIVE_ARRAY_VIEW_ARG_PAT = re.compile(
+    r"\bwp_native_array<[^<>]*>::make\(\s*reinterpret_cast<ulong>\(\s*var_(\w+)\s*\)"
+)
+
+
+def _native_snippet_array_elem(arg, key: str) -> str | None:
+    """MSL element type of a ``wp.array`` native-snippet parameter, or None
+    if ``arg`` is not a plain array."""
+    elem_ctype = arg.ctype()
+    m = re.match(r"^wp::array_t<\s*(.+?)\s*>$", elem_ctype)
+    if m is None:
+        return None
+    t = arg.type
+    inner = m.group(1)
+    msl = _SCALAR_CTYPE_TO_MSL.get(inner)
+    if msl is None or msl == "wp_f64" or t.ndim > 4:
+        raise MetalCodegenError(
+            f"@wp.func_native {key!r}: parameter {arg.label!r} of type {elem_ctype!r} is not supported on Metal "
+            "(array parameters of native snippets must have a 32-bit-or-narrower scalar dtype and at most 4 dims)"
+        )
+    return msl
+
+
+def _native_array_view_expr(caller_arg: str, elem_msl: str, ndim: int) -> str:
+    """``wp_native_array<T>::make(...)`` for the array ``caller_arg``
+    (``var_<label>``); its shape comes from ``<label>_shape``."""
+    m = re.match(r"^\s*var_(\w+)\s*$", caller_arg)
+    if m is None:
+        raise MetalCodegenError(
+            f"@wp.func_native: cannot pass array expression {caller_arg!r} to a native snippet on Metal"
+        )
+    label = m.group(1)
+    dims = [f"(int){label}_shape[{d}]" if d < ndim else "0" for d in range(4)]
+    return f"wp_native_array<{elem_msl}>::make(reinterpret_cast<ulong>(var_{label}), {ndim}, {', '.join(dims)})"
+
+
 def _native_snippet_call(fn_overload, caller_args, return_value_dst):
     """Lower a call to a ``@wp.func_native`` function to an MSL helper call.
 
@@ -13127,7 +13201,19 @@ def _native_snippet_call(fn_overload, caller_args, return_value_dst):
             default_builder_options={"enable_backward": False, "output_arch": None, "block_dim": 256},
         )
     params = []
-    for a in adj.args:
+    caller_args = list(caller_args)
+    array_labels = []
+    for i, a in enumerate(adj.args):
+        elem_msl = _native_snippet_array_elem(a, key)
+        if elem_msl is not None:
+            # ``wp.array`` parameter: a ``wp_native_array<T>`` view (device
+            # pointer, shape, byte strides) so ``arr.data`` / ``arr.shape[i]``
+            # / ``arr.strides[i]`` read as in the CUDA snippet.
+            params.append(f"wp_native_array<{elem_msl}> {a.label}")
+            array_labels.append(a.label)
+            if i < len(caller_args):
+                caller_args[i] = _native_array_view_expr(caller_args[i], elem_msl, a.type.ndim)
+            continue
         params.append(f"{_native_snippet_value_type(a.ctype(), f'parameter {a.label!r}', key)} {a.label}")
     ret = adj.arg_types.get("return")
     ret_msl = "void" if ret is None else _native_snippet_value_type(ret, "the return value", key)
@@ -13140,6 +13226,12 @@ def _native_snippet_call(fn_overload, caller_args, return_value_dst):
     ).hexdigest()[:10]
     name = f"{_NATIVE_SNIPPET_PREFIX}{fn_overload.native_func}_{digest}"
     body = _NATIVE_REINTERPRET_WRITE_PAT.sub(r"reinterpret_cast<thread \1&>\2", fn_overload.native_snippet)
+    if array_labels:
+        # ``(T*)arr.data + off``: an unqualified pointer is ``thread`` in
+        # MSL, so give pointer casts in array-taking snippets the ``device``
+        # space the array storage lives in.
+        body = _NATIVE_PTR_CAST_PAT.sub(r"(device \1*)", body)
+        body = _NATIVE_PTR_DECL_PAT.sub(r"device \1* ", body)
     body = _NATIVE_REINTERPRET_REF_PAT.sub(r"as_type<\1>(\2)", body)
     body = _NATIVE_GUARDED_SYNC_PAT.sub(lambda m: m.group("body"), body)
     _NATIVE_SNIPPET_DEFS[name] = f"inline {ret_msl} {name}({', '.join(params)}) {{\n{body}\n}}"
@@ -13167,6 +13259,7 @@ def _emit_referenced_user_funcs(source: str) -> str:
     parts = [_USER_FUNC_MSL_DEFS[n] for n in sorted(seen)]
     if native:
         parts.append(_NATIVE_SNIPPET_SHIMS)
+        parts.append(_NATIVE_ARRAY_VIEW_MSL)
         parts.extend(_NATIVE_SNIPPET_DEFS[n] for n in native)
     return "\n".join(parts) + "\n"
 
@@ -13916,6 +14009,76 @@ def _guard_struct_field_writes(lines: list[str], arrays: set[str]) -> list[str]:
         indent = ln[: len(ln) - len(ln.lstrip())]
         out.append(f"{indent}if ({m.group('arr')}_shape[0] != 0) {body}")
     return out
+
+
+# ``var_B = wp::array_t<T>(var_ptr, d0[, d1, ...]);`` — an array built
+# in-kernel from a raw ``uint64`` address (``wp.array(ptr=..., shape=...)``).
+_PTR_ARRAY_CTOR_PAT = re.compile(
+    r"^(?P<indent>\s*)var_(?P<lbl>\w+)\s*=\s*wp::array_t<\s*(?P<dt>[\w:]+)\s*>\s*"
+    r"\(\s*var_(?P<ptr>\w+)\s*,(?P<dims>[^;]*)\)\s*;\s*$"
+)
+# Prefix of the MSL locals standing in for such arrays (``__pa<label>`` is
+# the device pointer, ``__pa<label>_shape[k]`` its extents).
+_PTR_ARRAY_PREFIX = "__pa"
+
+
+def _lower_pointer_arrays(lines: list[str], adj, adjoint: bool) -> tuple[list[str], set[str], set[str]]:
+    """Lower arrays built from raw pointers to MSL pointer locals.
+
+    Kamino builds per-problem views with ``wp.array(ptr=<base + offset>,
+    shape=(n, n), dtype=float)`` over addresses taken by a native snippet
+    (``(uint64_t)arr.data``). On Metal a ``uint64`` holding a buffer's
+    ``gpuAddress`` converts back to a ``device T*``, so each such array
+    becomes a pointer local plus an ``int`` shape array, and every use is
+    renamed to the label ``__pa<label>`` — which the rest of the translator
+    treats like a dense (row-major, contiguous) array argument: indexing,
+    ``.shape``, ``array_store`` and ``tile_load`` / ``tile_store`` resolve
+    through ``__pa<label>[...]`` / ``__pa<label>_shape[k]``.
+
+    Returns ``(lines, original labels to skip declaring, new labels)``.
+    """
+    ctors: dict[str, tuple[str, int]] = {}
+    for ln in lines:
+        m = _PTR_ARRAY_CTOR_PAT.match(ln)
+        if m is None:
+            continue
+        msl = _SCALAR_CTYPE_TO_MSL.get(m.group("dt"))
+        dims = [d.strip() for d in _split_top_level_args(m.group("dims")) if d.strip()]
+        if msl is None or msl == "wp_f64" or not 1 <= len(dims) <= 4:
+            raise MetalCodegenError(
+                f"Kernel {adj.fun_name!r}: wp.array(ptr=...) of dtype {m.group('dt')!r} with {len(dims)} dims is not "
+                "supported on Metal (scalar dtypes of at most 32 bits, 1-4 dims)"
+            )
+        prev = ctors.get(m.group("lbl"))
+        if prev is not None and prev != (msl, len(dims)):
+            raise MetalCodegenError(f"Kernel {adj.fun_name!r}: array local var_{m.group('lbl')} changes type")
+        ctors[m.group("lbl")] = (msl, len(dims))
+    if not ctors:
+        return lines, set(), set()
+    if adjoint:
+        raise MetalCodegenError(
+            f"Kernel {adj.fun_name!r}: reverse mode through arrays built from raw pointers "
+            "(wp.array(ptr=...)) is not supported on Metal"
+        )
+    rename = re.compile(r"\bvar_(" + "|".join(re.escape(lbl) for lbl in sorted(ctors, key=len, reverse=True)) + r")\b")
+    decls = []
+    for lbl, (msl, nd) in ctors.items():
+        decls.append(f"    device {msl}* {_PTR_ARRAY_PREFIX}{lbl} = nullptr;")
+        decls.append(f"    int {_PTR_ARRAY_PREFIX}{lbl}_shape[{nd}] = {{{', '.join(['0'] * nd)}}};")
+    out = list(decls)
+    for ln in lines:
+        m = _PTR_ARRAY_CTOR_PAT.match(ln)
+        if m is not None and m.group("lbl") in ctors:
+            lbl = m.group("lbl")
+            msl, _nd = ctors[lbl]
+            name = f"{_PTR_ARRAY_PREFIX}{lbl}"
+            dims = [d.strip() for d in _split_top_level_args(m.group("dims")) if d.strip()]
+            stmts = [f"{name} = reinterpret_cast<device {msl}*>(var_{m.group('ptr')});"]
+            stmts += [f"{name}_shape[{k}] = (int)({d});" for k, d in enumerate(dims)]
+            out.append(m.group("indent") + " ".join(stmts))
+            continue
+        out.append(rename.sub(lambda mm: f"var_{_PTR_ARRAY_PREFIX}{mm.group(1)}", ln))
+    return out, set(ctors), {f"{_PTR_ARRAY_PREFIX}{lbl}" for lbl in ctors}
 
 
 def _materialize_for_loop_vars(lines: list[str]) -> list[str]:
@@ -14903,6 +15066,8 @@ def _generate_msl_kernel_uncached(
     forward_lines = _fix_negative_step_for_loops(forward_lines, adj=adj, extra_const_ints=_inlined_const_ints)
     # A loop variable read after its loop keeps its last iteration value.
     forward_lines = _materialize_for_loop_vars(forward_lines)
+    # ``wp.array(ptr=...)`` locals -> device pointer + shape locals.
+    forward_lines, _ptr_array_skip, ptr_array_labels = _lower_pointer_arrays(forward_lines, adj, adjoint)
 
     if os.environ.get("WARP_METAL_DUMP_IR"):
         _dump = os.path.join(os.environ["WARP_METAL_DUMP_IR"], f"{adj.fun_name}{'__adj' if adjoint else ''}.ir")
@@ -14910,7 +15075,7 @@ def _generate_msl_kernel_uncached(
         with open(_dump, "w") as _f:
             _f.write("\n".join(forward_lines))
 
-    vars_to_skip_decl: set[str] = _struct_skip | _drop_skip | _view_skip | _indexref_skip
+    vars_to_skip_decl: set[str] = _struct_skip | _drop_skip | _view_skip | _indexref_skip | _ptr_array_skip
 
     # Classify each array arg as input or output by scanning the IR strings.
     # MLX inputs are ``const device T*`` (read-only) — verified empirically —
@@ -14960,6 +15125,10 @@ def _generate_msl_kernel_uncached(
         r"(?:atomic_fetch_(add|sub|min|max|and|or|xor)_explicit|wp_atomic_(min|max|cas|exch))\s*\(\s*&\s*(\w+)\["
     )
     for raw in forward_lines:
+        for m in _NATIVE_ARRAY_VIEW_ARG_PAT.finditer(raw):
+            # Handed to a native snippet as a raw pointer: may be written.
+            written_arg_names.add(m.group(1))
+            plain_store_arg_names.add(m.group(1))
         m = array_store_pat.match(raw)
         if m:
             written_arg_names.add(m.group(1))
@@ -15152,7 +15321,10 @@ def _generate_msl_kernel_uncached(
     # mismatches in MLX-generated wrappers. So we emit per-component reads
     # ``floatN(arr[i*N+0], arr[i*N+1], ...)`` instead of any cast trick.
     arg_label_set = (
-        {a.label for a in adj.args} | {v.label for v in struct_field_array_vars} | {v.label for v in grad_array_vars}
+        {a.label for a in adj.args}
+        | {v.label for v in struct_field_array_vars}
+        | {v.label for v in grad_array_vars}
+        | ptr_array_labels
     )
     # Map argname -> (vec_size, msl_scalar) for each vec-typed array arg,
     # argname -> (rows, cols, msl_scalar) for each mat-typed array arg, and
@@ -16230,6 +16402,7 @@ def _generate_msl_kernel_uncached(
             *(arg.label for arg in adj.args),
             *(v.label for v in struct_field_array_vars),
             *(v.label for v in grad_array_vars),
+            *sorted(ptr_array_labels),
         ]
     )
     _arg_rename_pat = re.compile(rf"\bvar_({_arg_label_alt})\b") if _arg_label_alt else None
