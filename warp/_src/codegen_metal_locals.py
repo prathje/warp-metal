@@ -689,9 +689,7 @@ def lower_inlined_array_slots(nodes: list[Node], adj) -> list[Node]:
     from warp._src.codegen_metal import _lower_array_slot_ir  # noqa: PLC0415
 
     def is_candidate(n: Node) -> bool:
-        return not isinstance(n, (Comment, Empty, Pragma, _RawLine)) and (
-            "wp::index(" in n.raw or "_slot(" in n.raw
-        )
+        return not isinstance(n, (Comment, Empty, Pragma, _RawLine)) and ("wp::index(" in n.raw or "_slot(" in n.raw)
 
     cands = [n.raw for n in _iter_leaves(nodes) if is_candidate(n)]
     if not cands:
@@ -765,11 +763,15 @@ def fold_arg_slice_views(nodes: list[Node], adj, const_ints: dict[str, int]) -> 
             args = [a.strip() for a in _split_top_level_args(m.group("args"))]
             if len(args) == 3:
                 slices[m.group("lhs")] = (args[0], args[1], args[2])
-    if not slices:
+    if not slices and not any("wp::index(" in ln or "_slot(" in ln for ln in leaves):
         return nodes, set()
     arg_ndim = {a.label: int(getattr(a.type, "ndim", 1)) for a in adj.args if _is_array_arg(a)}
     kname = getattr(adj, "fun_name", "?")
     nonneg = _nonneg_locals(nodes, const_ints)
+    # Integer-index views of arguments stay with ``fold_views``; they are
+    # only tracked here so component stores through them (slot IR, which
+    # ``fold_views`` does not rewrite) can be lowered against the base.
+    int_views: dict[str, _SliceView] = {}
 
     def const_of(expr: str) -> int | None:
         e = expr.strip()
@@ -891,6 +893,12 @@ def fold_arg_slice_views(nodes: list[Node], adj, const_ints: dict[str, int]) -> 
                 views[lhs] = v
                 skip.add(lhs)
                 return _to_nodes(out)
+            if fn == "view" and (first in arg_ndim or first in int_views):
+                src = int_views.get(first) or base_info(first)
+                v = compose(src, args[1:], indent, out)
+                if v is not None and not out:
+                    int_views[lhs] = v
+                return [n]
             if first in views:
                 v = views[first]
                 if fn in (
@@ -960,8 +968,8 @@ def fold_arg_slice_views(nodes: list[Node], adj, const_ints: dict[str, int]) -> 
                 out.append(f"{indent}wp::adj_{fn}({', '.join(new)});")
                 return _to_nodes(out)
         m = _SLOT_REF_PAT.match(raw) or _SLOT_STORE_PAT.match(raw)
-        if m and m.group("arr") in views:
-            v = views[m.group("arr")]
+        if m and (m.group("arr") in views or (m.group("arr") in int_views and m.group("acc").strip())):
+            v = views.get(m.group("arr")) or int_views[m.group("arr")]
             idx = [a.strip() for a in _split_top_level_args(m.group("idx"))]
             bi = base_indices(v, idx, m.group("indent"), out)
             if bi is None:
@@ -970,6 +978,22 @@ def fold_arg_slice_views(nodes: list[Node], adj, const_ints: dict[str, int]) -> 
                 m.group(0)[m.start("arr") - m.start(0) - len("var_") : m.end("idx") - m.start(0)],
                 f"var_{v.base}, {', '.join(bi)}",
                 1,
+            )
+            out.extend(_lower_array_slot_ir([new], adj, [*leaves, new]))
+            return _to_nodes(out)
+        m = _SLOT_ATOMIC_PAT.match(raw)
+        if m and (m.group("arr") in views or m.group("arr") in int_views):
+            v = views.get(m.group("arr")) or int_views[m.group("arr")]
+            idx = [a.strip() for a in _split_top_level_args(m.group("idx"))]
+            bi = base_indices(v, idx, m.group("indent"), out)
+            if bi is None:
+                raise fail("index count does not match the sliced array's dimensions", raw)
+            new = (
+                raw[: m.start("arr")]
+                + v.base
+                + raw[m.end("arr") : m.start("idx")]
+                + ", ".join(bi)
+                + raw[m.end("idx") :]
             )
             out.extend(_lower_array_slot_ir([new], adj, [*leaves, new]))
             return _to_nodes(out)
@@ -1008,7 +1032,9 @@ def fold_arg_slice_views(nodes: list[Node], adj, const_ints: dict[str, int]) -> 
 # the selector with one ``if`` per candidate.
 
 _ASSIGN_VOID_PAT = re.compile(r"^(?P<indent>\s*)wp::assign\s*\(\s*var_(?P<dst>\w+)\s*,\s*var_(?P<src>\w+)\s*\)\s*;\s*$")
-_COPY_ANY_PAT = re.compile(r"^(?P<indent>\s*)var_(?P<lhs>\w+)\s*=\s*(?:wp::copy\s*\(\s*)?var_(?P<src>\w+)\s*\)?\s*;\s*$")
+_COPY_ANY_PAT = re.compile(
+    r"^(?P<indent>\s*)var_(?P<lhs>\w+)\s*=\s*(?:wp::copy\s*\(\s*)?var_(?P<src>\w+)\s*\)?\s*;\s*$"
+)
 
 
 def fold_dynamic_array_locals(nodes: list[Node], adj, var_ctypes: dict[str, str]) -> tuple[list[Node], set[str]]:
@@ -1111,7 +1137,7 @@ def fold_dynamic_array_locals(nodes: list[Node], adj, var_ctypes: dict[str, str]
     def is_member(tok: str) -> bool:
         return tok.startswith("var_") and tok[4:] in members
 
-    def rewrite(n: Node) -> list[Node]:  # noqa: PLR0911, PLR0912
+    def rewrite(n: Node) -> list[Node]:
         if isinstance(n, (Comment, Empty, Pragma)):
             return [n]
         raw = n.raw

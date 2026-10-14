@@ -263,6 +263,35 @@ class TestMetalR3Locals(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet, timeout=120)
 
+    def test_component_store_through_views(self):
+        # ``row = a[t]; row[j][1] = x`` (and through a slice) writes a
+        # component of an element of a view of an argument.
+        snippet = _snippet(
+            """
+            @wp.func
+            def setc(row: wp.array[wp.vec3], j: int, x: float):
+                row[j][1] = x
+                row[j][2] += x
+
+            @wp.kernel
+            def k(a: wp.array2d[wp.vec3]):
+                t = wp.tid()
+                row = a[t]
+                row[0][0] = float(t)
+                setc(a[t], 1, 5.0)
+                sub = a[t, 1:3]
+                sub[1][2] = 7.0
+
+            def run(dev):
+                a = wp.zeros((2, 3), dtype=wp.vec3, device=dev)
+                wp.launch(k, 2, [a], device=dev)
+                return (a.numpy(),)
+
+            compare(run)
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
     def test_component_store_in_inlined_func(self):
         # ``nzb_values[i][j, 0] = x`` / ``v[i][1] = x`` inside a ``@wp.func``
         # on an array the function was passed (Kamino's Jacobian assembly):
