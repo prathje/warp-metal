@@ -523,7 +523,10 @@ class TileExt:
         t = args[0]
         label = _lbl(t)
         shape = self._shape(label)
-        if shape is None or label not in self.dims:
+        # A single-element tile of a matrix (or other non-scalar, non-vec)
+        # element isn't in ``dims`` but collapses to a plain local, which
+        # ``_elem`` addresses directly.
+        if shape is None or (label not in self.dims and math.prod(shape) != 1):
             raise MetalCodegenError(f"MSL codegen: tile_scatter_{op} on an unknown tile ({m.group(0)!r})")
         idx = args[1:-2]
         value, has = args[-2], args[-1]

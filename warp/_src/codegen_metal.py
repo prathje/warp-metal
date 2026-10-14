@@ -8363,13 +8363,42 @@ _COOP_TILE_REDUCE_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_reduce\s*\(\s*([
 _COOP_TILE_OTHER_PAT = re.compile(r"\bwp::tile_(\w+)")
 # ``wp::min``/``wp::max`` may already be rewritten to ``metal::`` forms
 # by the time a line reaches the tile translator — accept both.
-_COOP_REDUCE_OPS = ("wp::add", "wp::min", "wp::max", "metal::min", "metal::max")
+_COOP_REDUCE_OPS = (
+    "wp::add",
+    "wp::min",
+    "wp::max",
+    "metal::min",
+    "metal::max",
+    "wp::mul",
+    "wp::bit_and",
+    "wp::bit_or",
+    "wp::bit_xor",
+)
 _COOP_SIMD_FN = {
     "wp::add": "simd_sum",
     "wp::min": "simd_min",
     "wp::max": "simd_max",
     "metal::min": "simd_min",
     "metal::max": "simd_max",
+    "wp::mul": "simd_product",
+    # Integer-only on CUDA too (``wp.bit_or`` has no float overload).
+    "wp::bit_and": "simd_and",
+    "wp::bit_or": "simd_or",
+    "wp::bit_xor": "simd_xor",
+}
+# Serial (one thread per block) ``tile_reduce`` combiners for builtin ops,
+# keyed like ``_COOP_SIMD_FN``. ``{a}`` is the accumulator, ``{b}`` the next
+# element; both scalars, native MSL vectors, or (vec tiles) components.
+_SERIAL_REDUCE_COMB = {
+    "wp::add": "{a} + {b}",
+    "wp::mul": "{a} * {b}",
+    "wp::min": "metal::min({a}, {b})",
+    "metal::min": "metal::min({a}, {b})",
+    "wp::max": "metal::max({a}, {b})",
+    "metal::max": "metal::max({a}, {b})",
+    "wp::bit_and": "({a} & {b})",
+    "wp::bit_or": "({a} | {b})",
+    "wp::bit_xor": "({a} ^ {b})",
 }
 _COOP_NATIVE_ELEM_PAT = re.compile(r"^(float|half|int|uint|short|ushort)([234])?$")
 _COOP_NATIVE_MAT_PAT = re.compile(r"^(float|half)([234])x([234])$")
@@ -10910,11 +10939,17 @@ _TILE_SCAN_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_scan_(inclusive|exclusi
 # ``wp::tile_zeros<dtype, ...>()`` / ``wp::tile_ones<dtype, ...>()`` —
 # constant-fill register tile. With block_dim=1 it's the corresponding
 # scalar 0 / 1 (or vec ``T(0)`` / ``T(1)``).
-_TILE_ZEROS_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_zeros\s*<\s*(?:wp::)?(\w+)\s*[^>]*>\s*\(\s*\)")
-_TILE_ONES_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_ones\s*<\s*(?:wp::)?(\w+)\s*[^>]*>\s*\(\s*\)")
+_TILE_ZEROS_PAT = re.compile(
+    r"\bvar_(\w+)\s*=\s*wp::tile_zeros\s*<\s*(?:wp::)?(\w+(?:\s*<[^<>]*>)?)\s*[^<>]*>\s*\(\s*\)"
+)
+_TILE_ONES_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_ones\s*<\s*(?:wp::)?(\w+(?:\s*<[^<>]*>)?)\s*[^<>]*>\s*\(\s*\)")
 # ``wp::tile_full<dtype, ...>(value)`` — the same constant fill with a
 # runtime value instead of a literal 0 / 1.
-_TILE_FULL_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_full\s*<\s*(?:wp::)?(\w+)\s*[^>]*>\s*\(([^)]*)\)")
+# Matrix element dtype of a fill (``wp::mat_t<R, C, wp::float32>``).
+_MAT_FILL_DTYPE_PAT = re.compile(r"^wp::mat_t\s*<\s*(\d+)\s*,\s*(\d+)\s*,\s*[\w:]+\s*>$")
+_TILE_FULL_PAT = re.compile(
+    r"\bvar_(\w+)\s*=\s*wp::tile_full\s*<\s*(?:wp::)?(\w+(?:\s*<[^<>]*>)?)\s*[^<>]*>\s*\(([^)]*)\)"
+)
 # ``wp::tile_from_thread<dtype, N>(value, thread_idx)`` — broadcast the
 # ``value`` held by lane ``thread_idx`` to every element of an N-tile. The
 # serial model runs one lane per tile, so that lane's ``value`` is the only
@@ -11758,7 +11793,9 @@ def _translate_tile_intrinsics(
             # lanes, matching CUDA's broadcast-result semantics.
             simd_fn = _COOP_SIMD_FN.get(op_fn)
             if simd_fn is None:
-                raise MetalCodegenError(f"distributed tile_reduce only supports wp.add/wp.min/wp.max; got {op_fn!r}")
+                raise MetalCodegenError(
+                    f"distributed tile_reduce supports wp.add/mul/min/max/bit_and/bit_or/bit_xor; got {op_fn!r}"
+                )
             return f"var_{lhs} = {_coop_reduce_expr(f'var_{in_label}', distributed_tiles[in_label], simd_fn)}"
         dims = tile_var_dims.get(in_label)
         if dims is None:
@@ -11771,14 +11808,7 @@ def _translate_tile_intrinsics(
         if vec_n > 0:
             # Vec-element tile: ``c[]`` holds ``n * vec_n`` scalars, element-
             # major. Reduce component-wise; the result is one vector.
-            comb = {
-                "wp::add": "{a} + {b}",
-                "wp::mul": "{a} * {b}",
-                "wp::min": "metal::min({a}, {b})",
-                "metal::min": "metal::min({a}, {b})",
-                "wp::max": "metal::max({a}, {b})",
-                "metal::max": "metal::max({a}, {b})",
-            }.get(op_fn)
+            comb = _SERIAL_REDUCE_COMB.get(op_fn)
             if comb is None:
                 raise MetalCodegenError(
                     f"MSL codegen: tile_reduce({op_fn}) over a vec-element tile is not supported on Metal"
@@ -11792,22 +11822,12 @@ def _translate_tile_intrinsics(
                 )
             return f"var_{lhs} = {_msl_vec_ctor(vec_n, _scalar)}({', '.join(parts)})"
         # Map known builtin op names to their accumulation expression.
-        if op_fn == "wp::add":
-            op_expr = "_tr_acc + var_{lhs}_in.c[_tr_i]"
-        elif op_fn == "wp::max":
-            op_expr = "metal::max(_tr_acc, var_{lhs}_in.c[_tr_i])"
-        elif op_fn == "wp::min":
-            op_expr = "metal::min(_tr_acc, var_{lhs}_in.c[_tr_i])"
-        elif op_fn == "wp::mul":
-            op_expr = "_tr_acc * var_{lhs}_in.c[_tr_i]"
-        else:
+        comb = _SERIAL_REDUCE_COMB.get(op_fn)
+        if comb is None:
             # Unknown op — leave the original (will trigger
             # unsupported-intrinsic error with the function name visible).
             return m.group(0)
-        # Substitute ``var_{lhs}_in`` placeholder with the actual tile
-        # var name; we don't actually need a separate name, but keeping
-        # the placeholder readable.
-        op_expr = op_expr.replace("{lhs}_in", in_label)
+        op_expr = comb.format(a="_tr_acc", b=f"var_{in_label}.c[_tr_i]")
         return (
             f"var_{lhs} = ({{ "
             f"auto _tr_acc = var_{in_label}.c[0]; "
@@ -12057,16 +12077,45 @@ def _translate_tile_intrinsics(
     line = _TILE_SCAN_PAT.sub(repl_tile_scan, line)
 
     def repl_zeros(m: re.Match[str]) -> str:
-        return _emit_tile_const_fill(m.group(1), m.group(2), "0")
+        out = _emit_tile_const_fill(m.group(1), m.group(2), "0")
+        return m.group(0) if out is None else out
 
     def repl_ones(m: re.Match[str]) -> str:
-        return _emit_tile_const_fill(m.group(1), m.group(2), "1")
+        out = _emit_tile_const_fill(m.group(1), m.group(2), "1")
+        return m.group(0) if out is None else out
+
+    def _emit_mat_tile_fill(lhs: str, mat_ctype: str, rows: int, cols: int, value: str) -> str:
+        """Fill a single-element matrix tile, which ``_msl_var_type``
+        collapses to a plain matrix local (``float3x3`` / ``wp_matRxC_*``).
+
+        Matches ``tile.h``: ``tile_zeros`` / ``tile_ones`` construct the
+        element as ``T(0)`` / ``T(1)`` (every entry set), and ``tile_full``
+        copies its (matrix-typed) value.
+        """
+        msl = _msl_scalar_type(mat_ctype)
+        if value == "0":
+            return f"var_{lhs} = {_msl_zero_init(msl)}"
+        if value != "1":
+            return f"var_{lhs} = {value}"
+        if msl.startswith("wp_"):
+            return (
+                f"var_{lhs} = ({{ {msl} _tf = {msl}(); "
+                f"for (int _tf_i = 0; _tf_i < {rows * cols}; ++_tf_i) _tf.c[_tf_i] = 1; _tf; }})"
+            )
+        col = f"{msl.split('x')[0][:-1]}{rows}(1)"
+        return f"var_{lhs} = {msl}({', '.join([col] * cols)})"
 
     def _emit_tile_const_fill(lhs: str, scalar_token: str, value: str) -> str:
         # ``wp::tile_zeros`` / ``wp::tile_ones`` may target a single-
         # element tile (which collapses to a scalar local) or a multi-
         # element tile. For multi-element, fill all slots.
         scalar_ctype = scalar_token if scalar_token.startswith("wp::") else f"wp::{scalar_token}"
+        if tile_var_vec_n.get(lhs, 0) > 0:
+            # Vec-element fill: lowered by ``codegen_metal_tiles``.
+            return None
+        mat = _MAT_FILL_DTYPE_PAT.match(scalar_ctype)
+        if mat is not None and lhs not in tile_var_dims:
+            return _emit_mat_tile_fill(lhs, scalar_ctype, int(mat.group(1)), int(mat.group(2)), value)
         msl = _SCALAR_CTYPE_TO_MSL.get(scalar_ctype, "float")
         dims = tile_var_dims.get(lhs)
         if dims is None:
@@ -12081,7 +12130,8 @@ def _translate_tile_intrinsics(
         value = m.group(3).strip()
         if not value:
             return m.group(0)
-        return _emit_tile_const_fill(m.group(1), m.group(2), f"({value})")
+        out = _emit_tile_const_fill(m.group(1), m.group(2), f"({value})")
+        return m.group(0) if out is None else out
 
     def repl_from_thread(m: re.Match[str]) -> str:
         args = [a.strip() for a in _split_top_level_args(m.group(3))]
@@ -12091,7 +12141,8 @@ def _translate_tile_intrinsics(
             # Distributed tile: every lane takes lane ``thread_idx``'s value.
             msl = distributed_tiles[m.group(1)]
             return f"var_{m.group(1)} = simd_shuffle(({msl})({args[0]}), (ushort)({args[1]}))"
-        return _emit_tile_const_fill(m.group(1), m.group(2), f"({args[0]})")
+        out = _emit_tile_const_fill(m.group(1), m.group(2), f"({args[0]})")
+        return m.group(0) if out is None else out
 
     line = _TILE_ZEROS_PAT.sub(repl_zeros, line)
     line = _TILE_ONES_PAT.sub(repl_ones, line)
