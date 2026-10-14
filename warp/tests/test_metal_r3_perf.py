@@ -175,6 +175,39 @@ print("ok")
         with tempfile.TemporaryDirectory() as cache:
             self.assertIn("ok", _run_metal_script(self, code, cache))
 
+    def test_translation_failure_is_cached(self):
+        # ``metal_print = "error"`` makes translation raise deterministically.
+        code = """
+import warp._src.codegen_metal as cm
+wp.config.metal_print = "error"
+calls = [0]
+orig = cm._generate_msl_kernel_uncached
+def counting(*a, **kw):
+    calls[0] += 1
+    return orig(*a, **kw)
+cm._generate_msl_kernel_uncached = counting
+
+@wp.kernel
+def kp(out: wp.array[float]):
+    wp.printf("%d\\n", wp.tid())
+    out[wp.tid()] = 1.0
+
+for _ in range(2):
+    try:
+        wp.launch(kp, dim=1, outputs=[wp.zeros(1, dtype=float, device="metal:0")], device="metal:0")
+    except cm.MetalCodegenError as e:
+        msg = str(e)
+    else:
+        raise AssertionError("expected MetalCodegenError")
+print("calls", calls[0], "printf" in msg or "print" in msg)
+"""
+        with tempfile.TemporaryDirectory() as cache:
+            first = _run_metal_script(self, code, cache)
+            self.assertIn("calls 1 True", first)
+            # A new process reads the failure from disk.
+            second = _run_metal_script(self, code, cache)
+            self.assertIn("calls 0 True", second)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

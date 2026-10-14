@@ -18647,11 +18647,89 @@ def _store_cached_artifact(key: str, artifact: MetalKernelArtifact) -> None:
         pass
 
 
+# Codegen failures are cached too (per process, and on disk as a
+# ``<key>.err`` entry next to the artifacts). A kernel the translator
+# rejects is rejected deterministically for a given cache key, but the
+# rejection can come minutes into translating a large inlined kernel
+# (Newton's narrow phase), and without a negative entry every launch —
+# every test, every process — paid that again before failing.
+
+
+def _codegen_failure_types() -> tuple[type[Exception], ...]:
+    from warp._src.codegen_metal_ast import MetalASTParseError  # noqa: PLC0415
+
+    return (MetalCodegenError, MetalASTParseError)
+
+
+def _rebuild_codegen_failure(type_name: str, message: str) -> Exception | None:
+    for exc_type in _codegen_failure_types():
+        if exc_type.__name__ == type_name:
+            return exc_type(message)
+    return None
+
+
+_failed_codegen_keys: dict[str, tuple[str, str]] = {}
+
+
+def _load_cached_failure(key: str) -> Exception | None:
+    """Return a fresh copy of the error a previous translation of ``key``
+    raised (this process first, then the on-disk cache), or ``None``.
+    ``WARP_METAL_DISABLE_ARTIFACT_CACHE=1`` disables both."""
+    if os.environ.get("WARP_METAL_DISABLE_ARTIFACT_CACHE") == "1":
+        return None
+    hit = _failed_codegen_keys.get(key)
+    if hit is not None:
+        return _rebuild_codegen_failure(*hit)
+    path = _artifact_cache_path(key)
+    if path is None:
+        return None
+    path = path[: -len(".pkl")] + ".err"
+    if not os.path.exists(path):
+        return None
+    import json  # noqa: PLC0415
+
+    try:
+        with open(path, encoding="utf-8") as f:
+            payload = json.load(f)
+        return _rebuild_codegen_failure(payload["type"], payload["message"])
+    except Exception:
+        return None
+
+
+def _store_cached_failure(key: str, exc: Exception) -> None:
+    if os.environ.get("WARP_METAL_DISABLE_ARTIFACT_CACHE") == "1":
+        return
+    _failed_codegen_keys[key] = (type(exc).__name__, str(exc))
+    path = _artifact_cache_path(key)
+    if path is None:
+        return
+    path = path[: -len(".pkl")] + ".err"
+    import json  # noqa: PLC0415
+    import tempfile  # noqa: PLC0415
+
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(path), suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump({"type": type(exc).__name__, "message": str(exc)}, f)
+            os.replace(tmp_path, path)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+    except Exception:
+        pass
+
+
 def generate_msl_kernel(
     kernel, block_dim: int | None = None, adjoint: bool = False, grad_args: tuple[str, ...] = ()
 ) -> MetalKernelArtifact:
     """Return the MSL artifact for a Warp ``Kernel``, using the on-disk
-    cache when possible.
+    cache when possible. Translation failures are cached as well (see
+    ``_load_cached_failure``).
 
     ``block_dim`` is the launch's block width — it decides whether the IR
     is rebuilt for the distributed-tile path (see ``_ensure_adj_built``).
@@ -18675,7 +18753,15 @@ def generate_msl_kernel(
             if cached.has_print:
                 _handle_metal_print(adj.fun_name)
             return cached
-    artifact = _generate_msl_kernel_uncached(kernel, adjoint=adjoint, grad_args=grad_args)
+        failed = _load_cached_failure(key)
+        if failed is not None:
+            raise failed
+    try:
+        artifact = _generate_msl_kernel_uncached(kernel, adjoint=adjoint, grad_args=grad_args)
+    except _codegen_failure_types() as exc:
+        if key is not None:
+            _store_cached_failure(key, exc)
+        raise
     if key is not None:
         _store_cached_artifact(key, artifact)
     return artifact
