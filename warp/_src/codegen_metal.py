@@ -19036,6 +19036,12 @@ def _vec_dtype_info(arg) -> tuple[int, str] | None:
         # The *value* type is a float vec — storage is ulong and each
         # component converts on access (see ``_is_demoted_f64_array``).
         return n, "float"
+    if scalar_ctype == "wp::float64" and _fp64_mode() == "error":
+        raise MetalCodegenError(
+            f"Arrays of vec_t with element type 'wp::float64' are rejected on Metal, which has no fp64; "
+            f"set warp.config.metal_fp64 (WARP_METAL_FP64) to 'demote' (compute in float32) or 'emulate' "
+            f"(software fp64)"
+        )
     if scalar_ctype not in _MSL_VEC_SCALAR_PREFIX:
         raise MetalCodegenError(f"MSL codegen does not yet support arrays of vec_t with element type {scalar_ctype!r}")
     return n, _MSL_VEC_SCALAR_PREFIX[scalar_ctype]
@@ -19062,6 +19068,12 @@ def _mat_dtype_info(arg) -> tuple[int, int, str] | None:
     scalar_ctype = f"wp::{scalar_cls.__name__}"
     if scalar_ctype == "wp::float64" and _is_demoted_f64_array(arg):
         return rows, cols, "float"
+    if scalar_ctype == "wp::float64" and _fp64_mode() == "error":
+        raise MetalCodegenError(
+            f"Arrays of mat_t with element type 'wp::float64' are rejected on Metal, which has no fp64; "
+            f"set warp.config.metal_fp64 (WARP_METAL_FP64) to 'demote' (compute in float32) or 'emulate' "
+            f"(software fp64)"
+        )
     if scalar_ctype not in _MSL_VEC_SCALAR_PREFIX:
         raise MetalCodegenError(f"MSL codegen does not yet support arrays of mat_t with element type {scalar_ctype!r}")
     return rows, cols, _MSL_VEC_SCALAR_PREFIX[scalar_ctype]

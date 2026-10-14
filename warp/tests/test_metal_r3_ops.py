@@ -380,6 +380,68 @@ class TestMetalR3Ops(unittest.TestCase):
             """,
         )
 
+    def _fp64_mat_arrays(self, mode: str, tol: str):
+        _run(
+            self,
+            f"""
+            wp.config.metal_fp64 = "{mode}"
+
+            @wp.struct
+            class Out:
+                m: wp.array[wp.mat44d]
+
+            @wp.kernel
+            def k(a: wp.array[wp.mat44d], v: wp.array[wp.vec3d], s: wp.array[wp.float64], o: Out,
+                  o2: wp.array[wp.mat33d], of: wp.array[float]):
+                i = wp.tid()
+                m = a[i]
+                o.m[i] = wp.transpose(m) * wp.float64(2.0) + m @ m
+                r = wp.mat33d(m[0, 0], m[0, 1], m[0, 2], m[1, 0], m[1, 1], m[1, 2], m[2, 0], m[2, 1], m[2, 2])
+                o2[i] = r * s[i]
+                of[i] = float(wp.dot(r @ v[i], v[i]) + m[3, 3])
+
+            def launch(dev):
+                rng = np.random.default_rng(1)
+                a = wp.array(rng.standard_normal((2, 4, 4)), dtype=wp.mat44d, device=dev)
+                v = wp.array(rng.standard_normal((2, 3)), dtype=wp.vec3d, device=dev)
+                s = wp.array([1.5, -0.25], dtype=wp.float64, device=dev)
+                o = Out()
+                o.m = wp.zeros(2, dtype=wp.mat44d, device=dev)
+                o2 = wp.zeros(2, dtype=wp.mat33d, device=dev)
+                of = wp.zeros(2, dtype=float, device=dev)
+                wp.launch(k, 2, [a, v, s, o], [o2, of], device=dev)
+                return o.m.numpy(), o2.numpy(), of.numpy()
+
+            cpu, metal = both(launch)
+            assert_same(cpu, metal, {tol})
+            """,
+        )
+
+    def test_fp64_mat_arrays_emulate(self):
+        self._fp64_mat_arrays("emulate", "rtol=1e-12, atol=1e-12")
+
+    def test_fp64_mat_arrays_demote(self):
+        self._fp64_mat_arrays("demote", "rtol=1e-5, atol=1e-5")
+
+    def test_fp64_mat_arrays_error_names_the_setting(self):
+        _run(
+            self,
+            """
+            wp.config.metal_fp64 = "error"
+
+            @wp.kernel
+            def k(a: wp.array[wp.mat33d]):
+                a[0] = wp.mat33d()
+
+            try:
+                wp.launch(k, 1, [wp.zeros(1, dtype=wp.mat33d, device="metal:0")], device="metal:0")
+            except Exception as e:
+                assert "metal_fp64" in str(e), str(e)
+            else:
+                raise AssertionError("float64 mat arrays should be rejected under metal_fp64='error'")
+            """,
+        )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
