@@ -201,6 +201,38 @@ class TestMetalR3Ops(unittest.TestCase):
             """,
         )
 
+    def test_big_mat_constructor_and_extract_adjoints(self):
+        # Newton's softbody tet energy differentiates a ``mat43`` built from
+        # 12 scalars and read by element and by row.
+        _run(
+            self,
+            """
+            mat43 = wp.types.matrix(shape=(4, 3), dtype=wp.float32)
+
+            @wp.kernel
+            def k(x: wp.array[float], v: wp.array[wp.vec3], out: wp.array[float]):
+                i = wp.tid()
+                a = x[i]
+                m = mat43(a, 2.0 * a, 3.0, a * a, 5.0, 6.0, -a, 8.0, 9.0, 10.0, a, 12.0)
+                w = 2.0 * m[1] + m[2] * 3.0
+                out[i] = m[3, 1] * m[0, 0] + wp.dot(w, v[i]) + wp.ddot(m, m)
+
+            def launch(dev):
+                x = wp.array([0.5, -1.5], dtype=float, device=dev, requires_grad=True)
+                v = wp.array(np.arange(6, dtype=np.float32).reshape(2, 3), dtype=wp.vec3, device=dev,
+                             requires_grad=True)
+                out = wp.zeros(2, dtype=float, device=dev, requires_grad=True)
+                tape = wp.Tape()
+                with tape:
+                    wp.launch(k, 2, [x, v], [out], device=dev)
+                tape.backward(grads={out: wp.ones(2, dtype=float, device=dev)})
+                return out.numpy(), x.grad.numpy(), v.grad.numpy()
+
+            cpu, metal = both(launch)
+            assert_same(cpu, metal, rtol=1e-5)
+            """,
+        )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

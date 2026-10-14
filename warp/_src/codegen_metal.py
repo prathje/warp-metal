@@ -1032,6 +1032,7 @@ def _emit_big_mat_struct(name: str, rows: int, cols: int, msl_scalar: str) -> st
     # Copy overload: ``mat_t<R, C>(m)`` with a same-type operand.
     body.append(f"inline {name} {name}_make({name} m) {{ return m; }}")
     body.append(f"inline {msl_scalar} wp_mat_extract({name} m, int row, int col) {{ return m.c[row * {cols} + col]; }}")
+    body.append(f"inline {msl_scalar} wp_mat_flat_elem({name} m, int i) {{ return m.c[i]; }}")
     body.append(
         f"inline void wp_mat_elem_store(thread {name}& m, int row, int col, {msl_scalar} v) "
         f"{{ m.c[row * {cols} + col] = v; }}"
@@ -1140,6 +1141,16 @@ def _emit_big_mat_struct(name: str, rows: int, cols: int, msl_scalar: str) -> st
     body.append(f"inline void wp_adj_ddot({name} a, {name} b, thread {name}& aa, thread {name}& ab, {msl_scalar} r) {{")
     body.append(f"    for (int i = 0; i < {n}; ++i) {{ aa.c[i] += b.c[i] * r; ab.c[i] += a.c[i] * r; }}")
     body.append("}")
+    # ``wp.extract(m, i, j)`` / ``wp.extract(m, i)`` reverse (row-major
+    # storage, so no transpose as in the native column-major overloads).
+    body.append(
+        f"inline void wp_adj_extract({name} m, int i, int j, thread {name}& am, thread int& ai, thread int& aj, "
+        f"{msl_scalar} r) {{ am.c[i * {cols} + j] += r; }}"
+    )
+    body.append(
+        f"inline void wp_adj_extract({name} m, int i, thread {name}& am, thread int& ai, {row_type} r) "
+        f"{{ for (int j = 0; j < {cols}; ++j) am.c[i * {cols} + j] += r[j]; }}"
+    )
     if rows == cols:
         # mat * mat (square — same struct type on both sides).
         body.append(f"inline {name} operator*({name} a, {name} b) {{")
@@ -1320,6 +1331,10 @@ def _emit_native_mat_extract_overloads(source: str) -> str:
     for scalar, rows, cols in sorted(seen):
         parts.append(
             f"inline {scalar} wp_mat_extract({scalar}{rows}x{cols} m, int row, int col) {{ return m[col][row]; }}"
+        )
+        parts.append(
+            f"inline {scalar} wp_mat_flat_elem({scalar}{rows}x{cols} m, int i) "
+            f"{{ return m[i % {cols}][i / {cols}]; }}"
         )
         # MSL matrices have no unary minus, and ``wp::neg`` lowers to ``(-x)``.
         if scalar in _MSL_NATIVE_MAT_SCALARS:
@@ -9434,7 +9449,10 @@ def _rewrite_adj_init_list_constructor(text: str) -> str:
             name = d[1:].strip() if d.startswith("&") else d
             if not name.isidentifier():
                 return m.group(0)
-            adds.append(f"{name} += {ret}[{i}];")
+            # Matrices are listed row-major; ``ret[i]`` would be a row
+            # (big-mat struct) or column (native), so read flat element i.
+            elem = f"wp_mat_flat_elem({ret}, {i})" if m.group(1) == "mat" else f"{ret}[{i}]"
+            adds.append(f"{name} += {elem};")
         return "do { " + " ".join(adds) + " } while(0)"
 
     return _ADJ_INIT_LIST_PAT.sub(repl, text)
