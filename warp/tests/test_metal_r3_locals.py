@@ -531,6 +531,36 @@ class TestMetalR3Locals(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet, timeout=120)
 
+    def test_tile_broadcast_column(self):
+        # A 2-D ``(R, 1)`` column broadcast to a square ``(R, R)`` tile
+        # repeats along the columns; it was transposed like a 1-D ``(R,)``
+        # tile (warp_nn's RNN/GRU bias add, reached once the cells inline).
+        snippet = _snippet(
+            """
+            @wp.kernel
+            def k(b: wp.array2d[float], v: wp.array[float], out: wp.array2d[float], out2: wp.array2d[float]):
+                i, j = wp.tid()
+                t = wp.tile_zeros(shape=(4, 4), dtype=float)
+                t += wp.tile_broadcast(wp.tile_load(b, shape=(4, 1), offset=(0, 0)), shape=(4, 4))
+                wp.tile_store(out, t, offset=(0, 0))
+                u = wp.tile_broadcast(wp.tile_load(v, shape=4, offset=0), shape=(4, 4))
+                wp.tile_store(out2, u, offset=(0, 0))
+
+            def run(dev):
+                b = wp.array(np.arange(4, dtype=np.float32).reshape(4, 1) + 1, device=dev)
+                v = wp.array(np.arange(4, dtype=np.float32) + 10, device=dev)
+                o = wp.zeros((4, 4), dtype=float, device=dev)
+                o2 = wp.zeros((4, 4), dtype=float, device=dev)
+                for bd in (1, 64):
+                    wp.launch_tiled(k, dim=(1, 1), inputs=[b, v, o, o2], block_dim=bd, device=dev)
+                return o.numpy(), o2.numpy()
+
+            res = compare(run)
+            np.testing.assert_array_equal(res["metal:0"][0][:, 3], [1.0, 2.0, 3.0, 4.0])
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

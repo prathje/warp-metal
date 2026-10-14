@@ -12646,6 +12646,16 @@ def _translate_tile_intrinsics(
         #       + c] = var_Y.c[c].
         #   (b) Source is 2-D, target is 2-D, target rows == 1 — collapse.
         # We support (a); fall back to identity for other shapes.
+        if in_cols == 1 and in_label in tile_2d_labels and in_rows == l_rows:
+            # A genuine 2-D ``(R, 1)`` column (not a 1-D ``(R,)`` tile,
+            # which shares the storage shape) repeats along the columns:
+            # ``X[r, c] = Y[r]``. With a square target the 1-D rule below
+            # would silently transpose it (warp_nn's RNN/GRU bias add).
+            return (
+                f"{{ for (int _bc_r = 0; _bc_r < {l_rows}; ++_bc_r) "
+                f"for (int _bc_c = 0; _bc_c < {l_cols}; ++_bc_c) "
+                f"var_{lhs}.c[_bc_r * {l_cols} + _bc_c] = var_{in_label}.c[_bc_r]; }}"
+            )
         if in_cols == 1 and in_rows == l_cols:
             # Source shape (l_cols, 1) tiled along ``r``.
             return (
