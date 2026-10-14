@@ -234,6 +234,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
         TestMetalArtifactCacheKeys,
         TestMetalArtifactSweep,
         TestMetalAsyncFill,
+        TestMetalAutoflush,
         TestMetalForLoopMaterialize,
         TestMetalTileBroadcast,
     )
@@ -447,6 +448,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
         TestMetalArtifactCacheKeys,
         TestMetalArtifactSweep,
         TestMetalAsyncFill,
+        TestMetalAutoflush,
         TestMetalForLoopMaterialize,
         TestMetalTileBroadcast,
         TestMetalMujocoWarp,

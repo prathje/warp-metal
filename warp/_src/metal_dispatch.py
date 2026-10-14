@@ -447,7 +447,19 @@ class MetalDispatcher:
         # non-dependent launches better than serial in-encoder
         # barriers do. Keep the barrier code (used when batching is
         # enabled by future workloads) but default to 1.
-        self._autoflush_every = 1
+        #
+        # That per-dispatch policy degrades badly when the GPU is busy
+        # (another process, or this one queueing faster than the GPU drains):
+        # every command buffer is scheduled on its own, and with a shared GPU
+        # we measured 1.5 ms per tiny launch at ``autoflush=1`` against 70 us
+        # at 64 (Newton's Featherstone pendulum: 146k launches, 180 s in
+        # dispatch). So commit immediately only while the previous command
+        # buffer has already completed (GPU idle: keeps the latency of the
+        # per-launch policy), and otherwise keep encoding into the open one
+        # until ``_autoflush_every`` dispatches.
+        # ``WARP_METAL_AUTOFLUSH=<n>`` overrides the batch size;
+        # ``WARP_METAL_AUTOFLUSH=1`` restores the strict per-launch commit.
+        self._autoflush_every = max(1, int(os.environ.get("WARP_METAL_AUTOFLUSH", "64") or "64"))
         # Cache the NSRange constructor — avoids one PyObjC lookup per
         # batch-bind.
         self._NSMakeRange = Metal.NSMakeRange
@@ -1329,16 +1341,23 @@ class MetalDispatcher:
         # slower on G1).
         encoder.memoryBarrierWithScope_(self._barrier_scope_buffers)
         self._dispatch_count += 1
-        if self._dispatch_count >= self._autoflush_every:
+        if self._dispatch_count >= self._autoflush_every or self._gpu_idle():
             # Bounded-memory dispatch: commit periodically so transient
             # refs in ``_inflight_refs`` get released by the GPU
             # completion handler. Doesn't block — a fresh cmd buffer
             # picks up the next dispatch on the same queue (commit order
-            # is preserved, ``sync()`` drains the full chain).
+            # is preserved, ``sync()`` drains the full chain). An idle GPU
+            # gets the work right away (see ``_autoflush_every``).
             self.flush()
             self._dispatch_count = 0
         if self._profile_dispatch:
             self._bump_stats(pso, grid, _time.perf_counter_ns() - _prof_t0)
+
+    def _gpu_idle(self) -> bool:
+        """Whether every committed command buffer has finished executing
+        (``MTLCommandBufferStatus`` 4 = Completed, 5 = Error)."""
+        pending = self._pending_commits
+        return not pending or pending[-1].status() >= 4
 
     def _bump_stats(self, pso, grid: tuple[int, int, int], elapsed_ns: int) -> None:
         """Record one dispatch's wall time into the per-kernel stats dict."""

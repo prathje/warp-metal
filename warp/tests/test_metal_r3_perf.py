@@ -305,5 +305,44 @@ class TestMetalAsyncFill(unittest.TestCase):
         _run_with_metal_enabled(self, snippet, timeout=120)
 
 
+@unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
+@unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
+class TestMetalAutoflush(unittest.TestCase):
+    def test_busy_gpu_batches_dependent_launches(self):
+        # While the GPU is busy, launches share a command buffer (separated
+        # by buffer barriers) instead of one commit each; dependent launches
+        # must still see each other's writes.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+            from warp._src.metal_dispatch import get_dispatcher
+
+            @wp.kernel
+            def step(src: wp.array[float], dst: wp.array[float]):
+                i = wp.tid()
+                dst[i] = src[i] * 0.5 + float(i)
+
+            n = 4096
+            res = {}
+            for dev in ("cpu", "metal:0"):
+                a = wp.zeros(n, dtype=float, device=dev)
+                b = wp.zeros(n, dtype=float, device=dev)
+                if dev == "metal:0":
+                    disp = get_dispatcher()
+                    wp.synchronize_device(dev)
+                    disp._autoflush_every = 8
+                    disp._gpu_idle = lambda: False
+                for k in range(101):
+                    src, dst = (a, b) if k % 2 == 0 else (b, a)
+                    wp.launch(step, dim=n, inputs=[src, dst], device=dev)
+                if dev == "metal:0":
+                    assert len(disp._pending_commits) == 101 // 8, len(disp._pending_commits)
+                res[dev] = b.numpy()
+            np.testing.assert_allclose(res["metal:0"], res["cpu"], rtol=1e-6)
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
