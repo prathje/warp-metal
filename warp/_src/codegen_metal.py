@@ -14594,15 +14594,30 @@ def _artifact_display_name(kernel, adj) -> str:
     return name
 
 
+def _struct_field_path_type(root_type, fpath: tuple[str, ...]):
+    """Type at ``fpath`` below a struct (or struct-array) kernel arg type.
+
+    A ``"[k]"`` component selects element ``k`` of a ``wp.array[Struct]``
+    (see ``fold_struct_array_array_fields``); any other names a field.
+    """
+    t = root_type
+    for comp in fpath:
+        if comp.startswith("["):
+            t = t.dtype
+        else:
+            t = t.vars[comp].type
+    return t
+
+
 def _struct_arg_array_ndims(adj, fields: dict[str, tuple[str, tuple[str, ...]]]) -> dict[str, int]:
     """ndim of each flattened struct-arg array field (synthetic label -> ndim)."""
     arg_types = {a.label: a.type for a in adj.args}
     out: dict[str, int] = {}
     for label, (arg_label, path) in fields.items():
-        t = arg_types.get(arg_label)
-        for name in path:
-            field = getattr(t, "vars", {}).get(name)
-            t = getattr(field, "type", None)
+        try:
+            t = _struct_field_path_type(arg_types.get(arg_label), path)
+        except (AttributeError, KeyError):
+            t = None
         ndim = getattr(t, "ndim", None)
         if isinstance(ndim, int) and ndim > 0:
             out[label] = ndim
@@ -14770,7 +14785,16 @@ def _generate_msl_kernel_uncached(
     _ast_nodes, _slice_view_skip = _fold_arg_slice_views(_ast_nodes, adj, {**_const_ints, **_inlined_const_ints})
     _local_arr_skip = _local_arr_skip | _slice_view_skip
     _ast_nodes, _mesh_skip = _ast_fold_mesh_get(_ast_nodes, adj, _inlined_var_ctypes)
-    _ast_nodes, _sa_skip, _sa_field_reads = _ast_fold_struct_array_fields(_ast_nodes, adj, _inlined_var_ctypes)
+    # Array fields of constant-index ``wp.array[Struct]`` elements become
+    # synthetic array inputs (``(arg, ("[k]", field))``), bound at launch.
+    _sa_synthetic: dict[str, tuple[str, tuple[str, ...]]] = {}
+    _ast_nodes, _sa_skip, _sa_field_reads = _ast_fold_struct_array_fields(
+        _ast_nodes,
+        adj,
+        _inlined_var_ctypes,
+        const_ints={**_const_ints, **_inlined_const_ints},
+        synthetic_out=_sa_synthetic,
+    )
     _has_print = _ast_has_print_calls(_ast_nodes)
     if _has_print:
         _handle_metal_print(adj.fun_name)
@@ -14782,7 +14806,7 @@ def _generate_msl_kernel_uncached(
     # array name (``qp_arg__points``); below we add a matching read-only
     # array input to the signature and the launcher binds the field's
     # buffer by walking the struct instance.
-    _struct_arg_array_fields: dict[str, tuple[str, tuple[str, ...]]] = {}
+    _struct_arg_array_fields: dict[str, tuple[str, tuple[str, ...]]] = dict(_sa_synthetic)
     # Native Warp wraps a negative index once (``arr[-1]`` is the last
     # element); the flat-offset translators do not. Wrap every index of a
     # kernel-array access (and of views of one) before the view fold
@@ -15004,9 +15028,7 @@ def _generate_msl_kernel_uncached(
 
         for syn_label, (root_label, fpath) in _struct_arg_array_fields.items():
             field_desc = f"struct arg {root_label!r} array field {'.'.join(fpath)!r}"
-            ftype = next(a.type for a in adj.args if a.label == root_label)
-            for comp in fpath:
-                ftype = ftype.vars[comp].type
+            ftype = _struct_field_path_type(next(a.type for a in adj.args if a.label == root_label), fpath)
             if isinstance(ftype, _wp_indexedarray) or getattr(ftype, "_wp_generic_type_str_", None) == "indexedarray_t":
                 raise MetalCodegenError(
                     f"Kernel {adj.fun_name!r}: {field_desc} is a wp.indexedarray, which is not "
@@ -18545,10 +18567,7 @@ def _load_cached_artifact(key: str, adj) -> MetalKernelArtifact | None:
             from warp._src.codegen import Var as _WpVar  # noqa: PLC0415
 
             root, fpath = sfa_paths[label]
-            ftype = by_label[root].type
-            for comp in fpath:
-                ftype = ftype.vars[comp].type
-            return _WpVar(label, ftype)
+            return _WpVar(label, _struct_field_path_type(by_label[root].type, fpath))
 
         input_args = [_arg_for(label) for label in payload["input_arg_labels"]]
         output_args = [_arg_for(label) for label in payload["output_arg_labels"]]
@@ -19461,13 +19480,52 @@ def _struct_field_launch_value(fwd_args, arg_by_name, root_label: str, fpath: tu
     caller binds a placeholder buffer in that case, matching how empty
     top-level arrays are handled.
     """
-    idx, _ = arg_by_name[root_label]
+    idx, arg = arg_by_name[root_label]
     value = fwd_args[idx]
+    if fpath and fpath[0].startswith("["):
+        return _struct_array_elem_field_value(value, arg.type.dtype, int(fpath[0][1:-1]), fpath[1:])
     for comp in fpath:
         if value is None:
             return None
         value = getattr(value, comp, None)
     return value
+
+
+def _struct_array_elem_field_value(arr, struct_type, k: int, fpath: tuple[str, ...]):
+    """The ``wp.array`` stored in field ``fpath`` of element ``k`` of struct array ``arr``.
+
+    The element's array record (``array_t``: data pointer, shape, strides)
+    is read straight from the array's host-visible storage, so this sees
+    whatever the host last wrote; struct arrays of array handles are built
+    on the host and not rewritten by kernels.
+    """
+    import ctypes  # noqa: PLC0415
+
+    import numpy as np  # noqa: PLC0415
+
+    if arr is None or getattr(arr, "ptr", None) is None or k >= arr.shape[0]:
+        return None
+    if not arr.is_contiguous:
+        raise RuntimeError("Metal: struct arrays with array members must be contiguous")
+    np_dtype = struct_type.numpy_dtype()
+    nbytes = np.dtype(np_dtype).itemsize
+    raw = (ctypes.c_char * nbytes).from_address(int(arr.ptr) + k * int(arr.strides[0]))
+    rec = np.frombuffer(bytes(raw), dtype=np_dtype)[0]
+    t = struct_type
+    for comp in fpath[:-1]:
+        rec = rec[comp]
+        t = t.vars[comp].type
+    field_type = t.vars[fpath[-1]].type
+    a = rec[fpath[-1]]
+    data = int(a["data"])
+    if data == 0:
+        return None
+    ndim = int(a["ndim"])
+    shape = tuple(int(x) for x in a["shape"][:ndim])
+    strides = tuple(int(x) for x in a["strides"][:ndim])
+    import warp as wp  # noqa: PLC0415
+
+    return wp.array(ptr=data, shape=shape, strides=strides, dtype=field_type.dtype, device=arr.device)
 
 
 def _iter_struct_array_grads(struct_type, adj_instance, _path: tuple[str, ...] = ()):

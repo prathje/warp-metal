@@ -2904,12 +2904,24 @@ _SA_ADDR_PAT = re.compile(r"^\s*var_(?P<lhs>\w+)\s*=\s*wp::address\s*\(\s*var_(?
 
 
 def fold_struct_array_array_fields(
-    nodes: list[Node], adj, extra_var_ctypes: dict[str, str] | None = None
+    nodes: list[Node],
+    adj,
+    extra_var_ctypes: dict[str, str] | None = None,
+    const_ints: dict[str, int] | None = None,
+    synthetic_out: dict[str, tuple[str, tuple[str, ...]]] | None = None,
 ) -> tuple[list[Node], set[str], set[str]]:
-    """Stub reads of array fields through ``wp.array[Struct]`` elements.
+    """Bind or stub reads of array fields through ``wp.array[Struct]`` elements.
+
+    When the element index is a non-negative constant (Newton's VBD kernels
+    read ``collision_info_array[0].<field>``) and ``synthetic_out`` is given,
+    each array field becomes a synthetic array input
+    ``<arg>__e<k>__<field>`` recorded in ``synthetic_out`` as
+    ``(arg, ("[k]", field))``; the launcher binds it from the element's
+    array record. Reads through any other element are stubbed.
 
     Returns ``(nodes, skip_decls, arg_labels)`` where ``arg_labels`` names
-    the struct-array kernel args whose array fields are read.
+    the struct-array kernel args whose array fields are read through a
+    stub.
     """
     from warp._src.codegen import Struct  # noqa: PLC0415
     from warp._src.codegen_metal import (  # noqa: PLC0415
@@ -2936,9 +2948,32 @@ def fold_struct_array_array_fields(
     ctypes_of.update(extra_var_ctypes or {})
 
     elem: dict[str, str] = {}  # element ptr / struct copy label -> arg label
+    elem_idx: dict[str, int] = {}  # element ptr / copy label -> constant element index
     fptr: dict[str, str] = {}  # array-field ptr / array value label -> arg label
     eptr: dict[str, str] = {}  # element-of-array-field ptr label -> arg label
+    syn_ptr: dict[str, str] = {}  # array-field ptr label -> synthetic array label
+    syn_val: dict[str, str] = {}  # loaded array-field value label -> synthetic array label
     used: set[str] = set()
+    consts = dict(const_ints or {})
+    for v in adj.variables:
+        if isinstance(v.constant, int) and not isinstance(v.constant, bool):
+            consts.setdefault(str(v.label), v.constant)
+
+    def _const_index(rest: str) -> int | None:
+        parts = [p.strip() for p in _split_top_level_args(rest)]
+        if len(parts) != 1:
+            return None
+        p = parts[0]
+        if re.fullmatch(r"\d+", p):
+            return int(p)
+        if p.startswith("var_") and isinstance(consts.get(p[4:]), int) and consts[p[4:]] >= 0:
+            return consts[p[4:]]
+        return None
+
+    def _sub_syn(text: str) -> str:
+        if not syn_val:
+            return text
+        return re.sub(r"\bvar_(\w+)\b", lambda mm: f"var_{syn_val.get(mm.group(1), mm.group(1))}", text)
 
     def rewrite_leaf(n: Node) -> list[Node]:
         raw = getattr(n, "raw", "") or ""
@@ -2947,12 +2982,20 @@ def fold_struct_array_array_fields(
         m = _SA_ADDR_PAT.match(raw)
         if m and m.group("arr") in struct_args:
             elem[m.group("lhs")] = m.group("arr")
+            k = _const_index(m.group("rest"))
+            if k is not None and synthetic_out is not None:
+                elem_idx[m.group("lhs")] = k
             return [n]
         m = _MESH_LOAD_PAT.match(raw)
         if m:
             src, lhs = m.group("src"), m.group("lhs")
+            if src in syn_ptr:
+                syn_val[lhs] = syn_ptr[src]
+                return []
             if src in elem:
                 elem[lhs] = elem[src]
+                if src in elem_idx:
+                    elem_idx[lhs] = elem_idx[src]
                 return [n]
             if src in fptr:
                 fptr[lhs] = fptr[src]
@@ -2970,14 +3013,28 @@ def fold_struct_array_array_fields(
         m = _MESH_COPY_PAT.match(raw)
         if m and m.group("src") in elem:
             elem[m.group("lhs")] = elem[m.group("src")]
+            if m.group("src") in elem_idx:
+                elem_idx[m.group("lhs")] = elem_idx[m.group("src")]
             return [n]
         if m and m.group("src") in fptr:
             fptr[m.group("lhs")] = fptr[m.group("src")]
             return []
+        if m and m.group("src") in syn_val:
+            syn_val[m.group("lhs")] = syn_val[m.group("src")]
+            return []
         m = _MESH_FIELD_PTR_PAT.match(raw)
         if m and m.group("root") in elem and m.group("field") in struct_args[elem[m.group("root")]]:
-            fptr[m.group("lhs")] = elem[m.group("root")]
+            root = m.group("root")
+            if root in elem_idx and synthetic_out is not None:
+                arg, k, field = elem[root], elem_idx[root], m.group("field")
+                syn = f"{arg}__e{k}__{field}"
+                synthetic_out[syn] = (arg, (f"[{k}]", field))
+                syn_ptr[m.group("lhs")] = syn
+                return []
+            fptr[m.group("lhs")] = elem[root]
             return []
+        if m and m.group("root") in syn_ptr and m.group("field") == "shape":
+            return parse([f"{_leading_indent(raw)}var_{m.group('lhs')} = &(var_{syn_ptr[m.group('root')]}.shape);"])
         if m and m.group("root") in fptr and m.group("field") == "shape":
             fptr[m.group("lhs")] = fptr[m.group("root")]
             used.add(fptr[m.group("root")])
@@ -2994,8 +3051,13 @@ def fold_struct_array_array_fields(
                 return "0"
             return mm.group(0)
 
-        new_raw = _MESH_SHAPE_EXTRACT_PAT.sub(_sub_extract, raw)
+        new_raw = _sub_syn(_MESH_SHAPE_EXTRACT_PAT.sub(_sub_extract, raw))
         for ref in re.findall(r"\bvar_(\w+)\b", new_raw):
+            if ref in syn_ptr:
+                raise MetalCodegenError(
+                    f"Kernel {adj.fun_name!r}: unsupported use of an array field of a wp.array[Struct] "
+                    f"element on Metal: {raw.strip()!r}"
+                )
             if ref in stubbed:
                 raise MetalCodegenError(
                     f"Kernel {adj.fun_name!r}: array fields of wp.array[Struct] elements are not supported on "
@@ -3031,7 +3093,7 @@ def fold_struct_array_array_fields(
         return out
 
     out = walk(nodes)
-    return out, set(fptr) | set(eptr), used
+    return out, set(fptr) | set(eptr) | set(syn_ptr) | set(syn_val), used
 
 
 # ---------------------------------------------------------------------------
