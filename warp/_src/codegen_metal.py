@@ -14749,8 +14749,9 @@ def _generate_msl_kernel_uncached(
     _coop_n_early = getattr(adj, "_metal_coop_block_n", 0)
     _coop_plan_early = getattr(adj, "_metal_coop_plan", None) if _coop_n_early > 0 else None
     _coop_coldist_early: dict[str, int] = dict(_coop_plan_early.coldist) if _coop_plan_early is not None else {}
-    for _v in adj.variables:
-        _parsed = _parse_tile_ctype(_v.ctype())
+
+    def _add_tile_elem_info(label, ctype) -> None:
+        _parsed = _parse_tile_ctype(ctype)
         if _parsed is not None:
             _elem, _rows, _cols = _parsed[1], _parsed[2], _parsed[3]
             # Distributed tiles (coop-block mode) are one element per lane,
@@ -14759,15 +14760,38 @@ def _generate_msl_kernel_uncached(
                 _rows = 1
             # Column-distributed tiles are one column per lane: the mapped
             # function runs over the lane's R elements.
-            if _coop_n_early > 0 and _v.label in _coop_coldist_early:
-                _rows, _cols = _coop_coldist_early[_v.label], 1
-            _tile_elem_info[_v.label] = (_elem, _rows, _cols)
+            if _coop_n_early > 0 and label in _coop_coldist_early:
+                _rows, _cols = _coop_coldist_early[label], 1
+            _tile_elem_info[label] = (_elem, _rows, _cols)
+
+    for _v in adj.variables:
+        _add_tile_elem_info(_v.label, _v.ctype())
     _ast_nodes, _tile_map_var_types = _expand_user_tile_map(_ast_nodes, adj, _tile_elem_info)
     _ast_nodes, _tile_map_adj_var_types = _expand_user_tile_map_adj(_ast_nodes, adj, _tile_elem_info)
     _tile_map_var_types = {**_tile_map_var_types, **_tile_map_adj_var_types}
     _ast_nodes, _inlined_const_ints, _inlined_struct_locals, _inlined_var_ctypes = _ast_inline(
         _ast_nodes, adj, extra_var_types=_tile_map_var_types
     )
+    # A ``wp.tile_map(user_fn, ...)`` inside an inlined ``@wp.func`` only
+    # appears once that body is spliced in (mujoco_warp's
+    # ``solve_search_sums`` map, reached through a ``wp.static`` factory):
+    # expand those too and inline the calls they produce.
+    for _round in range(4):
+        if not any("tile_map" in _ln for _ln in _ast_emit(_ast_nodes)):
+            break
+        for _lbl, _ct in _inlined_var_ctypes.items():
+            if _lbl not in _tile_elem_info:
+                _add_tile_elem_info(_lbl, _ct)
+        _ast_nodes, _tm_more = _expand_user_tile_map(_ast_nodes, adj, _tile_elem_info)
+        if not _tm_more:
+            break
+        _ast_nodes, _c_more, _s_more, _v_more = _ast_inline(
+            _ast_nodes, adj, extra_var_types={**_inlined_var_ctypes, **_tm_more}
+        )
+        _inlined_const_ints.update(_c_more)
+        _inlined_struct_locals.update(_s_more)
+        _inlined_var_ctypes.update(_v_more)
+        _inlined_var_ctypes.update(_tm_more)
     # Component stores into array elements inside inlined ``@wp.func``
     # bodies (``arr[i][j, k] = x`` on an array the function was passed).
     _ast_nodes = _lower_inlined_array_slots(_ast_nodes, adj)

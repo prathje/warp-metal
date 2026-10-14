@@ -561,6 +561,45 @@ class TestMetalR3Locals(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet, timeout=120)
 
+    def test_tile_map_inside_inlined_func(self):
+        # ``wp.tile_map(user_fn, ...)`` inside a ``@wp.func`` reached through
+        # ``wp.static`` (mujoco_warp's Newton decrement) only appears once
+        # the caller is inlined; the mapped function must still be inlined.
+        snippet = _snippet(
+            """
+            @wp.func
+            def sums(grad: float, solution: float):
+                return wp.vec2(solution * solution, grad * solution)
+
+            def make(n: int):
+                @wp.func
+                def dec(sol: wp.tile[float, n, 1], b: wp.array2d[float]):
+                    g = wp.tile_load(b, shape=(n, 1), offset=(0, 0))
+                    return wp.tile_reduce(wp.add, wp.tile_map(sums, g, sol))[0]
+
+                return dec
+
+            @wp.kernel
+            def k(a: wp.array2d[float], b: wp.array2d[float], out: wp.array[wp.vec2]):
+                sol = wp.tile_load(a, shape=(6, 1), offset=(0, 0))
+                out[0] = wp.static(make(6))(sol, b)
+
+            rng = np.random.default_rng(0)
+            A = rng.random((6, 1)).astype(np.float32)
+            B = rng.random((6, 1)).astype(np.float32)
+
+            def run(dev):
+                a = wp.array(A, device=dev)
+                b = wp.array(B, device=dev)
+                o = wp.zeros(1, dtype=wp.vec2, device=dev)
+                wp.launch_tiled(k, dim=1, inputs=[a, b, o], block_dim=1, device=dev)
+                return (o.numpy(),)
+
+            compare(run)
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
