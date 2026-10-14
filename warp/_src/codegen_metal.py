@@ -12636,13 +12636,26 @@ def _translate_tile_intrinsics(
         if in_n == 1:
             # Single-element source broadcast across the target tile.
             return f"{{ for (int _bc_i = 0; _bc_i < {l_n}; ++_bc_i) var_{lhs}.c[_bc_i] = var_{in_label}.c[0]; }}"
-        # Cases:
-        #   (a) Source is 1-D (in_cols == 1), target is 2-D — repeat
-        #       source along target's outer dim ``r``: var_X.c[r*l_cols
-        #       + c] = var_Y.c[c].
-        #   (b) Source is 2-D, target is 2-D, target rows == 1 — collapse.
-        # We support (a); fall back to identity for other shapes.
-        if in_cols == 1 and in_rows == l_cols:
+        # Cases (numpy broadcasting aligns trailing dims):
+        #   (a) Source is 1-D ``(C,)`` (``in_cols == 1``, not a 2-D tile),
+        #       target ``(R, C)`` — repeat the source along the target's
+        #       outer dim: var_X.c[r*l_cols + c] = var_Y.c[c].
+        #   (b) Source is a 2-D column ``(R, 1)``, target ``(R, C)`` —
+        #       repeat each row value across the columns:
+        #       var_X.c[r*l_cols + c] = var_Y.c[r].
+        #   (c) Source is a 2-D row ``(1, C)`` — as (a).
+        # A 2-D ``(R, 1)`` tile and a 1-D ``(R,)`` tile share ``tile_var_dims``
+        # (``tile_2d_labels`` tells them apart); taking (a) for a column
+        # broadcast added a bias column to only the first output column
+        # (warp_nn ``Linear``, Newton's ``DriveNeuralMLP``).
+        src_2d = in_label in tile_2d_labels
+        if src_2d and in_cols == 1 and in_rows == l_rows:
+            return (
+                f"{{ for (int _bc_r = 0; _bc_r < {l_rows}; ++_bc_r) "
+                f"for (int _bc_c = 0; _bc_c < {l_cols}; ++_bc_c) "
+                f"var_{lhs}.c[_bc_r * {l_cols} + _bc_c] = var_{in_label}.c[_bc_r]; }}"
+            )
+        if not src_2d and in_cols == 1 and in_rows == l_cols:
             # Source shape (l_cols, 1) tiled along ``r``.
             return (
                 f"{{ for (int _bc_r = 0; _bc_r < {l_rows}; ++_bc_r) "
@@ -12656,8 +12669,12 @@ def _translate_tile_intrinsics(
                 f"for (int _bc_c = 0; _bc_c < {l_cols}; ++_bc_c) "
                 f"var_{lhs}.c[_bc_r * {l_cols} + _bc_c] = var_{in_label}.c[_bc_c]; }}"
             )
-        # Unrecognised — leave identity as a safe fallback.
-        return f"var_{lhs} = var_{in_label}"
+        # Anything else would need a broadcast this lowering does not
+        # implement; an identity copy would silently read the wrong elements.
+        raise MetalCodegenError(
+            f"MSL codegen: tile_broadcast from shape {(in_rows, in_cols)} to {(l_rows, l_cols)} "
+            f"is not supported on Metal ({m.group(0)!r})"
+        )
 
     line = _TILE_BROADCAST_PAT.sub(_repl_tile_broadcast, line)
 

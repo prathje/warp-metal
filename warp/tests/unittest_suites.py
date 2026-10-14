@@ -234,6 +234,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
         TestMetalArtifactCacheKeys,
         TestMetalArtifactSweep,
         TestMetalForLoopMaterialize,
+        TestMetalTileBroadcast,
     )
     from warp.tests.test_metal_runtime import TestMetalRuntime, TestMetalRuntimeSubprocess
     from warp.tests.test_metal_tiles_ext import (
@@ -445,6 +446,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
         TestMetalArtifactCacheKeys,
         TestMetalArtifactSweep,
         TestMetalForLoopMaterialize,
+        TestMetalTileBroadcast,
         TestMetalMujocoWarp,
         TestMetalMeshWinding,
         TestMetalStructFieldWrite,

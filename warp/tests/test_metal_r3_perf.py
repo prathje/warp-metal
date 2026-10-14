@@ -222,5 +222,45 @@ print("calls", calls[0], "printf" in msg or "print" in msg)
             self.assertIn("calls 0 True", second)
 
 
+@unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
+@unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
+class TestMetalTileBroadcast(unittest.TestCase):
+    def test_column_and_row_broadcast(self):
+        # warp_nn ``Linear`` adds a bias tile ``(out, 1)`` broadcast to
+        # ``(out, batch)``; Metal repeated it along the wrong axis, so only
+        # batch row 0 received the bias (Newton DriveNeuralMLP tests).
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            R, C = 16, 16
+
+            @wp.kernel
+            def kcol(src: wp.array2d[float], out: wp.array2d[float]):
+                i, j = wp.tid()
+                t = wp.tile_zeros(shape=(R, C), dtype=float)
+                t += wp.tile_broadcast(wp.tile_load(src, shape=(R, 1), offset=(0, 0)), shape=(R, C))
+                wp.tile_store(out, t, offset=(0, 0))
+
+            @wp.kernel
+            def krow(src: wp.array[float], out: wp.array2d[float]):
+                i, j = wp.tid()
+                t = wp.tile_broadcast(wp.tile_load(src, shape=(C,), offset=(0,)), shape=(R, C))
+                wp.tile_store(out, t, offset=(0, 0))
+
+            col = np.arange(1, R + 1, dtype=np.float32).reshape(R, 1)
+            row = np.arange(1, C + 1, dtype=np.float32)
+            for dev in ("cpu", "metal:0"):
+                out = wp.zeros((R, C), dtype=float, device=dev)
+                wp.launch_tiled(kcol, dim=(1, 1), inputs=[wp.array(col, device=dev)], outputs=[out], device=dev, block_dim=64)
+                np.testing.assert_array_equal(out.numpy(), np.broadcast_to(col, (R, C)), err_msg=dev)
+                out = wp.zeros((R, C), dtype=float, device=dev)
+                wp.launch_tiled(krow, dim=(1, 1), inputs=[wp.array(row, device=dev)], outputs=[out], device=dev, block_dim=64)
+                np.testing.assert_array_equal(out.numpy(), np.broadcast_to(row, (R, C)), err_msg=dev)
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
