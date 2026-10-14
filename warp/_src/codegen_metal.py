@@ -20136,6 +20136,30 @@ def _maybe_staged_arg(value) -> bool:
     return type(value).__name__ == "indexedarray"
 
 
+def _fold_tiled_block_dim(artifact, dims: tuple, block_dim: int) -> tuple:
+    """Drop the trailing lane dim of a 4-D+ ``wp.launch_tiled`` launch.
+
+    ``wp.launch_tiled(dim=(a, b, c), block_dim=B)`` launches ``(a, b, c, B)``
+    and the kernel reads ``a, b, c = wp.tid()`` — on CUDA the first three
+    coordinates of the 4-D index. A serial (one thread per block) tile kernel
+    on Metal ignores the lane dim, so folding it away here leaves a 3-D grid
+    whose ``thread_position_in_grid`` already yields those coordinates. The
+    general fold below also drops it for <= 3-D launches; this one only runs
+    ahead of the 3-D limit check, and leaves 4-D-``wp.tid()`` and
+    distributed-lane kernels to their own handling.
+    """
+    if (
+        len(dims) > 3
+        and not artifact.tid4
+        and getattr(artifact, "coop_block_n", 0) == 0
+        and getattr(artifact, "tile_block_fold", True)
+        and block_dim > 1
+        and dims[-1] == block_dim
+    ):
+        return dims[:-1]
+    return dims
+
+
 def launch_metal_kernel_native(
     kernel,
     dim,
@@ -20759,6 +20783,7 @@ def launch_metal_kernel_native(
         dims = tuple(dim)
     if len(dims) == 0:
         return
+    dims = _fold_tiled_block_dim(artifact, dims, block_dim)
     if len(dims) == 4 and artifact.tid4:
         # 4-D tid: fold the last two launch dims into grid z; the kernel
         # decomposes via the ``__tid4_dim3`` input bound above.
@@ -21438,6 +21463,7 @@ def launch_metal_kernel(
         dims = tuple(dim)
     if len(dims) == 0:
         return
+    dims = _fold_tiled_block_dim(artifact, dims, block_dim)
     if len(dims) == 4 and artifact.tid4:
         # 4-D tid: fold the last two launch dims into grid z; the kernel
         # decomposes via the ``__tid4_dim3`` input bound above.
