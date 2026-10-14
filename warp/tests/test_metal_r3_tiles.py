@@ -1,0 +1,401 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Metal-vs-CPU checks for gaps found running Newton on Metal.
+
+Covers native-snippet array params, ``wp.array(ptr=...)`` locals, 4-D tiled
+launches, matrix-element tiles, builtin tile reducers, rebuildable volumes
+and strided transfers.
+
+Every case runs on ``cpu`` and ``metal:0`` and the results must agree. The
+Metal device must be enabled before ``wp.init()``, so each case runs in a
+subprocess (see ``test_metal_launch``).
+"""
+
+import textwrap
+import unittest
+
+from warp.tests.test_metal_launch import _has_mlx, _is_apple_silicon, _run_with_metal_native
+
+_PRELUDE = textwrap.dedent(
+    """
+    import numpy as np
+
+    def both(fn):
+        return {dev: fn(dev) for dev in ("cpu", "metal:0")}
+
+    def assert_same(res, atol=1e-5):
+        a, b = res["cpu"], res["metal:0"]
+        if not isinstance(a, (tuple, list)):
+            a, b = [a], [b]
+        for x, y in zip(a, b):
+            np.testing.assert_allclose(np.asarray(y), np.asarray(x), rtol=1e-5, atol=atol)
+    """
+)
+
+
+def _run(test_case, body: str, timeout: int = 300):
+    _run_with_metal_native(test_case, _PRELUDE + textwrap.dedent(body), timeout=timeout)
+
+
+@unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
+@unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
+class TestMetalR3Tiles(unittest.TestCase):
+    def test_func_native_array_params(self):
+        # ``arr.data`` / ``(T*)arr.data`` / ``arr.shape[i]`` in a snippet.
+        _run(
+            self,
+            """
+            @wp.func_native("return (uint64_t)arr.data + (uint64_t)(off * sizeof(float));")
+            def ptr_of(arr: wp.array[wp.float32], off: int) -> wp.uint64: ...
+
+            @wp.func_native("float* p = (float*)arr.data; p[i] = p[i] * 2.0f + (float)arr.shape[0];")
+            def scale(arr: wp.array[wp.float32], i: int): ...
+
+            @wp.kernel
+            def k(a: wp.array[wp.float32], out: wp.array[wp.uint64]):
+                i = wp.tid()
+                out[i] = ptr_of(a, i) - ptr_of(a, 0)
+                scale(a, i)
+
+            def run(dev):
+                a = wp.array(np.arange(5, dtype=np.float32), device=dev)
+                o = wp.zeros(5, dtype=wp.uint64, device=dev)
+                wp.launch(k, dim=5, inputs=[a], outputs=[o], device=dev)
+                return o.numpy().astype(np.float64), a.numpy()
+
+            assert_same(both(run))
+            """,
+        )
+
+    def test_pointer_array_views(self):
+        # Kamino's per-problem views: ``wp.array(ptr=base + offset, shape=(n, n))``
+        # with tile loads/stores that straddle the view's edge (zero-filled
+        # loads, dropped stores), element reads/writes and ``.shape``.
+        _run(
+            self,
+            """
+            from ctypes import sizeof
+
+            def make(dtype):
+                @wp.func_native("return (uint64_t)arr.data;")
+                def ptr(arr: wp.array[dtype]) -> wp.uint64: ...
+
+                @wp.func
+                def offset_ptr(arr: wp.array[dtype], start: int) -> wp.uint64:
+                    return ptr(arr) + wp.uint64(start) * wp.uint64(wp.static(sizeof(dtype._type_)))
+
+                return offset_ptr
+
+            f32_ptr = make(wp.float32)
+            i32_ptr = make(wp.int32)
+
+            @wp.kernel
+            def k(a: wp.array[float], idx: wp.array[wp.int32], off: int, n: int, out: wp.array[float]):
+                i, lane = wp.tid()
+                src = wp.array(ptr=f32_ptr(a, off), shape=(n, n), dtype=float)
+                dst = wp.array(ptr=f32_ptr(out, off), shape=(n, n), dtype=float)
+                ids = wp.array(ptr=i32_ptr(idx, 1), shape=(2,), dtype=wp.int32)
+                t = wp.tile_load(src, shape=(2, 2), offset=(n - 1, n - 1))
+                wp.tile_store(dst, t + wp.tile_ones(shape=(2, 2), dtype=float), offset=(n - 1, n - 1))
+                dst[0, ids[1]] = src[1, 0] + float(dst.shape[1])
+
+            def run(dev):
+                a = wp.array(np.arange(20, dtype=np.float32), device=dev)
+                idx = wp.array([7, 0, 1], dtype=wp.int32, device=dev)
+                o = wp.zeros(20, dtype=float, device=dev)
+                wp.launch_tiled(k, dim=1, inputs=[a, idx, 2, 3, o], block_dim=32, device=dev)
+                return o.numpy()
+
+            assert_same(both(run))
+            """,
+        )
+
+    def test_tile_store_bounds_on_arguments(self):
+        # A partial trailing tile must not write past the array's rows.
+        _run(
+            self,
+            """
+            @wp.kernel
+            def k(o: wp.array2d[float]):
+                i, lane = wp.tid()
+                wp.tile_store(o, wp.tile_ones(shape=(2, 2), dtype=float), offset=(2, 2))
+
+            def run(dev):
+                base = wp.zeros(20, dtype=float, device=dev)
+                wp.launch_tiled(k, dim=1, inputs=[base[:9].reshape((3, 3))], block_dim=32, device=dev)
+                return base.numpy()
+
+            assert_same(both(run))
+            """,
+        )
+
+    def test_launch_tiled_3d_grid(self):
+        # ``launch_tiled(dim=(a, b, c))`` launches 4-D; ``wp.tid()`` reads the
+        # first three coordinates.
+        _run(
+            self,
+            """
+            TS = 8
+
+            @wp.func
+            def clip_to_one(x: wp.float32):
+                return wp.min(x, 1.0)
+
+            @wp.kernel
+            def k(sp: wp.array3d[wp.float32], out: wp.array3d[wp.float32]):
+                w, i, j = wp.tid()
+                acc = wp.tile_zeros(shape=(TS, TS), dtype=wp.float32)
+                for kk in range((sp.shape[1] + TS - 1) // TS):
+                    a = wp.tile_reshape(wp.tile_load(sp, shape=(1, TS, TS), offset=(w, kk * TS, i * TS)), (TS, TS))
+                    b = wp.tile_reshape(wp.tile_load(sp, shape=(1, TS, TS), offset=(w, kk * TS, j * TS)), (TS, TS))
+                    wp.tile_matmul(wp.tile_transpose(a), b, acc)
+                o3 = wp.tile_map(clip_to_one, wp.tile_reshape(acc, (1, TS, TS)))
+                wp.tile_store(out, o3, offset=(w, i * TS, j * TS))
+
+            x = (np.random.default_rng(0).random((2, 13, 16)) > 0.7).astype(np.float32)
+
+            def run(dev):
+                o = wp.zeros((2, 16, 16), dtype=float, device=dev)
+                wp.launch_tiled(k, dim=(2, 2, 2), inputs=[wp.array(x, device=dev), o], block_dim=32, device=dev)
+                return o.numpy()
+
+            assert_same(both(run))
+            """,
+        )
+
+    def test_tile_map_closure_from_repeated_factory(self):
+        # The second factory call registers a same-named closure under the
+        # module key; the first kernel must still find its own function.
+        _run(
+            self,
+            """
+            def make(scale):
+                @wp.func
+                def f(x: wp.float32) -> wp.int32:
+                    return wp.int32(wp.isnan(x)) + wp.int32(scale)
+
+                @wp.kernel(module="unique")
+                def k(r: wp.array2d[wp.float32], out: wp.array[wp.int32]):
+                    w, i, lane = wp.tid()
+                    seg = wp.tile_load(r, shape=(1, 8), offset=(w, i * 8))
+                    if lane == 0:
+                        wp.atomic_max(out, w, wp.tile_max(wp.tile_map(f, seg))[0])
+
+                return k
+
+            k1 = make(10)
+            k2 = make(20)
+            x = np.random.default_rng(1).standard_normal((2, 16)).astype(np.float32)
+            x[1, 3] = np.nan
+
+            def run(dev):
+                outs = []
+                for k in (k1, k2):
+                    o = wp.zeros(2, dtype=wp.int32, device=dev)
+                    wp.launch_tiled(k, dim=(2, 2), inputs=[wp.array(x, device=dev), o], block_dim=32, device=dev)
+                    outs.append(o.numpy())
+                return outs
+
+            assert_same(both(run))
+            """,
+        )
+
+    def test_matrix_element_tiles(self):
+        _run(
+            self,
+            """
+            @wp.kernel
+            def k(v: wp.array[wp.vec3], out: wp.array[wp.mat33], ones: wp.array[wp.mat33],
+                  xf: wp.array[wp.transform]):
+                i, lane = wp.tid()
+                a = v[i]
+                m = wp.mat33(a[0], a[1], a[2], 2.0 * a[0], 2.0 * a[1], 2.0 * a[2], 1.0, 2.0, 3.0)
+                t = wp.tile_zeros(shape=(1,), dtype=wp.mat33, storage="shared")
+                wp.tile_scatter_masked(t, 0, m, lane == 0)
+                o = wp.tile_ones(shape=(1,), dtype=wp.mat33)
+                tt = wp.tile_zeros(shape=4, dtype=wp.transform, storage="shared")
+                tt[1] = wp.transform(a, wp.quat_identity())
+                if lane == 0:
+                    out[i] = wp.tile_extract(t, 0)
+                    ones[i] = wp.tile_extract(o, 0)
+                    xf[i] = tt[1]
+
+            x = np.random.default_rng(0).standard_normal((3, 3)).astype(np.float32)
+
+            def run(dev):
+                o = wp.zeros(3, dtype=wp.mat33, device=dev)
+                o1 = wp.zeros(3, dtype=wp.mat33, device=dev)
+                o2 = wp.zeros(3, dtype=wp.transform, device=dev)
+                wp.launch_tiled(k, dim=3, inputs=[wp.array(x, dtype=wp.vec3, device=dev), o, o1, o2],
+                                block_dim=32, device=dev)
+                return o.numpy(), o1.numpy(), o2.numpy()
+
+            assert_same(both(run))
+            """,
+        )
+
+    def test_tile_reduce_bitwise(self):
+        _run(
+            self,
+            """
+            BD = 32
+
+            @wp.kernel(module="unique")
+            def k(vals: wp.array[int], out: wp.array2d[int]):
+                block_id, lane = wp.tid()
+                bits = wp.tile_zeros(shape=BD, dtype=int, storage="shared")
+                b = int(0)
+                if lane < 8:
+                    b = vals[block_id * 8 + lane]
+                wp.tile_scatter_masked(bits, lane, b, True)
+                loaded = wp.tile_load(vals, shape=8, offset=block_id * 8)
+                if lane == 0:
+                    out[block_id, 0] = wp.tile_reduce(wp.bit_or, bits)[0]
+                    out[block_id, 1] = wp.tile_reduce(wp.bit_or, loaded)[0]
+                    out[block_id, 2] = wp.tile_reduce(wp.bit_and, loaded)[0]
+                    out[block_id, 3] = wp.tile_reduce(wp.bit_xor, loaded)[0]
+
+            x = np.random.default_rng(0).integers(0, 1 << 10, 32).astype(np.int32)
+
+            def run(dev):
+                o = wp.zeros((4, 4), dtype=int, device=dev)
+                wp.launch_tiled(k, dim=4, inputs=[wp.array(x, device=dev), o], block_dim=BD, device=dev)
+                return o.numpy()
+
+            res = both(run)
+            assert_same(res)
+            np.testing.assert_array_equal(res["metal:0"][:, 1], np.bitwise_or.reduce(x.reshape(4, 8), axis=1))
+            """,
+        )
+
+    def test_rebuildable_volumes(self):
+        _run(
+            self,
+            """
+            @wp.kernel
+            def lookup(vid: wp.uint64, pts: wp.array[wp.vec3i], out: wp.array[int]):
+                i = wp.tid()
+                p = pts[i]
+                out[i] = wp.volume_lookup_index(vid, p[0], p[1], p[2])
+
+            @wp.kernel
+            def sample(vid: wp.uint64, pts: wp.array[wp.vec3i], out: wp.array[float]):
+                i = wp.tid()
+                p = pts[i]
+                out[i] = wp.volume_lookup_f(vid, p[0], p[1], p[2])
+
+            rng = np.random.default_rng(0)
+            p1 = rng.integers(-20, 20, (50, 3)).astype(np.int32)
+            p2 = rng.integers(-40, 40, (80, 3)).astype(np.int32)
+            big = rng.integers(-500, 500, (400, 3)).astype(np.int32)
+            q = np.concatenate([p1, p2, rng.integers(-40, 40, (30, 3)).astype(np.int32)])
+
+            def run(dev):
+                res = []
+                st = wp.zeros(1, dtype=wp.uint32, device=dev)
+                qa = wp.array(q, dtype=wp.vec3i, device=dev)
+                out = wp.zeros(len(q), dtype=int, device=dev)
+                v = wp.Volume.allocate_by_voxels(
+                    wp.array(p1, dtype=wp.vec3i, device=dev), voxel_size=0.5, device=dev,
+                    max_active_voxels=200, status=st,
+                )
+                vid = v.id
+                wp.launch(lookup, dim=len(q), inputs=[v.id, qa, out], device=dev)
+                res += [out.numpy().copy(), st.numpy().copy(), list(v.get_active_stats()), list(v.get_rebuild_info()[1:])]
+                v.rebuild(wp.array(p2, dtype=wp.vec3i, device=dev), status=st)
+                assert v.id == vid
+                wp.launch(lookup, dim=len(q), inputs=[v.id, qa, out], device=dev)
+                res += [out.numpy().copy(), st.numpy().copy(), [v.get_voxel_count(), v.get_tile_count()]]
+                v.rebuild(wp.array(big, dtype=wp.vec3i, device=dev), status=st)
+                res += [st.numpy().copy()]
+                # Empty reservation, and an exact volume with every point masked out.
+                zero = wp.zeros(len(p1), dtype=wp.int32, device=dev)
+                e = wp.Volume.allocate_by_voxels(wp.array(p1, dtype=wp.vec3i, device=dev), voxel_size=1.0,
+                                                 device=dev, max_active_voxels=4, point_mask=zero)
+                e2 = wp.Volume.allocate_by_voxels(wp.array(p1, dtype=wp.vec3i, device=dev), voxel_size=1.0,
+                                                  device=dev, point_mask=zero)
+                res += [list(e.get_active_stats()), list(e.get_rebuild_info()[1:]), list(e2.get_active_stats())]
+                # Rebuildable tile volume with a background value.
+                t = wp.Volume.allocate_by_tiles(wp.array(p1[:4] * 8, dtype=wp.vec3i, device=dev), voxel_size=1.0,
+                                                bg_value=2.5, device=dev, max_tiles=16)
+                t.rebuild(wp.array(p2[:6] * 8, dtype=wp.vec3i, device=dev))
+                fo = wp.zeros(len(q), dtype=float, device=dev)
+                wp.launch(sample, dim=len(q), inputs=[t.id, qa, fo], device=dev)
+                res += [fo.numpy(), list(t.get_active_stats())]
+                return [np.asarray(r, dtype=np.float64) for r in res]
+
+            assert_same(both(run))
+            """,
+        )
+
+    def test_reverse_mode_strided_args(self):
+        _run(
+            self,
+            """
+            @wp.kernel
+            def gather(src: wp.array3d[float], idx: wp.array[int], dst: wp.array3d[float]):
+                i, j, k = wp.tid()
+                dst[i, j, k] = src[i, j, idx[k]] * 2.0
+
+            @wp.kernel
+            def weighted_sum(a: wp.array3d[float], loss: wp.array[float]):
+                i, j, k = wp.tid()
+                wp.atomic_add(loss, 0, a[i, j, k] * float(k + 1))
+
+            def run(dev):
+                base = wp.array(np.arange(30, dtype=np.float32).reshape(2, 3, 5), device=dev, requires_grad=True)
+                src = base[:, ::2, 1:]
+                idx = wp.array([3, 0, 2], dtype=int, device=dev)
+                dst = wp.zeros((2, 2, 3), dtype=float, device=dev, requires_grad=True)
+                loss = wp.zeros(1, dtype=float, device=dev, requires_grad=True)
+                tape = wp.Tape()
+                with tape:
+                    wp.launch(gather, dim=dst.shape, inputs=[src, idx], outputs=[dst], device=dev)
+                    wp.launch(weighted_sum, dim=dst.shape, inputs=[dst], outputs=[loss], device=dev)
+                tape.backward(loss)
+                return dst.numpy(), base.grad.numpy()
+
+            assert_same(both(run))
+            """,
+        )
+
+    def test_strided_copy_in_capture(self):
+        # Strided Metal<->Metal copies are device kernels, so they replay.
+        _run(
+            self,
+            """
+            d = "metal:0"
+            base = wp.array(np.arange(40, dtype=np.float32).reshape(5, 8), device=d)
+            dst = wp.zeros((5, 3), dtype=float, device=d)
+            dst2 = wp.zeros((5, 8), dtype=float, device=d)
+            with wp.ScopedCapture(device=d) as cap:
+                wp.copy(dst, base[:, 2:5])
+                wp.copy(dst2[:, ::3], base[:, 1:4])
+                wp.copy(dst2[:, 1:2], dst[:, 2:3])
+            base.assign(base.numpy() * 10.0)
+            wp.capture_launch(cap.graph)
+            h = base.numpy()
+            expect2 = np.zeros((5, 8), np.float32)
+            expect2[:, ::3] = h[:, 1:4]
+            expect2[:, 1:2] = h[:, 4:5]
+            np.testing.assert_array_equal(dst.numpy(), h[:, 2:5])
+            np.testing.assert_array_equal(dst2.numpy(), expect2)
+            """,
+        )
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
