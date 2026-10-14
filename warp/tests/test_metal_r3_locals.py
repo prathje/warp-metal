@@ -600,6 +600,49 @@ class TestMetalR3Locals(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet, timeout=120)
 
+    def test_tile_view_column_in_inlined_func(self):
+        # ``wp.tile_view(sol, shape=(m, 1))`` of an ``(n, 1)`` shared tile in
+        # a ``wp.static`` factory function (mujoco_warp's Newton decrement):
+        # the column coordinate of a unit dim was the row index, so the view
+        # read the parent's diagonal.
+        snippet = _snippet(
+            """
+            @wp.func
+            def sums(grad: float, solution: float):
+                return wp.vec2(solution * solution, grad * solution)
+
+            def make(n: int, m: int):
+                @wp.func
+                def dec(sol: wp.tile[float, n, 1], b: wp.array2d[float], out: wp.array2d[float]):
+                    g = wp.tile_load(b, shape=(m, 1), offset=(0, 0), bounds_check=False)
+                    act = wp.tile_view(sol, shape=(m, 1), offset=(0, 0))
+                    wp.tile_store(out, wp.tile_map(wp.mul, act, -1.0), bounds_check=False)
+                    return wp.tile_reduce(wp.add, wp.tile_map(sums, g, act))[0]
+
+                return dec
+
+            @wp.kernel
+            def k(a: wp.array2d[float], b: wp.array2d[float], out: wp.array2d[float], res: wp.array[wp.vec2]):
+                sol = wp.tile_load(a, shape=(8, 1), offset=(0, 0), storage="shared")
+                res[0] = wp.static(make(8, 6))(sol, b, out)
+
+            rng = np.random.default_rng(0)
+            A = rng.random((8, 1)).astype(np.float32)
+            B = rng.random((6, 1)).astype(np.float32)
+
+            def run(dev):
+                a = wp.array(A, device=dev)
+                b = wp.array(B, device=dev)
+                o = wp.zeros((6, 1), dtype=float, device=dev)
+                r = wp.zeros(1, dtype=wp.vec2, device=dev)
+                wp.launch_tiled(k, dim=1, inputs=[a, b, o, r], block_dim=1, device=dev)
+                return r.numpy(), o.numpy()
+
+            compare(run)
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -229,6 +229,13 @@ def _mutated_labels(line: str) -> set[str]:
     return out
 
 
+# ``<type> var_X;`` / ``<type> var_X = <type>();`` — a declaration that reads
+# no other local.
+_DECL_ONLY_PAT = re.compile(
+    r"^\s*(?:const\s+)?[A-Za-z_][\w:<>, ]*?[\s*]+var_\w+\s*(?:=\s*[A-Za-z_][\w:<>, ]*\(\s*0?\s*\))?\s*;\s*$"
+)
+
+
 class TileExt:
     """Per-kernel state for the extra tile lowerings (see module docstring)."""
 
@@ -346,6 +353,12 @@ class TileExt:
             rem = k
             for i in range(vd):
                 stride = math.prod(vshape[i + 1 :])
+                if vshape[i] == 1:
+                    # A unit dim (the column of an ``(R, 1)`` view) is always
+                    # coordinate 0; without this the trailing-stride-1 case
+                    # repeated the row coordinate, reading the diagonal.
+                    coords.append("0")
+                    continue
                 coords.append(f"(({rem}) / {stride})" if stride != 1 else f"({rem})")
                 rem = f"(({rem}) % {stride})" if stride != 1 else rem
             # right-align into the parent rank
@@ -435,6 +448,11 @@ class TileExt:
             return self._lower_view_def(line, m)
         pre = ""
         post = ""
+        if self.views and _DECL_ONLY_PAT.match(line):
+            # A local's declaration (the inliner declares a view local where
+            # the call is spliced in): nothing is read, and a refresh here
+            # would run before the view's offsets are even declared.
+            return self._lower_ops(line)
         if self.views:
             referenced = {mm.group(1) for mm in self._label_pat.finditer(line) if mm.group(0).startswith("var_")}
             views_here = [v for v in referenced if v in self.views]
