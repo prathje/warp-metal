@@ -388,7 +388,10 @@ def _vec_t_to_msl(n: int, scalar_ctype: str) -> str:
     like ``wp_vec6_float`` for which the codegen emits a custom struct
     declaration in the kernel header.
     """
-    if n < 1:
+    # ``vec_t<0, T>`` is legal Warp (e.g. a ``wp.static`` length that comes
+    # out zero); it becomes a ``wp_vec0_<scalar>`` struct with one padding
+    # slot, mirroring the native ``c[Length < 1 ? 1 : Length]`` storage.
+    if n < 0:
         raise MetalCodegenError(f"MSL codegen: vec_t<{n}, ...> not supported")
     full_ctype = f"wp::{scalar_ctype}"
     # float64 VALUE locals: under ``"demote"`` they are fp32 vectors, the
@@ -517,7 +520,7 @@ def _emit_big_vec_struct(name: str, n: int, msl_scalar: str) -> str:
     """
     body_lines: list[str] = []
     body_lines.append(f"struct {name} {{")
-    body_lines.append(f"    {msl_scalar} c[{n}];")
+    body_lines.append(f"    {msl_scalar} c[{max(n, 1)}];")
     body_lines.append(f"    inline thread {msl_scalar}& operator[](int i) thread {{ return c[i]; }}")
     body_lines.append(f"    inline {msl_scalar} operator[](int i) const thread {{ return c[i]; }}")
     if msl_scalar == _F64_EMU_MSL and n in _MSL_VEC_NATIVE_N:
@@ -544,7 +547,7 @@ def _emit_big_vec_struct(name: str, n: int, msl_scalar: str) -> str:
     # ``wp_vecN_<scalar>_make(scalar)`` for ``vec_t<N>(s)`` patterns
     # (e.g. ``wp.vec8(0.0)`` to zero-init or fill). For n == 1 this is
     # the same signature as the per-component factory above — skip it.
-    if n > 1:
+    if n != 1:
         body_lines.append(f"inline {name} {name}_make({msl_scalar} v) {{")
         body_lines.append(f"    {name} r;")
         for i in range(n):
@@ -628,7 +631,7 @@ def _emit_big_vec_struct(name: str, n: int, msl_scalar: str) -> str:
     # paths (e.g. ``_apply_ft`` checks whether a force-torque pair is the
     # zero spatial vector). Component-wise compare; results AND/OR'd.
     body_lines.append(f"inline bool operator==({name} a, {name} b) {{")
-    body_lines.append("    return " + " && ".join(f"a.c[{i}] == b.c[{i}]" for i in range(n)) + ";")
+    body_lines.append("    return " + (" && ".join(f"a.c[{i}] == b.c[{i}]" for i in range(n)) or "true") + ";")
     body_lines.append("}")
     body_lines.append(f"inline bool operator!=({name} a, {name} b) {{")
     body_lines.append("    return !(a == b);")
@@ -680,7 +683,7 @@ def _emit_big_vec_struct(name: str, n: int, msl_scalar: str) -> str:
     # ``wp.length`` / ``wp.normalize`` — ``metal::length`` only knows the
     # native vector widths. warp.fem's scalar function spaces make ``vec1``
     # dof values, so even n == 1 reaches these.
-    sum_sq = " + ".join(f"v.c[{i}] * v.c[{i}]" for i in range(n))
+    sum_sq = " + ".join(f"v.c[{i}] * v.c[{i}]" for i in range(n)) or _sc_zero(msl_scalar)
     body_lines.append(f"inline {msl_scalar} wp_length({name} v) {{")
     if msl_scalar == _F64_EMU_MSL:
         body_lines.append(f"    return metal::sqrt({sum_sq});")
@@ -702,15 +705,15 @@ def _emit_big_vec_struct(name: str, n: int, msl_scalar: str) -> str:
     # overloads are inline and cost nothing.
     ctor_args = ", ".join(f"{msl_scalar} c{i}" for i in range(n))
     ctor_refs = ", ".join(f"thread {msl_scalar}& a{i}" for i in range(n))
-    body_lines.append(f"inline void wp_adj_vec_t({ctor_args}, {ctor_refs}, {name} r) {{")
+    body_lines.append(f"inline void wp_adj_vec_t({ctor_args + ', ' + ctor_refs + ', ' if n else ''}{name} r) {{")
     for i in range(n):
         body_lines.append(f"    a{i} += r.c[{i}];")
     body_lines.append("}")
     # One-scalar form broadcasts, so its adjoint sums the whole gradient.
     # At n == 1 that signature is identical to the per-component form above,
     # and emitting both is a redefinition.
-    if n > 1:
-        bcast_sum = " + ".join(f"r.c[{i}]" for i in range(n))
+    if n != 1:
+        bcast_sum = " + ".join(f"r.c[{i}]" for i in range(n)) or _sc_zero(msl_scalar)
         body_lines.append(
             f"inline void wp_adj_vec_t({msl_scalar} c, thread {msl_scalar}& a, {name} r) {{ a += {bcast_sum}; }}"
         )
@@ -1134,6 +1137,9 @@ def _emit_big_mat_struct(name: str, rows: int, cols: int, msl_scalar: str) -> st
     body.append(f"    for (int i = 0; i < {n}; ++i) s += a.c[i] * b.c[i];")
     body.append("    return s;")
     body.append("}")
+    body.append(f"inline void wp_adj_ddot({name} a, {name} b, thread {name}& aa, thread {name}& ab, {msl_scalar} r) {{")
+    body.append(f"    for (int i = 0; i < {n}; ++i) {{ aa.c[i] += b.c[i] * r; ab.c[i] += a.c[i] * r; }}")
+    body.append("}")
     if rows == cols:
         # mat * mat (square — same struct type on both sides).
         body.append(f"inline {name} operator*({name} a, {name} b) {{")
@@ -1443,7 +1449,7 @@ def _emit_wp_dot_overloads(source: str) -> str:
             continue
         seen_big.add((n, scalar))
     for n, scalar in sorted(seen_big):
-        body_terms = " + ".join(f"a.c[{i}] * b.c[{i}]" for i in range(n))
+        body_terms = " + ".join(f"a.c[{i}] * b.c[{i}]" for i in range(n)) or _sc_zero(scalar)
         parts.append(f"inline {scalar} wp_dot(wp_vec{n}_{scalar} a, wp_vec{n}_{scalar} b) {{ return {body_terms}; }}")
     return "\n".join(parts)
 
@@ -6763,6 +6769,74 @@ _MISC_MATH_HELPERS: dict[str, str] = {
         "inline void wp_vec_slice_assign(thread metal::vec<T, 4>& d, metal::vec<T, 4> v, S s) "
         "{ int k = 0; for (int i = s.start; (s.step > 0) ? (i < s.stop) : (i > s.stop); i += s.step) d[k++] = v[i]; }"
     ),
+    # Reverse of the matrix slice reads above (``adj_extract`` overloads in
+    # ``warp/native/mat.h``): scatter the slice gradient back element-wise.
+    # Keyed on ``wp_slice_t`` so it is only emitted alongside that struct.
+    "wp_slice_t": (
+        "template <typename M, typename R>\n"
+        "inline void wp_adj_extract(M m, wp_slice_t rs, wp_slice_t cs, thread M& am, thread wp_slice_t&, "
+        "thread wp_slice_t&, R ar) {\n"
+        "    int ii = 0;\n"
+        "    for (int i = rs.start; (rs.step > 0) ? (i < rs.stop) : (i > rs.stop); i += rs.step, ++ii) {\n"
+        "        int jj = 0;\n"
+        "        for (int j = cs.start; (cs.step > 0) ? (j < cs.stop) : (j > cs.stop); j += cs.step, ++jj)\n"
+        "            wp_mat_elem_store(am, i, j, wp_mat_extract(am, i, j) + wp_mat_extract(ar, ii, jj));\n"
+        "    }\n"
+        "}\n"
+        "template <typename M, typename R>\n"
+        "inline void wp_adj_extract(M m, wp_slice_t rs, int col, thread M& am, thread wp_slice_t&, thread int&, "
+        "R ar) {\n"
+        "    int ii = 0;\n"
+        "    for (int i = rs.start; (rs.step > 0) ? (i < rs.stop) : (i > rs.stop); i += rs.step, ++ii)\n"
+        "        wp_mat_elem_store(am, i, col, wp_mat_extract(am, i, col) + ar[ii]);\n"
+        "}\n"
+        "template <typename M, typename R>\n"
+        "inline void wp_adj_extract(M m, int row, wp_slice_t cs, thread M& am, thread int&, thread wp_slice_t&, "
+        "R ar) {\n"
+        "    int jj = 0;\n"
+        "    for (int j = cs.start; (cs.step > 0) ? (j < cs.stop) : (j > cs.stop); j += cs.step, ++jj)\n"
+        "        wp_mat_elem_store(am, row, j, wp_mat_extract(am, row, j) + ar[jj]);\n"
+        "}"
+    ),
+    # One-argument native matrix constructor (``_rewrite_mat_t_constructor``):
+    # a same-shape matrix operand is copied, anything else is broadcast to
+    # every element (MSL's own one-scalar ctor would fill the diagonal).
+    "wp_mat_ctor1": (
+        "template <typename T, int C, int R>\n"
+        "inline metal::matrix<T, C, R> wp_mat_ctor1(metal::matrix<T, C, R>, metal::matrix<T, C, R> m) { return m; }\n"
+        "template <typename T, int C, int R, typename S>\n"
+        "inline metal::matrix<T, C, R> wp_mat_ctor1(metal::matrix<T, C, R> r, S s) {\n"
+        "    for (int c = 0; c < C; ++c) r[c] = metal::vec<T, R>(T(s));\n"
+        "    return r;\n"
+        "}"
+    ),
+    # Matrix slice copy (see the ``wp::extract<R, C>`` rule). The slice
+    # loops mirror ``warp/native/mat.h``'s ``extract`` overloads; element
+    # access goes through the per-type ``wp_mat_extract`` /
+    # ``wp_mat_elem_store`` overloads emitted with each matrix type.
+    "wp_mat_slice_assign": (
+        "template <typename D, typename M>\n"
+        "inline void wp_mat_slice_assign(thread D& d, M m, wp_slice_t rs, wp_slice_t cs) {\n"
+        "    int ii = 0;\n"
+        "    for (int i = rs.start; (rs.step > 0) ? (i < rs.stop) : (i > rs.stop); i += rs.step, ++ii) {\n"
+        "        int jj = 0;\n"
+        "        for (int j = cs.start; (cs.step > 0) ? (j < cs.stop) : (j > cs.stop); j += cs.step, ++jj)\n"
+        "            wp_mat_elem_store(d, ii, jj, wp_mat_extract(m, i, j));\n"
+        "    }\n"
+        "}\n"
+        "template <typename D, typename M>\n"
+        "inline void wp_mat_slice_assign(thread D& d, M m, wp_slice_t rs, int col) {\n"
+        "    int ii = 0;\n"
+        "    for (int i = rs.start; (rs.step > 0) ? (i < rs.stop) : (i > rs.stop); i += rs.step)\n"
+        "        d[ii++] = wp_mat_extract(m, i, col);\n"
+        "}\n"
+        "template <typename D, typename M>\n"
+        "inline void wp_mat_slice_assign(thread D& d, M m, int row, wp_slice_t cs) {\n"
+        "    int jj = 0;\n"
+        "    for (int j = cs.start; (cs.step > 0) ? (j < cs.stop) : (j > cs.stop); j += cs.step)\n"
+        "        d[jj++] = wp_mat_extract(m, row, j);\n"
+        "}"
+    ),
     "wp_argmin": (
         "template <typename V, int N>\n"
         "inline uint wp_argmin_impl(V v) {\n"
@@ -9306,7 +9380,7 @@ def _rewrite_vec_t_brace_constructor(text: str) -> str:
         if args_str.startswith("{") and args_str.endswith("}"):
             args_str = args_str[1:-1].strip()
         full_ctype = f"wp::{scalar_ctype}"
-        if full_ctype not in _MSL_VEC_SCALAR_PREFIX or n < 1:
+        if full_ctype not in _MSL_VEC_SCALAR_PREFIX or n < 0:
             return m.group(0)
         msl_scalar = _MSL_VEC_SCALAR_PREFIX[full_ctype]
         if _vec_native(n, msl_scalar):
@@ -9408,8 +9482,12 @@ def _rewrite_mat_t_constructor(text: str) -> str:
                 # to an explicit all-columns broadcast — ``mat22(1.0)`` must
                 # be all-ones, not identity. (Indistinguishable at 0.0,
                 # which is why this hid for so long.)
-                vec = f"{msl_scalar}{rows}({scalar_arg})"
-                return f"{msl_scalar}{rows}x{cols}({', '.join([vec] * cols)})"
+                #
+                # The operand may also be a same-shape matrix (a copy, e.g.
+                # warp.fem's ``mat33(value)`` on an already-matrix field
+                # value); the regex can't tell, so ``wp_mat_ctor1``'s
+                # overloads pick copy vs. broadcast from the operand type.
+                return f"wp_mat_ctor1({msl_scalar}{rows}x{cols}(0), {scalar_arg})"
             # Non-square or big sizes go through the broadcast factory.
             return f"wp_mat{rows}x{cols}_{msl_scalar}_make({scalar_arg})"
         if len(args) != rows * cols:
@@ -10276,6 +10354,18 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (
         re.compile(r"\bvar_(\w+)\s*=\s*wp::extract\s*<\s*\d+\s*>\s*\(\s*([^,()]+?)\s*,\s*([^,()]+?)\s*\)"),
         r"wp_vec_slice_assign(var_\1, \2, \3)",
+    ),
+    # ``var_X = wp::extract<N>(m, a, b)`` / ``wp::extract<R, C>(m, a, b)`` —
+    # matrix slices (``m[a:b, c]``, ``m[r, a:b]``, ``m[a:b, c:d]``). The
+    # result length/shape comes from the already-declared destination, so
+    # partial slices and big-mat (``wp_matRxC_*``) operands work alike;
+    # ``wp_mat_slice_assign`` copies element-wise through ``wp_mat_extract``.
+    (
+        re.compile(
+            r"\bvar_(\w+)\s*=\s*wp::extract\s*<\s*\d+\s*(?:,\s*\d+\s*)?>"
+            r"\s*\(\s*([^,()]+?)\s*,\s*([^,()]+?)\s*,\s*([^,()]+?)\s*\)"
+        ),
+        r"wp_mat_slice_assign(var_\1, \2, \3, \4)",
     ),
     # ``wp::assign_inplace<N>(v, s, x)`` — vector slice store ``v[a:b] = x``.
     (
@@ -14789,7 +14879,31 @@ def _generate_msl_kernel_uncached(
     # Flatten multi-dim ``wp::atomic_<op>(arr, i, j, ..., val)`` into the
     # 3-arg form the intrinsic regex handles, expanding to per-component
     # atomics for vec-typed arrays.
-    _ast_nodes = _ast_fold_multidim_atomics(_ast_nodes, adj, _early_vec_arr_info, _early_mat_arr_info)
+    # Struct-held array fields (``f.values`` -> ``<arg>__<field>``) bind
+    # like kernel arguments, so their composite-element atomics expand the
+    # same way.
+    from warp._src.codegen import Var as _WpVarForInfo  # noqa: PLC0415
+
+    _atomic_vec_arr_info = dict(_early_vec_arr_info)
+    _atomic_mat_arr_info = dict(_early_mat_arr_info)
+    for _syn_label, (_root_label, _fpath) in _struct_arg_array_fields.items():
+        _ftype = next(a.type for a in adj.args if a.label == _root_label)
+        for _comp in _fpath:
+            _ftype = _ftype.vars[_comp].type
+        _fvar = _WpVarForInfo(_syn_label, _ftype)
+        _v_info = _vec_dtype_info(_fvar)
+        if _v_info is not None:
+            _atomic_vec_arr_info[_syn_label] = _v_info
+        _m_info = _mat_dtype_info(_fvar)
+        if _m_info is not None:
+            _atomic_mat_arr_info[_syn_label] = _m_info
+    _ast_nodes = _ast_fold_multidim_atomics(
+        _ast_nodes,
+        adj,
+        _atomic_vec_arr_info,
+        _atomic_mat_arr_info,
+        extra_array_labels=set(_struct_arg_array_fields),
+    )
     forward_lines = _ast_emit(_ast_nodes)
 
     # Distributed-tile mode: the IR was rebuilt at the honest block width
@@ -15632,7 +15746,7 @@ def _generate_msl_kernel_uncached(
             local_name = _per_field_local(mangled_label, field_path)
             _zero = (
                 f"{field_info.msl_type}()"
-                if field_info.msl_type.startswith(("wp_mat", "wp_vec"))
+                if field_info.msl_type.startswith(("wp_mat", "wp_vec", "wp_texture"))
                 else f"{field_info.msl_type}(0)"
             )
             body_lines.append(f"    {field_info.msl_type} {local_name} = {_zero};")
@@ -16926,7 +17040,9 @@ def _generate_msl_kernel_uncached(
             dst = m_struct_zero.group(2)
             for fpath, _off, finfo in _iter_scalar_leaves(struct_local_layouts[dst]):
                 zero = (
-                    f"{finfo.msl_type}()" if finfo.msl_type.startswith(("wp_mat", "wp_vec")) else f"{finfo.msl_type}(0)"
+                    f"{finfo.msl_type}()"
+                    if finfo.msl_type.startswith(("wp_mat", "wp_vec", "wp_texture"))
+                    else f"{finfo.msl_type}(0)"
                 )
                 body_lines.append(f"{indent}{_per_field_local(dst, fpath)} = {zero};")
             continue

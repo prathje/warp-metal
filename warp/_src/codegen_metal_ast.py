@@ -1763,8 +1763,8 @@ def _inline_one_call(
     # Same value-level fp32 demotion the kernel body received (no-op unless
     # ``metal_demote_fp64`` is set).
     from warp._src.codegen_metal import (
-        _demote_f64_value_tokens,  # noqa: PLC0415
-        _normalize_adj_ir,  # noqa: PLC0415
+        _demote_f64_value_tokens,
+        _normalize_adj_ir,
     )
 
     _normalize_adj_ir(fn_overload.adj)
@@ -4597,6 +4597,7 @@ def fold_multidim_atomics(
     adj,
     vec_arr_info: dict[str, tuple[int, str]],
     mat_arr_info: dict[str, tuple[int, int, str]] | None = None,
+    extra_array_labels: set[str] | frozenset[str] = frozenset(),
 ) -> list[Node]:
     """Flatten multi-dim ``wp::atomic_<op>(arr, i, j, ..., val)`` calls.
 
@@ -4625,8 +4626,12 @@ def fold_multidim_atomics(
     Mat-dtype atomic isn't seen in the kernels we cover; if encountered,
     it falls through and surfaces a clear error in the unsupported-
     intrinsic guard.
+
+    ``extra_array_labels`` names further bound arrays (the synthetic
+    ``<arg>__<field>`` labels of struct-held array fields) that lower like
+    kernel arguments.
     """
-    arg_label_set = {a.label for a in adj.args}
+    arg_label_set = {a.label for a in adj.args} | set(extra_array_labels)
     return _apply_multidim_atomics(nodes, vec_arr_info, arg_label_set, mat_arr_info)
 
 
