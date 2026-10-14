@@ -719,6 +719,69 @@ class TestMetalR3Locals(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet, timeout=120)
 
+    def test_struct_array_dynamic_element_array_fields(self):
+        # ``data[gid].field[i]`` with a runtime element index (Newton's Gaussian
+        # splat bounds): each field reads through a per-element pointer table.
+        snippet = _snippet(
+            """
+            @wp.struct
+            class GData:
+                num_points: wp.int32
+                transforms: wp.array[wp.transformf]
+                scales: wp.array[wp.vec3f]
+                opacities: wp.array[wp.float32]
+                grid: wp.array2d[wp.float32]
+                rot: wp.array[wp.mat33]
+                min_response: wp.float32
+
+            @wp.func
+            def bounds(g: GData, i: int):
+                t = g.transforms[i]
+                s = g.scales[i] * g.opacities[i]
+                return wp.transform_get_translation(t) + s + wp.vec3(g.min_response) + g.rot[0] * wp.vec3(1.0, 2.0, 3.0)
+
+            @wp.kernel
+            def k(ids: wp.array[wp.uint64], data: wp.array[GData], out: wp.array[wp.vec3], cnt: wp.array[float]):
+                tid = wp.tid()
+                gid = ids[tid]
+                acc = wp.vec3(0.0)
+                for i in range(data[gid].num_points):
+                    acc += bounds(data[gid], i)
+                out[tid] = acc
+                d = data[gid]
+                cnt[tid] = float(d.scales.shape[0] * 10 + len(d.opacities)) + d.grid[1, 2] + float(d.grid.shape[1])
+
+            def run(dev):
+                rng = np.random.default_rng(0)
+                items = []
+                for g in range(3):
+                    n = g + 2
+                    gd = GData()
+                    gd.num_points = n
+                    gd.transforms = wp.array(rng.random((n, 7)).astype(np.float32), dtype=wp.transformf, device=dev)
+                    gd.scales = wp.array(rng.random((n, 3)).astype(np.float32), dtype=wp.vec3f, device=dev)
+                    gd.opacities = wp.array(rng.random(n).astype(np.float32), device=dev)
+                    gd.grid = wp.array(rng.random((2, 4)).astype(np.float32), device=dev)
+                    gd.rot = wp.array(rng.random((1, 3, 3)).astype(np.float32), dtype=wp.mat33, device=dev)
+                    gd.min_response = 0.1 * g
+                    items.append(gd)
+                data = wp.array(items, dtype=GData, device=dev)
+                ids = wp.array([2, 0, 1, 2], dtype=wp.uint64, device=dev)
+                o = wp.zeros(4, dtype=wp.vec3, device=dev)
+                c = wp.zeros(4, dtype=float, device=dev)
+                wp.launch(k, 4, [ids, data, o, c], device=dev)
+                # Rebinding an element's arrays on the host is seen by the next launch.
+                items[0].scales = wp.zeros(2, dtype=wp.vec3f, device=dev)
+                data.assign(wp.array(items, dtype=GData, device=dev))
+                o2 = wp.zeros(4, dtype=wp.vec3, device=dev)
+                wp.launch(k, 4, [ids, data, o2, c], device=dev)
+                return o.numpy(), c.numpy(), o2.numpy()
+
+            compare(run)
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

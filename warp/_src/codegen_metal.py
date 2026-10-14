@@ -14612,6 +14612,12 @@ def _struct_field_path_type(root_type, fpath: tuple[str, ...]):
     A ``"[k]"`` component selects element ``k`` of a ``wp.array[Struct]``
     (see ``fold_struct_array_array_fields``); any other names a field.
     """
+    if fpath and fpath[0] == "[*]":
+        # Per-element pointer table of a wp.array[Struct] array field.
+        from warp._src.types import array as _wp_array  # noqa: PLC0415
+        from warp._src.types import uint64 as _wp_uint64  # noqa: PLC0415
+
+        return _wp_array(dtype=_wp_uint64)
     t = root_type
     for comp in fpath:
         if comp.startswith("["):
@@ -19531,6 +19537,8 @@ def _struct_field_launch_value(fwd_args, arg_by_name, root_label: str, fpath: tu
     """
     idx, arg = arg_by_name[root_label]
     value = fwd_args[idx]
+    if fpath and fpath[0] == "[*]":
+        return _struct_array_ptr_table(value, arg.type.dtype, fpath[1:])
     if fpath and fpath[0].startswith("["):
         return _struct_array_elem_field_value(value, arg.type.dtype, int(fpath[0][1:-1]), fpath[1:])
     for comp in fpath:
@@ -19538,6 +19546,97 @@ def _struct_field_launch_value(fwd_args, arg_by_name, root_label: str, fpath: tu
             return None
         value = getattr(value, comp, None)
     return value
+
+
+_PTAB_RESIDENT_REFS: dict[int, int] = {}
+
+
+def _ptab_release(dispatcher, bufs) -> None:
+    for buf in bufs:
+        n = _PTAB_RESIDENT_REFS.get(id(buf), 0) - 1
+        if n <= 0:
+            _PTAB_RESIDENT_REFS.pop(id(buf), None)
+            dispatcher.remove_resident_resource(buf)
+        else:
+            _PTAB_RESIDENT_REFS[id(buf)] = n
+
+
+def _struct_array_ptr_table(arr, struct_type, fpath: tuple[str, ...]):
+    """Pointer table for array field ``fpath`` of every element of struct array ``arr``.
+
+    One row of four ``uint64`` per element: the field's GPU address and its
+    first three extents. The field buffers are declared GPU-resident (the
+    kernel reaches them through the addresses) for as long as ``arr`` lives.
+    The table is cached on ``arr`` and rebuilt when the element records
+    change; it is read from the array's host-visible storage like
+    :func:`_struct_array_elem_field_value`.
+    """
+    import ctypes  # noqa: PLC0415
+    import weakref  # noqa: PLC0415
+
+    import numpy as np  # noqa: PLC0415
+
+    import warp as wp  # noqa: PLC0415
+    from warp._src.context import _metal_find_buffer  # noqa: PLC0415
+    from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
+
+    if arr is None or getattr(arr, "ptr", None) is None or arr.size == 0:
+        return None
+    if not arr.is_contiguous:
+        raise RuntimeError("Metal: struct arrays with array members must be contiguous")
+    np_dtype = np.dtype(struct_type.numpy_dtype())
+    n = int(arr.shape[0])
+    raw = bytes((ctypes.c_char * (n * np_dtype.itemsize)).from_address(int(arr.ptr)))
+    cache = arr.__dict__.setdefault("_metal_ptab_cache", {})
+    hit = cache.get(fpath)
+    if hit is not None and hit[0] == raw:
+        return hit[1]
+    recs = np.frombuffer(raw, dtype=np_dtype)
+    t = struct_type
+    for comp in fpath[:-1]:
+        t = t.vars[comp].type
+    field_type = t.vars[fpath[-1]].type
+    elem_size = wp.types.type_size_in_bytes(field_type.dtype)
+    table = np.zeros(n * 4, dtype=np.uint64)
+    dispatcher = get_dispatcher()
+    bufs = []
+    for e in range(n):
+        a = recs[e]
+        for comp in fpath:
+            a = a[comp]
+        data = int(a["data"])
+        if data == 0:
+            continue
+        ndim = int(a["ndim"])
+        shape = [int(x) for x in a["shape"][:ndim]]
+        strides = [int(x) for x in a["strides"][:ndim]]
+        expect = elem_size
+        for d in reversed(range(ndim)):
+            if shape[d] > 1 and strides[d] != expect:
+                raise RuntimeError(
+                    f"Metal: array field {'.'.join(fpath)!r} of a wp.array[Struct] element must be contiguous"
+                )
+            expect *= shape[d]
+        buf, off = _metal_find_buffer(data)
+        if buf is None:
+            raise RuntimeError(
+                f"Metal: array field {'.'.join(fpath)!r} of a wp.array[Struct] element is not a Metal allocation"
+            )
+        table[e * 4] = int(buf.gpuAddress()) + int(off)
+        for d in range(min(ndim, 3)):
+            table[e * 4 + 1 + d] = shape[d]
+        if all(b is not buf for b in bufs):
+            bufs.append(buf)
+    for buf in bufs:
+        if _PTAB_RESIDENT_REFS.get(id(buf), 0) == 0:
+            dispatcher.add_resident_resource(buf)
+        _PTAB_RESIDENT_REFS[id(buf)] = _PTAB_RESIDENT_REFS.get(id(buf), 0) + 1
+    tab = wp.array(table, dtype=wp.uint64, device=arr.device)
+    if hit is not None:
+        hit[2]()  # release the previous table's residency now
+    fin = weakref.finalize(arr, _ptab_release, dispatcher, bufs)
+    cache[fpath] = (raw, tab, fin)
+    return tab
 
 
 def _struct_array_elem_field_value(arr, struct_type, k: int, fpath: tuple[str, ...]):
