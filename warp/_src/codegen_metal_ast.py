@@ -1454,6 +1454,18 @@ def _build_function_overload_table(adj) -> dict[str, list[Any]]:
     def _overloads(fn) -> tuple:
         return tuple(getattr(fn, "user_overloads", {}).values())
 
+    # The exact functions this body called during ``build``. ``wp.static``
+    # call targets are re-evaluated per call site, so two calls through the
+    # same factory expression (warp_nn's ``wp.static(tile_gemm(shape))(...)``
+    # twice in one kernel) resolve to two distinct ``Function`` objects whose
+    # ``native_func`` names differ only by suffix; the static-expression
+    # table and the module sweep below keep only the last of them.
+    for fn in getattr(adj, "called_user_functions", None) or ():
+        if isinstance(fn, Function) and not fn.is_builtin():
+            for overload in _overloads(fn):
+                _add(overload)
+            _add(fn)
+
     refs = adj.get_references()
     fn_table = refs[2]
     for fn in fn_table:
