@@ -158,6 +158,42 @@ class TestMetalR3Tiles(unittest.TestCase):
             """,
         )
 
+    def test_tile_cholesky_inplace_upper(self):
+        # ``fill_mode="upper"``: A = U^T U, U upper-triangular with the lower
+        # part zeroed, read from A's upper triangle (A deliberately non-symmetric).
+        _run(
+            self,
+            """
+            BS = 16
+
+            @wp.kernel(module="unique")
+            def k(a: wp.array2d[float], u: wp.array2d[float], l: wp.array2d[float]):
+                i, lane = wp.tid()
+                t = wp.tile_load(a, shape=(BS, BS), storage="shared")
+                wp.tile_cholesky_inplace(t, fill_mode="upper")
+                wp.tile_store(u, t)
+                s = wp.tile_load(a, shape=(BS, BS), storage="shared")
+                wp.tile_cholesky_inplace(s)
+                wp.tile_store(l, s)
+
+            rng = np.random.default_rng(0)
+            m = rng.standard_normal((BS, BS)).astype(np.float32)
+            a = m @ m.T + BS * np.eye(BS, dtype=np.float32)
+            a_up = np.triu(a) + np.tril(rng.standard_normal((BS, BS)).astype(np.float32), -1)
+
+            def run(dev):
+                u = wp.zeros((BS, BS), dtype=float, device=dev)
+                l = wp.zeros((BS, BS), dtype=float, device=dev)
+                wp.launch_tiled(k, dim=1, inputs=[wp.array(a_up, device=dev), u, l], block_dim=32, device=dev)
+                return u.numpy(), l.numpy()
+
+            res = both(run)
+            assert_same(res, atol=1e-4)
+            u = res["metal:0"][0]
+            np.testing.assert_allclose(u.T @ u, a, rtol=1e-4, atol=1e-3)
+            """,
+        )
+
     def test_tile_store_bounds_on_arguments(self):
         # A partial trailing tile must not write past the array's rows.
         _run(

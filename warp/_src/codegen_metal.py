@@ -11051,6 +11051,15 @@ _TILE_MATMUL_ASSIGN_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_matmul\s*\(([^
 # factorization. Two args after the LTO seg pad: the placeholder and the
 # tile to factor. ``upper`` template arg selects upper- vs lower-fill.
 _TILE_CHOLESKY_INPLACE_PAT = re.compile(r"\bwp::tile_cholesky_inplace\s*<[^()]*>\s*\(([^)]*)\)")
+
+
+def _cholesky_tpl_upper(call: str) -> bool:
+    """Whether a ``wp::tile_cholesky*<Upper, ...>(...)`` call is the upper
+    (``fill_mode="upper"``) variant: its first template argument is ``true``."""
+    m = re.search(r"<\s*(\w+)", call)
+    return m is not None and m.group(1) in ("true", "1")
+
+
 # ``tile_lower_solve_inplace(0, L_tile, B_tile)`` — solve ``L X = B``
 # for X, mutating B. The CPU/no-MathDx dispatch returns
 # ``(0, L, y)`` with empty templates, so the IR emits this builtin
@@ -12603,6 +12612,22 @@ def _translate_tile_intrinsics(
         if rows == 1:
             return f"{tile_arg} = metal::precise::sqrt(metal::max({tile_arg}, {_sc_lit(scalar, 1e-30)}))"
         helper = f"wp_tile_{rows}x{cols}_{scalar}_cholesky_inplace"
+        if _cholesky_tpl_upper(m.group(0)):
+            # ``fill_mode="upper"``: A = U^T U with U upper-triangular (lower
+            # part zeroed), read from A's upper triangle. Factor A^T in lower
+            # mode and transpose back: chol_lower(A^T)^T == U.
+            if tile_label in smem_tiles:
+                raise MetalCodegenError(
+                    "MSL codegen: tile_cholesky_inplace(fill_mode='upper') on a threadgroup-resident tile "
+                    "is not supported on Metal"
+                )
+            tr = (
+                f"for (int _ct_i = 0; _ct_i < {rows}; ++_ct_i) for (int _ct_j = _ct_i + 1; _ct_j < {rows}; ++_ct_j) "
+                f"{{ auto _ct_t = {tile_arg}.c[_ct_i * {rows} + _ct_j]; "
+                f"{tile_arg}.c[_ct_i * {rows} + _ct_j] = {tile_arg}.c[_ct_j * {rows} + _ct_i]; "
+                f"{tile_arg}.c[_ct_j * {rows} + _ct_i] = _ct_t; }}"
+            )
+            return f"{{ {tr} {helper}({tile_arg}); {tr} }}"
         return f"{helper}({tile_arg})"
 
     line = _TILE_CHOLESKY_INPLACE_PAT.sub(repl_cholesky_inplace, line)
@@ -12925,7 +12950,17 @@ def _translate_tile_intrinsics(
     line = _TILE_STORE_PAT.sub(repl_store, line)
     line = _TILE_STORE_INDEXED_PAT.sub(repl_store_indexed, line)
     line = _TILE_ATOMIC_ADD_PAT.sub(repl_tile_atomic_add, line)
+    for _um in _TILE_CHOLESKY_PAT.finditer(line):
+        if _cholesky_tpl_upper(_um.group(0)):
+            raise MetalCodegenError(
+                f"MSL codegen: fill_mode='upper' is not supported for this tile Cholesky op on Metal ({_um.group(0)!r})"
+            )
     line = _TILE_CHOLESKY_PAT.sub(repl_cholesky, line)
+    for _um in _TILE_CHOLESKY_SOLVE_PAT.finditer(line):
+        if _cholesky_tpl_upper(_um.group(0)):
+            raise MetalCodegenError(
+                f"MSL codegen: fill_mode='upper' is not supported for this tile Cholesky op on Metal ({_um.group(0)!r})"
+            )
     line = _TILE_CHOLESKY_SOLVE_PAT.sub(repl_cholesky_solve, line)
 
     def repl_cholesky_solve_inplace(m: re.Match[str]) -> str:
@@ -12953,6 +12988,11 @@ def _translate_tile_intrinsics(
             return f"{call};\n{wb}"
         return call
 
+    for _um in _TILE_CHOLESKY_SOLVE_INPLACE_PAT.finditer(line):
+        if _cholesky_tpl_upper(_um.group(0)):
+            raise MetalCodegenError(
+                f"MSL codegen: fill_mode='upper' is not supported for this tile Cholesky op on Metal ({_um.group(0)!r})"
+            )
     line = _TILE_CHOLESKY_SOLVE_INPLACE_PAT.sub(repl_cholesky_solve_inplace, line)
     return line
 
