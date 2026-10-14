@@ -230,6 +230,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
     from warp.tests.test_metal_launch import TestMetalLaunch
     from warp.tests.test_metal_mismatch import TestMetalMismatch
     from warp.tests.test_metal_mujoco_warp import TestMetalMujocoWarp
+    from warp.tests.test_metal_r3_locals import TestMetalR3Locals
     from warp.tests.test_metal_runtime import TestMetalRuntime, TestMetalRuntimeSubprocess
     from warp.tests.test_metal_tiles_ext import (
         TestMetalMeshWinding,
@@ -438,6 +439,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
         TestMetalLaunch,
         TestMetalMismatch,
         TestMetalMujocoWarp,
+        TestMetalR3Locals,
         TestMetalMeshWinding,
         TestMetalStructFieldWrite,
         TestMetalTextures,

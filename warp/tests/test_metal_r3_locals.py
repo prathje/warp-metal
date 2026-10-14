@@ -1,0 +1,507 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Metal codegen for local arrays, element addresses and indexing.
+
+Each test launches the same kernel on ``cpu`` and ``metal:0`` and compares:
+thread-local ``wp.zeros(shape, dtype)`` arrays, range slices of array
+arguments, component stores inside inlined functions, nested struct stores
+and ``wp.static`` factory functions called more than once.
+"""
+
+import textwrap
+import unittest
+
+from warp.tests.test_metal_launch import _has_mlx, _is_apple_silicon, _run_with_metal_enabled
+
+_COMPARE = textwrap.dedent(
+    """
+    import numpy as np
+
+    def compare(run):
+        res = {dev: run(dev) for dev in ("cpu", "metal:0")}
+        for a, b in zip(res["cpu"], res["metal:0"]):
+            np.testing.assert_allclose(np.asarray(b), np.asarray(a), rtol=1e-5, atol=1e-5)
+        return res
+    """
+)
+
+
+def _snippet(body: str) -> str:
+    return _COMPARE + textwrap.dedent(body)
+
+
+@unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
+@unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
+class TestMetalR3Locals(unittest.TestCase):
+    def test_fixed_array_scalar_and_vec(self):
+        # ``wp.zeros(shape, dtype)`` inside a kernel: writes from an inlined
+        # function, element read-modify-write, ``shape``/``len``, a vec
+        # element type and a component store into a vec element.
+        snippet = _snippet(
+            """
+            @wp.func
+            def fill(a: wp.array[float], n: int, s: float):
+                for i in range(n):
+                    a[i] = s * float(i)
+
+            @wp.func
+            def sumf(a: wp.array[float]) -> float:
+                t = float(0.0)
+                for i in range(a.shape[0]):
+                    t += a[i]
+                return t
+
+            @wp.kernel
+            def k(out: wp.array[float], outv: wp.array[wp.vec2]):
+                tid = wp.tid()
+                a = wp.zeros(shape=8, dtype=float)
+                fill(a, 8, float(tid))
+                a[3] = a[3] + 1.0
+                v = wp.zeros(shape=4, dtype=wp.vec2)
+                for i in range(4):
+                    v[i] = wp.vec2(float(i), float(tid))
+                v[1][0] = 7.0
+                a[-1] = a[-1] + 0.5
+                out[tid] = sumf(a) + float(a.shape[0]) + float(len(v))
+                outv[tid] = v[1] + v[3]
+
+            def run(dev):
+                o = wp.zeros(4, dtype=float, device=dev)
+                ov = wp.zeros(4, dtype=wp.vec2, device=dev)
+                wp.launch(k, 4, [o, ov], device=dev)
+                return o.numpy(), ov.numpy()
+
+            res = compare(run)
+            np.testing.assert_allclose(res["metal:0"][0], [13.5, 41.5, 69.5, 97.5])
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
+    def test_fixed_array_2d_mat_views_and_copies(self):
+        # 2-D fixed arrays, row views (``a[1]`` aliases the storage), a
+        # copy (``b = a`` copies, as ``fixedarray_t::operator=`` does),
+        # ``wp.atomic_add`` and matrix elements with an element store.
+        snippet = _snippet(
+            """
+            @wp.func
+            def bump(a: wp.array2d[float], i: int):
+                a[i, 1] += 2.0
+
+            @wp.kernel
+            def k(out: wp.array[float], outm: wp.array[wp.mat22]):
+                tid = wp.tid()
+                a = wp.zeros(shape=(3, 4), dtype=float)
+                for i in range(3):
+                    for j in range(4):
+                        a[i, j] = float(i * 4 + j + tid)
+                bump(a, 2)
+                row = a[1]
+                row[0] = 100.0
+                s = float(0.0)
+                for i in range(a.shape[0]):
+                    for j in range(a.shape[1]):
+                        s += a[i, j]
+                b = a
+                b[0, 0] = -1.0
+                wp.atomic_add(a, 0, 3, 5.0)
+                m = wp.zeros(shape=2, dtype=wp.mat22)
+                m[0] = wp.mat22(1.0, 2.0, 3.0, float(tid))
+                m[1][0, 1] = 9.0
+                m[1] = m[1] + m[0]
+                out[tid] = s + a[0, 0] + a[0, 3] + b[0, 0] + float(len(m))
+                outm[tid] = m[1]
+
+            def run(dev):
+                o = wp.zeros(4, dtype=float, device=dev)
+                om = wp.zeros(4, dtype=wp.mat22, device=dev)
+                wp.launch(k, 4, [o, om], device=dev)
+                return o.numpy(), om.numpy()
+
+            compare(run)
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
+    def test_fixed_array_pointer_aliased_view(self):
+        # Newton's contact-manifold builder carves two buffers out of one
+        # thread-local allocation with ``wp.array(ptr=buf.ptr + offset)``.
+        snippet = _snippet(
+            """
+            @wp.func
+            def add_unique(buf: wp.array[wp.vec2], count: int, p: wp.vec2, eps: float):
+                for i in range(count):
+                    if wp.length(buf[i] - p) < eps:
+                        return count, False
+                buf[count] = p
+                return count + 1, True
+
+            @wp.func
+            def area(buf: wp.array[wp.vec2], n: int) -> float:
+                a = float(0.0)
+                for i in range(n):
+                    j = (i + 1) % n
+                    a += buf[i][0] * buf[j][1] - buf[j][0] * buf[i][1]
+                return 0.5 * a
+
+            @wp.kernel
+            def k(pts: wp.array[wp.vec2], out: wp.array[float], cnt: wp.array[int]):
+                tid = wp.tid()
+                b_buffer = wp.zeros(shape=(10,), dtype=wp.vec2f)
+                a_buffer = wp.array(ptr=b_buffer.ptr + wp.uint64(5 * 8), shape=(5,), dtype=wp.vec2f)
+                a_count = int(0)
+                b_count = int(0)
+                for e in range(5):
+                    p = pts[(tid + e) % pts.shape[0]]
+                    a_count, added = add_unique(a_buffer, a_count, p, 1.0e-3)
+                    b_count, added2 = add_unique(b_buffer, b_count, p * 2.0, 1.0e-3)
+                out[tid] = area(a_buffer, a_count) + 10.0 * area(b_buffer, b_count) + b_buffer[5][0]
+                cnt[tid] = a_count * 10 + b_count
+
+            rng = np.random.default_rng(1)
+            P = rng.random((7, 2)).astype(np.float32)
+            P[3] = P[1]
+
+            def run(dev):
+                pts = wp.array(P, dtype=wp.vec2, device=dev)
+                o = wp.zeros(7, dtype=float, device=dev)
+                c = wp.zeros(7, dtype=int, device=dev)
+                wp.launch(k, 7, [pts, o, c], device=dev)
+                return o.numpy(), c.numpy()
+
+            compare(run)
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
+    def test_fixed_array_adjoint(self):
+        # The dual of a fixed array is a second fixed array that the
+        # element adjoints accumulate into, as on CPU.
+        snippet = _snippet(
+            """
+            @wp.func
+            def accum(buf: wp.array[float], x: float):
+                for i in range(buf.shape[0]):
+                    buf[i] = x * float(i + 1)
+
+            @wp.kernel
+            def k(x: wp.array[float], out: wp.array[float]):
+                t = wp.tid()
+                a = wp.zeros(shape=4, dtype=float)
+                accum(a, x[t])
+                s = float(0.0)
+                for i in range(4):
+                    s += a[i] * a[i]
+                out[t] = s
+
+            X = np.array([0.5, 1.0, -2.0], dtype=np.float32)
+
+            def run(dev):
+                x = wp.array(X, device=dev, requires_grad=True)
+                o = wp.zeros(3, dtype=float, device=dev, requires_grad=True)
+                tape = wp.Tape()
+                with tape:
+                    wp.launch(k, 3, [x, o], device=dev)
+                tape.backward(grads={o: wp.ones(3, dtype=float, device=dev)})
+                return o.numpy(), x.grad.numpy()
+
+            res = compare(run)
+            np.testing.assert_allclose(res["metal:0"][1], 60.0 * X, rtol=1e-5)
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
+    def test_slice_views_of_array_args(self):
+        # Range slices keep a dimension with an offset and a stride; Kamino
+        # takes ``ids[start:end]`` of an argument and indexes the view.
+        snippet = _snippet(
+            """
+            @wp.func
+            def total(a: wp.array[float]) -> float:
+                s = float(0.0)
+                for i in range(a.shape[0]):
+                    s += a[i]
+                return s
+
+            @wp.kernel
+            def k(x: wp.array2d[float], y: wp.array[float], ids: wp.array[wp.int32],
+                  out: wp.array2d[float], cnt: wp.array[float], outv: wp.array[wp.vec4]):
+                t = wp.tid()
+                row = x[t, 1:7:2]
+                col = x[1:, t]
+                tail = y[-3:]
+                rev = y[::-1]
+                sub2 = rev[1:4]
+                s = total(row) + 10.0 * total(col) + 100.0 * total(tail) + 1000.0 * sub2[0] + rev[-1]
+                o = out[t:t + 1, :]
+                o[0, 2] = s
+                wp.atomic_add(cnt[1:], t % 2, 1.0)
+                out[t, 0] = float(row.shape[0] * 100 + col.shape[0] * 10 + len(tail))
+                o2 = out[t]
+                o2[1] = float(sub2.shape[0])
+                sub = ids[2 * t:2 * t + 2]
+                for i in range(2):
+                    nz = sub[i]
+                    for j in range(4):
+                        outv[nz][j] = float(i * 4 + j)
+
+            X = np.arange(4 * 8, dtype=np.float32).reshape(4, 8)
+            Y = np.arange(6, dtype=np.float32) * 0.5
+
+            def run(dev):
+                x = wp.array(X, device=dev)
+                y = wp.array(Y, device=dev)
+                ids = wp.array(np.arange(8, dtype=np.int32)[::-1].copy(), device=dev)
+                o = wp.zeros((4, 3), dtype=float, device=dev)
+                c = wp.zeros(3, dtype=float, device=dev)
+                ov = wp.zeros(8, dtype=wp.vec4, device=dev)
+                wp.launch(k, 4, [x, y, ids, o, c, ov], device=dev)
+                return o.numpy(), c.numpy(), ov.numpy()
+
+            compare(run)
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
+    def test_component_store_in_inlined_func(self):
+        # ``nzb_values[i][j, 0] = x`` / ``v[i][1] = x`` inside a ``@wp.func``
+        # on an array the function was passed (Kamino's Jacobian assembly):
+        # the slot IR only appears once the body is inlined.
+        snippet = _snippet(
+            """
+            mat61f = wp.types.matrix(shape=(6, 1), dtype=wp.float32)
+            mat66f = wp.types.matrix(shape=(6, 6), dtype=wp.float32)
+
+            @wp.func
+            def store_block(nzb_id: int, block: mat66f, nzb_values: wp.array[mat61f], vv: wp.array[wp.vec3]):
+                for i in range(6):
+                    for j in range(6):
+                        nzb_values[nzb_id + i][j, 0] = block[j, i]
+                vv[nzb_id][1] = float(nzb_id)
+                vv[nzb_id][2] += 2.0
+
+            @wp.kernel
+            def k(vals: wp.array[mat61f], vv: wp.array[wp.vec3]):
+                t = wp.tid()
+                b = mat66f(0.0)
+                for i in range(6):
+                    for j in range(6):
+                        b[i, j] = float(i * 6 + j + t)
+                store_block(t * 6, b, vals, vv)
+
+            def run(dev):
+                v = wp.zeros(12, dtype=mat61f, device=dev)
+                vv = wp.zeros(12, dtype=wp.vec3, device=dev)
+                wp.launch(k, 2, [v, vv], device=dev)
+                return v.numpy(), vv.numpy()
+
+            compare(run)
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
+    def test_nested_struct_field_store(self):
+        # ``p.geom_a = g`` stores a whole struct into a nested-struct field
+        # of a struct local (Newton's speculative contact query).
+        snippet = _snippet(
+            """
+            @wp.struct
+            class Geo:
+                scale: wp.vec3
+                kind: int
+
+            @wp.struct
+            class Pair:
+                a: int
+                geom_a: Geo
+                geom_b: Geo
+
+            @wp.func
+            def make_pair(s: float, flip: bool) -> Pair:
+                g = Geo()
+                g.scale = wp.vec3(s, 2.0 * s, 3.0)
+                g.kind = 4
+                h = Geo()
+                h.scale = wp.vec3(-s)
+                h.kind = 7
+                p = Pair()
+                p.a = 1
+                p.geom_a = g
+                p.geom_b = h
+                if flip:
+                    p.geom_a = h
+                return p
+
+            @wp.kernel
+            def k(out: wp.array[wp.vec3], ok: wp.array[int]):
+                t = wp.tid()
+                p = make_pair(float(t), t == 1)
+                out[t] = p.geom_a.scale + p.geom_b.scale
+                ok[t] = p.geom_a.kind * 10 + p.geom_b.kind
+
+            def run(dev):
+                o = wp.zeros(2, dtype=wp.vec3, device=dev)
+                c = wp.zeros(2, dtype=int, device=dev)
+                wp.launch(k, 2, [o, c], device=dev)
+                return o.numpy(), c.numpy()
+
+            res = compare(run)
+            np.testing.assert_array_equal(res["metal:0"][1], [47, 77])
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
+    def test_static_factory_func_called_twice(self):
+        # Two ``wp.static(factory(...))(...)`` calls in one kernel resolve to
+        # two distinct functions; both must be inlined (warp_nn's GRU cell
+        # left the first one as an undeclared call).
+        snippet = _snippet(
+            """
+            def make(shape):
+                (d0, d1) = shape
+
+                @wp.func
+                def function(A: wp.array2d[float], B: wp.array2d[float], index: tuple[int, int]):
+                    i, j = index[0], index[1]
+                    C = wp.tile_zeros(shape=(d1, d0), dtype=A.dtype)
+                    a = wp.tile_load(A, shape=(d1, d0), offset=(j * d1, 0))
+                    b = wp.tile_load(B, shape=(d0, d0), offset=(i * d0, 0))
+                    wp.tile_matmul(a, wp.tile_transpose(b), C)
+                    return C
+
+                return function
+
+            def mk_kernel(shape):
+                @wp.kernel
+                def kernel(A: wp.array2d[float], B: wp.array2d[float], out: wp.array2d[float]):
+                    i, j = wp.tid()
+                    g = wp.static(make(shape))(A, B, index=(i, j))
+                    h = wp.static(make(shape))(B, A, index=(i, j))
+                    wp.tile_store(out, wp.tile_transpose(g + h), offset=(i * wp.static(shape[0]), j * wp.static(shape[1])))
+
+                return kernel
+
+            k = mk_kernel((2, 2))
+            rng = np.random.default_rng(1)
+            A = rng.random((4, 2)).astype(np.float32)
+            B = rng.random((4, 2)).astype(np.float32)
+
+            def run(dev):
+                a = wp.array(A, device=dev)
+                b = wp.array(B, device=dev)
+                o = wp.zeros((4, 4), dtype=float, device=dev)
+                wp.launch_tiled(k, dim=(2, 2), inputs=[a, b, o], block_dim=1, device=dev)
+                return (o.numpy(),)
+
+            compare(run)
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
+    def test_runtime_rebound_array_locals(self):
+        # mujoco_warp's polygon clipping swaps two scratch arrays inside a
+        # dynamic loop (``tmp = a; a = b; b = tmp``): rows of 2-D arguments
+        # in one kernel, whole 1-D arguments in the other.
+        snippet = _snippet(
+            """
+            @wp.func
+            def clip(n: int, polygon_out: wp.array[wp.vec3], clipped_out: wp.array[wp.vec3]) -> int:
+                npoly = n
+                for e in range(n):
+                    nclip = int(0)
+                    for i in range(npoly):
+                        P = polygon_out[i]
+                        if P[0] > float(e):
+                            clipped_out[nclip] = P * 0.5
+                            nclip += 1
+                        clipped_out[nclip] = P + wp.vec3(1.0)
+                        nclip += 1
+                        if nclip >= clipped_out.shape[0]:
+                            break
+                    tmp = polygon_out
+                    polygon_out = clipped_out
+                    clipped_out = tmp
+                    npoly = nclip
+                s = int(0)
+                for i in range(npoly):
+                    s += int(polygon_out[i][0])
+                return s
+
+            @wp.kernel
+            def k2d(poly: wp.array2d[wp.vec3], clipped: wp.array2d[wp.vec3], out: wp.array[int]):
+                t = wp.tid()
+                out[t] = clip(3, poly[t], clipped[t])
+
+            @wp.kernel
+            def k1d(poly: wp.array[wp.vec3], clipped: wp.array[wp.vec3], out: wp.array[int]):
+                out[0] = clip(4, poly, clipped) + int(poly[0][0] * 100.0)
+
+            rng = np.random.default_rng(0)
+            P2 = (rng.random((2, 16, 3)) * 4).astype(np.float32)
+            P1 = (rng.random((40, 3)) * 4).astype(np.float32)
+
+            def run(dev):
+                p = wp.array(P2, dtype=wp.vec3, device=dev)
+                c = wp.zeros((2, 16), dtype=wp.vec3, device=dev)
+                o = wp.zeros(2, dtype=int, device=dev)
+                wp.launch(k2d, 2, [p, c, o], device=dev)
+                p1 = wp.array(P1, dtype=wp.vec3, device=dev)
+                c1 = wp.zeros(40, dtype=wp.vec3, device=dev)
+                o1 = wp.zeros(1, dtype=int, device=dev)
+                wp.launch(k1d, 1, [p1, c1, o1], device=dev)
+                return o.numpy(), p.numpy(), c.numpy(), o1.numpy(), p1.numpy(), c1.numpy()
+
+            compare(run)
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
+    def test_struct_array_element_array_fields(self):
+        # Newton's VBD kernels read ``collision_info_array[0].<array field>``:
+        # the element's arrays are bound as kernel inputs at launch.
+        snippet = _snippet(
+            """
+            @wp.struct
+            class Info:
+                counts: wp.array[wp.int32]
+                offsets: wp.array[wp.int32]
+                pairs: wp.array[wp.int32]
+                dist: wp.array[float]
+                scale: float
+
+            @wp.func
+            def get_pair(info: Info, v: int, k: int):
+                off = info.offsets[v]
+                return info.pairs[2 * (off + k) + 1]
+
+            @wp.kernel
+            def k(infos: wp.array[Info], out: wp.array[float]):
+                t = wp.tid()
+                info = infos[0]
+                s = float(0.0)
+                if t < info.counts.shape[0]:
+                    for j in range(info.counts[t]):
+                        s += float(get_pair(info, t, j)) * info.dist[t]
+                out[t] = s * info.scale + float(infos[0].offsets[t])
+
+            def run(dev):
+                info = Info()
+                info.counts = wp.array([1, 2, 0], dtype=wp.int32, device=dev)
+                info.offsets = wp.array([0, 1, 3], dtype=wp.int32, device=dev)
+                info.pairs = wp.array(np.arange(8, dtype=np.int32) * 3, device=dev)
+                info.dist = wp.array([0.5, 2.0, 1.0], dtype=float, device=dev)
+                info.scale = 2.0
+                infos = wp.array([info], dtype=Info, device=dev)
+                o = wp.zeros(3, dtype=float, device=dev)
+                wp.launch(k, 3, [infos, o], device=dev)
+                return (o.numpy(),)
+
+            res = compare(run)
+            np.testing.assert_allclose(res["metal:0"][0], [3.0, 97.0, 3.0])
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
