@@ -15864,7 +15864,12 @@ def _generate_msl_kernel_uncached(
             # FK reads parent slots from a table indexed by the lane).
             if re.match(r"(?:\(\s*)?(?:&\s*)?wp::(?:address|view|load|index|array_load)\b", rhs.strip()):
                 continue
-            if "builtin_block_dim" in rhs or any(f"var_{t}" in rhs for t in _bd_tainted):
+            # Whole-token match: a substring test made ``var_1`` taint
+            # ``var_12`` and, with one probe per tainted label, went
+            # quadratic on Newton's ~200k-line narrow-phase kernel.
+            if "builtin_block_dim" in rhs or (
+                _bd_tainted and not _bd_tainted.isdisjoint(re.findall(r"\bvar_(\w+)\b", rhs))
+            ):
                 _bd_tainted.add(m_def.group(1))
         if _bd_tainted:
             for raw in forward_lines:
