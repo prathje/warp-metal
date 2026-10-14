@@ -13738,6 +13738,9 @@ _FOR_LOOP_LINE_PAT = re.compile(
 # Matches lines that introduce a compile-time int constant — used to
 # resolve a step expression like ``var_2__49`` to the literal ``-16``.
 _CONST_INT_DECL_PAT = re.compile(r"^\s*const int var_(\w+) = (-?\d+);\s*$")
+# Every ``var_<name>`` reference on a line (``<name>`` as ``\bvar_<name>\b``
+# would match it).
+_VAR_REF_PAT = re.compile(r"\bvar_(\w+)")
 
 
 def _fix_negative_step_for_loops(
@@ -13847,33 +13850,52 @@ def _materialize_for_loop_vars(lines: list[str]) -> list[str]:
     one assigned, as on CPU; loops whose variable dies with the loop are
     left alone.
     """
-    out = list(lines)
-    n_it = 0
-    i = 0
-    while i < len(out):
-        m = _FOR_LOOP_LINE_PAT.match(out[i])
-        if m is None:
-            i += 1
-            continue
+    # Decide on the input lines, then rewrite. Each rewrite only moves
+    # ``var_<iv>`` from the loop header into the line right after it,
+    # both inside the loop itself, so "is ``var_<iv>`` read after the
+    # loop's closing brace?" has the same answer before and after earlier
+    # rewrites. Answering it from a last-use index keeps the pass linear:
+    # rescanning the tail of the kernel per loop was quadratic and took
+    # minutes on large inlined kernels (Newton's narrow phase).
+    loops = []
+    for i, ln in enumerate(lines):
+        if "for (var_" in ln:
+            m = _FOR_LOOP_LINE_PAT.match(ln)
+            if m is not None:
+                loops.append((i, m))
+    if not loops:
+        return list(lines)
+    last_use: dict[str, int] = {}
+    for j, ln in enumerate(lines):
+        if "var_" in ln:
+            for name in _VAR_REF_PAT.findall(ln):
+                last_use[name] = j
+    rewrite: dict[int, re.Match[str]] = {}
+    for i, m in loops:
         depth = 0
         close = None
-        for j in range(i, len(out)):
-            depth += out[j].count("{") - out[j].count("}")
+        for j in range(i, len(lines)):
+            depth += lines[j].count("{") - lines[j].count("}")
             if depth <= 0:
                 close = j
                 break
-        iv = m.group("iv")
-        if close is None or not any(re.search(rf"\bvar_{iv}\b", ln) for ln in out[close + 1 :]):
-            i += 1
+        if close is not None and last_use.get(m.group("iv"), -1) > close:
+            rewrite[i] = m
+    out: list[str] = []
+    n_it = 0
+    for i, ln in enumerate(lines):
+        m = rewrite.get(i)
+        if m is None:
+            out.append(ln)
             continue
+        iv = m.group("iv")
         it = f"wp_for_it{n_it}"
         n_it += 1
-        cmp_op = ">" if re.search(rf"var_{iv} > ", out[i]) else "<"
+        cmp_op = ">" if re.search(rf"var_{iv} > ", ln) else "<"
         step = m.group("step")
         inc = f"++{it}" if step is None else f"{it} += {step}"
-        out[i] = f"{m.group('indent')}for (int {it} = {m.group('start')}; {it} {cmp_op} {m.group('stop')}; {inc}) {{"
-        out.insert(i + 1, f"{m.group('indent')}var_{iv} = {it};")
-        i += 2
+        out.append(f"{m.group('indent')}for (int {it} = {m.group('start')}; {it} {cmp_op} {m.group('stop')}; {inc}) {{")
+        out.append(f"{m.group('indent')}var_{iv} = {it};")
     return out
 
 
@@ -15832,7 +15854,9 @@ def _generate_msl_kernel_uncached(
             # FK reads parent slots from a table indexed by the lane).
             if re.match(r"(?:\(\s*)?(?:&\s*)?wp::(?:address|view|load|index|array_load)\b", rhs.strip()):
                 continue
-            if "builtin_block_dim" in rhs or any(f"var_{t}" in rhs for t in _bd_tainted):
+            # Whole-name set lookups: a substring test per tainted label was
+            # quadratic and let ``var_1`` taint ``var_12``.
+            if "builtin_block_dim" in rhs or (_bd_tainted and not _bd_tainted.isdisjoint(_VAR_REF_PAT.findall(rhs))):
                 _bd_tainted.add(m_def.group(1))
         if _bd_tainted:
             for raw in forward_lines:
