@@ -123,6 +123,41 @@ class TestMetalR3Tiles(unittest.TestCase):
             """,
         )
 
+    def test_array_slice_views(self):
+        # ``arr[a:b]`` in a kernel (Kamino's per-joint nonzero-block ids):
+        # reads, ``.shape``, omitted / negative bounds, rows of a 2-D array,
+        # and writes through the view.
+        _run(
+            self,
+            """
+            @wp.kernel
+            def k(ids: wp.array[wp.int32], off: wp.array[wp.int32], m: wp.array2d[float],
+                  out: wp.array[wp.int32], mo: wp.array[float]):
+                i = wp.tid()
+                sub = ids[off[i]:off[i + 1]]
+                acc = int(0)
+                for j in range(sub.shape[0]):
+                    acc += sub[j] * (j + 1)
+                out[i] = acc + sub[0] + ids[-2:][0] + ids[:3].shape[0]
+                rows = m[1:3]
+                mo[i] = rows[1, i] + float(rows.shape[0])
+                if i == 0:
+                    w = ids[9:]
+                    w[0] = 99
+
+            def run(dev):
+                o = wp.zeros(3, dtype=wp.int32, device=dev)
+                mo = wp.zeros(3, dtype=float, device=dev)
+                ids = wp.array(np.arange(10, dtype=np.int32) * 3, device=dev)
+                m = wp.array(np.arange(12, dtype=np.float32).reshape(4, 3), device=dev)
+                off = wp.array([0, 2, 5, 9], dtype=wp.int32, device=dev)
+                wp.launch(k, dim=3, inputs=[ids, off, m, o, mo], device=dev)
+                return o.numpy(), mo.numpy(), ids.numpy()
+
+            assert_same(both(run))
+            """,
+        )
+
     def test_tile_store_bounds_on_arguments(self):
         # A partial trailing tile must not write past the array's rows.
         _run(

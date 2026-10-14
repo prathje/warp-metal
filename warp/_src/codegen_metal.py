@@ -14022,63 +14022,143 @@ _PTR_ARRAY_CTOR_PAT = re.compile(
 _PTR_ARRAY_PREFIX = "__pa"
 
 
-def _lower_pointer_arrays(lines: list[str], adj, adjoint: bool) -> tuple[list[str], set[str], set[str]]:
-    """Lower arrays built from raw pointers to MSL pointer locals.
+# ``var_S = wp::slice_t(start, stop, step);`` and ``var_V = wp::view(var_A, var_S);``
+# — ``arr[start:stop]`` on an array.
+_SLICE_T_PAT = re.compile(r"^\s*var_(?P<lbl>\w+)\s*=\s*wp::slice_t\s*\((?P<args>[^;]*)\)\s*;\s*$")
+_SLICE_VIEW_PAT = re.compile(
+    r"^(?P<indent>\s*)var_(?P<lbl>\w+)\s*=\s*wp::view\s*\(\s*var_(?P<src>\w+)\s*,\s*var_(?P<sl>\w+)\s*\)\s*;\s*$"
+)
 
-    Kamino builds per-problem views with ``wp.array(ptr=<base + offset>,
-    shape=(n, n), dtype=float)`` over addresses taken by a native snippet
-    (``(uint64_t)arr.data``). On Metal a ``uint64`` holding a buffer's
-    ``gpuAddress`` converts back to a ``device T*``, so each such array
-    becomes a pointer local plus an ``int`` shape array, and every use is
-    renamed to the label ``__pa<label>`` — which the rest of the translator
-    treats like a dense (row-major, contiguous) array argument: indexing,
-    ``.shape``, ``array_store`` and ``tile_load`` / ``tile_store`` resolve
-    through ``__pa<label>[...]`` / ``__pa<label>_shape[k]``.
 
-    Returns ``(lines, original labels to skip declaring, new labels)``.
+def _lower_pointer_arrays(
+    lines: list[str], adj, adjoint: bool, consts: dict[str, int] | None = None
+) -> tuple[list[str], set[str], set[str], dict[str, str]]:
+    """Lower arrays built in-kernel to MSL pointer locals.
+
+    Two forms:
+
+    - ``wp.array(ptr=<base + offset>, shape=(n, n), dtype=float)`` over an
+      address a native snippet took (``(uint64_t)arr.data``) — Kamino's
+      per-problem matrix views. On Metal a ``uint64`` holding a buffer's
+      ``gpuAddress`` converts back to a ``device T*``.
+    - ``arr[start:stop]`` (a unit-step slice of the leading dim of a scalar
+      array argument), which stays contiguous.
+
+    Each becomes a pointer local plus an ``int`` shape array, and every use
+    is renamed to the label ``__pa<label>`` — which the rest of the
+    translator treats like a dense (row-major, contiguous) array argument:
+    indexing, ``.shape``, ``array_store`` and ``tile_load`` / ``tile_store``
+    resolve through ``__pa<label>[...]`` / ``__pa<label>_shape[k]``.
+
+    Returns ``(lines, original labels to skip declaring, new labels,
+    {new label: kernel argument it views})``.
     """
-    ctors: dict[str, tuple[str, int]] = {}
+    consts = consts or {}
+    arg_types = {a.label: a for a in adj.args}
+    # label -> (msl scalar, ndim, source arg label or None)
+    arrays: dict[str, tuple[str, int, str | None]] = {}
+    slices: dict[str, list[str]] = {}
     for ln in lines:
-        m = _PTR_ARRAY_CTOR_PAT.match(ln)
-        if m is None:
+        m = _SLICE_T_PAT.match(ln)
+        if m is not None:
+            slices[m.group("lbl")] = [a.strip() for a in _split_top_level_args(m.group("args"))]
             continue
-        msl = _SCALAR_CTYPE_TO_MSL.get(m.group("dt"))
-        dims = [d.strip() for d in _split_top_level_args(m.group("dims")) if d.strip()]
-        if msl is None or msl == "wp_f64" or not 1 <= len(dims) <= 4:
-            raise MetalCodegenError(
-                f"Kernel {adj.fun_name!r}: wp.array(ptr=...) of dtype {m.group('dt')!r} with {len(dims)} dims is not "
-                "supported on Metal (scalar dtypes of at most 32 bits, 1-4 dims)"
-            )
-        prev = ctors.get(m.group("lbl"))
-        if prev is not None and prev != (msl, len(dims)):
+        m = _PTR_ARRAY_CTOR_PAT.match(ln)
+        if m is not None:
+            msl = _SCALAR_CTYPE_TO_MSL.get(m.group("dt"))
+            dims = [d.strip() for d in _split_top_level_args(m.group("dims")) if d.strip()]
+            if msl is None or msl == "wp_f64" or not 1 <= len(dims) <= 4:
+                raise MetalCodegenError(
+                    f"Kernel {adj.fun_name!r}: wp.array(ptr=...) of dtype {m.group('dt')!r} with {len(dims)} dims "
+                    "is not supported on Metal (scalar dtypes of at most 32 bits, 1-4 dims)"
+                )
+            entry = (msl, len(dims), None)
+        else:
+            m = _SLICE_VIEW_PAT.match(ln)
+            if m is None or m.group("sl") not in slices:
+                continue
+            src = m.group("src")
+            sl = slices[m.group("sl")]
+            if src in arrays:
+                msl, nd, root = arrays[src]
+            elif src in arg_types and _is_array_arg(arg_types[src]):
+                arg = arg_types[src]
+                msl = _SCALAR_CTYPE_TO_MSL.get(_ARRAY_CTYPE_ELEM_PAT.sub(r"\1", arg.ctype()))
+                nd, root = arg.type.ndim, src
+                if msl is None or msl == "wp_f64" or type(arg.type).__name__ not in ("array", "_ArrayAnnotation"):
+                    continue
+            else:
+                continue
+            step = sl[2] if len(sl) == 3 else "1"
+            step_val = consts.get(step[4:]) if step.startswith("var_") else None
+            if step_val is None and re.fullmatch(r"\d+", step):
+                step_val = int(step)
+            if step_val != 1:
+                continue  # strided slices stay unsupported
+            entry = (msl, nd, root)
+        prev = arrays.get(m.group("lbl"))
+        if prev is not None and prev[:2] != entry[:2]:
             raise MetalCodegenError(f"Kernel {adj.fun_name!r}: array local var_{m.group('lbl')} changes type")
-        ctors[m.group("lbl")] = (msl, len(dims))
-    if not ctors:
-        return lines, set(), set()
+        arrays[m.group("lbl")] = entry
+    if not arrays:
+        return lines, set(), set(), {}
     if adjoint:
         raise MetalCodegenError(
-            f"Kernel {adj.fun_name!r}: reverse mode through arrays built from raw pointers "
-            "(wp.array(ptr=...)) is not supported on Metal"
+            f"Kernel {adj.fun_name!r}: reverse mode through arrays built in-kernel (wp.array(ptr=...) or "
+            "array slices) is not supported on Metal"
         )
-    rename = re.compile(r"\bvar_(" + "|".join(re.escape(lbl) for lbl in sorted(ctors, key=len, reverse=True)) + r")\b")
-    decls = []
-    for lbl, (msl, nd) in ctors.items():
-        decls.append(f"    device {msl}* {_PTR_ARRAY_PREFIX}{lbl} = nullptr;")
-        decls.append(f"    int {_PTR_ARRAY_PREFIX}{lbl}_shape[{nd}] = {{{', '.join(['0'] * nd)}}};")
-    out = list(decls)
+
+    def _name(lbl: str) -> str:
+        return f"{_PTR_ARRAY_PREFIX}{lbl}"
+
+    rename = re.compile(r"\bvar_(" + "|".join(re.escape(lbl) for lbl in sorted(arrays, key=len, reverse=True)) + r")\b")
+    out = []
+    for lbl, (msl, nd, _root) in arrays.items():
+        out.append(f"    device {msl}* {_name(lbl)} = nullptr;")
+        out.append(f"    int {_name(lbl)}_shape[{nd}] = {{{', '.join(['0'] * nd)}}};")
     for ln in lines:
         m = _PTR_ARRAY_CTOR_PAT.match(ln)
-        if m is not None and m.group("lbl") in ctors:
+        if m is not None and m.group("lbl") in arrays:
             lbl = m.group("lbl")
-            msl, _nd = ctors[lbl]
-            name = f"{_PTR_ARRAY_PREFIX}{lbl}"
+            msl = arrays[lbl][0]
             dims = [d.strip() for d in _split_top_level_args(m.group("dims")) if d.strip()]
-            stmts = [f"{name} = reinterpret_cast<device {msl}*>(var_{m.group('ptr')});"]
-            stmts += [f"{name}_shape[{k}] = (int)({d});" for k, d in enumerate(dims)]
+            stmts = [f"{_name(lbl)} = reinterpret_cast<device {msl}*>(var_{m.group('ptr')});"]
+            stmts += [f"{_name(lbl)}_shape[{k}] = (int)({d});" for k, d in enumerate(dims)]
             out.append(m.group("indent") + " ".join(stmts))
             continue
-        out.append(rename.sub(lambda mm: f"var_{_PTR_ARRAY_PREFIX}{mm.group(1)}", ln))
-    return out, set(ctors), {f"{_PTR_ARRAY_PREFIX}{lbl}" for lbl in ctors}
+        m = _SLICE_VIEW_PAT.match(ln)
+        if m is not None and m.group("lbl") in arrays:
+            lbl, src = m.group("lbl"), m.group("src")
+            msl, nd, _root = arrays[lbl]
+            sl = slices[m.group("sl")]
+            if src in arrays:
+                src_ptr, src_shape = _name(src), f"{_name(src)}_shape"
+            else:
+                src_ptr, src_shape = f"var_{src}", f"{src}_shape"
+            inner = " * ".join(f"{src_shape}[{k}]" for k in range(1, nd)) or "1"
+            # ``slice_adjust_indices`` (clamped, negative-wrapping, with the
+            # SLICE_BEGIN / SLICE_END sentinels of omitted bounds).
+            stmts = [
+                f"{{ const int _sl_n = {src_shape}[0];",
+                f"int _sl_a = (int)({sl[0]}); int _sl_b = (int)({sl[1]});",
+                "_sl_a = _sl_a == 2147483647 ? 0 : metal::clamp(_sl_a, -_sl_n, _sl_n);",
+                "_sl_a = _sl_a < 0 ? _sl_a + _sl_n : _sl_a;",
+                "_sl_b = _sl_b == (-2147483647 - 1) ? _sl_n : metal::clamp(_sl_b, -_sl_n, _sl_n);",
+                "_sl_b = _sl_b < 0 ? _sl_b + _sl_n : _sl_b;",
+                f"{_name(lbl)} = reinterpret_cast<device {msl}*>(reinterpret_cast<ulong>({src_ptr})) "
+                f"+ (long)_sl_a * (long)({inner});",
+                f"{_name(lbl)}_shape[0] = metal::max(_sl_b - _sl_a, 0);",
+            ]
+            stmts += [f"{_name(lbl)}_shape[{k}] = {src_shape}[{k}];" for k in range(1, nd)]
+            stmts.append("}")
+            out.append(m.group("indent") + " ".join(stmts))
+            continue
+        out.append(rename.sub(lambda mm: f"var_{_name(mm.group(1))}", ln))
+    roots = {_name(lbl): root for lbl, (_m, _n, root) in arrays.items() if root is not None}
+    return out, set(arrays), {_name(lbl) for lbl in arrays}, roots
+
+
+_ARRAY_CTYPE_ELEM_PAT = re.compile(r"^wp::array_t<\s*(.+?)\s*>$")
 
 
 def _materialize_for_loop_vars(lines: list[str]) -> list[str]:
@@ -15067,7 +15147,15 @@ def _generate_msl_kernel_uncached(
     # A loop variable read after its loop keeps its last iteration value.
     forward_lines = _materialize_for_loop_vars(forward_lines)
     # ``wp.array(ptr=...)`` locals -> device pointer + shape locals.
-    forward_lines, _ptr_array_skip, ptr_array_labels = _lower_pointer_arrays(forward_lines, adj, adjoint)
+    forward_lines, _ptr_array_skip, ptr_array_labels, ptr_array_roots = _lower_pointer_arrays(
+        forward_lines,
+        adj,
+        adjoint,
+        {
+            **{str(v.label): v.constant for v in adj.variables if isinstance(getattr(v, "constant", None), int)},
+            **{str(k): v for k, v in _inlined_const_ints.items() if isinstance(v, int)},
+        },
+    )
 
     if os.environ.get("WARP_METAL_DUMP_IR"):
         _dump = os.path.join(os.environ["WARP_METAL_DUMP_IR"], f"{adj.fun_name}{'__adj' if adjoint else ''}.ir")
@@ -15164,6 +15252,18 @@ def _generate_msl_kernel_uncached(
             written_arg_names.add(arr_name)
             atomic_arg_names.add(arr_name)
             atomic_op_kinds.setdefault(arr_name, set()).add(op_kind)
+    # In-kernel array locals (see ``_lower_pointer_arrays``) are plain
+    # ``device T*`` pointers: a write through a slice view is a write to the
+    # argument it views, and atomics on them have no ``atomic<T>`` typing.
+    for _pa in ptr_array_labels & atomic_arg_names:
+        raise MetalCodegenError(
+            f"Kernel {adj.fun_name!r}: atomic operations on an in-kernel array view "
+            f"(wp.array(ptr=...) or an array slice) are not supported on Metal"
+        )
+    for _pa in ptr_array_labels & written_arg_names:
+        if _pa in ptr_array_roots:
+            written_arg_names.add(ptr_array_roots[_pa])
+            plain_store_arg_names.add(ptr_array_roots[_pa])
 
     # MLX's ``atomic_outputs`` flag is per-kernel, not per-output: when set,
     # *every* output is typed ``device atomic<T>*``. We can still support
