@@ -20463,13 +20463,13 @@ def launch_metal_kernel_native(
 
     # Strided / indexed array arguments run through contiguous staging
     # copies (see ``warp._src.metal_array_args``).
-    if any(_maybe_staged_arg(v) for v in (*inputs, *outputs)):
+    if any(_maybe_staged_arg(v) for v in (*inputs, *outputs, *((*adj_inputs, *adj_outputs) if adjoint else ()))):
         from warp._src.metal_array_args import stage_launch_args  # noqa: PLC0415
 
-        staged = stage_launch_args(kernel, inputs, outputs, device, adjoint)
+        staged = stage_launch_args(kernel, inputs, outputs, device, adjoint, adj_inputs, adj_outputs)
         if staged is not None:
             return staged.run(
-                lambda k, i, o: launch_metal_kernel_native(
+                lambda k, i, o, ai, ao: launch_metal_kernel_native(
                     k,
                     dim,
                     i,
@@ -20477,8 +20477,8 @@ def launch_metal_kernel_native(
                     device,
                     block_dim=block_dim,
                     adjoint=adjoint,
-                    adj_inputs=adj_inputs,
-                    adj_outputs=adj_outputs,
+                    adj_inputs=ai,
+                    adj_outputs=ao,
                 )
             )
 

@@ -15401,21 +15401,33 @@ def copy(
                 from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
 
                 dispatcher = get_dispatcher()
-                if dispatcher._record_state is not None:
-                    raise RuntimeError(
-                        "wp.copy of a non-contiguous Metal array is not supported inside a "
-                        "Metal graph capture — the strided transfer runs on the host and would "
-                        "not be replayed. Move it outside the capture region."
-                    )
-                if _metal_is_private_ptr(getattr(src, "ptr", 0)) or _metal_is_private_ptr(getattr(dest, "ptr", 0)):
-                    raise RuntimeError(
-                        "wp.copy of a non-contiguous view of a private-storage Metal buffer "
-                        "(e.g. a wrapped Torch MPS tensor) is not supported — the strided copy "
-                        "runs on the host and the buffer has no host address. Copy a contiguous "
-                        "view instead, or .contiguous() the tensor before wrapping it."
-                    )
-                dispatcher.sync()
-            result = runtime.core.wp_array_copy_host(dst_ptr, src_ptr, dst_type, src_type, src_elem_size)
+                copied = False
+                if getattr(src.device, "is_metal", False) and getattr(dest.device, "is_metal", False):
+                    from warp._src.metal_array_args import metal_device_strided_copy  # noqa: PLC0415
+
+                    # Both sides on the GPU: gather / scatter with a device
+                    # kernel, which also records into a Metal graph capture.
+                    copied = metal_device_strided_copy(dest_nc, src_nc)
+                if copied:
+                    result = True
+                else:
+                    if dispatcher._record_state is not None:
+                        raise RuntimeError(
+                            "wp.copy of a non-contiguous Metal array is not supported inside a "
+                            "Metal graph capture — the strided transfer runs on the host and would "
+                            "not be replayed. Move it outside the capture region."
+                        )
+                    if _metal_is_private_ptr(getattr(src, "ptr", 0)) or _metal_is_private_ptr(getattr(dest, "ptr", 0)):
+                        raise RuntimeError(
+                            "wp.copy of a non-contiguous view of a private-storage Metal buffer "
+                            "(e.g. a wrapped Torch MPS tensor) is not supported — the strided copy "
+                            "runs on the host and the buffer has no host address. Copy a contiguous "
+                            "view instead, or .contiguous() the tensor before wrapping it."
+                        )
+                    dispatcher.sync()
+                    result = runtime.core.wp_array_copy_host(dst_ptr, src_ptr, dst_type, src_type, src_elem_size)
+            else:
+                result = runtime.core.wp_array_copy_host(dst_ptr, src_ptr, dst_type, src_type, src_elem_size)
 
         if not result:
             raise RuntimeError(f"Warp copy error: {runtime.get_error_string()}")

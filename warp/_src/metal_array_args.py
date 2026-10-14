@@ -16,7 +16,8 @@ directly. :func:`stage_launch_args` makes such launches work by staging:
 3. arguments the kernel writes are scattered back through the same
    strides / indices.
 
-All steps are ordinary dispatches, so a staged launch is asynchronous and
+Reverse-mode launches stage the paired gradient arrays the same way (gather
+before, scatter back after). All steps are ordinary dispatches, so a staged launch is asynchronous and
 records into a Metal graph capture like any other launch.
 
 A staged argument whose memory overlaps another array argument, where
@@ -156,6 +157,45 @@ def _stage_copy(value, dense, direction: int) -> None:
     )
 
 
+def _is_dense(value) -> bool:
+    return isinstance(value, wp._src.types.array) and value.is_contiguous
+
+
+def metal_device_strided_copy(dest, src) -> bool:
+    """``wp.copy`` between two Metal arrays of equal shape where at least one
+    is strided or indexed, as device dispatches of the staging kernel.
+
+    Returns ``False`` (caller falls back to the host strided copy) for
+    anything other than ``wp.array`` / ``wp.indexedarray`` views of up to
+    four dimensions. The dispatches order after pending kernels on the same
+    queue and record into an active Metal graph capture, so the copy replays
+    with the graph (the host path cannot).
+    """
+    from warp._src.context import runtime  # noqa: PLC0415
+
+    kinds = (wp._src.types.array, wp._src.types.indexedarray)
+    if not isinstance(src, kinds) or not isinstance(dest, kinds):
+        return False
+    if src.ndim > 4 or dest.ndim > 4 or src.size == 0:
+        return src.size == 0
+    for v in (src, dest):
+        base = v.data if isinstance(v, wp._src.types.indexedarray) else v
+        if base is None or base.ptr is None:
+            return False
+    device = dest.device
+    if _is_dense(dest):
+        _stage_copy(src, dest, 0)
+    elif _is_dense(src):
+        _stage_copy(dest, src, 1)
+    else:
+        tmp = wp.empty(src.shape, dtype=src.dtype, device=device)
+        if device.is_capturing:
+            runtime._metal_capture_graph._metal_retain.append(tmp)
+        _stage_copy(src, tmp, 0)
+        _stage_copy(dest, tmp, 1)
+    return True
+
+
 def _array_variant(kernel):
     """``kernel`` re-specialized with ``wp.array`` in place of every
     ``wp.indexedarray`` parameter (cached on ``kernel``)."""
@@ -238,48 +278,79 @@ class StagedLaunch:
     """A launch whose strided / indexed arguments were replaced by
     contiguous temporaries; :meth:`run` launches and scatters back."""
 
-    def __init__(self, kernel, inputs, outputs, staged):
+    def __init__(self, kernel, inputs, outputs, staged, adj_inputs=(), adj_outputs=(), adj_staged=()):
         self.kernel = kernel
         self.inputs = inputs
         self.outputs = outputs
+        self.adj_inputs = adj_inputs
+        self.adj_outputs = adj_outputs
         self._staged = staged  # [(arg_index, original, temporary)]
+        self._adj_staged = adj_staged  # [(original, temporary)], all scattered back
 
     def run(self, launch_fn, block_dim=None):
-        result = launch_fn(self.kernel, self.inputs, self.outputs)
+        result = launch_fn(self.kernel, self.inputs, self.outputs, self.adj_inputs, self.adj_outputs)
         written = _written_arg_labels(self.kernel, block_dim)
         args = self.kernel.adj.args
         for i, original, tmp in self._staged:
             if args[i].label in written:
                 _stage_copy(original, tmp, 1)
+        # Gradient arrays are read-modify-written by the adjoint kernel
+        # (accumulated, or consumed and zeroed for stored outputs).
+        for original, tmp in self._adj_staged:
+            _stage_copy(original, tmp, 1)
         return result
 
 
-def stage_launch_args(kernel, inputs, outputs, device, adjoint: bool = False) -> StagedLaunch | None:
-    """Return a :class:`StagedLaunch` if any argument needs staging, else ``None``."""
+def stage_launch_args(
+    kernel, inputs, outputs, device, adjoint: bool = False, adj_inputs=(), adj_outputs=()
+) -> StagedLaunch | None:
+    """Return a :class:`StagedLaunch` if any argument needs staging, else ``None``.
+
+    In reverse mode the gradient arrays paired with the arguments are staged
+    too: gathered before the adjoint launch and scattered back after it.
+    """
     values = [*inputs, *outputs]
-    if not any(_needs_staging(v) for v in values):
+    adj_values = [*adj_inputs, *adj_outputs] if adjoint else []
+    if not any(_needs_staging(v) for v in (*values, *adj_values)):
         return None
-    if adjoint:
-        raise RuntimeError(
-            f"Kernel '{kernel.key}': reverse-mode launches with strided or indexed array arguments "
-            "are not supported on Metal; pass contiguous arrays."
-        )
     from warp._src.context import runtime  # noqa: PLC0415
 
     variant = _array_variant(kernel)
     staged_indices = {i for i, v in enumerate(values) if _needs_staging(v)}
     _check_staged_aliasing(variant, values, staged_indices, _written_arg_labels(variant, None))
     graph = runtime._metal_capture_graph if device.is_capturing else None
+
+    def _stage(value):
+        tmp = wp.empty(value.shape, dtype=value.dtype, device=device)
+        if graph is not None:
+            graph._metal_retain.append(tmp)
+        _stage_copy(value, tmp, 0)
+        return tmp
+
     staged = []
     new_values = list(values)
     for i, value in enumerate(values):
         if not _needs_staging(value):
             continue
-        tmp = wp.empty(value.shape, dtype=value.dtype, device=device)
-        if graph is not None:
-            graph._metal_retain.append(tmp)
-        _stage_copy(value, tmp, 0)
+        tmp = _stage(value)
         new_values[i] = tmp
         staged.append((i, value, tmp))
+    adj_staged = []
+    new_adj = list(adj_values)
+    for i, value in enumerate(adj_values):
+        if not _needs_staging(value):
+            continue
+        tmp = _stage(value)
+        new_adj[i] = tmp
+        adj_staged.append((value, tmp))
     n_in = len(inputs)
-    return StagedLaunch(variant, new_values[:n_in], new_values[n_in:], staged)
+    n_adj_in = len(adj_inputs) if adjoint else 0
+    return StagedLaunch(
+        variant,
+        new_values[:n_in],
+        new_values[n_in:],
+        staged,
+        adj_inputs=tuple(new_adj[:n_adj_in]) if adjoint else adj_inputs,
+        adj_outputs=tuple(new_adj[n_adj_in:]) if adjoint else adj_outputs,
+        adj_staged=adj_staged,
+    )
