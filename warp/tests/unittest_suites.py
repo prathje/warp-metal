@@ -233,6 +233,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
     from warp.tests.test_metal_r3_perf import (
         TestMetalArtifactCacheKeys,
         TestMetalArtifactSweep,
+        TestMetalAsyncFill,
         TestMetalForLoopMaterialize,
         TestMetalTileBroadcast,
     )
@@ -445,6 +446,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
         TestMetalMismatch,
         TestMetalArtifactCacheKeys,
         TestMetalArtifactSweep,
+        TestMetalAsyncFill,
         TestMetalForLoopMaterialize,
         TestMetalTileBroadcast,
         TestMetalMujocoWarp,

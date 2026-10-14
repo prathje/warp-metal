@@ -262,5 +262,48 @@ class TestMetalTileBroadcast(unittest.TestCase):
         _run_with_metal_enabled(self, snippet, timeout=120)
 
 
+@unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
+@unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
+class TestMetalAsyncFill(unittest.TestCase):
+    def test_zero_and_fill_do_not_drain_queue(self):
+        # ``zero_()`` / ``fill_()`` behind queued kernels used to sync() and
+        # memset on the host — one GPU round trip each (Newton's VBD solver
+        # zeroes five arrays per iteration: 70k syncs, ~600 s in one test).
+        # They now enqueue a device fill ordered after the queued kernels.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+            from warp._src.metal_dispatch import get_dispatcher
+
+            @wp.kernel
+            def write(a: wp.array[float], v: float):
+                a[wp.tid()] = v
+
+            disp = get_dispatcher()
+            calls = [0]
+            orig = type(disp).sync
+            def counting(self):
+                calls[0] += 1
+                return orig(self)
+            type(disp).sync = counting
+
+            n = 1 << 16
+            a = wp.empty(n, dtype=float, device="metal:0")
+            b = wp.empty(n, dtype=wp.vec3, device="metal:0")
+            for _ in range(3):
+                wp.launch(write, dim=n, inputs=[a, 1.0], device="metal:0")
+                a.zero_()
+                wp.launch(write, dim=n // 2, inputs=[a, 2.0], device="metal:0")
+                b.fill_(wp.vec3(1.0, 2.0, 3.0))
+            assert calls[0] == 0, calls[0]
+            expected = np.zeros(n, dtype=np.float32)
+            expected[: n // 2] = 2.0
+            np.testing.assert_array_equal(a.numpy(), expected)
+            np.testing.assert_array_equal(b.numpy(), np.tile([1.0, 2.0, 3.0], (n, 1)).astype(np.float32))
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

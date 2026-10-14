@@ -5668,14 +5668,25 @@ def _metal_find_buffer(ptr: int):
 
 
 def _metal_host_memset(ptr, value, nbytes):
-    """``wp_memset_host`` for Metal arrays: drains queued GPU work first
-    (unified memory — a pending kernel write would land after the host op),
-    and inside an ICB recording records a device-side fill instead so the
-    op replays with the captured graph."""
+    """``wp_memset_host`` for Metal arrays.
+
+    Inside an ICB recording, or for a private-storage buffer, it records a
+    device-side fill so the op replays with the captured graph. With GPU
+    work still queued it also fills on the device: the fill orders after
+    the queued kernels on the same queue, where a host memset would first
+    have to drain them (``sync()``) — one GPU round trip per ``zero_()``,
+    tens of thousands per Newton VBD test. With nothing queued, the host
+    memset is immediate.
+    """
     if warp.config.metal_native_dispatch:
         from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
 
         disp = get_dispatcher()
+        if disp.has_pending_work() and disp._record_state is None and not _metal_is_private_ptr(ptr):
+            buf, off = _metal_find_buffer(ptr) if ptr and nbytes > 0 else (None, 0)
+            if buf is not None:
+                disp.device_fill(buf, value, nbytes, offset=off)
+                return True
         if disp._record_state is not None or _metal_is_private_ptr(ptr):
             if not ptr or nbytes <= 0:
                 return True
@@ -5692,12 +5703,17 @@ def _metal_host_memset(ptr, value, nbytes):
 
 
 def _metal_host_memtile(ptr, src_ptr, srcsize, reps):
-    """``wp_memtile_host`` for Metal arrays — same drain/record policy as
-    :func:`_metal_host_memset`."""
+    """``wp_memtile_host`` for Metal arrays — same device-fill / drain /
+    record policy as :func:`_metal_host_memset`."""
     if warp.config.metal_native_dispatch:
         from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
 
         disp = get_dispatcher()
+        if disp.has_pending_work() and disp._record_state is None and not _metal_is_private_ptr(ptr):
+            buf, off = _metal_find_buffer(ptr) if ptr and srcsize > 0 and reps > 0 else (None, 0)
+            if buf is not None:
+                disp.device_memtile(buf, ctypes.string_at(src_ptr, srcsize), reps, offset=off)
+                return None
         if disp._record_state is not None or _metal_is_private_ptr(ptr):
             if not ptr or srcsize <= 0 or reps <= 0:
                 return None
