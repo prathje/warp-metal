@@ -1061,6 +1061,14 @@ def _emit_big_mat_struct(name: str, rows: int, cols: int, msl_scalar: str) -> st
     row_vec_ty, row_at = _vec_ty(rows)  # result of mat * vec
     if msl_scalar == _F64_EMU_MSL and rows == cols and rows in (1, 2, 3, 4):
         body.append(_emit_f64_square_mat_helpers(name, rows))
+    if msl_scalar == _F64_EMU_MSL and _mat_native(rows, cols, "float"):
+        # ``wp.mat44d(m_f32)`` / ``wp.mat44(m_f64)``: element-wise conversions
+        # against the native column-major ``floatNxN`` (``m[c][r]``).
+        nat = f"float{rows}x{cols}"
+        to64 = "; ".join(f"r.c[{r * cols + c}] = wp_f64_from(m[{c}][{r}])" for r in range(rows) for c in range(cols))
+        to32 = "; ".join(f"r[{c}][{r}] = float(m.c[{r * cols + c}])" for r in range(rows) for c in range(cols))
+        body.append(f"inline {name} {name}_make({nat} m) {{ {name} r; {to64}; return r; }}")
+        body.append(f"inline {nat} wp_mat_ctor1({nat} r, {name} m) {{ {to32}; return r; }}")
     # ``wp_get_diag`` for square big mats (the native sizes come from
     # ``_MISC_MATH_HELPERS``, the float 1x1 one from the ``need_mat1x1`` block).
     if rows == cols and (rows > 1 or msl_scalar == _F64_EMU_MSL):
@@ -1805,7 +1813,12 @@ inline float wp_f64_to_f32(ulong b) {
     int e32 = exp - 1023 + 127;
     if (e32 >= 255) return as_type<float>(sign | 0x7f800000u);  // overflow -> inf
     if (e32 <= 0) return as_type<float>(sign);                  // underflow -> 0
-    return as_type<float>(sign | (uint(e32) << 23) | uint(man >> 29));
+    // Round to nearest, ties to even (what a hardware double->float
+    // conversion does); a mantissa carry bumps the exponent, up to inf.
+    uint m32 = uint(man >> 29);
+    ulong rem = man & 0x1fffffffull;
+    if (rem > 0x10000000ull || (rem == 0x10000000ull && (m32 & 1u))) m32 += 1u;
+    return as_type<float>(sign | ((uint(e32) << 23) + m32));
 }
 inline ulong wp_f32_to_f64(float f) {
     uint b = as_type<uint>(f);

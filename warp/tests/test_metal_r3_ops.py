@@ -442,6 +442,69 @@ class TestMetalR3Ops(unittest.TestCase):
             """,
         )
 
+    def _fp64_mat_conversions(self, mode: str):
+        # Newton's RTX viewer writes ``wp.mat44d(wp.mat44(...))`` into a
+        # ``wp.array[wp.mat44d]``.
+        _run(
+            self,
+            f"""
+            wp.config.metal_fp64 = "{mode}"
+
+            @wp.kernel
+            def k(a: wp.array[wp.mat44], b: wp.array[wp.mat33d], o: wp.array[wp.mat44d], o2: wp.array[wp.mat33],
+                  o3: wp.array[wp.mat22d], o4: wp.array[wp.vec3d]):
+                i = wp.tid()
+                o[i] = wp.mat44d(a[i])
+                o2[i] = wp.mat33(b[i])
+                o3[i] = wp.mat22d(wp.mat22(1.0, 2.0, 3.0, 4.0))
+                o4[i] = wp.vec3d(wp.vec3(a[i][0, 0], 2.0, 3.0))
+
+            def launch(dev):
+                a = wp.array(np.arange(32, dtype=np.float32).reshape(2, 4, 4) * 0.1, dtype=wp.mat44, device=dev)
+                b = wp.array(np.arange(18, dtype=np.float64).reshape(2, 3, 3) * 0.1, dtype=wp.mat33d, device=dev)
+                outs = [wp.zeros(2, dtype=t, device=dev) for t in (wp.mat44d, wp.mat33, wp.mat22d, wp.vec3d)]
+                wp.launch(k, 2, [a, b], outs, device=dev)
+                return [x.numpy() for x in outs]
+
+            cpu, metal = both(launch)
+            assert_same(cpu, metal)
+            """,
+        )
+
+    def test_fp64_mat_conversions_emulate(self):
+        self._fp64_mat_conversions("emulate")
+
+    def test_fp64_mat_conversions_demote(self):
+        self._fp64_mat_conversions("demote")
+
+    def test_fp64_demote_rounds_to_nearest(self):
+        # Demoted float64 reads must round like a hardware double->float
+        # conversion (ties to even), not truncate the mantissa.
+        _run(
+            self,
+            """
+            wp.config.metal_fp64 = "demote"
+
+            @wp.kernel
+            def k(a: wp.array[wp.float64], o: wp.array[float]):
+                i = wp.tid()
+                o[i] = float(a[i])
+
+            rng = np.random.default_rng(0)
+            f = rng.standard_normal(1000).astype(np.float32)
+            x = np.concatenate([
+                rng.standard_normal(20000) * 10.0 ** rng.integers(-30, 30, 20000),
+                f.astype(np.float64) + np.spacing(f).astype(np.float64) / 2,  # exact ties
+                [3.4028235677973366e38, 1.0e39, -0.0, np.inf, -np.inf],
+            ])
+            a = wp.array(x, dtype=wp.float64, device="metal:0")
+            o = wp.zeros(len(x), dtype=float, device="metal:0")
+            wp.launch(k, len(x), [a], [o], device="metal:0")
+            ref = x.astype(np.float32)
+            np.testing.assert_array_equal(o.numpy(), ref)
+            """,
+        )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
