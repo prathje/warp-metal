@@ -1809,9 +1809,20 @@ def _inline_one_call(
             continue
         arg_var = fn_overload.adj.args[i]
         ctype = arg_var.ctype()
+        copy_label = f"{inline_id}__argcopy_{pname}"
+        if ctype.startswith("wp::array_t<") and any(
+            re.match(rf"^\s*wp::assign\s*\(\s*var_{pname}\s*,", ln) for ln in fn_lines
+        ):
+            # The callee REBINDS the array param (``a, b = b, a`` in a
+            # loop): bind a local handle so the rebinding stays inside the
+            # callee. ``codegen_metal_locals.fold_dynamic_array_locals``
+            # lowers the rebinding.
+            param_copy_decls.extend(parse([f"    var_{copy_label} = {caller_arg};"]))
+            subs[f"var_{pname}"] = f"var_{copy_label}"
+            var_types[copy_label] = ctype
+            continue
         if ctype.endswith("*") or "array_t" in ctype or "tile_t" in ctype:
             continue
-        copy_label = f"{inline_id}__argcopy_{pname}"
         if isinstance(arg_var.type, Struct):
             # Struct locals are split into per-field MSL locals; register
             # the copy so declarations are emitted, and let the whole-

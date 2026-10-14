@@ -167,6 +167,10 @@ from warp._src.codegen_metal_ast import lower_reverse_ranges as _ast_lower_rever
 from warp._src.codegen_metal_ast import parse as _ast_parse
 from warp._src.codegen_metal_ast import query_iterator_vars as _ast_query_iterator_vars
 from warp._src.codegen_metal_ast import wrap_negative_array_indices as _ast_wrap_negative_array_indices
+from warp._src.codegen_metal_locals import fold_arg_slice_views as _fold_arg_slice_views
+from warp._src.codegen_metal_locals import fold_dynamic_array_locals as _fold_dynamic_array_locals
+from warp._src.codegen_metal_locals import fold_local_arrays as _fold_local_arrays
+from warp._src.codegen_metal_locals import lower_inlined_array_slots as _lower_inlined_array_slots
 from warp.config import DeterministicMode
 
 if TYPE_CHECKING:
@@ -14062,6 +14066,7 @@ def _lower_array_slot_ir(lines: list[str], adj, all_lines: list[str]) -> list[st
         return lines
     kinds: dict[str, tuple] = {}
     f64_arrays: set[str] = set()
+    arg_array_labels = {arg.label for arg in adj.args if _is_array_arg(arg)}
     for arg in adj.args:
         if not _is_array_arg(arg):
             continue
@@ -14181,6 +14186,13 @@ def _lower_array_slot_ir(lines: list[str], adj, all_lines: list[str]) -> list[st
             or re.search(r"\bwp::adj_array_\w+_slot\(", ln)
         ):
             m_any = re.search(r"var_(\w+)", ln.split("(", 1)[1] if "(" in ln else ln)
+            if m_any is not None and m_any.group(1) not in arg_array_labels:
+                # Not a kernel array argument: a thread-local array (lowered
+                # by ``codegen_metal_locals``) or an alias a later fold
+                # resolves. Anything left unresolved fails as a remaining
+                # intrinsic.
+                out.append(ln)
+                continue
             what = f"array {m_any.group(1)!r}" if m_any else "an array"
             raise MetalCodegenError(
                 f"Kernel {adj.fun_name!r}: assigning to or atomically updating a component/field of an element "
@@ -14731,19 +14743,39 @@ def _generate_msl_kernel_uncached(
     _ast_nodes, _inlined_const_ints, _inlined_struct_locals, _inlined_var_ctypes = _ast_inline(
         _ast_nodes, adj, extra_var_types=_tile_map_var_types
     )
+    # Component stores into array elements inside inlined ``@wp.func``
+    # bodies (``arr[i][j, k] = x`` on an array the function was passed).
+    _ast_nodes = _lower_inlined_array_slots(_ast_nodes, adj)
     # Drop statically-dead branches (geom-type constants baked by kernel
     # builders) BEFORE the view/field folds — dead mesh-only branches
     # reference array struct fields that are never assigned for the live
     # geom types.
     _ast_nodes = _ast_fold_const_branches(_ast_nodes, adj, _inlined_const_ints)
     _ast_nodes, _tuple_skip = _ast_fold_tuples(_ast_nodes, adj, _inlined_var_ctypes)
+    # Thread-local ``wp.zeros(shape, dtype)`` arrays (``wp::fixedarray_t``)
+    # and the array locals derived from them -> MSL thread arrays.
+    _ast_nodes, _local_arr_skip = _fold_local_arrays(
+        _ast_nodes,
+        adj,
+        {**{str(_v.label): _v.ctype() for _v in adj.variables}, **_inlined_var_ctypes},
+        {**_const_ints, **_inlined_const_ints},
+        adjoint=adjoint,
+    )
+    # Array locals rebound at runtime (``a, b = b, a`` in a dynamic loop).
+    _ast_nodes, _dyn_arr_skip = _fold_dynamic_array_locals(
+        _ast_nodes, adj, {**{str(_v.label): _v.ctype() for _v in adj.variables}, **_inlined_var_ctypes}
+    )
+    _local_arr_skip = _local_arr_skip | _dyn_arr_skip
+    # Range-slice views of array arguments (``arr[a:b]``).
+    _ast_nodes, _slice_view_skip = _fold_arg_slice_views(_ast_nodes, adj, {**_const_ints, **_inlined_const_ints})
+    _local_arr_skip = _local_arr_skip | _slice_view_skip
     _ast_nodes, _mesh_skip = _ast_fold_mesh_get(_ast_nodes, adj, _inlined_var_ctypes)
     _ast_nodes, _sa_skip, _sa_field_reads = _ast_fold_struct_array_fields(_ast_nodes, adj, _inlined_var_ctypes)
     _has_print = _ast_has_print_calls(_ast_nodes)
     if _has_print:
         _handle_metal_print(adj.fun_name)
     _ast_nodes, _drop_skip = _ast_fold_drop(_ast_nodes, adj, _inlined_var_ctypes)
-    _drop_skip = _drop_skip | _tuple_skip | _mesh_skip | _sa_skip
+    _drop_skip = _drop_skip | _tuple_skip | _mesh_skip | _sa_skip | _local_arr_skip
     # ``_struct_arg_array_fields``: synthetic label -> (arg label, field
     # path) for every ``wp.array`` field of a struct-typed kernel arg the
     # body reads. The fold rewrites those accesses against the synthetic
@@ -18343,9 +18375,10 @@ def _codegen_source_hash() -> str:
         import hashlib  # noqa: PLC0415
 
         import warp._src.codegen_metal_ast as _ast_mod  # noqa: PLC0415
+        import warp._src.codegen_metal_locals as _locals_mod  # noqa: PLC0415
 
         h = hashlib.sha256()
-        for mod_file in (__file__, _ast_mod.__file__, _mtiles.__file__, _mtex.__file__):
+        for mod_file in (__file__, _ast_mod.__file__, _mtiles.__file__, _mtex.__file__, _locals_mod.__file__):
             with open(mod_file, "rb") as f:
                 h.update(f.read())
         _codegen_source_hash_cached = h.hexdigest()
