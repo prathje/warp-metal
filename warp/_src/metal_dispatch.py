@@ -819,17 +819,23 @@ class MetalDispatcher:
         import glob  # noqa: PLC0415
         import time  # noqa: PLC0415
 
+        # Archives written within the last day are kept as well: checkouts
+        # with different codegen sources sharing this cache directory would
+        # otherwise delete each other's archives on every process start.
+        if os.path.exists(archive_path):
+            try:
+                os.utime(archive_path)
+            except OSError:
+                pass
         for old in glob.glob(os.path.join(cache_dir, "metal_pso_archive*")):
             if old == archive_path:
                 continue
-            if ".tmp." in os.path.basename(old):
-                # Another process may be serializing into this temp file
-                # right now; only reap ones abandoned long ago.
-                try:
-                    if time.time() - os.path.getmtime(old) < 3600:
-                        continue
-                except OSError:
+            grace = 3600 if ".tmp." in os.path.basename(old) else 24 * 3600
+            try:
+                if time.time() - os.path.getmtime(old) < grace:
                     continue
+            except OSError:
+                continue
             try:
                 os.remove(old)
             except OSError:

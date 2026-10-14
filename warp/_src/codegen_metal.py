@@ -18407,6 +18407,14 @@ def _codegen_source_hash() -> str:
 _artifact_cache_swept = False
 
 
+# Sibling salt directories touched within this window are kept: several
+# checkouts with different codegen sources (worktrees, a dev build next to
+# an installed one) share one kernel cache directory, and sweeping on sight
+# made each process wipe the others' artifacts, so they all fell back to
+# minutes-long re-translation of large kernels.
+_ARTIFACT_SWEEP_GRACE_S = 24 * 3600
+
+
 def _sweep_stale_artifact_dirs(base: str, keep: str) -> None:
     """Delete artifact subdirectories from other codegen versions (and
     loose ``.pkl`` files from the old flat layout) under ``base``.
@@ -18415,20 +18423,30 @@ def _sweep_stale_artifact_dirs(base: str, keep: str) -> None:
     source, so entries outside the current salt directory can never be
     read again — without this sweep the cache grew without bound
     (observed at 226 MB / 13k orphaned pickles after a dev cycle).
-    Best-effort: a concurrent process on a different codegen version
-    just regenerates its artifacts.
+    Entries modified within ``_ARTIFACT_SWEEP_GRACE_S`` may belong to a
+    concurrently used checkout and are kept; the current salt directory is
+    touched so others see it as live.
     """
     import shutil  # noqa: PLC0415
+    import time  # noqa: PLC0415
 
+    try:
+        os.makedirs(os.path.join(base, keep), exist_ok=True)
+        os.utime(os.path.join(base, keep))
+    except OSError:
+        pass
     try:
         entries = os.listdir(base)
     except OSError:
         return
+    now = time.time()
     for name in entries:
         if name == keep:
             continue
         path = os.path.join(base, name)
         try:
+            if now - os.path.getmtime(path) < _ARTIFACT_SWEEP_GRACE_S:
+                continue
             if os.path.isdir(path):
                 shutil.rmtree(path, ignore_errors=True)
             else:

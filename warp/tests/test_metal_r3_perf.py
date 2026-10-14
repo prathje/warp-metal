@@ -113,6 +113,19 @@ class TestMetalForLoopMaterialize(unittest.TestCase):
         self.assertIn("wp_for_it0", out[-5])
 
 
+class TestMetalArtifactSweep(unittest.TestCase):
+    def test_recent_sibling_salts_survive(self):
+        import warp._src.codegen_metal as cm  # noqa: PLC0415
+
+        with tempfile.TemporaryDirectory() as base:
+            for name in ("keep", "fresh", "stale"):
+                os.makedirs(os.path.join(base, name))
+            old = time.time() - 2 * cm._ARTIFACT_SWEEP_GRACE_S
+            os.utime(os.path.join(base, "stale"), (old, old))
+            cm._sweep_stale_artifact_dirs(base, "keep")
+            self.assertEqual(sorted(os.listdir(base)), ["fresh", "keep"])
+
+
 @unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
 @unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
 class TestMetalArtifactCacheKeys(unittest.TestCase):
