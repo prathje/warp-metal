@@ -1427,6 +1427,67 @@ def fold_empty_struct_array_fields(
     return new_nodes, skip
 
 
+def fold_array_copy_aliases(nodes: list[Node], adj, var_ctypes: dict[str, str]) -> tuple[list[Node], set[str]]:
+    """Alias array locals that are plain copies of another array.
+
+    ``on = plane_normal`` (mujoco_warp's polygon clipping) copies an array
+    *handle*: both names refer to the same storage. When the copy is the
+    local's only definition, every use is renamed to the source so the view
+    fold and the argument lowering see the original array. (Locals that are
+    also rebound are handled by :func:`fold_dynamic_array_locals`.)
+    """
+    from warp._src.codegen_metal_ast import _substitute_var_refs  # noqa: PLC0415
+
+    array_labels = {lbl for lbl, ct in var_ctypes.items() if ct and ct.startswith("wp::array_t<")}
+    arg_arrays = {a.label for a in adj.args if _local_array_ctype(a.ctype())}
+    leaves = [n for n in _iter_leaves(nodes) if not isinstance(n, (Comment, Empty, Pragma))]
+    defs: dict[str, list[str]] = {}
+    for n in leaves:
+        m = re.match(r"^\s*var_(\w+)\s*=", n.raw)
+        if m and m.group(1) in array_labels:
+            defs.setdefault(m.group(1), []).append(n.raw)
+        m = _ASSIGN_VOID_PAT.match(n.raw)
+        if m and m.group("dst") in array_labels:
+            defs.setdefault(m.group("dst"), []).extend([n.raw, n.raw])
+    alias: dict[str, str] = {}
+    for lbl, lines in defs.items():
+        if len(lines) != 1:
+            continue
+        m = _COPY_ANY_PAT.match(lines[0])
+        if m and (m.group("src") in array_labels or m.group("src") in arg_arrays) and m.group("src") != lbl:
+            alias[lbl] = m.group("src")
+    if not alias:
+        return nodes, set()
+
+    def resolve(x: str) -> str:
+        seen = set()
+        while x in alias and x not in seen:
+            seen.add(x)
+            x = alias[x]
+        return x
+
+    subs = {f"var_{k}": f"var_{resolve(k)}" for k in alias}
+
+    def rewrite(n: Node) -> list[Node]:
+        if isinstance(n, (Comment, Empty, Pragma)):
+            return [n]
+        raw = n.raw
+        if isinstance(n, _RawLine):
+            m = _DECL_PAT.match(raw)
+            if m and m.group("label") in alias:
+                return []
+            return [n]
+        m = _COPY_ANY_PAT.match(raw)
+        if m and m.group("lhs") in alias:
+            return []
+        if "var_" not in raw:
+            return [n]
+        new = _substitute_var_refs(raw, subs)
+        return [n] if new == raw else _to_nodes([new])
+
+    return _map_leaves(nodes, rewrite), set(alias)
+
+
 def _to_nodes(lines: list[str]) -> list[Node]:
     out: list[Node] = []
     for ln in lines:
@@ -1500,6 +1561,7 @@ def _ctype_size(ctype: str) -> int:
 
 __all__ = [
     "fold_arg_slice_views",
+    "fold_array_copy_aliases",
     "fold_dynamic_array_locals",
     "fold_empty_struct_array_fields",
     "fold_local_arrays",

@@ -688,6 +688,37 @@ class TestMetalR3Locals(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet, timeout=120)
 
+    def test_array_handle_copies(self):
+        # ``on = plane_normal`` copies an array handle (mujoco_warp's polygon
+        # clipping); writes through the copy reach the argument.
+        snippet = _snippet(
+            """
+            @wp.func
+            def fill(plane_normal: wp.array[wp.vec3], plane_dist: wp.array[float], n: int):
+                on = plane_normal
+                pd = plane_dist
+                for i in range(n):
+                    pd[i] = float(i) * 2.0
+                    on[i] = wp.vec3(float(i))
+                return pd[n - 1] + on[0][1] + float(on.shape[0])
+
+            @wp.kernel
+            def k(pnorm: wp.array2d[wp.vec3], pdist: wp.array2d[float], out: wp.array[float]):
+                t = wp.tid()
+                out[t] = fill(pnorm[t], pdist[t], 3)
+
+            def run(dev):
+                a = wp.zeros((2, 4), dtype=wp.vec3, device=dev)
+                b = wp.zeros((2, 4), dtype=float, device=dev)
+                o = wp.zeros(2, dtype=float, device=dev)
+                wp.launch(k, 2, [a, b, o], device=dev)
+                return o.numpy(), a.numpy(), b.numpy()
+
+            compare(run)
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
