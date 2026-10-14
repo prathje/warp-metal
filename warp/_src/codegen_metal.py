@@ -14246,7 +14246,16 @@ _ELEM_FIELD_ADDR_PAT = re.compile(
 )
 _ADJ_FIELD_ZERO_PAT = re.compile(r"^(?P<indent>\s*)adj_(?P<root>\w+)(?P<path>(?:\.\w+)+)\s*=\s*\{\s*\}\s*;\s*$")
 _STRUCT_FIELD_DUAL_ZERO_CALL = "wp::__metal_struct_field_dual_zero"
+# Numbering of the synthetic pointer temps. ``_normalize_adj_ir`` restarts
+# it for every adjoint (after any ``mtp`` label already in its IR), so the
+# normalised IR — which the artifact cache key hashes — does not depend on
+# how many other kernels this process normalised before. A process-wide
+# counter made the key depend on test order: the same kernel missed the
+# cache in every process that built its kernels in another order.
+# Uniqueness is only needed within one adjoint: the inliners mangle the
+# temps of every spliced callee body (``_SYNTH_TMP_PAT``).
 _METAL_TMP_COUNTER = [0]
+_MTP_LABEL_PAT = re.compile(r"\bvar_mtp(\d+)\b")
 
 
 def _metal_tmp_label() -> str:
@@ -14346,18 +14355,35 @@ def _normalize_adj_ir(adj, seen=None) -> None:
     if id(adj) in seen:
         return
     seen.add(id(adj))
-    # Idempotent, so re-running it on already-normalised IR is harmless.
-    # ``body_reverse`` is stored in forward order but consumed reversed (and
-    # loop recompute blocks are spliced in pre-reversed), so normalise it in
-    # consumption order to keep multi-line expansions correctly ordered.
-    for block in getattr(adj, "blocks", None) or ():
-        for attr in ("body_forward", "body_replay"):
-            lines = getattr(block, attr, None)
+    blocks = getattr(adj, "blocks", None)
+    # Idempotent, so re-running it on already-normalised IR is harmless —
+    # but it runs for every inlined call of a function and recursively for
+    # its callees, so skip blocks normalised before. ``Adjoint.build``
+    # replaces ``adj.blocks`` with a fresh list, which invalidates this.
+    if blocks and not (
+        getattr(adj, "_metal_normalized_blocks", None) is blocks and adj._metal_normalized_n == len(blocks)
+    ):
+        start = 0
+        for block in blocks:
+            for attr in ("body_forward", "body_replay", "body_reverse"):
+                for ln in getattr(block, attr, None) or ():
+                    if "mtp" in ln:
+                        for n in _MTP_LABEL_PAT.findall(ln):
+                            start = max(start, int(n))
+        _METAL_TMP_COUNTER[0] = start
+        # ``body_reverse`` is stored in forward order but consumed reversed (and
+        # loop recompute blocks are spliced in pre-reversed), so normalise it in
+        # consumption order to keep multi-line expansions correctly ordered.
+        for block in blocks:
+            for attr in ("body_forward", "body_replay"):
+                lines = getattr(block, attr, None)
+                if lines:
+                    lines[:] = _normalize_ir_lines(list(lines))
+            lines = getattr(block, "body_reverse", None)
             if lines:
-                lines[:] = _normalize_ir_lines(list(lines))
-        lines = getattr(block, "body_reverse", None)
-        if lines:
-            lines[:] = list(reversed(_normalize_ir_lines(list(reversed(lines)))))
+                lines[:] = list(reversed(_normalize_ir_lines(list(reversed(lines)))))
+        adj._metal_normalized_blocks = blocks
+        adj._metal_normalized_n = len(blocks)
     for func in getattr(adj, "called_user_functions", None) or ():
         func_adj = getattr(func, "adj", None)
         if func_adj is not None:
@@ -18355,7 +18381,9 @@ def _generate_msl_kernel_uncached(
 # closure-kernel instantiations previously collided (same kernel.key,
 # args, and IR statements; different baked ``const`` declarations).
 # v11: native packed arrays go bindless (``ptr_table`` / ``__arg_ptrs``).
-_ARTIFACT_CACHE_VERSION = 16
+# v17: Warp's deep kernel content hash joins the key (callee closures), and
+# user-function native names in the hashed body are canonicalised.
+_ARTIFACT_CACHE_VERSION = 17
 _codegen_source_hash_cached: str | None = None
 
 
@@ -18432,12 +18460,61 @@ def _artifact_cache_path(key: str) -> str | None:
     return os.path.join(base, salt, f"{key}.pkl")
 
 
+def _kernel_content_hash(kernel) -> str:
+    """Warp's deep content hash of ``kernel``: its source, argument types,
+    and — recursively — every referenced ``@wp.func``, constant and
+    ``wp.static`` value (``ModuleHasher._hash_kernel_identity``, the identity
+    the CUDA/CPU module cache uses).
+
+    The IR body alone does not cover inlined callees: two factory-made
+    kernels whose only difference sits in a called closure function (say a
+    ``wp.static(flag)`` branch) have identical kernel IR, so processes that
+    created only one of them each shared the other's cached artifact.
+    """
+    import hashlib  # noqa: PLC0415
+
+    from warp._src.context import ModuleHasher  # noqa: PLC0415
+
+    # Only the side-effect-free per-kernel part: ``ModuleHasher.__init__``
+    # and ``hash_kernel`` also write ``kernel.grid_stride``/``kernel.hash``.
+    hasher = ModuleHasher.__new__(ModuleHasher)
+    hasher.function_hashes = {}
+    hasher.functions_in_progress = set()
+    ch = hashlib.sha256()
+    hasher._hash_kernel_identity(ch, kernel)
+    return ch.hexdigest()
+
+
+def _canonical_user_call_names(body: str, adj) -> str:
+    """Replace the native names of user functions called in ``body`` with
+    first-use-ordered placeholders.
+
+    Warp suffixes the native name of a function created again under an
+    existing key (factory closures: ``..._admit_0``, ``..._admit_1``), so
+    a kernel rebuilt by a later factory call had different IR text and
+    missed the artifact cache. Callee content is covered by
+    ``_kernel_content_hash``.
+    """
+    names = {getattr(f, "native_func", None) for f in (getattr(adj, "called_user_functions", None) or ())}
+    names.discard(None)
+    if not names:
+        return body
+    pat = re.compile(r"\b(" + "|".join(re.escape(n) for n in sorted(names, key=len, reverse=True)) + r")\b")
+    order: dict[str, str] = {}
+
+    def repl(m: re.Match[str]) -> str:
+        return order.setdefault(m.group(1), f"__wp_user_fn_{len(order)}")
+
+    return pat.sub(repl, body)
+
+
 def _artifact_cache_key(kernel, adj) -> str | None:
     """Cache key over everything the generated artifact depends on."""
     import hashlib  # noqa: PLC0415
 
     try:
-        body = "\n".join(adj.blocks[0].body_forward)
+        content_hash = _kernel_content_hash(kernel)
+        body = _canonical_user_call_names("\n".join(adj.blocks[0].body_forward), adj)
         arg_sig = ";".join(f"{a.label}:{a.ctype()}" for a in adj.args)
         # Closure-generated kernels (e.g. mujoco_warp's ``@wp.kernel``
         # factories) can share ``kernel.key``, arg signature, AND
@@ -18462,6 +18539,7 @@ def _artifact_cache_key(kernel, adj) -> str | None:
         warp.config.version,
         _codegen_source_hash(),
         kernel.key,
+        content_hash,
         arg_sig,
         str(opts.get("block_dim")),
         str(opts.get("output_arch")),

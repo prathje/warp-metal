@@ -231,6 +231,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
     from warp.tests.test_metal_mismatch import TestMetalMismatch
     from warp.tests.test_metal_mujoco_warp import TestMetalMujocoWarp
     from warp.tests.test_metal_r3_perf import (
+        TestMetalArtifactCacheKeys,
         TestMetalForLoopMaterialize,
     )
     from warp.tests.test_metal_runtime import TestMetalRuntime, TestMetalRuntimeSubprocess
@@ -440,6 +441,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
         TestMetalDisabled,
         TestMetalLaunch,
         TestMetalMismatch,
+        TestMetalArtifactCacheKeys,
         TestMetalForLoopMaterialize,
         TestMetalMujocoWarp,
         TestMetalMeshWinding,

@@ -113,5 +113,68 @@ class TestMetalForLoopMaterialize(unittest.TestCase):
         self.assertIn("wp_for_it0", out[-5])
 
 
+@unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
+@unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
+class TestMetalArtifactCacheKeys(unittest.TestCase):
+    def test_closure_callee_difference_is_not_shared(self):
+        # Kernel IR is identical for both flags (the difference is inside the
+        # inlined ``pick``); a process that only ever built the ``False``
+        # variant used to load the ``True`` variant's cached artifact.
+        with tempfile.TemporaryDirectory() as cache:
+            for flag in ("True", "False"):
+                out = _run_metal_script(
+                    self,
+                    _CLOSURE_FACTORY
+                    + f"""
+k = make({flag})
+np.testing.assert_array_equal(run(k, "metal:0"), run(k, "cpu"))
+print("ok")
+""",
+                    cache,
+                )
+                self.assertIn("ok", out)
+
+    def test_key_stable_across_factory_rebuilds(self):
+        # Re-creating a closure kernel renames its callees (``pick_0`` ->
+        # ``pick_1``) and the process-wide synthetic-temp counter advanced
+        # between builds; both changed the key, so the rebuilt kernel missed
+        # the cache and was translated again.
+        code = (
+            _CLOSURE_FACTORY
+            + """
+import warp._src.codegen_metal as cm
+
+@wp.struct
+class S:
+    a: wp.vec3
+    b: float
+
+def make_struct_kernel():
+    @wp.kernel(module="r3_struct")
+    def ks(out: wp.array[S]):
+        s = S()
+        s.a = wp.vec3(1.0, 2.0, 3.0)
+        s.b = 4.0
+        out[wp.tid()] = s
+    return ks
+
+keys = []
+for _ in range(2):
+    ks = make_struct_kernel()
+    wp.launch(ks, dim=1, outputs=[wp.zeros(1, dtype=S, device="metal:0")], device="metal:0")
+    k = make(True)
+    run(k, "metal:0")
+    keys.append((cm._artifact_cache_key(ks, ks.adj), cm._artifact_cache_key(k, k.adj)))
+assert keys[0] == keys[1], keys
+k_false = make(False)
+run(k_false, "metal:0")
+assert cm._artifact_cache_key(k_false, k_false.adj) != keys[0][1]
+print("ok")
+"""
+        )
+        with tempfile.TemporaryDirectory() as cache:
+            self.assertIn("ok", _run_metal_script(self, code, cache))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
