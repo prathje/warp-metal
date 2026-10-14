@@ -7518,6 +7518,21 @@ def _emit_tile_struct(rows: int, cols: int, msl_scalar: str) -> str:
     parts.append("        }")
     parts.append("    }")
     parts.append("}")
+    # Bounds-checked overload: skips elements outside ``[0, n_rows) x [0, n_cols)``.
+    parts.append(
+        f"inline void {name}_store(device {msl_scalar}* arr, "
+        f"int base, int row_stride, int row_off, int col_off, {name} t, int n_rows, int n_cols) {{"
+    )
+    parts.append(f"    for (int i = 0; i < {rows}; ++i) {{")
+    parts.append("        int r = row_off + i;")
+    parts.append(f"        for (int j = 0; j < {cols}; ++j) {{")
+    parts.append("            int c = col_off + j;")
+    parts.append("            if (r >= 0 && r < n_rows && c >= 0 && c < n_cols) {")
+    parts.append(f"                arr[base + r * row_stride + c] = t.c[i * {cols} + j];")
+    parts.append("            }")
+    parts.append("        }")
+    parts.append("    }")
+    parts.append("}")
     return "\n".join(parts)
 
 
@@ -11103,7 +11118,7 @@ _TILE_LOAD_PAT = re.compile(
 _TILE_STORE_PAT = re.compile(
     r"\bwp::tile_store\s*<\s*"
     r"(wp::vec_t<\d+,\s*wp::\w+>|wp::\w+|wp_vec\d+_\w+|wp_mat\d+x\d+_\w+)"
-    r"\s*,\s*\w+\s*,\s*\w+\s*>\s*\(([^)]*)\)"
+    r"\s*,\s*(\w+)\s*,\s*\w+\s*>\s*\(([^)]*)\)"
 )
 # ``wp::tile_store_indexed(dest, indices, axis, offset, src)`` — scatter
 # ``src`` into ``dest`` at the positions named by the ``indices`` tile. Emitted
@@ -11462,7 +11477,10 @@ def _translate_tile_intrinsics(
             msl_scalar = _SCALAR_CTYPE_TO_MSL.get(dtype_token)
         if msl_scalar is None:
             return m.group(0)
-        args = [a.strip() for a in m.group(2).split(",")]
+        # ``tile_store<T, BoundsCheck, Aligned>``: CUDA skips out-of-range
+        # elements unless the check is compiled out.
+        bounds_check = m.group(2) != "false"
+        args = [a.strip() for a in m.group(3).split(",")]
         # Last arg is the source tile, first is the destination array,
         # everything between is leading-slice indices + tile offsets.
         arr = args[0]
@@ -11579,6 +11597,20 @@ def _translate_tile_intrinsics(
                 f"wp_f32_to_f64({tile_var}.c[_ts_i * {cols} + _ts_j]); }}"
             )
         helper = f"wp_tile_{rows}x{cols}_{msl_scalar}_store"
+        if bounds_check and arr_name in shaped_array_names:
+            # Partial trailing blocks drop their out-of-range elements, as
+            # ``wp.tile_store`` does on CPU/CUDA, instead of writing past the
+            # row (into the next row, or past the end of the buffer).
+            n_lead = len(lead_idx_args)
+            if two_d:
+                n_rows_expr = f"(int){arr_name}_shape[{n_lead}]"
+                n_cols_expr = f"(int){arr_name}_shape[{n_lead + 1}]"
+            else:
+                n_rows_expr, n_cols_expr = f"(int){arr_name}_shape[{n_lead}]", "1"
+            return (
+                f"{helper}({arr}, {base_expr}, {row_stride}, {row_off}, {col_off}, {tile_var}, "
+                f"{n_rows_expr}, {n_cols_expr})"
+            )
         return f"{helper}({arr}, {base_expr}, {row_stride}, {row_off}, {col_off}, {tile_var})"
 
     def repl_tile_atomic_add(m: re.Match[str]) -> str:
