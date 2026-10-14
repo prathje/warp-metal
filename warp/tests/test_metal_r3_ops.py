@@ -333,6 +333,53 @@ class TestMetalR3Ops(unittest.TestCase):
             """,
         )
 
+    def test_expect_checks_are_compiled_out(self):
+        # On CPU ``wp.expect_*`` only prints on mismatch; Metal has no printf,
+        # so it drops them like ``wp.print`` and the kernel still runs.
+        _run(
+            self,
+            """
+            wp.config.metal_print = "ignore"
+
+            @wp.func
+            def chk(a: int, b: int):
+                wp.expect_eq(a, b)
+                wp.expect_neq(a, b + 1)
+
+            @wp.kernel
+            def k(x: wp.array[int], v: wp.array[wp.vec3], out: wp.array[int]):
+                i = wp.tid()
+                chk(x[i], i)
+                wp.expect_eq(v[i], v[i])
+                wp.expect_near(v[i], v[i] + wp.vec3(0.01), 0.1)
+                wp.expect_near(1.0, 1.05, 0.1)
+                out[i] = x[i] * 2
+
+            def launch(dev):
+                x = wp.array([0, 5], dtype=int, device=dev)
+                v = wp.zeros(2, dtype=wp.vec3, device=dev)
+                out = wp.zeros(2, dtype=int, device=dev)
+                wp.launch(k, 2, [x, v], [out], device=dev)
+                return out.numpy()
+
+            cpu, metal = both(launch)
+            assert_same(cpu, metal)
+
+            wp.config.metal_print = "error"
+
+            @wp.kernel
+            def k2(x: wp.array[int]):
+                wp.expect_eq(x[0], 1)
+
+            try:
+                wp.launch(k2, 1, [wp.zeros(1, dtype=int, device="metal:0")], device="metal:0")
+            except Exception as e:
+                assert "expect" in str(e), str(e)
+            else:
+                raise AssertionError("metal_print='error' should reject wp.expect_eq")
+            """,
+        )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

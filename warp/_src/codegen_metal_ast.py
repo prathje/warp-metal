@@ -3228,8 +3228,11 @@ def fold_drop_unsupported_locals(
 
 
 # ``wp.printf`` lowers to ``printf(...)``; ``wp.print(x)`` to ``wp::print(x)``
-# (and ``wp::adj_print`` in reverse bodies). See ``warp.config.metal_print``.
-_PRINT_OPS = frozenset({"printf", "print", "adj_print"})
+# (and ``wp::adj_print`` in reverse bodies). ``wp.expect_eq`` / ``expect_neq``
+# / ``expect_near`` only print on mismatch (``warp/native/builtin.h``; they
+# never abort and have no adjoint), so they are output-only like ``print``.
+# See ``warp.config.metal_print``.
+_PRINT_OPS = frozenset({"printf", "print", "adj_print", "expect_eq", "expect_neq", "expect_near"})
 
 
 def has_print_calls(nodes) -> bool:

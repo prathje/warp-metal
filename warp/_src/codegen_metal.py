@@ -14699,7 +14699,8 @@ def _handle_metal_print(kernel_name: str) -> None:
     mode = str(getattr(_cfg, "metal_print", "warn")).strip().lower()
     if mode == "error":
         raise MetalCodegenError(
-            f"Kernel {kernel_name!r} calls wp.print()/wp.printf(), which Metal kernels cannot execute "
+            f"Kernel {kernel_name!r} calls wp.print()/wp.printf() (or a printing wp.expect_*() check), "
+            f"which Metal kernels cannot execute "
             f"(warp.config.metal_print = 'error')"
         )
     if mode == "ignore" or _metal_print_warned:
@@ -14708,7 +14709,8 @@ def _handle_metal_print(kernel_name: str) -> None:
     from warp._src.logger import log_warning as warn  # noqa: PLC0415
 
     warn(
-        f"wp.print()/wp.printf() calls are compiled out on Metal devices (first seen in kernel "
+        f"wp.print()/wp.printf() calls (and the printing wp.expect_eq()/expect_neq()/expect_near() "
+        f"checks) are compiled out on Metal devices (first seen in kernel "
         f"{kernel_name!r}); set warp.config.metal_print = 'error' to make this an error or 'ignore' "
         f"to silence this warning.",
         category=UserWarning,
