@@ -6576,6 +6576,14 @@ class Volume:
         """Id understood by the native host/device volume API (differs from ``id`` on Metal)."""
         return getattr(self, "_host_id", None) or self.id
 
+    @property
+    def _count_id(self) -> int:
+        """Native id for tile / voxel counts: a rebuildable Metal volume reports
+        its reserved capacity like CPU/CUDA, which only the host shadow (the
+        descriptor marked rebuildable) knows."""
+        shadow = getattr(self, "_metal_host_shadow", None)
+        return shadow.id if shadow is not None else self._native_id
+
     def __del__(self):
         if not self.id:
             return
@@ -6615,7 +6623,7 @@ class Volume:
             ctypes.c_uint32(0),
         )
         self.runtime.core.wp_volume_get_tile_and_voxel_count(
-            self._native_id, ctypes.byref(tile_count), ctypes.byref(voxel_count)
+            self._count_id, ctypes.byref(tile_count), ctypes.byref(voxel_count)
         )
         return tile_count.value
 
@@ -6659,7 +6667,7 @@ class Volume:
             ctypes.c_uint32(0),
         )
         self.runtime.core.wp_volume_get_tile_and_voxel_count(
-            self._native_id, ctypes.byref(tile_count), ctypes.byref(voxel_count)
+            self._count_id, ctypes.byref(tile_count), ctypes.byref(voxel_count)
         )
         return voxel_count.value
 
@@ -7528,11 +7536,15 @@ class Volume:
             # grid on the host, then upload its bytes into a Metal volume.
             # (Passing Metal pointers to the host builder produced a host-side
             # volume whose id the GPU cannot read: every lookup returned 0.)
-            if rebuildable or max_tiles is not None or max_lower_nodes is not None or max_upper_nodes is not None:
-                raise NotImplementedError(
-                    "Volume.allocate_by_tiles() on Metal devices does not support rebuildable volumes "
-                    "or rebuild capacities yet."
-                )
+            # Rebuildable volumes keep the host-built grid as a shadow that
+            # ``rebuild`` updates and re-uploads in place (see
+            # ``_metal_from_host_volume``).
+            rebuildable = (
+                rebuildable or max_tiles is not None or max_lower_nodes is not None or max_upper_nodes is not None
+            )
+            if rebuildable and status is not None:
+                status = _volume_rebuild_status_array(status, device)
+            host_status = warp.zeros(1, dtype=uint32, device="cpu") if rebuildable and status is not None else None
             host = cls.allocate_by_tiles(
                 tile_points.to("cpu"),
                 voxel_size=voxel_size,
@@ -7540,12 +7552,14 @@ class Volume:
                 translation=translation,
                 device="cpu",
                 transform=transform,
+                rebuildable=rebuildable,
+                max_tiles=max_tiles,
+                max_lower_nodes=max_lower_nodes,
+                max_upper_nodes=max_upper_nodes,
+                status=host_status,
                 point_mask=None if point_mask is None else point_mask.to("cpu"),
             )
-            grid = warp.clone(host.array(), device=device)
-            volume = cls(grid, copy=False)
-            volume._grid_array = grid
-            return volume
+            return cls._metal_from_host_volume(host, device, rebuildable, status, host_status)
 
         if tile_points.device != device:
             tile_points = tile_points.to(device)
@@ -7766,10 +7780,27 @@ class Volume:
                 or max_lower_nodes is not None
                 or max_upper_nodes is not None
             ):
-                raise NotImplementedError(
-                    "Volume.allocate_by_voxels() on Metal devices does not support rebuildable volumes "
-                    "or rebuild capacities yet."
+                # Rebuildable: build with the native host builder, which
+                # reserves the requested capacities, and keep that grid as
+                # the shadow ``rebuild`` updates (see ``_metal_from_host_volume``).
+                if status is not None:
+                    status = _volume_rebuild_status_array(status, device)
+                host_status = warp.zeros(1, dtype=uint32, device="cpu") if status is not None else None
+                host = cls.allocate_by_voxels(
+                    voxel_points.to("cpu"),
+                    voxel_size=voxel_size,
+                    translation=translation,
+                    device="cpu",
+                    transform=transform,
+                    rebuildable=True,
+                    max_active_voxels=max_active_voxels,
+                    max_leaf_nodes=max_leaf_nodes,
+                    max_lower_nodes=max_lower_nodes,
+                    max_upper_nodes=max_upper_nodes,
+                    status=host_status,
+                    point_mask=None if point_mask is None else point_mask.to("cpu"),
                 )
+                return cls._metal_from_host_volume(host, device, True, status, host_status)
             # ``status`` is only written for rebuildable volumes (as on CPU/CUDA).
             from warp._src.nanovdb_builder import build_onindex_grid  # noqa: PLC0415
 
@@ -7789,6 +7820,18 @@ class Volume:
                 ijk = np.floor(uvw + np.float32(0.5)).astype(np.int32)
             else:
                 ijk = pts.astype(np.int32)
+            if ijk.shape[0] == 0:
+                # No active voxels: the NumPy builder can't emit an empty
+                # tree; the native host builder can (as on CPU/CUDA).
+                host = cls.allocate_by_voxels(
+                    voxel_points.to("cpu"),
+                    voxel_size=voxel_size,
+                    translation=translation,
+                    device="cpu",
+                    transform=transform,
+                    point_mask=None if point_mask is None else point_mask.to("cpu"),
+                )
+                return cls._metal_from_host_volume(host, device, False, None, None)
             grid = array(build_onindex_grid(ijk, mat, trans), dtype=uint8, device=device)
             volume = cls(grid, copy=False)
             volume._grid_array = grid  # aliased, so keep the storage alive with the volume
@@ -7901,12 +7944,71 @@ class Volume:
                 type and shape.
         """
 
+        if getattr(self, "_metal_host_shadow", None) is not None:
+            return self._metal_rebuild(points, status=status, point_mask=point_mask)
         if self._rebuild_info.kind == "tiles":
             return self._rebuild_tiles(points, status=status, point_mask=point_mask)
         if self._rebuild_info.kind == "voxels":
             return self._rebuild_voxels(points, status=status, point_mask=point_mask)
 
         raise RuntimeError("Volume is not rebuildable")
+
+    @classmethod
+    def _metal_from_host_volume(cls, host: Volume, device, rebuildable: builtins.bool, status, host_status) -> Volume:
+        """Upload a host-built grid into a new Metal volume.
+
+        For a rebuildable volume the host volume is kept as a shadow: its
+        buffer already spans the reserved capacity, so the Metal buffer is
+        sized for every later rebuild, and :meth:`rebuild` runs the native
+        host rebuild on the shadow and copies the bytes into the same Metal
+        buffer — the volume ``id`` (its ``gpuAddress``) stays valid.
+        """
+        grid = warp.clone(host.array(), device=device)
+        volume = cls(grid, copy=False)
+        volume._grid_array = grid
+        if rebuildable:
+            volume._metal_host_shadow = host
+            volume._rebuild_info = host._rebuild_info
+            if status is not None:
+                warp.copy(status, host_status)
+        return volume
+
+    def _metal_rebuild(self, points: array, status: array | None = None, point_mask: array | None = None):
+        """:meth:`rebuild` for a Metal volume: rebuild the host shadow, then
+        re-upload its bytes into the existing Metal grid buffer."""
+        if self.device.is_capturing:
+            raise RuntimeError(
+                "Volume.rebuild() on a Metal device runs the NanoVDB builder on the host and cannot be "
+                "recorded into a Metal graph capture; rebuild outside the capture region."
+            )
+        if status is not None:
+            status = _volume_rebuild_status_array(status, self.device)
+        if not _is_contiguous_vec_like_array(points, vec_length=3, scalar_types=(float32, int32)):
+            raise RuntimeError(
+                "points must be contiguous and either a 1D Warp array of vec3f or vec3i or a 2D n-by-3 array of int32 or float32."
+            )
+        host_status = warp.zeros(1, dtype=uint32, device="cpu") if status is not None else None
+        shadow = self._metal_host_shadow
+        shadow.rebuild(
+            points.to("cpu"),
+            status=host_status,
+            point_mask=None if point_mask is None else point_mask.to("cpu"),
+        )
+        # ``wp.copy`` host -> Metal drains queued kernels that may still read
+        # the old topology before overwriting the grid.
+        warp.copy(self._grid_array, shadow.array())
+        # The host-side descriptor aliasing the Metal buffer caches the grid
+        # header (tile / voxel counts, metadata): re-register it.
+        self.runtime.core.wp_volume_destroy_host(self._host_id)
+        nbytes = self._grid_array.size
+        self._host_id = self.runtime.core.wp_volume_create_host(
+            ctypes.cast(self._grid_array.ptr, ctypes.c_void_p), nbytes, False, False
+        )
+        if self._host_id == 0:
+            raise RuntimeError("Failed to re-register the rebuilt Metal volume")
+        if status is not None:
+            warp.copy(status, host_status)
+        return status
 
     def _rebuild_tiles(
         self, tile_points: array, status: array | None = None, point_mask: array | None = None
