@@ -1919,8 +1919,10 @@ template <typename T> inline void wp_adj_assign(T dest, T src, thread T& adj_des
     adj_src = adj_dest;
     adj_dest = T();
 }
+// The condition's dual is dropped by ``_translate_adjoint_intrinsics``: it
+// never receives a gradient, and an array condition (``if arr:``) has none.
 template <typename C, typename T>
-inline void wp_adj_where(C c, T a, T b, thread C& ac, thread T& aa, thread T& ab, T r) {
+inline void wp_adj_where(C c, T a, T b, thread T& aa, thread T& ab, T r) {
     if (!!c) aa += r; else ab += r;
 }
 // In-place element writes: ``v[i] op= value`` on a vector (3-arg forward) or
@@ -2419,7 +2421,7 @@ _ADJ_CALL_PAT = re.compile(r"\bwp::adj_([A-Za-z_]\w*)\s*\(")
 # The three array-indexed adjoints, lowered inside the generator (they need
 # the array's shape to build a flat index).
 _ADJ_ARRAY_PAT = re.compile(
-    r"^(?P<indent>\s*)wp::adj_(?P<op>address|array_store|atomic_add)\s*\((?P<args>.*)\)\s*;\s*$"
+    r"^(?P<indent>\s*)wp::adj_(?P<op>address|array_store|atomic_add|atomic_sub)\s*\((?P<args>.*)\)\s*;\s*$"
 )
 
 # Tile adjoints that pair a tile against an array, so they need the same
@@ -2613,6 +2615,37 @@ def _split_top_level_args(s: str) -> list[str]:
     return out
 
 
+_ADJ_WHERE_CALL = "wp::adj_where("
+
+
+def _drop_adj_where_cond_dual(line: str) -> str:
+    """Drop the condition dual from ``wp::adj_where(c, a, b, adj_c, adj_a, adj_b, adj_r)``.
+
+    The condition never receives a gradient (``warp/native/builtin.h`` leaves
+    it untouched), and when it is an array (``if arr:``) no dual exists at
+    all, so naming it would reference an undeclared ``adj_<arr>``.
+    """
+    start = line.find(_ADJ_WHERE_CALL)
+    if start == -1:
+        return line
+    open_idx = start + len(_ADJ_WHERE_CALL)
+    depth = 1
+    i = open_idx
+    while i < len(line) and depth:
+        if line[i] in "([":
+            depth += 1
+        elif line[i] in ")]":
+            depth -= 1
+        i += 1
+    if depth:
+        return line
+    args = [a.strip() for a in _split_top_level_args(line[open_idx : i - 1])]
+    if len(args) != 7:
+        return line
+    del args[3]
+    return f"{line[:open_idx]}{', '.join(args)}){line[i:]}"
+
+
 def _translate_adjoint_intrinsics(line: str) -> str:
     """Rewrite ``wp::adj_<builtin>(...)`` calls to their MSL helpers.
 
@@ -2621,6 +2654,8 @@ def _translate_adjoint_intrinsics(line: str) -> str:
     machinery that only the generator has, so they are lowered before
     this pass runs.
     """
+
+    line = _drop_adj_where_cond_dual(line)
 
     def repl(m: re.Match[str]) -> str:
         name = m.group(1)
@@ -14340,6 +14375,9 @@ def _metal_tmp_label() -> str:
     return f"mtp{_METAL_TMP_COUNTER[0]}"
 
 
+_TILE_GRAD_ZERO_PAT = re.compile(r"^(?P<indent>\s*)adj_(?P<label>\w+)\.grad_zero\(\)\s*;\s*$")
+
+
 def _normalize_ir_lines(lines: list[str]) -> list[str]:
     """Rewrite Warp >= 1.18 struct-field IR into the shapes the translator matches.
 
@@ -14385,6 +14423,13 @@ def _normalize_ir_lines(lines: list[str]) -> list[str]:
         stripped = ln.lstrip()
         if stripped.startswith("//"):
             out.append(ln)
+            continue
+        m = _TILE_GRAD_ZERO_PAT.match(ln)
+        if m:
+            # ``adj_T.grad_zero();`` resets an owning tile's dual at the top
+            # of each reverse loop iteration; the aggregate-init form gets
+            # the same typed zero as any other dual reset.
+            out.append(f"{m.group('indent')}adj_{m.group('label')} = {{}};")
             continue
         m = _ADJ_FIELD_ZERO_PAT.match(ln)
         if m:
@@ -16784,7 +16829,8 @@ def _generate_msl_kernel_uncached(
                 #   address:     arr, i..,        adj_arr, adj_i.., adj_ret
                 #   array_store: arr, i.., value, adj_arr, adj_i.., adj_value
                 #   atomic_add:  arr, i.., value, adj_arr, adj_i.., adj_value, adj_ret
-                fixed = {"address": 3, "array_store": 4, "atomic_add": 5}[op]
+                #   atomic_sub:  same as atomic_add; the gradient flows negated
+                fixed = {"address": 3, "array_store": 4, "atomic_add": 5, "atomic_sub": 5}[op]
                 if (len(args) - fixed) % 2 != 0:
                     raise MetalCodegenError(f"Kernel {adj.fun_name!r}: unexpected wp::adj_{op} arity in: {raw.strip()}")
                 ndim = (len(args) - fixed) // 2
@@ -16804,7 +16850,7 @@ def _generate_msl_kernel_uncached(
                     continue
                 # ``adj_value`` for atomic_add sits before the trailing
                 # ``adj_ret``; for the other two it is last.
-                adj_val = args[-2] if op == "atomic_add" else args[-1]
+                adj_val = args[-2] if op in ("atomic_add", "atomic_sub") else args[-1]
                 flat = _flat_index_expr(arr, indices)
                 vec_n = vec_arr_info.get(arr, (None,))[0]
                 if arr in struct_arr_info:
@@ -16839,6 +16885,8 @@ def _generate_msl_kernel_uncached(
                         body_lines.append(_finalize(f"{indent}wp_adj_accum(&{tgt}, {adj_val}{comp});"))
                     elif op == "atomic_add":
                         body_lines.append(_finalize(f"{indent}{adj_val}{comp} += {tgt};"))
+                    elif op == "atomic_sub":
+                        body_lines.append(_finalize(f"{indent}{adj_val}{comp} -= {tgt};"))
                     else:  # array_store consumes the incoming gradient
                         body_lines.append(_finalize(f"{indent}{adj_val}{comp} += {tgt};"))
                         body_lines.append(_finalize(f"{indent}{tgt} = 0.0f;"))

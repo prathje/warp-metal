@@ -233,6 +233,106 @@ class TestMetalR3Ops(unittest.TestCase):
             """,
         )
 
+    def test_tile_dual_reset_in_dynamic_loop(self):
+        # Owning tile duals are reset each reverse loop iteration with
+        # ``adj_t.grad_zero()`` (warp_nn's tiled GEMM, Newton's neural MLP drive).
+        _run(
+            self,
+            """
+            @wp.kernel
+            def k(x: wp.array[float], n: int, out: wp.array[float]):
+                i = wp.tid()
+                for kk in range(n):
+                    a = wp.tile_load(x, shape=4, offset=kk * 4)
+                    b = a * a
+                    wp.tile_store(out, b, offset=kk * 4)
+
+            def launch(dev):
+                x = wp.array(np.arange(8, dtype=np.float32) * 0.5, dtype=float, device=dev, requires_grad=True)
+                out = wp.zeros(8, dtype=float, device=dev, requires_grad=True)
+                tape = wp.Tape()
+                with tape:
+                    wp.launch_tiled(k, dim=1, inputs=[x, 2], outputs=[out], block_dim=1 if dev == "cpu" else 32,
+                                    device=dev)
+                tape.backward(grads={out: wp.array(np.arange(8, dtype=np.float32) + 1, dtype=float, device=dev)})
+                return out.numpy(), x.grad.numpy()
+
+            cpu, metal = both(launch)
+            assert_same(cpu, metal, rtol=1e-6)
+            """,
+        )
+
+    def test_array_condition_and_atomic_sub_adjoints(self):
+        # ``if arr:`` (XPBD's optional constraint weights) lowers to a
+        # ``where`` whose condition is an array with no dual; Newton's
+        # differentiable contacts use ``wp.atomic_sub`` in reverse mode.
+        _run(
+            self,
+            """
+            @wp.struct
+            class S:
+                f: wp.array[wp.spatial_vector]
+
+            @wp.kernel
+            def k(deltas: wp.array[wp.spatial_vector], w: wp.array[float], idx: wp.array[int],
+                  qd_out: wp.array[wp.spatial_vector]):
+                tid = wp.tid()
+                weight = 1.0
+                if w:
+                    inv_weight = w[tid]
+                    if inv_weight > 0.0:
+                        weight = 1.0 / inv_weight
+                j = tid
+                if idx:
+                    j = idx[tid]
+                wp.atomic_add(qd_out, j, deltas[tid] * weight)
+
+            @wp.kernel
+            def ks(x: wp.array[float], v: wp.array[wp.vec3], s: S, out: wp.array[float], o3: wp.array2d[wp.vec3]):
+                i = wp.tid()
+                wp.atomic_sub(out, i % 2, x[i] * x[i])
+                wp.atomic_sub(o3, i % 2, 1, v[i] * 2.0)
+                wp.atomic_sub(s.f, i % 2, wp.spatial_vector(x[i], 0.0, 1.0, 2.0, x[i] * 3.0, 0.0))
+                out[2] -= x[i]
+
+            def launch(dev, use_w):
+                d = wp.array(np.arange(12, dtype=np.float32).reshape(2, 6), dtype=wp.spatial_vector, device=dev,
+                             requires_grad=True)
+                w = wp.array([2.0, 4.0], dtype=float, device=dev, requires_grad=True) if use_w else None
+                idx = wp.array([1, 0], dtype=int, device=dev) if use_w else None
+                q = wp.zeros(2, dtype=wp.spatial_vector, device=dev, requires_grad=True)
+                tape = wp.Tape()
+                with tape:
+                    wp.launch(k, 2, [d, w, idx], [q], device=dev)
+                tape.backward(grads={q: wp.array(np.ones((2, 6), dtype=np.float32), dtype=wp.spatial_vector,
+                                                 device=dev)})
+                return q.numpy(), d.grad.numpy(), (w.grad.numpy() if use_w else np.zeros(1))
+
+            def launch_sub(dev):
+                x = wp.array(np.arange(4, dtype=np.float32) + 1, dtype=float, device=dev, requires_grad=True)
+                v = wp.array(np.arange(12, dtype=np.float32).reshape(4, 3), dtype=wp.vec3, device=dev,
+                             requires_grad=True)
+                out = wp.zeros(3, dtype=float, device=dev, requires_grad=True)
+                o3 = wp.zeros((2, 2), dtype=wp.vec3, device=dev, requires_grad=True)
+                s = S()
+                s.f = wp.zeros(2, dtype=wp.spatial_vector, device=dev, requires_grad=True)
+                tape = wp.Tape()
+                with tape:
+                    wp.launch(ks, 4, [x, v, s], [out, o3], device=dev)
+                tape.backward(grads={
+                    out: wp.array([1.0, 2.0, 3.0], dtype=float, device=dev),
+                    o3: wp.array(np.ones((2, 2, 3), dtype=np.float32), dtype=wp.vec3, device=dev),
+                })
+                return out.numpy(), o3.numpy(), s.f.numpy(), x.grad.numpy(), v.grad.numpy()
+
+            for use_w in (True, False):
+                cpu, metal = both(lambda dev: launch(dev, use_w))
+                assert_same(cpu, metal, rtol=1e-6)
+            cpu, metal = both(launch_sub)
+            assert_same(cpu, metal, rtol=1e-6)
+            """,
+        )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

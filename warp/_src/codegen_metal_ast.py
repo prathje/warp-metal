@@ -4553,6 +4553,7 @@ _ADJ_ARRAY_VIEW_OPS = (
     "adj_address",
     "adj_array_store",
     "adj_atomic_add",
+    "adj_atomic_sub",
     "adj_tile_load",
     "adj_tile_store",
     "adj_tile_atomic_add",
@@ -4578,6 +4579,7 @@ _ADJ_ARRAY_VIEW_EXTRAS = {
     "adj_address": (0, 1),
     "adj_array_store": (1, 1),
     "adj_atomic_add": (1, 2),
+    "adj_atomic_sub": (1, 2),
 }
 _ATOMIC_TO_MSL = {
     "atomic_add": "atomic_fetch_add_explicit",
