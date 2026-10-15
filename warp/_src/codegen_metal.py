@@ -13258,12 +13258,49 @@ def _translate_tile_intrinsics(
                 f"MSL codegen: fill_mode='upper' is not supported for this tile Cholesky op on Metal ({_um.group(0)!r})"
             )
     line = _TILE_CHOLESKY_PAT.sub(repl_cholesky, line)
-    for _um in _TILE_CHOLESKY_SOLVE_PAT.finditer(line):
-        if _cholesky_tpl_upper(_um.group(0)):
+
+    def _upper_solve_via_lower(m: re.Match[str], pat: re.Pattern[str], repl, l_pos: int) -> str:
+        """``fill_mode="upper"`` solve: ``U`` holds ``A = U^T U``, so solving
+        with ``U`` equals the lower-mode solve with ``L = U^T``. Run the
+        lower lowering on a transposed private copy of ``U``."""
+        call = m.group(0)
+        args_s = call[call.index("(", call.index(">")) + 1 : call.rindex(")")]
+        args = [a.strip() for a in args_s.split(",")]
+        u_arg = args[l_pos] if len(args) > l_pos else ""
+        u_label = u_arg[len("var_") :] if u_arg.startswith("var_") else ""
+        dims = tile_var_dims.get(u_label)
+        if dims is None or u_label in smem_tiles or dims[0] != dims[1]:
             raise MetalCodegenError(
-                f"MSL codegen: fill_mode='upper' is not supported for this tile Cholesky op on Metal ({_um.group(0)!r})"
+                f"MSL codegen: fill_mode='upper' is not supported for this tile Cholesky op on Metal ({call!r})"
             )
-    line = _TILE_CHOLESKY_SOLVE_PAT.sub(repl_cholesky_solve, line)
+        n = dims[0]
+        tmp_label = f"{u_label}__cholT"
+        tile_var_dims[tmp_label] = dims
+        args[l_pos] = f"var_{tmp_label}"
+        lower_call = re.sub(r"<\s*(true|1)\b", "<false", call[: call.index("(", call.index(">"))], count=1)
+        lowered = pat.sub(repl, f"{lower_call}({', '.join(args)})")
+        if lowered == f"{lower_call}({', '.join(args)})":
+            raise MetalCodegenError(
+                f"MSL codegen: fill_mode='upper' is not supported for this tile Cholesky op on Metal ({call!r})"
+            )
+        if n == 1:
+            return f"{{ auto var_{tmp_label} = {u_arg}; {lowered}; }}"
+        tr = (
+            f"for (int _ct_i = 0; _ct_i < {n}; ++_ct_i) for (int _ct_j = _ct_i + 1; _ct_j < {n}; ++_ct_j) "
+            f"{{ auto _ct_t = var_{tmp_label}.c[_ct_i * {n} + _ct_j]; "
+            f"var_{tmp_label}.c[_ct_i * {n} + _ct_j] = var_{tmp_label}.c[_ct_j * {n} + _ct_i]; "
+            f"var_{tmp_label}.c[_ct_j * {n} + _ct_i] = _ct_t; }}"
+        )
+        return f"{{ auto var_{tmp_label} = {u_arg}; {tr} {lowered}; }}"
+
+    line = _TILE_CHOLESKY_SOLVE_PAT.sub(
+        lambda m: (
+            _upper_solve_via_lower(m, _TILE_CHOLESKY_SOLVE_PAT, repl_cholesky_solve, 1)
+            if _cholesky_tpl_upper(m.group(0))
+            else repl_cholesky_solve(m)
+        ),
+        line,
+    )
 
     def repl_cholesky_solve_inplace(m: re.Match[str]) -> str:
         # Args: leading LTO seg, L tile (NxN), b tile (NxK).
@@ -13290,12 +13327,14 @@ def _translate_tile_intrinsics(
             return f"{call};\n{wb}"
         return call
 
-    for _um in _TILE_CHOLESKY_SOLVE_INPLACE_PAT.finditer(line):
-        if _cholesky_tpl_upper(_um.group(0)):
-            raise MetalCodegenError(
-                f"MSL codegen: fill_mode='upper' is not supported for this tile Cholesky op on Metal ({_um.group(0)!r})"
-            )
-    line = _TILE_CHOLESKY_SOLVE_INPLACE_PAT.sub(repl_cholesky_solve_inplace, line)
+    line = _TILE_CHOLESKY_SOLVE_INPLACE_PAT.sub(
+        lambda m: (
+            _upper_solve_via_lower(m, _TILE_CHOLESKY_SOLVE_INPLACE_PAT, repl_cholesky_solve_inplace, 1)
+            if _cholesky_tpl_upper(m.group(0))
+            else repl_cholesky_solve_inplace(m)
+        ),
+        line,
+    )
     return line
 
 

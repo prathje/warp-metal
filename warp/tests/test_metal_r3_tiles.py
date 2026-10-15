@@ -267,6 +267,68 @@ class TestMetalR3Tiles(unittest.TestCase):
             """,
         )
 
+    def test_tile_cholesky_solve_upper(self):
+        # mujoco_warp's blocked LDL: factor in upper mode from a gathered
+        # shared tile, then ``tile_cholesky_solve(U, b, fill_mode="upper")``
+        # (A = U^T U), both right after the factor and from a stored factor.
+        _run(
+            self,
+            """
+            BS = wp.constant(6)
+            BA = wp.constant(36)
+
+            @wp.kernel(module="unique")
+            def factor_solve(a: wp.array[float], idx: wp.array[int], y: wp.array[float], u_out: wp.array[float],
+                             x: wp.array[float], x2: wp.array2d[float]):
+                i, lane = wp.tid()
+                ids = wp.tile_load(idx, shape=(BA,), storage="shared")
+                blk = wp.tile_load_indexed(a, ids, shape=(BA,), storage="shared")
+                U = wp.tile_reshape(blk, (BS, BS))
+                wp.tile_cholesky_inplace(U, fill_mode="upper")
+                wp.tile_store(u_out, wp.tile_reshape(U, (BA,)))
+                rhs = wp.tile_load(y, shape=(BS,))
+                wp.tile_store(x, wp.tile_cholesky_solve(U, rhs, fill_mode="upper"))
+                b2 = wp.tile_load(x2, shape=(BS, 2))
+                wp.tile_cholesky_solve_inplace(U, b2, fill_mode="upper")
+                wp.tile_store(x2, b2)
+
+            @wp.kernel(module="unique")
+            def solve_stored(u_in: wp.array[float], y: wp.array[float], x: wp.array[float]):
+                i, lane = wp.tid()
+                U = wp.tile_reshape(wp.tile_load(u_in, shape=(BA,)), (BS, BS))
+                rhs = wp.tile_load(y, shape=(BS,))
+                wp.tile_store(x, wp.tile_cholesky_solve(U, rhs, fill_mode="upper"))
+
+            rng = np.random.default_rng(1)
+            m = rng.standard_normal((BS, BS)).astype(np.float32)
+            a = (m @ m.T + BS * np.eye(BS, dtype=np.float32)).astype(np.float32)
+            perm = rng.permutation(BS * BS)
+            a_perm = np.empty(BS * BS, dtype=np.float32)
+            a_perm[perm] = a.ravel()
+            yv = rng.standard_normal(BS).astype(np.float32)
+            b2 = rng.standard_normal((BS, 2)).astype(np.float32)
+
+            def run(dev):
+                u = wp.zeros(BS * BS, dtype=float, device=dev)
+                x = wp.zeros(BS, dtype=float, device=dev)
+                x2 = wp.array(b2, device=dev)
+                xs = wp.zeros(BS, dtype=float, device=dev)
+                wp.launch_tiled(factor_solve, dim=1, inputs=[wp.array(a_perm, device=dev),
+                                wp.array(perm.astype(np.int32), dtype=int, device=dev), wp.array(yv, device=dev),
+                                u, x, x2], block_dim=32, device=dev)
+                wp.launch_tiled(solve_stored, dim=1, inputs=[u, wp.array(yv, device=dev), xs], block_dim=32,
+                                device=dev)
+                return u.numpy(), x.numpy(), x2.numpy(), xs.numpy()
+
+            res = both(run)
+            assert_same(res, atol=1e-4)
+            _u, x, x2, xs = res["metal:0"]
+            np.testing.assert_allclose(a @ x, yv, rtol=1e-3, atol=1e-3)
+            np.testing.assert_allclose(a @ xs, yv, rtol=1e-3, atol=1e-3)
+            np.testing.assert_allclose(a @ x2, b2, rtol=1e-3, atol=1e-3)
+            """,
+        )
+
     def test_tile_store_bounds_on_arguments(self):
         # A partial trailing tile must not write past the array's rows.
         _run(
