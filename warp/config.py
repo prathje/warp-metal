@@ -413,7 +413,9 @@ Setting this to ``True`` selects the ``"demote"`` mode whenever
 metal_print: str = _os.environ.get("WARP_METAL_PRINT", "").strip().lower() or "warn"
 """How Metal kernels handle ``wp.print()`` / ``wp.printf()``.
 
-Metal compute kernels have no ``printf``, so the calls are compiled out:
+Metal compute kernels have no ``printf``, so the calls are compiled out, as are
+``wp.expect_eq()`` / ``wp.expect_neq()`` / ``wp.expect_near()``, which only print
+a message on mismatch:
 
 * ``"warn"`` (default): drop them and warn once per process, naming the first
   kernel affected.
