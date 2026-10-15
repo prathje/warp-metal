@@ -575,6 +575,55 @@ class TestMetalR3Ops(unittest.TestCase):
             """,
         )
 
+    def test_negative_matrix_and_vector_indices(self):
+        # Warp wraps negative row/col/component indices (``mat.h``/``vec.h``);
+        # constant and runtime ones, reads, writes, slices and adjoints.
+        _run(
+            self,
+            """
+            M66 = wp.types.matrix(shape=(6, 6), dtype=wp.float32)
+            M43 = wp.types.matrix(shape=(4, 3), dtype=wp.float32)
+
+            def make(M, O):
+                @wp.kernel
+                def k(a: wp.array[M], v: wp.array[wp.vec3], r: int, c: int, o: wp.array[O],
+                      loss: wp.array[float]):
+                    i = wp.tid()
+                    m = a[i]
+                    q = v[i]
+                    row = m[r]
+                    m[-1, 0] = q[-1]
+                    q[-2] = 4.0
+                    o[i] = row
+                    rs = m[r, :]
+                    cs = m[:, c]
+                    loss[i] = (m[r, c] * 3.0 + row[1] * 2.0 + m[-1, -2] + m[-2][0] * 5.0 + m[-1, 0]
+                               + q[-2] + wp.dot(q, q) + rs[0] + cs[1] * 2.0)
+                return k
+
+            cases = [(M66, wp.types.vector(6, wp.float32), 6, 6), (M43, wp.vec3, 4, 3),
+                     (wp.mat33, wp.vec3, 3, 3)]
+            for M, O, R, C in cases:
+                k = make(M, O)
+                for r, c in ((-1, -2), (1, 2), (-R, 0)):
+                    def launch(dev):
+                        a = wp.array(np.arange(2 * R * C, dtype=np.float32).reshape(2, R, C), dtype=M,
+                                     device=dev, requires_grad=True)
+                        v = wp.array(np.arange(6, dtype=np.float32).reshape(2, 3), dtype=wp.vec3, device=dev,
+                                     requires_grad=True)
+                        o = wp.zeros(2, dtype=O, device=dev, requires_grad=True)
+                        loss = wp.zeros(2, dtype=float, device=dev, requires_grad=True)
+                        tape = wp.Tape()
+                        with tape:
+                            wp.launch(k, 2, [a, v, r, c], [o, loss], device=dev)
+                        tape.backward(grads={loss: wp.ones(2, dtype=float, device=dev)})
+                        return o.numpy(), loss.numpy(), a.grad.numpy(), v.grad.numpy()
+
+                    cpu, metal = both(launch)
+                    assert_same(cpu, metal)
+            """,
+        )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

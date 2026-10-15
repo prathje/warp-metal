@@ -734,7 +734,14 @@ def _emit_big_vec_struct(name: str, n: int, msl_scalar: str) -> str:
     # The index is non-differentiable but Warp still names its dual.
     body_lines.append(
         f"inline void wp_adj_extract({name} v, int i, thread {name}& av, thread int& ai, {msl_scalar} r) "
-        f"{{ av.c[i] += r; }}"
+        f"{{ av.c[i < 0 ? i + {n} : i] += r; }}"
+    )
+    # Element read / write with Warp's negative-index wrap (``vec.h``); these
+    # beat the generic ``wp_extract`` / ``wp_index_store`` templates.
+    body_lines.append(f"inline {msl_scalar} wp_extract({name} v, int i) {{ return v.c[i < 0 ? i + {n} : i]; }}")
+    body_lines.append(
+        f"template <typename V> inline void wp_index_store(thread {name}& t, int i, V v) "
+        f"{{ t.c[i < 0 ? i + {n} : i] = v; }}"
     )
     # Scalar scale / divide. The generic ``wp_adj_mul`` template deduces a
     # single ``T`` for both operands, so a struct-by-scalar product has no
@@ -1031,21 +1038,25 @@ def _emit_big_mat_struct(name: str, rows: int, cols: int, msl_scalar: str) -> st
         body.append("}")
     # Copy overload: ``mat_t<R, C>(m)`` with a same-type operand.
     body.append(f"inline {name} {name}_make({name} m) {{ return m; }}")
-    body.append(f"inline {msl_scalar} wp_mat_extract({name} m, int row, int col) {{ return m.c[row * {cols} + col]; }}")
+    # Negative row/col wrap like ``warp/native/mat.h``.
+    wrap_r = f"if (row < 0) row += {rows}; if (col < 0) col += {cols};"
+    body.append(f"inline {msl_scalar} wp_mat_extract({name} m, int row, int col) {{ {wrap_r} return m.c[row * {cols} + col]; }}")
     body.append(f"inline {msl_scalar} wp_mat_flat_elem({name} m, int i) {{ return m.c[i]; }}")
     body.append(
         f"inline void wp_mat_elem_store(thread {name}& m, int row, int col, {msl_scalar} v) "
-        f"{{ m.c[row * {cols} + col] = v; }}"
+        f"{{ {wrap_r} m.c[row * {cols} + col] = v; }}"
     )
     # Single-index row read/write for ``wp::extract(m, i)`` and the 3-arg
     # ``*_inplace(m, i, v)`` forms. Concrete overloads so the row comes back
     # by value — the generic ``wp_extract`` template would deduce the row-ref
     # proxy type, which dangles once the by-value matrix copy dies.
     row_get = row_make.replace("c[i", "m.c[i")
-    body.append(f"inline {row_type} wp_extract({name} m, int i) {{ return {row_get}; }}")
+    body.append(f"inline {row_type} wp_extract({name} m, int i) {{ if (i < 0) i += {rows}; return {row_get}; }}")
     vcomp = "v[{j}]" if row_type == f"{msl_scalar}{cols}" else "v.c[{j}]"
     row_stores = "; ".join(f"m.c[i * {cols} + {j}] = {vcomp.format(j=j)}" for j in range(cols))
-    body.append(f"inline void wp_index_store(thread {name}& m, int i, {row_type} v) {{ {row_stores}; }}")
+    body.append(
+        f"inline void wp_index_store(thread {name}& m, int i, {row_type} v) {{ if (i < 0) i += {rows}; {row_stores}; }}"
+    )
 
     # ---- Arithmetic ----------------------------------------------------
     # Element-wise binary ops, scalar scale, and matrix products. The vec
@@ -1153,11 +1164,11 @@ def _emit_big_mat_struct(name: str, rows: int, cols: int, msl_scalar: str) -> st
     # storage, so no transpose as in the native column-major overloads).
     body.append(
         f"inline void wp_adj_extract({name} m, int i, int j, thread {name}& am, thread int& ai, thread int& aj, "
-        f"{msl_scalar} r) {{ am.c[i * {cols} + j] += r; }}"
+        f"{msl_scalar} r) {{ if (i < 0) i += {rows}; if (j < 0) j += {cols}; am.c[i * {cols} + j] += r; }}"
     )
     body.append(
         f"inline void wp_adj_extract({name} m, int i, thread {name}& am, thread int& ai, {row_type} r) "
-        f"{{ for (int j = 0; j < {cols}; ++j) am.c[i * {cols} + j] += r[j]; }}"
+        f"{{ if (i < 0) i += {rows}; for (int j = 0; j < {cols}; ++j) am.c[i * {cols} + j] += r[j]; }}"
     )
     if rows == cols:
         # mat * mat (square — same struct type on both sides).
@@ -1338,7 +1349,8 @@ def _emit_native_mat_extract_overloads(source: str) -> str:
     needs_slice = "wp::slice_t" in source or "wp_slice_t" in source
     for scalar, rows, cols in sorted(seen):
         parts.append(
-            f"inline {scalar} wp_mat_extract({scalar}{rows}x{cols} m, int row, int col) {{ return m[col][row]; }}"
+            f"inline {scalar} wp_mat_extract({scalar}{rows}x{cols} m, int row, int col) "
+            f"{{ if (row < 0) row += {rows}; if (col < 0) col += {cols}; return m[col][row]; }}"
         )
         parts.append(
             f"inline {scalar} wp_mat_flat_elem({scalar}{rows}x{cols} m, int i) "
@@ -1356,7 +1368,7 @@ def _emit_native_mat_extract_overloads(source: str) -> str:
         # assignment is legal, so this is a store function.
         parts.append(
             f"inline void wp_mat_elem_store(thread {scalar}{rows}x{cols}& m, int row, int col, {scalar} v) "
-            f"{{ m[col][row] = v; }}"
+            f"{{ if (row < 0) row += {rows}; if (col < 0) col += {cols}; m[col][row] = v; }}"
         )
         if needs_slice:
             # Row-slice: extract a vec spanning a row range at a fixed
@@ -1367,6 +1379,7 @@ def _emit_native_mat_extract_overloads(source: str) -> str:
             parts.append(
                 f"inline {scalar}{rows} wp_mat_extract({scalar}{rows}x{cols} m, wp_slice_t s, int col) {{\n"
                 f"    {scalar}{rows} ret = {scalar}{rows}(0);\n"
+                f"    if (col < 0) col += {cols};\n"
                 f"    int ii = 0;\n"
                 f"    for (int i = s.start; (s.step > 0) ? (i < s.stop) : (i > s.stop); i += s.step) {{\n"
                 f"        ret[ii++] = m[col][i];\n"
@@ -1378,6 +1391,7 @@ def _emit_native_mat_extract_overloads(source: str) -> str:
             parts.append(
                 f"inline {scalar}{cols} wp_mat_extract({scalar}{rows}x{cols} m, int row, wp_slice_t s) {{\n"
                 f"    {scalar}{cols} ret = {scalar}{cols}(0);\n"
+                f"    if (row < 0) row += {rows};\n"
                 f"    int ii = 0;\n"
                 f"    for (int i = s.start; (s.step > 0) ? (i < s.stop) : (i > s.stop); i += s.step) {{\n"
                 f"        ret[ii++] = m[i][row];\n"
@@ -1426,6 +1440,10 @@ def _emit_wp_extract_helpers(source: str) -> str:
     parts: list[str] = [
         "template <typename T> inline auto wp_extract(T v, int i) { return v[i]; }",
         "template <typename T, typename V> inline void wp_index_store(thread T& t, int i, V v) { t[i] = v; }",
+        # Native vectors wrap negative indices like ``warp/native/vec.h``.
+        "template <typename T, int N> inline T wp_extract(metal::vec<T, N> v, int i) { return v[i < 0 ? i + N : i]; }",
+        "template <typename T, int N, typename V> inline void wp_index_store(thread metal::vec<T, N>& t, int i, V v) "
+        "{ t[i < 0 ? i + N : i] = v; }",
     ]
     seen: set[tuple[str, int]] = set()
     for m in _NATIVE_MAT_NAME_PAT.finditer(source):
@@ -1433,9 +1451,14 @@ def _emit_wp_extract_helpers(source: str) -> str:
             seen.add((m.group(1), int(m.group(2))))
     for scalar, n in sorted(seen):
         row = ", ".join(f"m[{c}][i]" for c in range(n))
-        parts.append(f"inline {scalar}{n} wp_extract({scalar}{n}x{n} m, int i) {{ return {scalar}{n}({row}); }}")
+        parts.append(
+            f"inline {scalar}{n} wp_extract({scalar}{n}x{n} m, int i) {{ if (i < 0) i += {n}; return {scalar}{n}({row}); }}"
+        )
         stores = " ".join(f"m[{c}][i] = v[{c}];" for c in range(n))
-        parts.append(f"inline void wp_index_store(thread {scalar}{n}x{n}& m, int i, {scalar}{n} v) {{ {stores} }}")
+        parts.append(
+            f"inline void wp_index_store(thread {scalar}{n}x{n}& m, int i, {scalar}{n} v) "
+            f"{{ if (i < 0) i += {n}; {stores} }}"
+        )
     return "\n".join(parts)
 
 
@@ -2134,7 +2157,7 @@ def _adj_vec_helpers(n: int, scalar: str = "float") -> str:
         # ``wp.extract(v, i)`` on a vector: scatter the scalar adjoint back
         # into the indexed component. The index itself is non-differentiable.
         f"inline void wp_adj_extract({v} a, int i, thread {v}& aa, thread int& ai, {sc} r) {{\n"
-        f"    aa[i] += r;\n}}\n"
+        f"    aa[i < 0 ? i + {n} : i] += r;\n}}\n"
         # Component-wise products. MSL's ``*`` on vectors is already
         # component-wise, so these mirror the scalar rules per lane.
         f"inline void wp_adj_cw_mul({v} a, {v} b, thread {v}& aa, thread {v}& ab, {v} r) {{\n"
@@ -2163,7 +2186,7 @@ def _adj_int_vec_helpers(n: int, scalar: str) -> str:
         f"inline void wp_adj_vec_t({args}, {refs}, {v} r) {{\n{comps}}}\n"
         f"inline void wp_adj_vec_t({scalar} c, thread {scalar}& a, {v} r) {{ a += {bcast}; }}\n"
         f"inline void wp_adj_extract({v} a, int i, thread {v}& aa, thread int& ai, {scalar} r) {{\n"
-        f"    aa[i] += r;\n}}\n"
+        f"    aa[i < 0 ? i + {n} : i] += r;\n}}\n"
     )
 
 
@@ -2253,11 +2276,12 @@ def _adj_mat_helpers(n: int) -> str:
         f"    aa += r * b;\n    ab += metal::transpose(r) * a;\n}}\n"
         # ``wp.extract(m, i, j)`` — logical (i, j) is ``m[j][i]`` here.
         f"inline void wp_adj_extract({m} m, int i, int j, thread {m}& am, "
-        f"thread int& ai, thread int& aj, float r) {{\n    am[j][i] += r;\n}}\n"
+        f"thread int& ai, thread int& aj, float r) {{\n"
+        f"    if (i < 0) i += {n}; if (j < 0) j += {n};\n    am[j][i] += r;\n}}\n"
         # Row extract: ``wp.extract(m, i)`` yields logical row i, whose
         # components live one per column.
         f"inline void wp_adj_extract({m} m, int i, thread {m}& am, thread int& ai, {v} r) {{\n"
-        f"    for (int j = 0; j < {n}; ++j) am[j][i] += r[j];\n}}\n"
+        f"    if (i < 0) i += {n};\n    for (int j = 0; j < {n}; ++j) am[j][i] += r[j];\n}}\n"
         f"inline void wp_adj_determinant({m} m, thread {m}& am, float r) {{\n{det_body}}}\n"
         # d(inv)/dM, see Giles, "An extended collection of matrix derivative
         # results for forward and reverse mode AD", 2.2.3.
@@ -6876,7 +6900,8 @@ _MISC_MATH_HELPERS: dict[str, str] = {
     # Matrix slice copy (see the ``wp::extract<R, C>`` rule). The slice
     # loops mirror ``warp/native/mat.h``'s ``extract`` overloads; element
     # access goes through the per-type ``wp_mat_extract`` /
-    # ``wp_mat_elem_store`` overloads emitted with each matrix type.
+    # ``wp_mat_elem_store`` overloads emitted with each matrix type, which
+    # also apply the negative row/col wrap of a fixed int index.
     "wp_mat_slice_assign": (
         "template <typename D, typename M>\n"
         "inline void wp_mat_slice_assign(thread D& d, M m, wp_slice_t rs, wp_slice_t cs) {\n"
