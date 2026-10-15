@@ -22,9 +22,10 @@ compile time; reads, writes, atomics, component stores, ``len``/``shape``
 and element pointers become direct accesses to the storage. Element
 pointers (``wp::address``) become MSL ``thread T*`` locals.
 
-The reverse pass mirrors the native semantics: the dual of a fixed array is a
-second fixed array of the same shape (``adj_<label>``) that the element
-adjoints accumulate into.
+Reverse mode is supported for 1-D fixed arrays accessed directly: the dual
+is a second fixed array of the same shape (``adj_<label>``) that the element
+adjoints accumulate into, as natively. Reverse mode through multi-dimensional
+fixed arrays or through views of them raises.
 
 Anything else that touches one of these locals (passing it to a native
 function, storing its pointer, a loop-carried reassignment to a different
@@ -696,6 +697,17 @@ def fold_local_arrays(
                 return [f"{indent}/* adjoint of a thread-local array copy: see adj_ storage */"]
             return None
         arr = arrays[first[4:]]
+        if fn in ("address", "array_store", "atomic_add", "atomic_sub") and (
+            len(arr.dims) != 1 or arr.storage != first[4:] or arr.offset != "0"
+        ):
+            # Natively the dual of a multi-dimensional or view-accessed fixed
+            # array follows ``array_t`` stride/view semantics that this flat
+            # dual storage does not reproduce; refuse rather than diverge.
+            raise fail(
+                "reverse mode through a multi-dimensional thread-local array, or through a view of one, is "
+                "not supported on Metal (only 1-D wp.zeros arrays accessed directly)",
+                raw,
+            )
         if fn == "address":
             # adj_address(arr, i.., adj_arr, adj_i.., adj_ret)
             nidx = (len(args) - 3) // 2

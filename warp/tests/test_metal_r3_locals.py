@@ -933,6 +933,35 @@ class TestMetalR3Locals(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet, timeout=120)
 
+    def test_fixed_array_adjoint_multi_dim_raises(self):
+        # Reverse mode through a 2-D fixed array (or a view of one) does not
+        # follow the native dual's view semantics; it raises instead.
+        snippet = _snippet(
+            """
+            @wp.kernel
+            def k(x: wp.array[float], out: wp.array[float]):
+                t = wp.tid()
+                a = wp.zeros(shape=(2, 2), dtype=float)
+                a[1, 0] = x[t] * 3.0
+                out[t] = a[1, 0] * a[1, 0]
+
+            from warp._src.codegen_metal import MetalCodegenError
+            dev = "metal:0"
+            x = wp.array([1.0, 2.0], dtype=float, device=dev, requires_grad=True)
+            o = wp.zeros(2, dtype=float, device=dev, requires_grad=True)
+            tape = wp.Tape()
+            with tape:
+                wp.launch(k, 2, [x, o], device=dev)
+            try:
+                tape.backward(grads={o: wp.ones(2, dtype=float, device=dev)})
+            except MetalCodegenError as e:
+                assert "reverse mode" in str(e), e
+            else:
+                raise AssertionError("2-D fixed-array reverse mode was not rejected")
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
