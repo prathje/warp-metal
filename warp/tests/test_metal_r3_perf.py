@@ -538,6 +538,34 @@ class TestMetalSharedBufferOrdering(unittest.TestCase):
 @unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
 @unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
 class TestMetalDispatcherRobustness(unittest.TestCase):
+    def test_sync_raises_on_failed_command_buffer(self):
+        snippet = textwrap.dedent(
+            """
+            from warp._src.metal_dispatch import MetalDispatchError, get_dispatcher
+
+            class FailedCB:
+                def waitUntilCompleted(self):
+                    pass
+                def status(self):
+                    return 5
+                def error(self):
+                    return "simulated GPU fault"
+
+            d = get_dispatcher()
+            d.sync()
+            d._pending_commits.append(FailedCB())
+            try:
+                d.sync()
+            except MetalDispatchError as e:
+                assert "simulated GPU fault" in str(e), e
+            else:
+                raise AssertionError("sync() swallowed a failed command buffer")
+            assert not d._pending_commits
+            d.sync()
+            """
+        )
+        _run_with_metal_enabled(self, snippet)
+
     def test_bad_autoflush_env_falls_back(self):
         import warnings  # noqa: PLC0415
 

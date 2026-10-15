@@ -1518,11 +1518,20 @@ class MetalDispatcher:
         # outstanding. They were committed to the same queue in commit
         # order; we wait sequentially so any host read after ``sync()``
         # sees a consistent post-execution view of every shared buffer.
+        failed = None
         for cb in self._pending_commits:
             cb.waitUntilCompleted()
+            if failed is None and cb.status() == 5:  # MTLCommandBufferStatusError
+                failed = cb
         self._pending_commits = []
         # Everything has completed — release the pinned transient refs.
         self._inflight_refs_by_buf = []
+        if failed is not None:
+            # A command buffer batches up to ``_autoflush_every`` launches, so
+            # a GPU fault (e.g. a page fault from an out-of-bounds access)
+            # would otherwise silently discard all of their results.
+            self._armed_loop_checks.clear()
+            raise MetalDispatchError(f"Metal command buffer failed on the GPU: {failed.error()}")
         if self._armed_loop_checks:
             armed = list(self._armed_loop_checks.values())
             self._armed_loop_checks.clear()
@@ -2193,6 +2202,13 @@ class MetalDispatcher:
                         cb, last = inflight.pop(0)
                         if cb.status() < 4:
                             cb.waitUntilCompleted()
+                        if cb.status() != 4:
+                            # Errored: its loop latches are not trustworthy,
+                            # so encode the rest of the program unchanged
+                            # (``sync()`` reports the error).
+                            inflight.clear()
+                            active.clear()
+                            break
                         done_idx = last
                     for k, (start, end, addr) in enumerate(active):
                         if done_idx >= start and ctypes.c_int32.from_address(addr).value == 0:
