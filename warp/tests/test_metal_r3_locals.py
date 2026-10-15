@@ -862,6 +862,50 @@ class TestMetalR3Locals(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet, timeout=120)
 
+    def test_struct_array_element_arrays_reject_capture(self):
+        # The element records are resolved to buffers on the host at launch;
+        # a graph replay would keep reading the arrays bound at capture time,
+        # so capturing such a kernel raises instead of going stale.
+        snippet = _snippet(
+            """
+            @wp.struct
+            class G:
+                vals: wp.array[float]
+
+            @wp.kernel
+            def kc(data: wp.array[G], out: wp.array[float]):
+                out[wp.tid()] = data[0].vals[wp.tid()]
+
+            @wp.kernel
+            def kd(ids: wp.array[int], data: wp.array[G], out: wp.array[float]):
+                out[wp.tid()] = data[ids[0]].vals[wp.tid()]
+
+            dev = "metal:0"
+            g = G()
+            g.vals = wp.array([1.0, 2.0], dtype=float, device=dev)
+            data = wp.array([g], dtype=G, device=dev)
+            out = wp.zeros(2, dtype=float, device=dev)
+            ids = wp.zeros(1, dtype=int, device=dev)
+            wp.launch(kc, 2, [data, out], device=dev)
+            wp.launch(kd, 2, [ids, data, out], device=dev)
+            np.testing.assert_allclose(out.numpy(), [1.0, 2.0])
+            for kern, args in ((kc, [data, out]), (kd, [ids, data, out])):
+                try:
+                    with wp.ScopedCapture(device=dev):
+                        wp.launch(kern, 2, args, device=dev)
+                except RuntimeError as e:
+                    assert "cannot be captured" in str(e), e
+                else:
+                    raise AssertionError("capturing a struct-array array-field read was not rejected")
+            # Rebinding a record to a new array is seen by the next launch.
+            g.vals = wp.array([5.0, 6.0], dtype=float, device=dev)
+            data.assign(wp.array([g], dtype=G, device=dev))
+            wp.launch(kd, 2, [ids, data, out], device=dev)
+            np.testing.assert_allclose(out.numpy(), [5.0, 6.0])
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -19537,6 +19537,18 @@ def _struct_field_launch_value(fwd_args, arg_by_name, root_label: str, fpath: tu
     """
     idx, arg = arg_by_name[root_label]
     value = fwd_args[idx]
+    if fpath and fpath[0].startswith("["):
+        from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
+
+        if get_dispatcher()._record_state is not None:
+            # The element records are resolved to buffers on the host at
+            # launch; a replay would keep reading the arrays bound at
+            # capture time even after ``data.assign(...)`` rebinds them.
+            raise RuntimeError(
+                f"Metal: kernel reads array fields of the elements of {root_label!r} (a wp.array of a struct "
+                "with array members), which cannot be captured into a Metal graph; launch it outside "
+                "wp.ScopedCapture"
+            )
     if fpath and fpath[0] == "[*]":
         return _struct_array_ptr_table(value, arg.type.dtype, fpath[1:])
     if fpath and fpath[0].startswith("["):
@@ -19568,11 +19580,12 @@ def _struct_array_ptr_table(arr, struct_type, fpath: tuple[str, ...]):
     """Pointer table for array field ``fpath`` of every element of struct array ``arr``.
 
     One row of five ``uint64`` per element: the field's GPU address and its
-    four extents. The field buffers are declared GPU-resident (the
-    kernel reaches them through the addresses) for as long as ``arr`` lives.
-    The table is cached on ``arr`` and rebuilt when the element records
-    change; it is read from the array's host-visible storage like
-    :func:`_struct_array_elem_field_value`.
+    four extents, resolved from the element records in the array's
+    host-visible storage at every launch (so a record rebound to a new
+    array, even one reusing a freed array's address, is seen). The field
+    buffers are declared GPU-resident until the next launch rebuilds the
+    table or ``arr`` is collected. Graph capture is rejected by the caller:
+    a replay could not re-resolve the records.
     """
     import ctypes  # noqa: PLC0415
     import weakref  # noqa: PLC0415
@@ -19589,11 +19602,10 @@ def _struct_array_ptr_table(arr, struct_type, fpath: tuple[str, ...]):
         raise RuntimeError("Metal: struct arrays with array members must be contiguous")
     np_dtype = np.dtype(struct_type.numpy_dtype())
     n = int(arr.shape[0])
+    # The records may have just been written by queued GPU work
+    # (``data.assign(...)``): wait for it before reading them on the host.
+    get_dispatcher().sync()
     raw = bytes((ctypes.c_char * (n * np_dtype.itemsize)).from_address(int(arr.ptr)))
-    cache = arr.__dict__.setdefault("_metal_ptab_cache", {})
-    hit = cache.get(fpath)
-    if hit is not None and hit[0] == raw:
-        return hit[1]
     recs = np.frombuffer(raw, dtype=np_dtype)
     t = struct_type
     for comp in fpath[:-1]:
@@ -19601,7 +19613,6 @@ def _struct_array_ptr_table(arr, struct_type, fpath: tuple[str, ...]):
     field_type = t.vars[fpath[-1]].type
     elem_size = wp.types.type_size_in_bytes(field_type.dtype)
     table = np.zeros(n * _PTAB_ROW, dtype=np.uint64)
-    dispatcher = get_dispatcher()
     bufs = []
     for e in range(n):
         a = recs[e]
@@ -19630,6 +19641,12 @@ def _struct_array_ptr_table(arr, struct_type, fpath: tuple[str, ...]):
             table[e * _PTAB_ROW + 1 + d] = shape[d]
         if all(b is not buf for b in bufs):
             bufs.append(buf)
+    cache = arr.__dict__.setdefault("_metal_ptab_cache", {})
+    hit = cache.get(fpath)
+    key = table.tobytes()
+    if hit is not None and hit[0] == key:
+        return hit[1]
+    dispatcher = get_dispatcher()
     for buf in bufs:
         if _PTAB_RESIDENT_REFS.get(id(buf), 0) == 0:
             dispatcher.add_resident_resource(buf)
@@ -19638,7 +19655,7 @@ def _struct_array_ptr_table(arr, struct_type, fpath: tuple[str, ...]):
     if hit is not None:
         hit[2]()  # release the previous table's residency now
     fin = weakref.finalize(arr, _ptab_release, dispatcher, bufs)
-    cache[fpath] = (raw, tab, fin)
+    cache[fpath] = (key, tab, fin)
     return tab
 
 
@@ -19658,6 +19675,10 @@ def _struct_array_elem_field_value(arr, struct_type, k: int, fpath: tuple[str, .
         return None
     if not arr.is_contiguous:
         raise RuntimeError("Metal: struct arrays with array members must be contiguous")
+    from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
+
+    # Wait for queued writes to the records (``data.assign(...)``).
+    get_dispatcher().sync()
     np_dtype = struct_type.numpy_dtype()
     nbytes = np.dtype(np_dtype).itemsize
     raw = (ctypes.c_char * nbytes).from_address(int(arr.ptr) + k * int(arr.strides[0]))
