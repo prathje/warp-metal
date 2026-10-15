@@ -372,6 +372,56 @@ class TestMetalR3Tiles(unittest.TestCase):
             """,
         )
 
+    def test_aliased_array_arguments(self):
+        # One allocation bound to several array params: Metal treats kernel
+        # buffers as non-aliasing, so a read through one param could miss
+        # the kernel's own store through another. CPU order must hold.
+        _run(
+            self,
+            """
+            @wp.kernel
+            def chain(a: wp.array[float], b: wp.array[float]):
+                i = wp.tid()
+                if i == 0:
+                    for j in range(4):
+                        b[j + 1] = a[j] * 2.0
+
+            @wp.kernel
+            def two_out(b: wp.array[float], c: wp.array[float]):
+                i = wp.tid()
+                if i == 0:
+                    for j in range(4):
+                        b[j + 1] = c[j] + 1.0
+
+            @wp.func_native("float v = ((float*)src.data)[i]; ((float*)dst.data)[i + 1] = v * 2.0f;")
+            def cp(src: wp.array[wp.float32], dst: wp.array[wp.float32], i: int): ...
+
+            @wp.kernel
+            def native_chain(a: wp.array[wp.float32], b: wp.array[wp.float32]):
+                i = wp.tid()
+                if i == 0:
+                    for j in range(4):
+                        cp(a, b, j)
+
+            def run(dev):
+                with wp.ScopedDevice(dev):
+                    x = wp.array(np.arange(1, 7, dtype=np.float32))
+                    wp.launch(chain, dim=1, inputs=[x, x])
+                    y = wp.array(np.arange(1, 8, dtype=np.float32))
+                    wp.launch(chain, dim=1, inputs=[y[1:6], y[2:7]])
+                    z = wp.array(np.arange(1, 7, dtype=np.float32))
+                    wp.launch(two_out, dim=1, inputs=[z, z])
+                    w = wp.array(np.arange(1, 6, dtype=np.float32))
+                    wp.launch(native_chain, dim=1, inputs=[w, w])
+                    u = wp.array(np.arange(1, 6, dtype=np.float32))
+                    v = wp.array(np.arange(1, 6, dtype=np.float32))
+                    wp.launch(chain, dim=1, inputs=[u, v])
+                    return x.numpy(), y.numpy(), z.numpy(), w.numpy(), v.numpy()
+
+            assert_same(both(run))
+            """,
+        )
+
     def test_tile_store_bounds_on_arguments(self):
         # A partial trailing tile must not write past the array's rows.
         _run(

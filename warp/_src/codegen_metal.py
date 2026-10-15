@@ -21023,8 +21023,13 @@ def _native_scalar_param_msl(arg_var) -> str:
 _METAL_MAX_BUFFER_ARGS = 31
 
 
-def _wrap_msl_for_native_dispatch(artifact) -> str:
+def _wrap_msl_for_native_dispatch(artifact, aliases: dict[str, tuple[str, int]] | None = None) -> str:
     """Build the full MSL kernel function string for native dispatch.
+
+    ``aliases`` maps array params to ``(root param, byte offset)`` for a
+    launch where they share memory with ``root`` (see
+    ``_alias_variant_pso``): their buffer slot stays bound, but the body
+    reads them through a pointer derived from ``root``.
 
     Mirrors what ``mx.fast.metal_kernel`` wraps around the kernel body
     (header includes + ``[[kernel]] void custom_kernel_<name>(...)``
@@ -21263,13 +21268,27 @@ def _wrap_msl_for_native_dispatch(artifact) -> str:
     spill_set = set(spill_slots)
     for k, i in enumerate(spill_slots):
         sname, ptype = pending[i][1]
+        if aliases and sname in aliases:
+            raise MetalCodegenError(
+                f"Kernel {artifact.name!r}: array argument {sname!r} shares memory with {aliases[sname][0]!r} and "
+                "the kernel has more than 31 buffer arguments; pass separate arrays"
+            )
         value_prologue.append(f"    {ptype} {sname} = reinterpret_cast<{ptype}>(__spill_ptrs[{k}]);")
+    alias_prologue: list[str] = []
     slot = 0
     for i, (decl, _spill) in enumerate(pending):
         if i in spill_set:
             continue
+        if aliases and _spill is not None and _spill[0] in aliases:
+            aname, ptype = _spill
+            root, delta = aliases[aname]
+            decl = f"{decl}__alias_src"
+            alias_prologue.append(
+                f"    {ptype} {aname} = reinterpret_cast<{ptype}>(reinterpret_cast<device char*>({root}) + ({delta}L));"
+            )
         params.append(f"  {decl} [[buffer({slot})]]")
         slot += 1
+    value_prologue.extend(alias_prologue)
     if spill_slots:
         params.append(f"  const constant ulong* __spill_ptrs [[buffer({slot})]]")
     artifact.native_spill_slots = tuple(spill_slots)
@@ -21613,6 +21632,97 @@ def _fold_tiled_block_dim(artifact, dims: tuple, block_dim: int) -> tuple:
     return dims
 
 
+def _array_byte_span(value) -> tuple[int, int] | None:
+    """``[lo, hi)`` device-address bytes an array view can touch."""
+    ptr = value.ptr
+    n = value.size
+    if not ptr or not n:
+        return None
+    if value.is_contiguous:
+        return ptr, ptr + n * value.strides[-1]
+    from warp._src.types import type_size_in_bytes  # noqa: PLC0415
+
+    extent = type_size_in_bytes(value.dtype)
+    for n, st in zip(value.shape, value.strides):
+        extent += (n - 1) * abs(st)
+    return ptr, ptr + extent
+
+
+def _array_params_aliasing(inputs: list, outputs: list) -> tuple[tuple[str, str, int], ...]:
+    """``(param, root output, byte offset)`` for each array param (read-only
+    input, or output after the first) whose memory overlaps an output's."""
+    roots: list[tuple[str, int, int]] = []
+    found: list[tuple[str, str, int]] = []
+
+    def root_of(lo: int, hi: int) -> tuple[str, int] | None:
+        for rname, rlo, rhi in roots:
+            if lo < rhi and rlo < hi:
+                return rname, rlo
+        return None
+
+    for name, value in outputs:
+        sp = _array_byte_span(value)
+        if sp is None:
+            continue
+        r = root_of(*sp)
+        if r is None:
+            roots.append((name, sp[0], sp[1]))
+        else:
+            found.append((name, r[0], sp[0] - r[1]))
+    if not roots:
+        return ()
+    lo_min = min(r[1] for r in roots)
+    hi_max = max(r[2] for r in roots)
+    for name, value in inputs:
+        p = value.ptr
+        # Cheap reject (an input starting past every output) before the
+        # span computation; this runs on every launch.
+        if not p or p >= hi_max:
+            continue
+        sp = _array_byte_span(value)
+        if sp is None or sp[1] <= lo_min:
+            continue
+        r = root_of(*sp)
+        if r is not None:
+            found.append((name, r[0], sp[0] - r[1]))
+    return tuple(found)
+
+
+def _alias_variant_pso(kernel, artifact, aliases: tuple[tuple[str, str, int], ...], adjoint: bool,
+                       grad_args: tuple[str, ...]):
+    """PSO for a launch that binds overlapping memory to several array params.
+
+    Apple's compiler treats distinct kernel buffer arguments as
+    non-aliasing: with ``wp.launch(k, inputs=[a, a])`` a read through one
+    param may be served from before the kernel's own store through the
+    other (CPU and CUDA read the stored value). For such a launch each
+    overlapping param is re-derived in the body from the first output it
+    overlaps (``aliases``: ``(param, root output, byte offset)``), so the
+    compiler sees one pointer.
+    """
+    from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
+
+    cache = getattr(kernel, "_metal_alias_psos", None)
+    if cache is None:
+        cache = {}
+        kernel._metal_alias_psos = cache
+    key = (adjoint, grad_args, aliases, id(artifact))
+    hit = cache.get(key)
+    if hit is not None:
+        return hit[1]
+    wrapped = _wrap_msl_for_native_dispatch(artifact, {name: (root, off) for name, root, off in aliases})
+    try:
+        pso = get_dispatcher().compile(wrapped, f"custom_kernel_{artifact.name}")
+    except Exception as exc:
+        raise MetalCodegenError(
+            f"Kernel '{kernel.key}': argument(s) {', '.join(a[0] for a in aliases)} share memory with another "
+            f"array argument and the Metal variant for that failed to compile ({exc}). Pass separate arrays."
+        ) from exc
+    # The artifact is kept with its PSO so ``id(artifact)`` stays unique.
+    cache[key] = (artifact, pso)
+    return pso
+
+
 def launch_metal_kernel_native(
     kernel,
     dim,
@@ -21856,6 +21966,11 @@ def launch_metal_kernel_native(
 
     # init_shadow_names is already cached on the kernel above.
 
+    # Read-only array inputs and output arrays, to detect an input bound in
+    # ``constant`` memory that aliases an output (see ``_alias_variant_pso``).
+    alias_in: list = []
+    alias_out: list = []
+
     # 1) Real inputs from the kernel signature.
     for name in artifact.input_names:
         if name in arg_var_by_name:
@@ -21878,6 +21993,7 @@ def launch_metal_kernel_native(
                     )
                 else:
                     bindings.append(_resolve_mtl(value, kernel.key, name))
+                    alias_in.append((name, value))
                 binding_modes.append("r")
                 continue
             idx, _ = arg_by_name[name]
@@ -21889,6 +22005,7 @@ def launch_metal_kernel_native(
                         f"device; got {getattr(value, 'device', '?')}"
                     )
                 bindings.append(_resolve_mtl(value, kernel.key, name))
+                alias_in.append((name, value))
                 binding_modes.append("r")
             elif isinstance(arg_var.type, Struct):
                 layout = _struct_layout_for(arg_var.type)
@@ -22208,6 +22325,7 @@ def launch_metal_kernel_native(
                 f"device; got {getattr(value, 'device', '?')}"
             )
         mtl = _resolve_mtl(value, kernel.key, name)
+        alias_out.append((name, value))
         # NO pre-launch zero-fill: outputs bind in place, matching CUDA
         # semantics where callers zero accumulators explicitly
         # (``d.nefc.zero_()`` etc.). An earlier version zero-filled
@@ -22228,6 +22346,11 @@ def launch_metal_kernel_native(
         # other binding's mode on the same MTLBuffer (so this and an
         # init-shadow ``r`` on the same buffer collapse to RW).
         binding_modes.append("rw")
+
+    if alias_out and (alias_in or len(alias_out) > 1):
+        aliased = _array_params_aliasing(alias_in, alias_out)
+        if aliased:
+            pso = _alias_variant_pso(kernel, artifact, aliased, adjoint, grad_args)
 
     # ---- Compute grid + threadgroup (mirrors MLX path's logic) ----
     if isinstance(dim, int):
