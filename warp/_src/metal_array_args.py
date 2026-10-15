@@ -99,9 +99,17 @@ kernel void wp_stage_accum_f32(device atomic_float* view [[buffer(0)]],
     const uint e = tid / p.elem_units;
     const uint u = tid % p.elem_units;
     const long off = wp_stage_offset(p, e, i0, i1, i2, i3) / 4 + long(u);
-    const float delta = dense[tid] - orig[tid];
-    if (delta != 0.0f) {
-        atomic_fetch_add_explicit(&view[off], delta, memory_order_relaxed);
+    const float o = orig[tid];
+    const float d = dense[tid];
+    if (metal::isfinite(o)) {
+        const float delta = d - o;
+        if (delta != 0.0f) {
+            atomic_fetch_add_explicit(&view[off], delta, memory_order_relaxed);
+        }
+    } else if (!(d == o)) {
+        // A non-finite original has no meaningful difference (inf - inf is
+        // NaN): store the new value instead.
+        atomic_store_explicit(&view[off], d, memory_order_relaxed);
     }
 }
 
@@ -221,6 +229,23 @@ def metal_device_strided_copy(dest, src) -> bool:
     return True
 
 
+def _is_injective(value) -> bool:
+    """Whether distinct elements of ``value`` occupy distinct memory.
+
+    Index arrays are not inspected (that would read them on the host), so an
+    indexed array counts as possibly aliasing.
+    """
+    if isinstance(value, wp._src.types.indexedarray):
+        return False
+    dims = sorted((abs(st), sh) for sh, st in zip(value.shape, value.strides, strict=True) if sh > 1)
+    extent = wp._src.types.type_size_in_bytes(value.dtype)
+    for stride, size in dims:
+        if stride < extent:
+            return False
+        extent = stride * size
+    return True
+
+
 def _array_variant(kernel):
     """``kernel`` re-specialized with ``wp.array`` in place of every
     ``wp.indexedarray`` parameter (cached on ``kernel``)."""
@@ -299,6 +324,20 @@ def _written_arg_labels(kernel, block_dim) -> frozenset:
     return labels
 
 
+def _native_view_arg_labels(kernel) -> frozenset:
+    """Array arguments the kernel hands to a native snippet as raw memory."""
+    import re  # noqa: PLC0415
+
+    labels = kernel.__dict__.get("_metal_native_view_args")
+    if labels is None:
+        from warp._src.codegen_metal import generate_msl_kernel  # noqa: PLC0415
+
+        src = generate_msl_kernel(kernel).source
+        labels = frozenset(re.findall(r"wp_native_array<[^<>]*>::make\(reinterpret_cast<ulong>\((\w+)\)", src))
+        kernel._metal_native_view_args = labels
+    return labels
+
+
 class StagedLaunch:
     """A launch whose strided / indexed arguments were replaced by
     contiguous temporaries; :meth:`run` launches and scatters back."""
@@ -355,11 +394,18 @@ def stage_launch_args(
         _stage_copy(value, tmp, 0)
         return tmp
 
+    native_args = _native_view_arg_labels(variant)
     staged = []
     new_values = list(values)
     for i, value in enumerate(values):
         if not _needs_staging(value):
             continue
+        if variant.adj.args[i].label in native_args:
+            raise RuntimeError(
+                f"Kernel '{kernel.key}': strided or indexed argument {variant.adj.args[i].label!r} is passed to a "
+                "@wp.func_native snippet; on Metal the kernel sees a dense copy, which a snippet reading raw "
+                "memory would index differently than on CPU/CUDA. Pass a contiguous array."
+            )
         tmp = _stage(value)
         new_values[i] = tmp
         staged.append((i, value, tmp))
@@ -375,6 +421,13 @@ def stage_launch_args(
             orig = wp.clone(tmp)
             if graph is not None:
                 graph._metal_retain.append(orig)
+        elif not _is_injective(value):
+            raise RuntimeError(
+                f"Kernel '{kernel.key}': the gradient array for a strided or indexed argument has dtype "
+                f"{wp._src.types.type_repr(value.dtype)} and elements that alias (zero or overlapping strides, or "
+                "an index array); on Metal only float32 gradients of such views can be accumulated. Pass a "
+                "contiguous gradient array."
+            )
         adj_staged.append((value, tmp, orig))
     n_in = len(inputs)
     n_adj_in = len(adj_inputs) if adjoint else 0
