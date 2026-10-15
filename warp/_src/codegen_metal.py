@@ -18494,6 +18494,28 @@ def _sweep_stale_artifact_dirs(base: str, keep: str) -> None:
             pass
 
 
+_artifact_salt_touched_at = 0.0
+
+
+def _touch_artifact_salt_dir(key: str) -> None:
+    """Refresh the current salt directory's mtime (at most hourly) so a
+    long-running process that only ever hits the cache is not swept by
+    another checkout as stale (see ``_ARTIFACT_SWEEP_GRACE_S``)."""
+    global _artifact_salt_touched_at
+    import time  # noqa: PLC0415
+
+    now = time.time()
+    if now - _artifact_salt_touched_at < 3600:
+        return
+    _artifact_salt_touched_at = now
+    path = _artifact_cache_path(key)
+    if path is not None:
+        try:
+            os.utime(os.path.dirname(path))
+        except OSError:
+            pass
+
+
 def _artifact_cache_path(key: str) -> str | None:
     """Directory-qualified path for a cache entry, or ``None`` if caching
     is unavailable (no kernel cache dir yet) or disabled.
@@ -18807,6 +18829,7 @@ def generate_msl_kernel(
     if key is not None:
         cached = _load_cached_artifact(key, adj)
         if cached is not None:
+            _touch_artifact_salt_dir(key)
             if cached.has_print:
                 _handle_metal_print(adj.fun_name)
             return cached

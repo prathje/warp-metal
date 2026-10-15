@@ -125,6 +125,25 @@ class TestMetalArtifactSweep(unittest.TestCase):
             cm._sweep_stale_artifact_dirs(base, "keep")
             self.assertEqual(sorted(os.listdir(base)), ["fresh", "keep"])
 
+    def test_cache_hits_keep_salt_dir_fresh(self):
+        # A process that only hits the cache must still look alive to the
+        # sweep of other checkouts.
+        import warp._src.codegen_metal as cm  # noqa: PLC0415
+
+        with tempfile.TemporaryDirectory() as base:
+            salt_dir = os.path.join(base, "salt")
+            os.makedirs(salt_dir)
+            old = time.time() - 2 * cm._ARTIFACT_SWEEP_GRACE_S
+            os.utime(salt_dir, (old, old))
+            orig_path, orig_at = cm._artifact_cache_path, cm._artifact_salt_touched_at
+            cm._artifact_cache_path = lambda key: os.path.join(salt_dir, f"{key}.pkl")
+            cm._artifact_salt_touched_at = 0.0
+            try:
+                cm._touch_artifact_salt_dir("k")
+            finally:
+                cm._artifact_cache_path, cm._artifact_salt_touched_at = orig_path, orig_at
+            self.assertGreater(os.path.getmtime(salt_dir), time.time() - 60)
+
 
 @unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
 @unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
