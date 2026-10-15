@@ -352,6 +352,36 @@ class TestMetalR3Tiles(unittest.TestCase):
             """,
         )
 
+    def test_lane_scatter_reduce_distributed(self):
+        # Every lane scatters its own element, then a bitwise block reduce
+        # (CUDA lane semantics; CPU runs one lane per block, so compare with
+        # a NumPy reference).
+        _run(
+            self,
+            """
+            BD = 32
+
+            @wp.kernel(module="unique")
+            def k(vals: wp.array[int], out: wp.array[int], nblocks: int):
+                block_id, lane = wp.tid()
+                bits = wp.tile_zeros(shape=BD, dtype=int, storage="shared")
+                for e in range(block_id, 6, nblocks):
+                    b = int(0)
+                    if lane < 8:
+                        b = vals[e * 8 + lane]
+                    wp.tile_scatter_masked(bits, lane, b, True)
+                    m = wp.tile_reduce(wp.bit_or, bits)[0]
+                    if lane < 10 and m & (1 << lane) != 0:
+                        wp.atomic_add(out, e, 1 << lane)
+
+            x = np.random.default_rng(3).integers(0, 1 << 10, 48).astype(np.int32)
+            o = wp.zeros(6, dtype=int, device="metal:0")
+            wp.launch_tiled(k, dim=2, inputs=[wp.array(x, device="metal:0"), o, 2], block_dim=BD, device="metal:0")
+            ref = np.bitwise_or.reduce(x.reshape(6, 8), axis=1) & 1023
+            np.testing.assert_array_equal(o.numpy(), ref)
+            """,
+        )
+
     def test_rebuildable_volumes(self):
         _run(
             self,

@@ -8373,6 +8373,7 @@ def _coop_tiles_enabled() -> bool:
 # and ``threadgroup == simdgroup`` (no extra smem staging needed).
 _COOP_BLOCK_DIM = 32
 
+_COOP_SCATTER_MASKED_PAT = re.compile(r"\bwp::tile_scatter_masked\s*\(([^;]*)\)\s*;")
 _COOP_TILE_CTOR_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile\s*<")
 _COOP_TILE_REDUCE_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_reduce\s*\(\s*([\w:]+)\s*,\s*var_(\w+)\s*\)")
 _COOP_TILE_OTHER_PAT = re.compile(r"\bwp::tile_(\w+)")
@@ -8600,6 +8601,9 @@ def _coop_block_classify(adj, honest: bool = False) -> _CoopPlan | None:
         if m.group(1) not in ctor_labels and m.group(1) not in tile_vars:
             return None
 
+    # The lane index ``j`` of ``i, j = wp.tid()`` (2-D form only).
+    _lane_m = re.search(r"builtin_tid2d\s*\(\s*var_\w+\s*,\s*var_(\w+)\s*\)", text)
+    lane_label = _lane_m.group(1) if _lane_m else None
     reduce_labels: set[str] = set()
     for raw in lines:
         lhs_m = re.match(r"\s*var_(\w+)\s*=", raw)
@@ -8704,6 +8708,13 @@ def _coop_block_classify(adj, honest: bool = False) -> _CoopPlan | None:
                 distributed.add(lhs)
             elif op in ("zeros", "ones", "full", "arange"):
                 if lhs not in distributed:
+                    return None
+            elif op == "scatter_masked":
+                # ``tile_scatter_masked(t, lane, value, mask)``: each lane
+                # writes its own element of a distributed tile.
+                if len(args) != 4 or _label(args[0]) not in distributed or lane_label is None:
+                    return None
+                if _label(args[1]) != lane_label:
                     return None
             else:
                 return None
@@ -15893,6 +15904,17 @@ def _generate_msl_kernel_uncached(
             # ``_coop_block_eligible`` for the ops that keep them per-lane.
             if (label in _ctor_labels and kind == "register") or dtype_ctype in _SCALAR_CTYPE_TO_MSL:
                 distributed_tiles[label] = _msl_scalar_type(dtype_ctype)
+    if distributed_tiles:
+        # Lane-indexed masked scatter into a distributed tile (only form the
+        # classifier admits): the lane updates its own element.
+        def _repl_coop_scatter(m: re.Match[str]) -> str:
+            args = [a.strip() for a in _split_top_level_args(m.group(1))]
+            t = args[0][len("var_") :] if args[0].startswith("var_") else args[0]
+            if t not in distributed_tiles or len(args) != 4:
+                return m.group(0)
+            return f"if ({args[3]}) {{ var_{t} = ({distributed_tiles[t]})({args[2]}); }}"
+
+        forward_lines = [_COOP_SCATTER_MASKED_PAT.sub(_repl_coop_scatter, ln) for ln in forward_lines]
     # Column-distributed 2-D tiles (``(R, block_dim)``, column ``j`` on lane
     # ``j``): label → (rows, element MSL scalar). Each lane owns an R-vector,
     # declared and translated as an ``(R, 1)`` private tile struct. ``full``
