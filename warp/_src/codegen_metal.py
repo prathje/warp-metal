@@ -6434,6 +6434,15 @@ _MISC_MATH_HELPERS: dict[str, str] = {
     "wp_wrap_index": (
         "template <typename T, typename S>\ninline T wp_wrap_index(T i, S n) { return i < T(0) ? T(i + T(n)) : i; }"
     ),
+    # Thread-local array index: the value goes through a ``volatile`` local
+    # first. Apple's compiler miscompiles a loop-carried index that wraps
+    # negative values into a private array when a second private array is
+    # written in the same loop (metal-port/rev_r3_locals/msl_bug_neg5.metal);
+    # hiding the index value from its range analysis avoids it.
+    "wp_wrap_index_local": (
+        "template <typename T, typename S>\n"
+        "inline T wp_wrap_index_local(T i, S n) { volatile T v = i; T k = v; return k < T(0) ? T(k + T(n)) : k; }"
+    ),
     "wp_frac": ("template <typename T>\ninline T wp_frac(T x) { return x - metal::trunc(x); }"),
     "wp_degrees": ("template <typename T>\ninline T wp_degrees(T x) { return x * T(57.29577951308232087679); }"),
     "wp_radians": ("template <typename T>\ninline T wp_radians(T x) { return x * T(0.01745329251994329577); }"),

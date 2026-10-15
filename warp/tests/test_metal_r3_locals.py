@@ -1021,6 +1021,41 @@ class TestMetalR3Locals(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet, timeout=120)
 
+    def test_fixed_array_loop_carried_negative_index(self):
+        # A loop-carried negative index wrapped into two thread-local arrays
+        # trips an Apple compiler miscompile (plain-MSL reproducer:
+        # metal-port/rev_r3_locals/msl_bug_neg5.metal); the index goes through
+        # a volatile local. The loop-carried ``j`` must also not be folded as
+        # the constant it starts as.
+        snippet = _snippet(
+            """
+            @wp.kernel
+            def k(out: wp.array2d[float], n: int):
+                tid = wp.tid()
+                a = wp.zeros(shape=6, dtype=float)
+                m = wp.zeros(shape=(3, 6), dtype=float)
+                j = int(-1)
+                for i in range(n):
+                    a[j] = a[j] + float(i + 1)
+                    m[(j % 3) - 1, j] = float(i)
+                    j = j - 1
+                    if j < -6:
+                        j = int(-1)
+                for i in range(6):
+                    out[tid, i] = a[i]
+                    out[tid, 6 + i] = m[1, i] + m[2, i] * 10.0 + m[0, i] * 100.0
+
+            def run(dev):
+                o = wp.zeros((64, 12), dtype=float, device=dev)
+                wp.launch(k, 64, [o, 9], device=dev)
+                return (o.numpy(),)
+
+            res = compare(run)
+            np.testing.assert_allclose(res["metal:0"][0][0, :6], [6.0, 5.0, 4.0, 12.0, 10.0, 8.0])
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

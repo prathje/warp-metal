@@ -232,7 +232,19 @@ def fold_local_arrays(
                 return v
         return None
 
+    # Only single-definition locals fold: a loop-carried ``j = int(-1)`` is
+    # later reassigned through ``wp::assign``.
+    _ndefs: dict[str, int] = {}
+    for _n in _iter_leaves(nodes):
+        _r = getattr(_n, "raw", "")
+        for _mm in re.finditer(r"^\s*var_(\w+)\s*=|\bwp::(?:assign|\w+_inplace)\s*\(\s*var_(\w+)", _r):
+            _lbl = _mm.group(1) or _mm.group(2)
+            _ndefs[_lbl] = _ndefs.get(_lbl, 0) + (1 if _mm.group(1) else 2)
+
     def fold_const(raw: str) -> None:
+        _m0 = re.match(r"^\s*var_(\w+)\s*=", raw)
+        if _m0 is None or _ndefs.get(_m0.group(1), 0) != 1:
+            return
         lit = re.match(r"^\s*var_(\w+)\s*=\s*(-?\d+)(?:[uU]?[lL]{0,2}|[lL]{0,2}[uU]?)\s*;\s*$", raw)
         if lit:
             folded[lit.group(1)] = int(lit.group(2))
@@ -311,7 +323,9 @@ def fold_local_arrays(
                     continue
                 terms.append(f"{c} * ({strides[k]})")
                 continue
-            iv = i if (i.startswith("var_") and i[4:] in nonneg) else f"wp_wrap_index({i}, {dim})"
+            # ``wp_wrap_index_local`` launders the index through a volatile
+            # (Apple compiler bug; see its definition in codegen_metal).
+            iv = i if (i.startswith("var_") and i[4:] in nonneg) else f"wp_wrap_index_local({i}, {dim})"
             terms.append(iv if strides[k] == "1" else f"{iv} * {strides[k]}")
         expr = arr.offset
         for t in terms:
