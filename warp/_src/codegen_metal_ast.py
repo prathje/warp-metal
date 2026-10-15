@@ -3342,9 +3342,10 @@ def fold_mesh_get(
             return f"({ln})" if ln is not None else mm.group(0)
 
         new_raw = _MESH_LEN_PAT.sub(_sub_len, _MESH_SHAPE_EXTRACT_PAT.sub(_sub_extract, raw))
-        aliased = field_ptr.keys() | arr.keys() | shape_ptr.keys() | shape_val.keys() | elem_ptr.keys()
+        # Membership per dict: rebuilding the union of all alias keys for
+        # every leaf made this pass quadratic on mesh-heavy kernels.
         for ref in re.findall(r"\bvar_(\w+)\b", new_raw):
-            if ref in aliased:
+            if ref in field_ptr or ref in arr or ref in shape_ptr or ref in shape_val or ref in elem_ptr:
                 raise _metal_codegen_error(
                     f"wp.mesh_get(): unsupported use of a mesh field on Metal (only element reads and "
                     f"shape queries of points/velocities/indices are supported): {raw.strip()!r}"

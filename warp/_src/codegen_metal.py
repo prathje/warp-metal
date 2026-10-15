@@ -1731,7 +1731,9 @@ def _f64_emulate_helpers() -> str:
     L.append("inline bool isinf(wp_f64 a) { return wp_f64_isinf(a); }")
     L.append("inline bool isfinite(wp_f64 a) { return wp_f64_isfinite(a); }")
     for fn in _F64_EMU_FP32_UNARY:
-        L.append(f"inline wp_f64 {fn}(wp_f64 a) {{ return wp_f64_from(metal::precise::{fn}(float(a))); }}")
+        # acos/asin clamp their domain like ``warp/native/builtin.h``.
+        arg = "metal::clamp(float(a), -1.0f, 1.0f)" if fn in ("acos", "asin") else "float(a)"
+        L.append(f"inline wp_f64 {fn}(wp_f64 a) {{ return wp_f64_from(metal::precise::{fn}({arg})); }}")
     for fn in _F64_EMU_FP32_BINARY:
         L.append(
             f"inline wp_f64 {fn}(wp_f64 a, wp_f64 b) "
@@ -3187,6 +3189,21 @@ inline float4 wp_quat_normalize(float4 q) {
     // Reciprocal-then-multiply, NOT q / l — matches ``quat.h`` rounding.
     return (l > 0.0f) ? (q * (1.0f / l)) : float4(0.0f, 0.0f, 0.0f, 1.0f);
 }
+"""
+
+
+# ``wp.acos`` / ``wp.asin`` clamp their argument to [-1, 1] on CPU and CUDA
+# (``warp/native/builtin.h``), so a dot product of unit vectors that rounds
+# to 1.0000001 still yields 0 / pi/2. ``metal::acos`` returns NaN there
+# (Newton's cloth lift force NaN'd every particle). Other operand types
+# (emulated float64) keep their own overloads.
+_ACOS_ASIN_HELPERS = """\
+template <typename T> inline T wp_acos(T x) { return metal::acos(x); }
+template <typename T> inline T wp_asin(T x) { return metal::asin(x); }
+inline float wp_acos(float x) { return metal::acos(metal::clamp(x, -1.0f, 1.0f)); }
+inline float wp_asin(float x) { return metal::asin(metal::clamp(x, -1.0f, 1.0f)); }
+inline half wp_acos(half x) { return half(metal::acos(metal::clamp(float(x), -1.0f, 1.0f))); }
+inline half wp_asin(half x) { return half(metal::asin(metal::clamp(float(x), -1.0f, 1.0f))); }
 """
 
 
@@ -9214,6 +9231,8 @@ def _build_kernel_header(source: str) -> str:
     # ``wp_normalize`` internally (mirroring native code's guarded
     # ``normalize``), so it must precede all of them.
     parts.append(_NORMALIZE_HELPERS)
+    if "wp_acos" in source or "wp_asin" in source:
+        parts.append(_ACOS_ASIN_HELPERS)
     # The quat/transform adjoint bodies call the forward ``wp_quat_rotate`` /
     # ``wp_quat_inverse`` / ``wp_transform_get_*``, so the forward blocks are
     # pulled in whenever their adjoints are needed — not just when the kernel
@@ -10895,6 +10914,9 @@ for _name in _MATH_BUILTIN_NAMES:
         # ``metal::length`` covers the native widths only; the big-vec
         # structs get their own overload next to each struct definition.
         _INTRINSIC_PATTERNS.append((re.compile(rf"\bwp::{_name}\b"), "wp_length"))
+    elif _name in ("acos", "asin"):
+        # Clamped domain like native Warp (see ``_ACOS_ASIN_HELPERS``).
+        _INTRINSIC_PATTERNS.append((re.compile(rf"\bwp::{_name}\b"), f"wp_{_name}"))
     elif _name == "transpose":
         # ``metal::transpose`` only knows native ``floatRxC``; non-square
         # Warp matrices are our row-major structs (see ``_msl_mat_name``),
@@ -12860,23 +12882,26 @@ def _translate_tile_intrinsics(
         if in_n == 1:
             # Single-element source broadcast across the target tile.
             return f"{{ for (int _bc_i = 0; _bc_i < {l_n}; ++_bc_i) var_{lhs}.c[_bc_i] = var_{in_label}.c[0]; }}"
-        # Cases:
-        #   (a) Source is 1-D (in_cols == 1), target is 2-D — repeat
-        #       source along target's outer dim ``r``: var_X.c[r*l_cols
-        #       + c] = var_Y.c[c].
-        #   (b) Source is 2-D, target is 2-D, target rows == 1 — collapse.
-        # We support (a); fall back to identity for other shapes.
-        if in_cols == 1 and in_label in tile_2d_labels and in_rows == l_rows:
-            # A genuine 2-D ``(R, 1)`` column (not a 1-D ``(R,)`` tile,
-            # which shares the storage shape) repeats along the columns:
-            # ``X[r, c] = Y[r]``. With a square target the 1-D rule below
-            # would silently transpose it (warp_nn's RNN/GRU bias add).
+        # Cases (numpy broadcasting aligns trailing dims):
+        #   (a) Source is 1-D ``(C,)`` (``in_cols == 1``, not a 2-D tile),
+        #       target ``(R, C)`` — repeat the source along the target's
+        #       outer dim: var_X.c[r*l_cols + c] = var_Y.c[c].
+        #   (b) Source is a 2-D column ``(R, 1)``, target ``(R, C)`` —
+        #       repeat each row value across the columns:
+        #       var_X.c[r*l_cols + c] = var_Y.c[r].
+        #   (c) Source is a 2-D row ``(1, C)`` — as (a).
+        # A 2-D ``(R, 1)`` tile and a 1-D ``(R,)`` tile share ``tile_var_dims``
+        # (``tile_2d_labels`` tells them apart); taking (a) for a column
+        # broadcast added a bias column to only the first output column
+        # (warp_nn ``Linear``, Newton's ``DriveNeuralMLP``).
+        src_2d = in_label in tile_2d_labels
+        if src_2d and in_cols == 1 and in_rows == l_rows:
             return (
                 f"{{ for (int _bc_r = 0; _bc_r < {l_rows}; ++_bc_r) "
                 f"for (int _bc_c = 0; _bc_c < {l_cols}; ++_bc_c) "
                 f"var_{lhs}.c[_bc_r * {l_cols} + _bc_c] = var_{in_label}.c[_bc_r]; }}"
             )
-        if in_cols == 1 and in_rows == l_cols:
+        if not src_2d and in_cols == 1 and in_rows == l_cols:
             # Source shape (l_cols, 1) tiled along ``r``.
             return (
                 f"{{ for (int _bc_r = 0; _bc_r < {l_rows}; ++_bc_r) "
@@ -12890,8 +12915,12 @@ def _translate_tile_intrinsics(
                 f"for (int _bc_c = 0; _bc_c < {l_cols}; ++_bc_c) "
                 f"var_{lhs}.c[_bc_r * {l_cols} + _bc_c] = var_{in_label}.c[_bc_c]; }}"
             )
-        # Unrecognised — leave identity as a safe fallback.
-        return f"var_{lhs} = var_{in_label}"
+        # Anything else would need a broadcast this lowering does not
+        # implement; an identity copy would silently read the wrong elements.
+        raise MetalCodegenError(
+            f"MSL codegen: tile_broadcast from shape {(in_rows, in_cols)} to {(l_rows, l_cols)} "
+            f"is not supported on Metal ({m.group(0)!r})"
+        )
 
     line = _TILE_BROADCAST_PAT.sub(_repl_tile_broadcast, line)
 
@@ -13972,6 +14001,9 @@ _FOR_LOOP_LINE_PAT = re.compile(
 # Matches lines that introduce a compile-time int constant — used to
 # resolve a step expression like ``var_2__49`` to the literal ``-16``.
 _CONST_INT_DECL_PAT = re.compile(r"^\s*const int var_(\w+) = (-?\d+);\s*$")
+# Every ``var_<name>`` reference on a line (``<name>`` as ``\bvar_<name>\b``
+# would match it).
+_VAR_REF_PAT = re.compile(r"\bvar_(\w+)")
 
 
 def _fix_negative_step_for_loops(
@@ -14081,33 +14113,52 @@ def _materialize_for_loop_vars(lines: list[str]) -> list[str]:
     one assigned, as on CPU; loops whose variable dies with the loop are
     left alone.
     """
-    out = list(lines)
-    n_it = 0
-    i = 0
-    while i < len(out):
-        m = _FOR_LOOP_LINE_PAT.match(out[i])
-        if m is None:
-            i += 1
-            continue
+    # Decide on the input lines, then rewrite. Each rewrite only moves
+    # ``var_<iv>`` from the loop header into the line right after it,
+    # both inside the loop itself, so "is ``var_<iv>`` read after the
+    # loop's closing brace?" has the same answer before and after earlier
+    # rewrites. Answering it from a last-use index keeps the pass linear:
+    # rescanning the tail of the kernel per loop was quadratic and took
+    # minutes on large inlined kernels (Newton's narrow phase).
+    loops = []
+    for i, ln in enumerate(lines):
+        if "for (var_" in ln:
+            m = _FOR_LOOP_LINE_PAT.match(ln)
+            if m is not None:
+                loops.append((i, m))
+    if not loops:
+        return list(lines)
+    last_use: dict[str, int] = {}
+    for j, ln in enumerate(lines):
+        if "var_" in ln:
+            for name in _VAR_REF_PAT.findall(ln):
+                last_use[name] = j
+    rewrite: dict[int, re.Match[str]] = {}
+    for i, m in loops:
         depth = 0
         close = None
-        for j in range(i, len(out)):
-            depth += out[j].count("{") - out[j].count("}")
+        for j in range(i, len(lines)):
+            depth += lines[j].count("{") - lines[j].count("}")
             if depth <= 0:
                 close = j
                 break
-        iv = m.group("iv")
-        if close is None or not any(re.search(rf"\bvar_{iv}\b", ln) for ln in out[close + 1 :]):
-            i += 1
+        if close is not None and last_use.get(m.group("iv"), -1) > close:
+            rewrite[i] = m
+    out: list[str] = []
+    n_it = 0
+    for i, ln in enumerate(lines):
+        m = rewrite.get(i)
+        if m is None:
+            out.append(ln)
             continue
+        iv = m.group("iv")
         it = f"wp_for_it{n_it}"
         n_it += 1
-        cmp_op = ">" if re.search(rf"var_{iv} > ", out[i]) else "<"
+        cmp_op = ">" if re.search(rf"var_{iv} > ", ln) else "<"
         step = m.group("step")
         inc = f"++{it}" if step is None else f"{it} += {step}"
-        out[i] = f"{m.group('indent')}for (int {it} = {m.group('start')}; {it} {cmp_op} {m.group('stop')}; {inc}) {{"
-        out.insert(i + 1, f"{m.group('indent')}var_{iv} = {it};")
-        i += 2
+        out.append(f"{m.group('indent')}for (int {it} = {m.group('start')}; {it} {cmp_op} {m.group('stop')}; {inc}) {{")
+        out.append(f"{m.group('indent')}var_{iv} = {it};")
     return out
 
 
@@ -14466,7 +14517,16 @@ _ELEM_FIELD_ADDR_PAT = re.compile(
 )
 _ADJ_FIELD_ZERO_PAT = re.compile(r"^(?P<indent>\s*)adj_(?P<root>\w+)(?P<path>(?:\.\w+)+)\s*=\s*\{\s*\}\s*;\s*$")
 _STRUCT_FIELD_DUAL_ZERO_CALL = "wp::__metal_struct_field_dual_zero"
+# Numbering of the synthetic pointer temps. ``_normalize_adj_ir`` restarts
+# it for every adjoint (after any ``mtp`` label already in its IR), so the
+# normalised IR — which the artifact cache key hashes — does not depend on
+# how many other kernels this process normalised before. A process-wide
+# counter made the key depend on test order: the same kernel missed the
+# cache in every process that built its kernels in another order.
+# Uniqueness is only needed within one adjoint: the inliners mangle the
+# temps of every spliced callee body (``_SYNTH_TMP_PAT``).
 _METAL_TMP_COUNTER = [0]
+_MTP_LABEL_PAT = re.compile(r"\bvar_mtp(\d+)\b")
 
 
 def _metal_tmp_label() -> str:
@@ -14576,18 +14636,35 @@ def _normalize_adj_ir(adj, seen=None) -> None:
     if id(adj) in seen:
         return
     seen.add(id(adj))
-    # Idempotent, so re-running it on already-normalised IR is harmless.
-    # ``body_reverse`` is stored in forward order but consumed reversed (and
-    # loop recompute blocks are spliced in pre-reversed), so normalise it in
-    # consumption order to keep multi-line expansions correctly ordered.
-    for block in getattr(adj, "blocks", None) or ():
-        for attr in ("body_forward", "body_replay"):
-            lines = getattr(block, attr, None)
+    blocks = getattr(adj, "blocks", None)
+    # Idempotent, so re-running it on already-normalised IR is harmless —
+    # but it runs for every inlined call of a function and recursively for
+    # its callees, so skip blocks normalised before. ``Adjoint.build``
+    # replaces ``adj.blocks`` with a fresh list, which invalidates this.
+    if blocks and not (
+        getattr(adj, "_metal_normalized_blocks", None) is blocks and adj._metal_normalized_n == len(blocks)
+    ):
+        start = 0
+        for block in blocks:
+            for attr in ("body_forward", "body_replay", "body_reverse"):
+                for ln in getattr(block, attr, None) or ():
+                    if "mtp" in ln:
+                        for n in _MTP_LABEL_PAT.findall(ln):
+                            start = max(start, int(n))
+        _METAL_TMP_COUNTER[0] = start
+        # ``body_reverse`` is stored in forward order but consumed reversed (and
+        # loop recompute blocks are spliced in pre-reversed), so normalise it in
+        # consumption order to keep multi-line expansions correctly ordered.
+        for block in blocks:
+            for attr in ("body_forward", "body_replay"):
+                lines = getattr(block, attr, None)
+                if lines:
+                    lines[:] = _normalize_ir_lines(list(lines))
+            lines = getattr(block, "body_reverse", None)
             if lines:
-                lines[:] = _normalize_ir_lines(list(lines))
-        lines = getattr(block, "body_reverse", None)
-        if lines:
-            lines[:] = list(reversed(_normalize_ir_lines(list(reversed(lines)))))
+                lines[:] = list(reversed(_normalize_ir_lines(list(reversed(lines)))))
+        adj._metal_normalized_blocks = blocks
+        adj._metal_normalized_n = len(blocks)
     for func in getattr(adj, "called_user_functions", None) or ():
         func_adj = getattr(func, "adj", None)
         if func_adj is not None:
@@ -16205,12 +16282,9 @@ def _generate_msl_kernel_uncached(
             # FK reads parent slots from a table indexed by the lane).
             if re.match(r"(?:\(\s*)?(?:&\s*)?wp::(?:address|view|load|index|array_load)\b", rhs.strip()):
                 continue
-            # Whole-token match: a substring test made ``var_1`` taint
-            # ``var_12`` and, with one probe per tainted label, went
-            # quadratic on Newton's ~200k-line narrow-phase kernel.
-            if "builtin_block_dim" in rhs or (
-                _bd_tainted and not _bd_tainted.isdisjoint(re.findall(r"\bvar_(\w+)\b", rhs))
-            ):
+            # Whole-name set lookups: a substring test per tainted label was
+            # quadratic and let ``var_1`` taint ``var_12``.
+            if "builtin_block_dim" in rhs or (_bd_tainted and not _bd_tainted.isdisjoint(_VAR_REF_PAT.findall(rhs))):
                 _bd_tainted.add(m_def.group(1))
         if _bd_tainted:
             for raw in forward_lines:
@@ -18739,7 +18813,9 @@ def _generate_msl_kernel_uncached(
 # closure-kernel instantiations previously collided (same kernel.key,
 # args, and IR statements; different baked ``const`` declarations).
 # v11: native packed arrays go bindless (``ptr_table`` / ``__arg_ptrs``).
-_ARTIFACT_CACHE_VERSION = 16
+# v17: Warp's deep kernel content hash joins the key (callee closures), and
+# user-function native names in the hashed body are canonicalised.
+_ARTIFACT_CACHE_VERSION = 17
 _codegen_source_hash_cached: str | None = None
 
 
@@ -18764,6 +18840,14 @@ def _codegen_source_hash() -> str:
 _artifact_cache_swept = False
 
 
+# Sibling salt directories touched within this window are kept: several
+# checkouts with different codegen sources (worktrees, a dev build next to
+# an installed one) share one kernel cache directory, and sweeping on sight
+# made each process wipe the others' artifacts, so they all fell back to
+# minutes-long re-translation of large kernels.
+_ARTIFACT_SWEEP_GRACE_S = 24 * 3600
+
+
 def _sweep_stale_artifact_dirs(base: str, keep: str) -> None:
     """Delete artifact subdirectories from other codegen versions (and
     loose ``.pkl`` files from the old flat layout) under ``base``.
@@ -18772,24 +18856,56 @@ def _sweep_stale_artifact_dirs(base: str, keep: str) -> None:
     source, so entries outside the current salt directory can never be
     read again — without this sweep the cache grew without bound
     (observed at 226 MB / 13k orphaned pickles after a dev cycle).
-    Best-effort: a concurrent process on a different codegen version
-    just regenerates its artifacts.
+    Entries modified within ``_ARTIFACT_SWEEP_GRACE_S`` may belong to a
+    concurrently used checkout and are kept; the current salt directory is
+    touched so others see it as live.
     """
     import shutil  # noqa: PLC0415
+    import time  # noqa: PLC0415
 
+    try:
+        os.makedirs(os.path.join(base, keep), exist_ok=True)
+        os.utime(os.path.join(base, keep))
+    except OSError:
+        pass
     try:
         entries = os.listdir(base)
     except OSError:
         return
+    now = time.time()
     for name in entries:
         if name == keep:
             continue
         path = os.path.join(base, name)
         try:
+            if now - os.path.getmtime(path) < _ARTIFACT_SWEEP_GRACE_S:
+                continue
             if os.path.isdir(path):
                 shutil.rmtree(path, ignore_errors=True)
             else:
                 os.unlink(path)
+        except OSError:
+            pass
+
+
+_artifact_salt_touched_at = 0.0
+
+
+def _touch_artifact_salt_dir(key: str) -> None:
+    """Refresh the current salt directory's mtime (at most hourly) so a
+    long-running process that only ever hits the cache is not swept by
+    another checkout as stale (see ``_ARTIFACT_SWEEP_GRACE_S``)."""
+    global _artifact_salt_touched_at
+    import time  # noqa: PLC0415
+
+    now = time.time()
+    if now - _artifact_salt_touched_at < 3600:
+        return
+    _artifact_salt_touched_at = now
+    path = _artifact_cache_path(key)
+    if path is not None:
+        try:
+            os.utime(os.path.dirname(path))
         except OSError:
             pass
 
@@ -18817,12 +18933,61 @@ def _artifact_cache_path(key: str) -> str | None:
     return os.path.join(base, salt, f"{key}.pkl")
 
 
+def _kernel_content_hash(kernel) -> str:
+    """Warp's deep content hash of ``kernel``: its source, argument types,
+    and — recursively — every referenced ``@wp.func``, constant and
+    ``wp.static`` value (``ModuleHasher._hash_kernel_identity``, the identity
+    the CUDA/CPU module cache uses).
+
+    The IR body alone does not cover inlined callees: two factory-made
+    kernels whose only difference sits in a called closure function (say a
+    ``wp.static(flag)`` branch) have identical kernel IR, so processes that
+    created only one of them each shared the other's cached artifact.
+    """
+    import hashlib  # noqa: PLC0415
+
+    from warp._src.context import ModuleHasher  # noqa: PLC0415
+
+    # Only the side-effect-free per-kernel part: ``ModuleHasher.__init__``
+    # and ``hash_kernel`` also write ``kernel.grid_stride``/``kernel.hash``.
+    hasher = ModuleHasher.__new__(ModuleHasher)
+    hasher.function_hashes = {}
+    hasher.functions_in_progress = set()
+    ch = hashlib.sha256()
+    hasher._hash_kernel_identity(ch, kernel)
+    return ch.hexdigest()
+
+
+def _canonical_user_call_names(body: str, adj) -> str:
+    """Replace the native names of user functions called in ``body`` with
+    first-use-ordered placeholders.
+
+    Warp suffixes the native name of a function created again under an
+    existing key (factory closures: ``..._admit_0``, ``..._admit_1``), so
+    a kernel rebuilt by a later factory call had different IR text and
+    missed the artifact cache. Callee content is covered by
+    ``_kernel_content_hash``.
+    """
+    names = {getattr(f, "native_func", None) for f in (getattr(adj, "called_user_functions", None) or ())}
+    names.discard(None)
+    if not names:
+        return body
+    pat = re.compile(r"\b(" + "|".join(re.escape(n) for n in sorted(names, key=len, reverse=True)) + r")\b")
+    order: dict[str, str] = {}
+
+    def repl(m: re.Match[str]) -> str:
+        return order.setdefault(m.group(1), f"__wp_user_fn_{len(order)}")
+
+    return pat.sub(repl, body)
+
+
 def _artifact_cache_key(kernel, adj) -> str | None:
     """Cache key over everything the generated artifact depends on."""
     import hashlib  # noqa: PLC0415
 
     try:
-        body = "\n".join(adj.blocks[0].body_forward)
+        content_hash = _kernel_content_hash(kernel)
+        body = _canonical_user_call_names("\n".join(adj.blocks[0].body_forward), adj)
         arg_sig = ";".join(f"{a.label}:{a.ctype()}" for a in adj.args)
         # Closure-generated kernels (e.g. mujoco_warp's ``@wp.kernel``
         # factories) can share ``kernel.key``, arg signature, AND
@@ -18847,6 +19012,7 @@ def _artifact_cache_key(kernel, adj) -> str | None:
         warp.config.version,
         _codegen_source_hash(),
         kernel.key,
+        content_hash,
         arg_sig,
         str(opts.get("block_dim")),
         str(opts.get("output_arch")),
@@ -18951,11 +19117,89 @@ def _store_cached_artifact(key: str, artifact: MetalKernelArtifact) -> None:
         pass
 
 
+# Codegen failures are cached too (per process, and on disk as a
+# ``<key>.err`` entry next to the artifacts). A kernel the translator
+# rejects is rejected deterministically for a given cache key, but the
+# rejection can come minutes into translating a large inlined kernel
+# (Newton's narrow phase), and without a negative entry every launch —
+# every test, every process — paid that again before failing.
+
+
+def _codegen_failure_types() -> tuple[type[Exception], ...]:
+    from warp._src.codegen_metal_ast import MetalASTParseError  # noqa: PLC0415
+
+    return (MetalCodegenError, MetalASTParseError)
+
+
+def _rebuild_codegen_failure(type_name: str, message: str) -> Exception | None:
+    for exc_type in _codegen_failure_types():
+        if exc_type.__name__ == type_name:
+            return exc_type(message)
+    return None
+
+
+_failed_codegen_keys: dict[str, tuple[str, str]] = {}
+
+
+def _load_cached_failure(key: str) -> Exception | None:
+    """Return a fresh copy of the error a previous translation of ``key``
+    raised (this process first, then the on-disk cache), or ``None``.
+    ``WARP_METAL_DISABLE_ARTIFACT_CACHE=1`` disables both."""
+    if os.environ.get("WARP_METAL_DISABLE_ARTIFACT_CACHE") == "1":
+        return None
+    hit = _failed_codegen_keys.get(key)
+    if hit is not None:
+        return _rebuild_codegen_failure(*hit)
+    path = _artifact_cache_path(key)
+    if path is None:
+        return None
+    path = path[: -len(".pkl")] + ".err"
+    if not os.path.exists(path):
+        return None
+    import json  # noqa: PLC0415
+
+    try:
+        with open(path, encoding="utf-8") as f:
+            payload = json.load(f)
+        return _rebuild_codegen_failure(payload["type"], payload["message"])
+    except Exception:
+        return None
+
+
+def _store_cached_failure(key: str, exc: Exception) -> None:
+    if os.environ.get("WARP_METAL_DISABLE_ARTIFACT_CACHE") == "1":
+        return
+    _failed_codegen_keys[key] = (type(exc).__name__, str(exc))
+    path = _artifact_cache_path(key)
+    if path is None:
+        return
+    path = path[: -len(".pkl")] + ".err"
+    import json  # noqa: PLC0415
+    import tempfile  # noqa: PLC0415
+
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(path), suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump({"type": type(exc).__name__, "message": str(exc)}, f)
+            os.replace(tmp_path, path)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+    except Exception:
+        pass
+
+
 def generate_msl_kernel(
     kernel, block_dim: int | None = None, adjoint: bool = False, grad_args: tuple[str, ...] = ()
 ) -> MetalKernelArtifact:
     """Return the MSL artifact for a Warp ``Kernel``, using the on-disk
-    cache when possible.
+    cache when possible. Translation failures are cached as well (see
+    ``_load_cached_failure``).
 
     ``block_dim`` is the launch's block width — it decides whether the IR
     is rebuilt for the distributed-tile path (see ``_ensure_adj_built``).
@@ -18976,10 +19220,19 @@ def generate_msl_kernel(
     if key is not None:
         cached = _load_cached_artifact(key, adj)
         if cached is not None:
+            _touch_artifact_salt_dir(key)
             if cached.has_print:
                 _handle_metal_print(adj.fun_name)
             return cached
-    artifact = _generate_msl_kernel_uncached(kernel, adjoint=adjoint, grad_args=grad_args)
+        failed = _load_cached_failure(key)
+        if failed is not None:
+            raise failed
+    try:
+        artifact = _generate_msl_kernel_uncached(kernel, adjoint=adjoint, grad_args=grad_args)
+    except _codegen_failure_types() as exc:
+        if key is not None:
+            _store_cached_failure(key, exc)
+        raise
     if key is not None:
         _store_cached_artifact(key, artifact)
     return artifact

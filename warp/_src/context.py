@@ -5509,8 +5509,9 @@ def _metal_get_buffer(ptr: int):
 
 def _metal_release_buffer(ptr: int) -> None:
     with _metal_buffer_lock:
-        _metal_buffer_registry.pop(ptr, None)
+        released = _metal_buffer_registry.pop(ptr, None)
         _metal_unindex_buffer(ptr)
+    _metal_unmark_shared_buffer(released)
 
 
 # Foreign (externally owned) Metal buffers — e.g. a Torch MPS tensor's
@@ -5520,6 +5521,29 @@ def _metal_release_buffer(ptr: int) -> None:
 _metal_foreign_refcounts: dict[int, int] = {}
 
 
+def _metal_mark_shared_buffer(mtl_buf) -> None:
+    """Tell the native dispatcher that ``mtl_buf`` is also used from another
+    framework's command queue (Torch / DLPack interop), so launches binding
+    it are committed immediately instead of batched (see
+    ``MetalDispatcher._shared_ids``)."""
+    if mtl_buf is None or not warp.config.metal_native_dispatch:
+        return
+    from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
+
+    get_dispatcher().mark_shared(mtl_buf)
+
+
+def _metal_unmark_shared_buffer(mtl_buf) -> None:
+    if mtl_buf is None:
+        return
+    # No import here: this runs from array finalizers, also during
+    # interpreter shutdown when imports fail.
+    _md = sys.modules.get("warp._src.metal_dispatch")
+    disp = getattr(_md, "_dispatcher_singleton", None) if _md is not None else None
+    if disp is not None:
+        disp.unmark_shared(mtl_buf)
+
+
 def _metal_register_foreign_buffer(ptr: int, owner) -> None:
     with _metal_buffer_lock:
         if ptr in _metal_buffer_registry and ptr not in _metal_foreign_refcounts:
@@ -5527,12 +5551,17 @@ def _metal_register_foreign_buffer(ptr: int, owner) -> None:
             # array round-tripped through an external framework and wrapped
             # back). The allocator entry outlives any foreign wrapper —
             # leave it alone so releasing the wrapper can't unregister it.
-            return
-        n = _metal_foreign_refcounts.get(ptr, 0)
-        _metal_foreign_refcounts[ptr] = n + 1
-        if n == 0:
-            _metal_buffer_registry[ptr] = owner
-            _metal_index_buffer(ptr, owner)
+            shared = _metal_buffer_registry[ptr]
+        else:
+            n = _metal_foreign_refcounts.get(ptr, 0)
+            _metal_foreign_refcounts[ptr] = n + 1
+            if n == 0:
+                _metal_buffer_registry[ptr] = owner
+                _metal_index_buffer(ptr, owner)
+            shared = _metal_buffer_registry[ptr]
+    _metal_mark_shared_buffer(shared)
+    if shared is not owner:
+        _metal_mark_shared_buffer(owner)
 
 
 def _metal_release_foreign_buffer(ptr: int) -> None:
@@ -5545,8 +5574,9 @@ def _metal_release_foreign_buffer(ptr: int) -> None:
             _metal_foreign_refcounts[ptr] = n - 1
             return
         _metal_foreign_refcounts.pop(ptr, None)
-        _metal_buffer_registry.pop(ptr, None)
+        released = _metal_buffer_registry.pop(ptr, None)
         _metal_unindex_buffer(ptr)
+        _metal_unmark_shared_buffer(released)
         objc_id = _metal_private_owners.pop(ptr, None)
         if objc_id is not None:
             _metal_private_keys.pop(objc_id, None)
@@ -5610,6 +5640,7 @@ def _metal_register_private_buffer(objc_id: int, mtl_buf) -> int:
         if n == 0:
             _metal_buffer_registry[ptr] = mtl_buf
             _metal_index_buffer(ptr, mtl_buf)
+    _metal_mark_shared_buffer(_metal_buffer_registry.get(ptr, mtl_buf))
     return ptr
 
 
@@ -5668,14 +5699,25 @@ def _metal_find_buffer(ptr: int):
 
 
 def _metal_host_memset(ptr, value, nbytes):
-    """``wp_memset_host`` for Metal arrays: drains queued GPU work first
-    (unified memory — a pending kernel write would land after the host op),
-    and inside an ICB recording records a device-side fill instead so the
-    op replays with the captured graph."""
+    """``wp_memset_host`` for Metal arrays.
+
+    Inside an ICB recording, or for a private-storage buffer, it records a
+    device-side fill so the op replays with the captured graph. With GPU
+    work still queued it also fills on the device: the fill orders after
+    the queued kernels on the same queue, where a host memset would first
+    have to drain them (``sync()``) — one GPU round trip per ``zero_()``,
+    tens of thousands per Newton VBD test. With nothing queued, the host
+    memset is immediate.
+    """
     if warp.config.metal_native_dispatch:
         from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
 
         disp = get_dispatcher()
+        if disp.has_pending_work() and disp._record_state is None and not _metal_is_private_ptr(ptr):
+            buf, off = _metal_find_buffer(ptr) if ptr and nbytes > 0 else (None, 0)
+            if buf is not None:
+                disp.device_fill(buf, value, nbytes, offset=off)
+                return True
         if disp._record_state is not None or _metal_is_private_ptr(ptr):
             if not ptr or nbytes <= 0:
                 return True
@@ -5692,12 +5734,17 @@ def _metal_host_memset(ptr, value, nbytes):
 
 
 def _metal_host_memtile(ptr, src_ptr, srcsize, reps):
-    """``wp_memtile_host`` for Metal arrays — same drain/record policy as
-    :func:`_metal_host_memset`."""
+    """``wp_memtile_host`` for Metal arrays — same device-fill / drain /
+    record policy as :func:`_metal_host_memset`."""
     if warp.config.metal_native_dispatch:
         from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
 
         disp = get_dispatcher()
+        if disp.has_pending_work() and disp._record_state is None and not _metal_is_private_ptr(ptr):
+            buf, off = _metal_find_buffer(ptr) if ptr and srcsize > 0 and reps > 0 else (None, 0)
+            if buf is not None:
+                disp.device_memtile(buf, ctypes.string_at(src_ptr, srcsize), reps, offset=off)
+                return None
         if disp._record_state is not None or _metal_is_private_ptr(ptr):
             if not ptr or srcsize <= 0 or reps <= 0:
                 return None
