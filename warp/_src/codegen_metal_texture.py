@@ -106,6 +106,66 @@ def struct_field_read(msl: str, buf: str, base: str) -> str:
     return f"{msl}{{((ulong({hi}) << 32) | ulong({lo})), {ints}}}"
 
 
+_FIELD_PTR_PAT = re.compile(r"^\s*var_(?P<ptr>\w+)\s*=\s*&\s*\(\s*var_(?P<tex>\w+)\s*\.\s*(?P<field>\w+)\s*\)\s*;\s*$")
+_LOAD_PAT = re.compile(r"^(?P<indent>\s*)var_(?P<lhs>\w+)\s*=\s*wp::load\s*\(\s*var_(?P<ptr>\w+)\s*\)\s*;\s*$")
+_FIELDS = {
+    "wp_texture1d_t": ("width", "num_channels", "dtype"),
+    "wp_texture2d_t": ("width", "height", "num_channels", "dtype"),
+    "wp_texture3d_t": ("width", "height", "depth", "num_channels", "dtype"),
+}
+
+
+def texture_labels(adj, var_ctypes: dict[str, str]) -> dict[str, str]:
+    """``{label: msl struct}`` of the kernel's texture-valued args and locals."""
+    out: dict[str, str] = {}
+    for a in adj.args:
+        info = texture_class_info(a.type)
+        if info is not None:
+            out[str(a.label)] = info[1]
+    for lbl, ct in var_ctypes.items():
+        msl = msl_var_type(ct) if ct else None
+        if msl is not None:
+            out[str(lbl)] = msl
+    return out
+
+
+def fold_field_reads(lines: list[str], tex: dict[str, str], kname: str) -> list[str]:
+    """``p = &(t.width); x = wp::load(p)`` on a texture value -> ``x = t.width``.
+
+    Warp reads a texture's geometry (``t.width``, ``t.height``, ...) through a
+    field address; the value structs here are plain MSL structs, so the read
+    becomes a member access. Any other use of such an address raises.
+    """
+    if not tex or not any("&" in ln for ln in lines):
+        return lines
+    from warp._src.codegen_metal import MetalCodegenError  # noqa: PLC0415
+
+    ptrs: dict[str, str] = {}
+    out: list[str] = []
+    for ln in lines:
+        m = _FIELD_PTR_PAT.match(ln)
+        if m and m.group("tex") in tex:
+            field = m.group("field")
+            if field not in _FIELDS[tex[m.group("tex")]]:
+                raise MetalCodegenError(
+                    f"Kernel {kname!r}: texture field {field!r} is not available on Metal (line: {ln.strip()})"
+                )
+            ptrs[m.group("ptr")] = f"var_{m.group('tex')}.{field}"
+            continue
+        if ptrs:
+            m = _LOAD_PAT.match(ln)
+            if m and m.group("ptr") in ptrs:
+                out.append(f"{m.group('indent')}var_{m.group('lhs')} = {ptrs[m.group('ptr')]};")
+                continue
+            for p in ptrs:
+                if re.search(rf"\bvar_{re.escape(p)}\b", ln):
+                    raise MetalCodegenError(
+                        f"Kernel {kname!r}: a texture's fields are read-only on Metal (line: {ln.strip()})"
+                    )
+        out.append(ln)
+    return out
+
+
 _SAMPLE_PAT = re.compile(r"\bwp::texture_sample\s*<\s*([^;]*?)\s*>\s*\(")
 
 
@@ -140,6 +200,17 @@ def translate(line: str) -> str:
 
 def uses_textures(source: str) -> bool:
     return "wp_tex_sample_" in source or "wp_texture" in source
+
+
+def kernel_uses_textures(adj) -> bool:
+    """Whether a kernel takes a texture value or an array of them (its MSL
+    signature names the ``wp_texture*_t`` structs even when the body does
+    not)."""
+    for a in adj.args:
+        t = a.type
+        if texture_class_info(t) is not None or texture_class_info(getattr(t, "dtype", None)) is not None:
+            return True
+    return False
 
 
 # The CPU sampler (texture.h, built by the host compiler) evaluates

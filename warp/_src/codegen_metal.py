@@ -15808,6 +15808,12 @@ def _generate_msl_kernel_uncached(
     forward_lines = _fix_negative_step_for_loops(forward_lines, adj=adj, extra_const_ints=_inlined_const_ints)
     # A loop variable read after its loop keeps its last iteration value.
     forward_lines = _materialize_for_loop_vars(forward_lines)
+    # ``t.width`` etc. on texture values.
+    forward_lines = _mtex.fold_field_reads(
+        forward_lines,
+        _mtex.texture_labels(adj, {**{str(_v.label): _v.ctype() for _v in adj.variables}, **_inlined_var_ctypes}),
+        adj.fun_name,
+    )
     # ``wp.array(ptr=...)`` locals -> device pointer + shape locals.
     forward_lines, _ptr_array_skip, ptr_array_labels, ptr_array_roots = _lower_pointer_arrays(
         forward_lines,
@@ -19283,6 +19289,10 @@ def _generate_msl_kernel_uncached(
     # but their type is never spelled in the body, so the header scan would
     # miss the struct / extract helpers they need. Name them for the scan.
     _value_param_types = " ".join(t for t in (_value_param_msl_type(a) for a in input_args) if t)
+    if _mtex.kernel_uses_textures(adj):
+        # Texture params / texture arrays name ``wp_texture*_t`` in the
+        # signature only.
+        _value_param_types += " wp_texture"
     header = _build_kernel_header(source + ("\n" + _value_param_types if _value_param_types else ""))
     if "WP_NATIVE_BLOCK_SYNC" in header or (coop_block_n == 0 and "WP_TILE_" in header):
         header = (_NATIVE_SYNC_COOP if coop_block_n > 0 else _NATIVE_SYNC_SERIAL) + header
@@ -19348,6 +19358,7 @@ def _generate_msl_kernel_uncached(
             or "wp_volume_" in source
             or _mtiles.source_uses_bvh(source)
             or _mtex.uses_textures(source)
+            or _mtex.kernel_uses_textures(adj)
         ),
         # NB: ``builtin_block_dim`` is checked on the kernel's own IR — a
         # ``wp.block_dim()`` buried in a non-inlined wp.func would be
@@ -20657,6 +20668,11 @@ def _array_view_dtype_and_shape(value):
     if isinstance(dtype, Struct):
         layout = _struct_layout_for(dtype)
         return mx.float32, (*value.shape, layout.scalars_per_elem)
+    if _mtex.texture_class_info(dtype) is not None:
+        # ``texture*_t`` value structs, viewed as their 32-bit words.
+        import ctypes  # noqa: PLC0415
+
+        return mx.uint32, (*value.shape, ctypes.sizeof(dtype._wp_ctype_) // 4)
     return _wp_dtype_to_mx_dtype(dtype), value.shape
 
 
@@ -20967,6 +20983,11 @@ def _native_array_inner_msl(arg_var) -> str:
         # Structs are exposed to the kernel as flat float32 storage —
         # the codegen rewrites field accesses to per-scalar indices.
         return "float"
+    tex_info = _mtex.texture_class_info(dtype)
+    if tex_info is not None:
+        # ``wp.array[wp.Texture2D]``: elements are the ``texture*_t`` value
+        # structs (descriptor gpuAddress + geometry), same layout in MSL.
+        return tex_info[1]
     scalar_ctype = f"wp::{dtype.__name__}"
     return _native_scalar_msl_type(scalar_ctype)
 

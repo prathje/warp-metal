@@ -329,6 +329,49 @@ class TestMetalR3Tiles(unittest.TestCase):
             """,
         )
 
+    def test_texture_array_args_and_fields(self):
+        # ``wp.array[wp.Texture2D]`` kernel args (mujoco_warp's renderer) and
+        # ``t.width`` / ``t.height`` reads on texture params, array elements
+        # and struct fields.
+        _run(
+            self,
+            """
+            @wp.kernel
+            def k(textures: wp.array[wp.Texture2D], ids: wp.array[int], uv: wp.array[wp.vec2],
+                  out: wp.array[wp.vec4]):
+                i = wp.tid()
+                t = textures[ids[i]]
+                out[i] = wp.texture_sample(t, uv[i], dtype=wp.vec4) + wp.vec4(float(t.width), float(t.height), 0.0, 0.0)
+
+            @wp.struct
+            class S:
+                t: wp.Texture2D
+
+            @wp.kernel
+            def dims(t: wp.Texture2D, s: S, out: wp.array[int]):
+                tt = s.t
+                out[0] = t.width + 10 * t.height + 100 * tt.width + 1000 * s.t.height
+
+            def run(dev):
+                rng = np.random.default_rng(0)
+                with wp.ScopedDevice(dev):
+                    texs = [wp.Texture2D(rng.random((4 + j, 3 + j, 4)).astype(np.float32),
+                                         filter_mode=wp.TextureFilterMode.LINEAR) for j in range(3)]
+                    arr = wp.array(texs, dtype=wp.Texture2D)
+                    ids = wp.array([2, 0, 1, 2], dtype=int)
+                    uv = wp.array(rng.random((4, 2)).astype(np.float32), dtype=wp.vec2)
+                    out = wp.zeros(4, dtype=wp.vec4)
+                    wp.launch(k, dim=4, inputs=[arr, ids, uv, out])
+                    s = S()
+                    s.t = texs[1]
+                    o2 = wp.zeros(1, dtype=int)
+                    wp.launch(dims, dim=1, inputs=[texs[2], s, o2])
+                    return out.numpy(), o2.numpy()
+
+            assert_same(both(run))
+            """,
+        )
+
     def test_tile_store_bounds_on_arguments(self):
         # A partial trailing tile must not write past the array's rows.
         _run(
