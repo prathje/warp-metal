@@ -412,5 +412,45 @@ class TestMetalNestedCaptureWhileReplay(unittest.TestCase):
         _run_with_metal_enabled(self, snippet, timeout=120)
 
 
+_ACOS_SNIPPET = """
+import numpy as np
+
+@wp.kernel
+def k(x: wp.array[float], xd: wp.array[wp.float64], a: wp.array[float], b: wp.array[float],
+      h: wp.array[wp.float16], d: wp.array[wp.float64]):
+    i = wp.tid()
+    a[i] = wp.acos(x[i])
+    b[i] = wp.asin(x[i])
+    h[i] = wp.acos(wp.float16(x[i]))
+    d[i] = wp.acos(xd[i]) + wp.asin(xd[i])
+
+xs = np.array([1.0000001, -1.0000001, 1.5, 0.5, 1.0, -0.25], np.float32)
+res = {}
+for dev in ("cpu", "metal:0"):
+    outs = [wp.zeros(6, dtype=t, device=dev) for t in (float, float, wp.float16, wp.float64)]
+    wp.launch(k, dim=6, inputs=[wp.array(xs, device=dev), wp.array(xs.astype(np.float64), dtype=wp.float64, device=dev)],
+              outputs=outs, device=dev)
+    res[dev] = [o.numpy() for o in outs]
+for c, m in zip(res["cpu"], res["metal:0"]):
+    assert np.isfinite(m).all(), m
+    np.testing.assert_allclose(m.astype(np.float64), c.astype(np.float64), atol=2e-3)
+"""
+
+
+@unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
+@unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
+class TestMetalAcosAsinDomain(unittest.TestCase):
+    # ``wp.acos`` / ``wp.asin`` clamp to [-1, 1] natively; ``metal::acos``
+    # returned NaN for a unit-vector dot that rounded to 1.0000001 (Newton's
+    # cloth_hanging semi-implicit lift force NaN'd every particle).
+    def test_clamped_domain_demote(self):
+        with tempfile.TemporaryDirectory() as cache:
+            _run_metal_script(self, _ACOS_SNIPPET, cache, env_extra={"WARP_METAL_FP64": "demote"})
+
+    def test_clamped_domain_emulate(self):
+        with tempfile.TemporaryDirectory() as cache:
+            _run_metal_script(self, _ACOS_SNIPPET, cache, env_extra={"WARP_METAL_FP64": "emulate"})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

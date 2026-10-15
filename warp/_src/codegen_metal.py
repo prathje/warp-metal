@@ -1671,7 +1671,9 @@ def _f64_emulate_helpers() -> str:
     L.append("inline bool isinf(wp_f64 a) { return wp_f64_isinf(a); }")
     L.append("inline bool isfinite(wp_f64 a) { return wp_f64_isfinite(a); }")
     for fn in _F64_EMU_FP32_UNARY:
-        L.append(f"inline wp_f64 {fn}(wp_f64 a) {{ return wp_f64_from(metal::precise::{fn}(float(a))); }}")
+        # acos/asin clamp their domain like ``warp/native/builtin.h``.
+        arg = "metal::clamp(float(a), -1.0f, 1.0f)" if fn in ("acos", "asin") else "float(a)"
+        L.append(f"inline wp_f64 {fn}(wp_f64 a) {{ return wp_f64_from(metal::precise::{fn}({arg})); }}")
     for fn in _F64_EMU_FP32_BINARY:
         L.append(
             f"inline wp_f64 {fn}(wp_f64 a, wp_f64 b) "
@@ -3083,6 +3085,21 @@ inline float4 wp_quat_normalize(float4 q) {
     // Reciprocal-then-multiply, NOT q / l — matches ``quat.h`` rounding.
     return (l > 0.0f) ? (q * (1.0f / l)) : float4(0.0f, 0.0f, 0.0f, 1.0f);
 }
+"""
+
+
+# ``wp.acos`` / ``wp.asin`` clamp their argument to [-1, 1] on CPU and CUDA
+# (``warp/native/builtin.h``), so a dot product of unit vectors that rounds
+# to 1.0000001 still yields 0 / pi/2. ``metal::acos`` returns NaN there
+# (Newton's cloth lift force NaN'd every particle). Other operand types
+# (emulated float64) keep their own overloads.
+_ACOS_ASIN_HELPERS = """\
+template <typename T> inline T wp_acos(T x) { return metal::acos(x); }
+template <typename T> inline T wp_asin(T x) { return metal::asin(x); }
+inline float wp_acos(float x) { return metal::acos(metal::clamp(x, -1.0f, 1.0f)); }
+inline float wp_asin(float x) { return metal::asin(metal::clamp(x, -1.0f, 1.0f)); }
+inline half wp_acos(half x) { return half(metal::acos(metal::clamp(float(x), -1.0f, 1.0f))); }
+inline half wp_asin(half x) { return half(metal::asin(metal::clamp(float(x), -1.0f, 1.0f))); }
 """
 
 
@@ -9032,6 +9049,8 @@ def _build_kernel_header(source: str) -> str:
     # ``wp_normalize`` internally (mirroring native code's guarded
     # ``normalize``), so it must precede all of them.
     parts.append(_NORMALIZE_HELPERS)
+    if "wp_acos" in source or "wp_asin" in source:
+        parts.append(_ACOS_ASIN_HELPERS)
     # The quat/transform adjoint bodies call the forward ``wp_quat_rotate`` /
     # ``wp_quat_inverse`` / ``wp_transform_get_*``, so the forward blocks are
     # pulled in whenever their adjoints are needed — not just when the kernel
@@ -10694,6 +10713,9 @@ for _name in _MATH_BUILTIN_NAMES:
         # ``metal::length`` covers the native widths only; the big-vec
         # structs get their own overload next to each struct definition.
         _INTRINSIC_PATTERNS.append((re.compile(rf"\bwp::{_name}\b"), "wp_length"))
+    elif _name in ("acos", "asin"):
+        # Clamped domain like native Warp (see ``_ACOS_ASIN_HELPERS``).
+        _INTRINSIC_PATTERNS.append((re.compile(rf"\bwp::{_name}\b"), f"wp_{_name}"))
     elif _name == "transpose":
         # ``metal::transpose`` only knows native ``floatRxC``; non-square
         # Warp matrices are our row-major structs (see ``_msl_mat_name``),

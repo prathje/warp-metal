@@ -231,6 +231,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
     from warp.tests.test_metal_mismatch import TestMetalMismatch
     from warp.tests.test_metal_mujoco_warp import TestMetalMujocoWarp
     from warp.tests.test_metal_r3_perf import (
+        TestMetalAcosAsinDomain,
         TestMetalArtifactCacheKeys,
         TestMetalArtifactSweep,
         TestMetalAsyncFill,
@@ -446,6 +447,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
         TestMetalDisabled,
         TestMetalLaunch,
         TestMetalMismatch,
+        TestMetalAcosAsinDomain,
         TestMetalArtifactCacheKeys,
         TestMetalArtifactSweep,
         TestMetalAsyncFill,
