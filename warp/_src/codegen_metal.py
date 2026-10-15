@@ -16550,6 +16550,7 @@ def _generate_msl_kernel_uncached(
     )
     array_arg_labels_local = {a.label for a in adj.args if _is_array_arg(a)}
     array_truth_unot_pat = re.compile(r"wp::unot\(\s*var_(?P<name>\w+)\s*\)")
+    array_truth_adj_where_pat = re.compile(r"wp::adj_where\(\s*var_(?P<name>\w+)\s*,")
     array_truth_where_pat = re.compile(
         r"wp::where\(\s*var_(?P<name>\w+)\s*,\s*(?P<x>[^,()]+?)\s*,\s*(?P<y>[^,()]+?)\s*\)"
     )
@@ -16564,6 +16565,18 @@ def _generate_msl_kernel_uncached(
             line = array_truth_where_pat.sub(
                 lambda m: (
                     f"(({m.group('name')}_shape[0] != 0) ? ({m.group('x')}) : ({m.group('y')}))"
+                    if m.group("name") in array_arg_labels_local
+                    else m.group(0)
+                ),
+                line,
+            )
+        # Reverse of that select: ``wp::adj_where(var_arr, ...)`` must branch
+        # on the same test, or a ``None`` array routes the gradient into the
+        # wrong operand.
+        if "wp::adj_where(" in line:
+            line = array_truth_adj_where_pat.sub(
+                lambda m: (
+                    f"wp::adj_where(({m.group('name')}_shape[0] != 0),"
                     if m.group("name") in array_arg_labels_local
                     else m.group(0)
                 ),

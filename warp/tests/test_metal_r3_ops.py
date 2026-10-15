@@ -536,6 +536,45 @@ class TestMetalR3Ops(unittest.TestCase):
             """,
         )
 
+    def test_optional_array_condition_adjoint(self):
+        # ``if arr:`` / ``wp.where(arr, ...)`` with a ``None`` array: the
+        # reverse select must take the same branch as the forward one.
+        _run(
+            self,
+            """
+            @wp.kernel
+            def k_if(x: wp.array[float], w: wp.array[float], out: wp.array[float]):
+                i = wp.tid()
+                v = x[i] * 2.0
+                if w:
+                    v = x[i] * 7.0 * w[i]
+                out[i] = v
+
+            @wp.kernel
+            def k_where(x: wp.array[float], y: wp.array[float], arr: wp.array[float], out: wp.array[float]):
+                i = wp.tid()
+                out[i] = wp.where(arr, x[i] * 7.0, y[i] * 3.0)
+
+            def launch(dev, use_arr):
+                x = wp.array([1.0, 2.0], dtype=float, device=dev, requires_grad=True)
+                y = wp.array([3.0, 4.0], dtype=float, device=dev, requires_grad=True)
+                w = wp.array([0.5, 2.0], dtype=float, device=dev) if use_arr else None
+                o1 = wp.zeros(2, dtype=float, device=dev, requires_grad=True)
+                o2 = wp.zeros(2, dtype=float, device=dev, requires_grad=True)
+                tape = wp.Tape()
+                with tape:
+                    wp.launch(k_if, 2, [x, w], [o1], device=dev)
+                    wp.launch(k_where, 2, [x, y, w], [o2], device=dev)
+                tape.backward(grads={o1: wp.ones(2, dtype=float, device=dev),
+                                     o2: wp.array([1.0, 2.0], dtype=float, device=dev)})
+                return o1.numpy(), o2.numpy(), x.grad.numpy(), y.grad.numpy()
+
+            for use_arr in (False, True):
+                cpu, metal = both(lambda dev: launch(dev, use_arr))
+                assert_same(cpu, metal)
+            """,
+        )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
