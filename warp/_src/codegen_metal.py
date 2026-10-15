@@ -15016,9 +15016,18 @@ def _generate_msl_kernel_uncached(
     _atomic_vec_arr_info = dict(_early_vec_arr_info)
     _atomic_mat_arr_info = dict(_early_mat_arr_info)
     for _syn_label, (_root_label, _fpath) in _struct_arg_array_fields.items():
-        _ftype = next(a.type for a in adj.args if a.label == _root_label)
+        _ftype = next((a.type for a in adj.args if a.label == _root_label), None)
         for _comp in _fpath:
-            _ftype = _ftype.vars[_comp].type
+            if _ftype is None:
+                break
+            if _comp.startswith("["):
+                # ``[k]`` / ``[*]``: an element of a struct-typed array.
+                _ftype = getattr(_ftype, "dtype", None)
+                continue
+            _fvars = getattr(_ftype, "vars", None)
+            _ftype = _fvars[_comp].type if _fvars is not None and _comp in _fvars else None
+        if _ftype is None:
+            continue
         _fvar = _WpVarForInfo(_syn_label, _ftype)
         _v_info = _vec_dtype_info(_fvar)
         if _v_info is not None:
