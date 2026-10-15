@@ -85,6 +85,26 @@ kernel void wp_stage_copy(device U* view [[buffer(0)]],
     }
 }
 
+// Accumulating scatter for float gradients: ``view[off] += dense - orig``
+// (atomically, so elements of a self-aliasing view each keep their share).
+kernel void wp_stage_accum_f32(device atomic_float* view [[buffer(0)]],
+                               device const float* dense [[buffer(1)]],
+                               device const int* i0 [[buffer(2)]],
+                               device const int* i1 [[buffer(3)]],
+                               device const int* i2 [[buffer(4)]],
+                               device const int* i3 [[buffer(5)]],
+                               constant StageParams& p [[buffer(6)]],
+                               device const float* orig [[buffer(7)]],
+                               uint tid [[thread_position_in_grid]]) {
+    const uint e = tid / p.elem_units;
+    const uint u = tid % p.elem_units;
+    const long off = wp_stage_offset(p, e, i0, i1, i2, i3) / 4 + long(u);
+    const float delta = dense[tid] - orig[tid];
+    if (delta != 0.0f) {
+        atomic_fetch_add_explicit(&view[off], delta, memory_order_relaxed);
+    }
+}
+
 template [[host_name("wp_stage_copy_4")]] kernel void wp_stage_copy<uint>(
     device uint*, device uint*, device const int*, device const int*, device const int*, device const int*,
     constant StageParams&, uint);
@@ -111,7 +131,7 @@ def _view_layout(value):
     return value, list(value.strides), [None] * value.ndim
 
 
-def _stage_copy(value, dense, direction: int) -> None:
+def _stage_copy(value, dense, direction: int, orig=None) -> None:
     from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
 
     base, strides, indices = _view_layout(value)
@@ -139,9 +159,13 @@ def _stage_copy(value, dense, direction: int) -> None:
     params = _mu._bytes("<4I4I4q", ndim, idx_mask, elem_units, direction, *shape, *full_strides)
     n = value.size * elem_units
     view_mode, dense_mode = ("r", "w") if direction == 0 else ("w", "r")
+    entry, extra, extra_modes = f"wp_stage_copy_{unit}", [], []
+    if orig is not None:
+        # Accumulating scatter (see ``_accumulates``): float32 words only.
+        entry, extra, extra_modes, view_mode = "wp_stage_accum_f32", [_mu._slice(orig)], ["r"], "rw"
     _mu._dispatch(
-        f"wp_stage_copy_{unit}",
-        [view_slice, _mu._slice(dense), *idx_bindings, params],
+        entry,
+        [view_slice, _mu._slice(dense), *idx_bindings, params, *extra],
         [
             view_mode,
             dense_mode,
@@ -150,6 +174,7 @@ def _stage_copy(value, dense, direction: int) -> None:
             "r" if idx_mask & 4 else None,
             "r" if idx_mask & 8 else None,
             None,
+            *extra_modes,
         ],
         (n, 1, 1),
         (min(256, n), 1, 1),
@@ -285,7 +310,7 @@ class StagedLaunch:
         self.adj_inputs = adj_inputs
         self.adj_outputs = adj_outputs
         self._staged = staged  # [(arg_index, original, temporary)]
-        self._adj_staged = adj_staged  # [(original, temporary)], all scattered back
+        self._adj_staged = adj_staged  # [(original, temporary, gathered copy or None)]
 
     def run(self, launch_fn, block_dim=None):
         result = launch_fn(self.kernel, self.inputs, self.outputs, self.adj_inputs, self.adj_outputs)
@@ -295,9 +320,12 @@ class StagedLaunch:
             if args[i].label in written:
                 _stage_copy(original, tmp, 1)
         # Gradient arrays are read-modify-written by the adjoint kernel
-        # (accumulated, or consumed and zeroed for stored outputs).
-        for original, tmp in self._adj_staged:
-            _stage_copy(original, tmp, 1)
+        # (accumulated, or consumed and zeroed for stored outputs). float32
+        # gradients scatter back the change atomically, so a view whose
+        # elements alias (an index array repeating an index, overlapping
+        # strides) keeps every contribution; others copy back.
+        for original, tmp, orig in self._adj_staged:
+            _stage_copy(original, tmp, 1, orig)
         return result
 
 
@@ -342,7 +370,12 @@ def stage_launch_args(
             continue
         tmp = _stage(value)
         new_adj[i] = tmp
-        adj_staged.append((value, tmp))
+        orig = None
+        if wp._src.types.type_scalar_type(value.dtype) is wp.float32:
+            orig = wp.clone(tmp)
+            if graph is not None:
+                graph._metal_retain.append(orig)
+        adj_staged.append((value, tmp, orig))
     n_in = len(inputs)
     n_adj_in = len(adj_inputs) if adjoint else 0
     return StagedLaunch(

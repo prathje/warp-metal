@@ -539,6 +539,26 @@ class TestMetalR3Tiles(unittest.TestCase):
                 return hits.numpy()
 
             assert_same(both(run))
+
+            # Overlapping strides: each aliased gradient element keeps every share.
+            @wp.kernel
+            def weigh(src: wp.array2d[float], loss: wp.array[float]):
+                i, j = wp.tid()
+                wp.atomic_add(loss, 0, src[i, j] * float(i + 2 * j + 1))
+
+            def run_alias(dev):
+                base = wp.array(np.arange(4, dtype=np.float32), device=dev, requires_grad=True)
+                v = wp.array(ptr=base.ptr, shape=(2, 3), strides=(4, 4), dtype=float, device=dev)
+                v.grad = wp.array(ptr=base.grad.ptr, shape=(2, 3), strides=(4, 4), dtype=float, device=dev)
+                v.requires_grad = True
+                loss = wp.zeros(1, dtype=float, device=dev, requires_grad=True)
+                tape = wp.Tape()
+                with tape:
+                    wp.launch(weigh, dim=(2, 3), inputs=[v], outputs=[loss], device=dev)
+                tape.backward(loss)
+                return loss.numpy(), base.grad.numpy()
+
+            assert_same(both(run_alias))
             """,
         )
 
