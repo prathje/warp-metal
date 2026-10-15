@@ -496,6 +496,8 @@ class TestMetalR3Ops(unittest.TestCase):
                 rng.standard_normal(20000) * 10.0 ** rng.integers(-30, 30, 20000),
                 f.astype(np.float64) + np.spacing(f).astype(np.float64) / 2,  # exact ties
                 [3.4028235677973366e38, 1.0e39, -0.0, np.inf, -np.inf],
+                # just below FLT_MIN: rounds up to FLT_MIN, not to 0
+                [1.1754943508222875e-38 * (1 - 2**-25), -1.1754943508222875e-38 * (1 - 2**-24)],
             ])
             a = wp.array(x, dtype=wp.float64, device="metal:0")
             o = wp.zeros(len(x), dtype=float, device="metal:0")

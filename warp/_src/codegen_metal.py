@@ -1835,6 +1835,9 @@ inline float wp_f64_to_f32(ulong b) {
     if (exp == 0) return as_type<float>(sign);  // double denormal < 1e-308: flush to 0
     int e32 = exp - 1023 + 127;
     if (e32 >= 255) return as_type<float>(sign | 0x7f800000u);  // overflow -> inf
+    // Just below FLT_MIN, round-to-nearest-even lands on FLT_MIN itself;
+    // smaller results would be fp32 subnormals, which flush to 0.
+    if (e32 == 0 && man >= 0xfffffe0000000ull) return as_type<float>(sign | 0x00800000u);
     if (e32 <= 0) return as_type<float>(sign);                  // underflow -> 0
     // Round to nearest, ties to even (what a hardware double->float
     // conversion does); a mantissa carry bumps the exponent, up to inf.
