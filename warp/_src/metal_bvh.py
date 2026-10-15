@@ -397,17 +397,24 @@ class MetalBvh:
         if getattr(self._dispatcher, "_record_state", None) is not None:
             # Inside a Metal graph capture: the host builder can neither read
             # the replay-time bounds nor be recorded. Refit instead — the
-            # topology is kept, every node's bounds are recomputed from the
-            # current items, so queries on the replayed graph stay exact
-            # (only traversal cost can grow as items move far apart).
+            # topology is kept and every node's bounds are recomputed from
+            # the current items, so replayed queries stay exact (traversal
+            # only slows as items drift apart). Grouped trees are partitioned
+            # by group id, which a refit cannot re-partition.
+            if self.groups is not None:
+                raise RuntimeError(
+                    "wp.Bvh.rebuild() of a grouped BVH cannot be recorded into a Metal graph capture: "
+                    "the tree is built on the host and a refit cannot follow changed group ids. "
+                    "Rebuild outside the capture region."
+                )
             global _warned_capture_rebuild
             if not _warned_capture_rebuild:
                 _warned_capture_rebuild = True
                 warnings.warn(
-                    "wp.Bvh.rebuild() inside a Metal graph capture records a refit (the tree is built on "
-                    "the host, which a captured graph cannot replay); query results are unchanged but "
-                    "traversal may slow down if items move far. Rebuild outside the capture to "
-                    "re-balance the tree.",
+                    "wp.Bvh.rebuild() inside a Metal graph capture is recorded as a refit (the tree is "
+                    "built on the host, which a captured graph cannot replay): replayed queries see the "
+                    "current item bounds, but the tree is not re-balanced, so traversal may slow down as "
+                    "items move. Rebuild outside the capture to re-balance it.",
                     stacklevel=3,
                 )
             self.refit()
