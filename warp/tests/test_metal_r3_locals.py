@@ -1057,5 +1057,68 @@ class TestMetalR3Locals(unittest.TestCase):
         _run_with_metal_enabled(self, snippet, timeout=120)
 
 
+    def test_struct_field_arrays_chosen_by_const_branches(self):
+        # mujoco_warp's ``multicontact``: ``if t1 == MESH: vert = g1.vert
+        # elif t2 == MESH: vert = g2.vert`` with closure-constant geom types,
+        # then uses under ``if t1 == MESH or t2 == MESH``. The merge
+        # ``vert = where(c, a, b)`` must follow the live branch (and vanish
+        # when neither is live) instead of naming a dropped alias.
+        snippet = _snippet(
+            """
+            @wp.struct
+            class G:
+                vert: wp.array[wp.vec3]
+                graph: wp.array[int]
+                n: int
+
+            @wp.func
+            def make(v: wp.array[wp.vec3], gr: wp.array[int], t: int, want: int) -> G:
+                g = G()
+                g.n = 0
+                if t == want:
+                    g.vert = v
+                    g.graph = gr
+                    g.n = 2
+                return g
+
+            @wp.func
+            def use(g1: G, g2: G, t1: int, t2: int) -> float:
+                acc = float(0.0)
+                if t1 == 7:
+                    vert = g1.vert
+                    graph = g1.graph
+                elif t2 == 7:
+                    vert = g2.vert
+                    graph = g2.graph
+                if t1 == 7 or t2 == 7:
+                    for i in range(2):
+                        acc += vert[graph[i]][0]
+                if t1 == 7 and t2 == 7:
+                    acc += 100.0
+                return acc + float(g1.n + g2.n)
+
+            def make_kernel(T1, T2):
+                @wp.kernel(module="unique")
+                def k(v: wp.array[wp.vec3], gr: wp.array[int], out: wp.array[float]):
+                    tid = wp.tid()
+                    out[tid] = use(make(v, gr, T1, 7), make(v, gr, T2, 7), T1, T2)
+
+                return k
+
+            for T1, T2 in ((6, 6), (7, 6), (6, 7), (7, 7)):
+                k = make_kernel(T1, T2)
+
+                def run(dev):
+                    v = wp.array(np.arange(12, dtype=np.float32).reshape(4, 3), dtype=wp.vec3, device=dev)
+                    gr = wp.array([1, 3], dtype=int, device=dev)
+                    o = wp.zeros(2, dtype=float, device=dev)
+                    wp.launch(k, 2, [v, gr, o], device=dev)
+                    return (o.numpy(),)
+
+                compare(run)
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

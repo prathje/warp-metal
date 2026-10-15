@@ -30,6 +30,7 @@ Design constraints:
 
 from __future__ import annotations
 
+import dataclasses
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -3611,21 +3612,96 @@ def fold_const_branches(nodes: list[Node], adj, extra_const_ints: dict[str, int]
                     continue
             if isinstance(n, (If, For, While, _DoWhileZero)):
                 changed |= _eval_pass(n.body)
+        # Short-circuit ``a or b`` / ``a and b``, which Warp emits as
+        #   x = a; if (!x) { ...; x = x || b; }   (``if (x)`` / ``&&`` for and)
+        # ``x`` has two assignments, so it is folded as a pattern: the
+        # value is const when ``a`` decides it or both operands are const.
+        # The ``if`` itself is left to run (it reads the first value).
+        for i in range(len(ns) - 1):
+            n, nxt = ns[i], ns[i + 1]
+            if not isinstance(n, Assign) or n.lhs in const_bools or assign_counts.get(n.lhs) != 2:
+                continue
+            ma = _CONST_COPY_PAT.match(n.expr.raw.strip())
+            if not ma or not isinstance(nxt, If) or not nxt.body:
+                continue
+            last = nxt.body[-1]
+            if not isinstance(last, Assign) or last.lhs != n.lhs:
+                continue
+            mo = _CONST_ANDOR_PAT.match(last.expr.raw.strip())
+            if not mo or mo.group(1) != n.lhs:
+                continue
+            is_or = mo.group(2) == "||"
+            cond = nxt.cond.strip()
+            want = _CONST_NOT_PAT.match(cond) if is_or else _IF_COND_VAR_PAT.match(cond)
+            if not want or want.group(1) != n.lhs:
+                continue
+            a = const_bools.get(ma.group(1))
+            b = const_bools.get(mo.group(3))
+            if a is not None and a == is_or:
+                val = a
+            elif a is not None and b is not None:
+                val = b
+            else:
+                continue
+            const_bools[n.lhs] = val
+            short_circuit_ifs.add(id(nxt))
+            changed = True
         return changed
 
+    short_circuit_ifs: set[int] = set()
     while _eval_pass(nodes):
         pass
 
     if not const_bools:
         return nodes
 
+    def _const_cond(cond: str) -> bool | None:
+        c = cond.strip()
+        m = _IF_COND_VAR_PAT.match(c)
+        if m and m.group(1) in const_bools:
+            return const_bools[m.group(1)]
+        m = _CONST_NOT_PAT.match(c)
+        if m and m.group(1) in const_bools:
+            return not const_bools[m.group(1)]
+        return None
+
+    folded_where: set[str] = set()
+
+    def _fold_where(n: Assign) -> Node | None:
+        # ``x = wp::where(c, a, b)`` merges values assigned in an ``if``'s
+        # branches; with ``c`` constant one branch was dropped above, and
+        # its value (for an array, an alias that is never declared) must
+        # not be referenced.
+        raw = n.expr.raw.strip()
+        if not raw.startswith("wp::where(") or not raw.endswith(")"):
+            return None
+        args = [a.strip() for a in _split_top_level_args(raw[len("wp::where(") : -1])]
+        if len(args) != 3:
+            return None
+        m = _IF_COND_VAR_PAT.match(args[0])
+        if not m or m.group(1) not in const_bools:
+            return None
+        chosen = args[1] if const_bools[m.group(1)] else args[2]
+        indent = n.raw[: len(n.raw) - len(n.raw.lstrip())]
+        try:
+            folded = parse_line(f"{indent}var_{n.lhs} = {chosen};")
+        except MetalASTParseError:
+            return None
+        folded_where.add(n.lhs)
+        return folded
+
     def _rewrite(ns: tuple[Node, ...] | list[Node]) -> list[Node]:
         out: list[Node] = []
         for n in ns:
+            if isinstance(n, Assign):
+                folded = _fold_where(n)
+                if folded is not None:
+                    out.append(folded)
+                    continue
             if isinstance(n, If):
-                m = _IF_COND_VAR_PAT.match(n.cond.strip())
-                if m and m.group(1) in const_bools:
-                    if const_bools[m.group(1)]:
+                known = None if id(n) in short_circuit_ifs else _const_cond(n.cond)
+                if known is not None:
+                    if known:
                         out.extend(_rewrite(n.body))
                     continue
                 out.append(
@@ -3654,7 +3730,46 @@ def fold_const_branches(nodes: list[Node], adj, extra_const_ints: dict[str, int]
             out.append(n)
         return out
 
-    return _rewrite(nodes)
+    out = _rewrite(nodes)
+    if not folded_where:
+        return out
+    # A folded merge whose result is never read (the value of a dropped
+    # branch, e.g. ``vert`` in mujoco_warp's ``multicontact`` for two
+    # non-mesh geoms) is dropped with it.
+    refs: dict[str, int] = {}
+
+    def _count_refs(ns) -> None:
+        for n in ns:
+            for lbl in _VAR_LABEL_PAT.findall(n.raw):
+                refs[lbl] = refs.get(lbl, 0) + 1
+            body = getattr(n, "body", None)
+            if isinstance(body, tuple):
+                _count_refs(body)
+                raw_close = getattr(n, "raw_close", None)
+                if raw_close:
+                    for lbl in _VAR_LABEL_PAT.findall(raw_close):
+                        refs[lbl] = refs.get(lbl, 0) + 1
+
+    _count_refs(out)
+    dead = {lbl for lbl in folded_where if refs.get(lbl, 0) <= 1}
+    if not dead:
+        return out
+
+    def _drop(ns) -> list[Node]:
+        res: list[Node] = []
+        for n in ns:
+            if isinstance(n, Assign) and n.lhs in dead:
+                continue
+            body = getattr(n, "body", None)
+            if isinstance(body, tuple):
+                n = dataclasses.replace(n, body=tuple(_drop(body)))
+            res.append(n)
+        return res
+
+    return _drop(out)
+
+
+_VAR_LABEL_PAT = re.compile(r"\bvar_(\w+)")
 
 
 def fold_views(
