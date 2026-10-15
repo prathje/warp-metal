@@ -488,6 +488,60 @@ class TestMetalR3Tiles(unittest.TestCase):
             """,
         )
 
+    def test_bvh_rebuild_in_capture(self):
+        # A captured rebuild replays as a refit: queries on moved items match CPU.
+        _run(
+            self,
+            """
+            @wp.kernel
+            def move(lo: wp.array[wp.vec3], up: wp.array[wp.vec3], t: wp.array[float]):
+                i = wp.tid()
+                d = wp.vec3(t[0] * float(i % 5), 0.0, 0.0)
+                lo[i] = lo[i] + d
+                up[i] = up[i] + d
+
+            @wp.kernel
+            def query(bvh: wp.uint64, qlo: wp.array[wp.vec3], qup: wp.array[wp.vec3], hits: wp.array[int]):
+                i = wp.tid()
+                q = wp.bvh_query_aabb(bvh, qlo[i], qup[i])
+                idx = int(0)
+                n = int(0)
+                while wp.bvh_query_next(q, idx):
+                    n += idx + 1
+                hits[i] = n
+
+            rng = np.random.default_rng(0)
+            c = rng.random((64, 3)).astype(np.float32) * 4.0
+            ql = rng.random((32, 3)).astype(np.float32) * 6.0
+            qu = ql + 0.7
+
+            def run(dev):
+                lo = wp.array(c - 0.1, dtype=wp.vec3, device=dev)
+                up = wp.array(c + 0.1, dtype=wp.vec3, device=dev)
+                t = wp.array([0.3], dtype=float, device=dev)
+                bvh = wp.Bvh(lo, up)
+                hits = wp.zeros(32, dtype=int, device=dev)
+                qa, qb = wp.array(ql, dtype=wp.vec3, device=dev), wp.array(qu, dtype=wp.vec3, device=dev)
+
+                def step():
+                    wp.launch(move, dim=64, inputs=[lo, up, t], device=dev)
+                    bvh.rebuild()
+                    wp.launch(query, dim=32, inputs=[bvh.id, qa, qb, hits], device=dev)
+
+                if dev == "cpu":
+                    step()
+                    step()
+                else:
+                    with wp.ScopedCapture(device=dev) as cap:
+                        step()
+                    wp.capture_launch(cap.graph)
+                    wp.capture_launch(cap.graph)
+                return hits.numpy()
+
+            assert_same(both(run))
+            """,
+        )
+
     def test_strided_copy_in_capture(self):
         # Strided Metal<->Metal copies are device kernels, so they replay.
         _run(
