@@ -825,8 +825,102 @@ class _SliceView:
         return [k for k, d in enumerate(self.dims) if d[0] == "slice"]
 
 
-def fold_arg_slice_views(nodes: list[Node], adj, const_ints: dict[str, int]) -> tuple[list[Node], set[str]]:
-    """Lower range-slice views of kernel array arguments; see above."""
+def fold_arg_slice_views(
+    nodes: list[Node], adj, const_ints: dict[str, int]
+) -> tuple[list[Node], set[str], set[str]]:
+    """Lower range-slice views of kernel array arguments; see above.
+
+    Element accesses are all this fold rewrites. A view that also reaches an
+    operation that needs the array itself (``tile_load`` / ``tile_store``, a
+    ``@wp.func_native`` snippet) is left in place when it is a unit-step
+    slice of the leading dim of an argument (``arr[a:b]``), which stays
+    contiguous: ``_lower_pointer_arrays`` turns it into a pointer array.
+    Any other such view raises.
+
+    Returns ``(nodes, labels to skip declaring, labels handed to
+    _lower_pointer_arrays)``.
+    """
+    from warp._src.codegen_metal import MetalCodegenError  # noqa: PLC0415
+
+    new_nodes, skip, views = _fold_arg_slice_views_once(nodes, adj, const_ints, frozenset())
+    if not views:
+        return new_nodes, skip, set()
+    escaped = _slice_views_left_referenced(new_nodes, set(views))
+    if not escaped:
+        return new_nodes, skip, set()
+    kname = getattr(adj, "fun_name", "?")
+    handoff = _contiguous_arg_slices(nodes, adj, const_ints)
+    bad = sorted(escaped - handoff)
+    if bad:
+        raise MetalCodegenError(
+            f"Kernel {kname!r}: the array slice var_{bad[0]} is used by an operation that needs the array itself "
+            "(tile_load / tile_store, a @wp.func_native snippet, ...); on Metal that works only for a unit-step "
+            "slice of the leading dim of a kernel array argument (arr[a:b]) with a 32-bit-or-narrower scalar "
+            "dtype. Index the slice element-wise, or pass the slice from the host."
+        )
+    new_nodes, skip, views = _fold_arg_slice_views_once(nodes, adj, const_ints, frozenset(escaped))
+    left = _slice_views_left_referenced(new_nodes, set(views))
+    if left:
+        raise MetalCodegenError(
+            f"Kernel {kname!r}: the array slice var_{sorted(left)[0]} is derived from a slice that is handed to a "
+            "tile or native-snippet operation; slices of such slices are not supported on Metal"
+        )
+    return new_nodes, skip, set(escaped)
+
+
+def _slice_views_left_referenced(nodes: list[Node], labels: set[str]) -> set[str]:
+    """Folded view labels still referenced after the fold (uses it cannot
+    rewrite to base-array accesses)."""
+    alt = "|".join(re.escape(lbl) for lbl in sorted(labels, key=len, reverse=True))
+    pat = re.compile(r"\bvar_(" + alt + r")\b|(?<![\w])(" + alt + r")_shape\b")
+    found: set[str] = set()
+    for n in _iter_leaves(nodes):
+        if isinstance(n, (Comment, Empty, Pragma)):
+            continue
+        for m in pat.finditer(n.raw):
+            found.add(m.group(1) or m.group(2))
+    return found
+
+
+def _contiguous_arg_slices(nodes: list[Node], adj, const_ints: dict[str, int]) -> set[str]:
+    """Labels of ``var_V = wp::view(var_A, var_S)`` where ``A`` is a scalar
+    (at most 32-bit) ``wp.array`` argument and ``S`` a unit-step slice:
+    the leading-dim slices ``_lower_pointer_arrays`` can lower."""
+    from warp._src.codegen_metal import (  # noqa: PLC0415
+        _ARRAY_CTYPE_ELEM_PAT,
+        _SCALAR_CTYPE_TO_MSL,
+        _SLICE_VIEW_PAT,
+        _is_array_arg,
+    )
+
+    ok_args = set()
+    for a in adj.args:
+        if not _is_array_arg(a) or type(a.type).__name__ not in ("array", "_ArrayAnnotation"):
+            continue
+        msl = _SCALAR_CTYPE_TO_MSL.get(_ARRAY_CTYPE_ELEM_PAT.sub(r"\1", a.ctype()))
+        if msl is not None and msl != "wp_f64":
+            ok_args.add(a.label)
+    leaves = [n.raw for n in _iter_leaves(nodes) if not isinstance(n, (Comment, Empty, Pragma))]
+    unit_slices = set()
+    for ln in leaves:
+        m = _SLICE_CTOR_PAT.match(ln)
+        if m:
+            args = [a.strip() for a in _split_top_level_args(m.group("args"))]
+            st = args[2] if len(args) == 3 else ""
+            stv = const_ints.get(st[4:]) if st.startswith("var_") else (int(st) if _INT_LIT_PAT.match(st) else None)
+            if stv == 1:
+                unit_slices.add(m.group("lhs"))
+    out = set()
+    for ln in leaves:
+        m = _SLICE_VIEW_PAT.match(ln)
+        if m and m.group("src") in ok_args and m.group("sl") in unit_slices:
+            out.add(m.group("lbl"))
+    return out
+
+
+def _fold_arg_slice_views_once(
+    nodes: list[Node], adj, const_ints: dict[str, int], exclude: frozenset[str]
+) -> tuple[list[Node], set[str], dict[str, "_SliceView"]]:
     from warp._src.codegen_metal import MetalCodegenError, _is_array_arg, _lower_array_slot_ir  # noqa: PLC0415
     from warp._src.codegen_metal_ast import _nonneg_locals  # noqa: PLC0415
 
@@ -839,7 +933,7 @@ def fold_arg_slice_views(nodes: list[Node], adj, const_ints: dict[str, int]) -> 
             if len(args) == 3:
                 slices[m.group("lhs")] = (args[0], args[1], args[2])
     if not slices and not any("wp::index(" in ln or "_slot(" in ln for ln in leaves):
-        return nodes, set()
+        return nodes, set(), {}
     arg_ndim = {a.label: int(getattr(a.type, "ndim", 1)) for a in adj.args if _is_array_arg(a)}
     kname = getattr(adj, "fun_name", "?")
     nonneg = _nonneg_locals(nodes, const_ints)
@@ -958,6 +1052,8 @@ def fold_arg_slice_views(nodes: list[Node], adj, const_ints: dict[str, int]) -> 
             fn, lhs, indent = m.group("fn"), m.group("lhs"), m.group("indent")
             args = [a.strip() for a in _split_top_level_args(m.group("args"))]
             first = args[0][4:] if args and args[0].startswith("var_") else ""
+            if lhs in exclude:
+                return [n]
             if fn == "view" and (
                 first in views or (first in arg_ndim and any(a[4:] in slices for a in args[1:] if a.startswith("var_")))
             ):
@@ -1091,8 +1187,8 @@ def fold_arg_slice_views(nodes: list[Node], adj, const_ints: dict[str, int]) -> 
 
     new_nodes = _map_leaves(nodes, rewrite)
     if not views:
-        return nodes, set()
-    return [*decls, *new_nodes], skip
+        return nodes, set(), {}
+    return [*decls, *new_nodes], skip, views
 
 
 # ---------------------------------------------------------------------------

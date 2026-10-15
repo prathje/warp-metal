@@ -158,6 +158,79 @@ class TestMetalR3Tiles(unittest.TestCase):
             """,
         )
 
+    def test_array_slice_views_handed_to_tiles_and_snippets(self):
+        # Argument slices that reach tile_load / tile_store or a native
+        # snippet: unit-step leading-dim slices become pointer arrays, the
+        # rest must raise (never an undeclared identifier or a silent no-op).
+        _run(
+            self,
+            """
+            from warp._src.codegen_metal import MetalCodegenError
+
+            @wp.func_native("((float*)arr.data)[i] += 1.0f;")
+            def inc(arr: wp.array[wp.float32], i: int): ...
+
+            @wp.kernel
+            def k1(a: wp.array[float], o: wp.array[float]):
+                i, lane = wp.tid()
+                s = a[3:9]
+                t = wp.tile_load(s, shape=8, offset=0)
+                wp.tile_store(o, t + wp.tile_ones(shape=8, dtype=float))
+                wp.tile_store(a[1:4], wp.tile_ones(shape=4, dtype=float) * float(s.shape[0]))
+
+            @wp.kernel
+            def k2(a: wp.array2d[float], o: wp.array2d[float]):
+                i, lane = wp.tid()
+                s = a[1:3]
+                t = wp.tile_load(s, shape=(2, 4), offset=(0, 1))
+                wp.tile_store(o, t)
+
+            @wp.kernel
+            def k3(a: wp.array[float], o: wp.array[float]):
+                i = wp.tid()
+                s = a[2:6]
+                inc(s, i)
+                o[i] = s[i]
+
+            def run(dev):
+                a = wp.array(np.arange(10, dtype=np.float32) + 1.0, device=dev)
+                o = wp.zeros(8, dtype=float, device=dev)
+                wp.launch_tiled(k1, dim=1, inputs=[a, o], block_dim=32, device=dev)
+                m = wp.array(np.arange(24, dtype=np.float32).reshape(4, 6), device=dev)
+                mo = wp.zeros((2, 4), dtype=float, device=dev)
+                wp.launch_tiled(k2, dim=1, inputs=[m, mo], block_dim=32, device=dev)
+                b = wp.array(np.arange(10, dtype=np.float32), device=dev)
+                bo = wp.zeros(4, dtype=float, device=dev)
+                wp.launch(k3, dim=4, inputs=[b, bo], device=dev)
+                return o.numpy(), a.numpy(), mo.numpy(), b.numpy(), bo.numpy()
+
+            assert_same(both(run))
+
+            @wp.kernel
+            def strided(a: wp.array[float], o: wp.array[float]):
+                i, lane = wp.tid()
+                wp.tile_store(o, wp.tile_load(a[::2], shape=4, offset=0))
+
+            @wp.kernel
+            def row_cols(a: wp.array2d[float], o: wp.array[float]):
+                i, lane = wp.tid()
+                wp.tile_store(o, wp.tile_load(a[1, 2:6], shape=4, offset=0))
+
+            d = "metal:0"
+            for kern, arr in (
+                (strided, wp.zeros(8, dtype=float, device=d)),
+                (row_cols, wp.zeros((4, 6), dtype=float, device=d)),
+            ):
+                try:
+                    wp.launch_tiled(kern, dim=1, inputs=[arr, wp.zeros(4, dtype=float, device=d)], block_dim=32,
+                                    device=d)
+                except MetalCodegenError as e:
+                    assert "unit-step" in str(e), str(e)
+                else:
+                    raise AssertionError(f"{kern.key}: expected MetalCodegenError")
+            """,
+        )
+
     def test_tile_cholesky_inplace_upper(self):
         # ``fill_mode="upper"``: A = U^T U, U upper-triangular with the lower
         # part zeroed, read from A's upper triangle (A deliberately non-symmetric).

@@ -14419,18 +14419,25 @@ def _gpu_address_locals(lines: list[str]) -> set[str]:
 
 
 def _lower_pointer_arrays(
-    lines: list[str], adj, adjoint: bool, consts: dict[str, int] | None = None
+    lines: list[str],
+    adj,
+    adjoint: bool,
+    consts: dict[str, int] | None = None,
+    arg_slices: set[str] | frozenset[str] = frozenset(),
 ) -> tuple[list[str], set[str], set[str], dict[str, str]]:
     """Lower arrays built in-kernel to MSL pointer locals.
 
-    Two forms:
+    Forms:
 
     - ``wp.array(ptr=<base + offset>, shape=(n, n), dtype=float)`` over an
       address a native snippet took (``(uint64_t)arr.data``) — Kamino's
       per-problem matrix views. On Metal a ``uint64`` holding a buffer's
       ``gpuAddress`` converts back to a ``device T*``.
-    - ``arr[start:stop]`` (a unit-step slice of the leading dim of a scalar
-      array argument), which stays contiguous.
+    - unit-step slices ``p[start:stop]`` of the leading dim of such arrays.
+    - the labels in ``arg_slices``: slices of kernel array arguments that
+      ``codegen_metal_locals.fold_arg_slice_views`` (which owns argument
+      slices) hands over because they reach a tile load/store or a native
+      snippet.
 
     Each becomes a pointer local plus an ``int`` shape array, and every use
     is renamed to the label ``__pa<label>`` — which the rest of the
@@ -14481,12 +14488,10 @@ def _lower_pointer_arrays(
             sl = slices[m.group("sl")]
             if src in arrays:
                 msl, nd, root = arrays[src]
-            elif src in arg_types and _is_array_arg(arg_types[src]):
+            elif m.group("lbl") in arg_slices:
                 arg = arg_types[src]
-                msl = _SCALAR_CTYPE_TO_MSL.get(_ARRAY_CTYPE_ELEM_PAT.sub(r"\1", arg.ctype()))
+                msl = _SCALAR_CTYPE_TO_MSL[_ARRAY_CTYPE_ELEM_PAT.sub(r"\1", arg.ctype())]
                 nd, root = arg.type.ndim, src
-                if msl is None or msl == "wp_f64" or type(arg.type).__name__ not in ("array", "_ArrayAnnotation"):
-                    continue
             else:
                 continue
             step = sl[2] if len(sl) == 3 else "1"
@@ -14494,6 +14499,10 @@ def _lower_pointer_arrays(
             if step_val is None and re.fullmatch(r"\d+", step):
                 step_val = int(step)
             if step_val != 1:
+                if m.group("lbl") in arg_slices:
+                    raise MetalCodegenError(
+                        f"Kernel {adj.fun_name!r}: slice var_{m.group('lbl')} of argument {src!r} is not unit-step"
+                    )
                 continue  # strided slices stay unsupported
             entry = (msl, nd, root)
         prev = arrays.get(m.group("lbl"))
@@ -15610,7 +15619,9 @@ def _generate_msl_kernel_uncached(
     )
     _local_arr_skip = _local_arr_skip | _empty_field_skip
     # Range-slice views of array arguments (``arr[a:b]``).
-    _ast_nodes, _slice_view_skip = _fold_arg_slice_views(_ast_nodes, adj, {**_const_ints, **_inlined_const_ints})
+    _ast_nodes, _slice_view_skip, _arg_slice_handoff = _fold_arg_slice_views(
+        _ast_nodes, adj, {**_const_ints, **_inlined_const_ints}
+    )
     _local_arr_skip = _local_arr_skip | _slice_view_skip
     _ast_nodes, _mesh_skip = _ast_fold_mesh_get(_ast_nodes, adj, _inlined_var_ctypes)
     # Array fields of constant-index ``wp.array[Struct]`` elements become
@@ -15767,6 +15778,7 @@ def _generate_msl_kernel_uncached(
             **{str(v.label): v.constant for v in adj.variables if isinstance(getattr(v, "constant", None), int)},
             **{str(k): v for k, v in _inlined_const_ints.items() if isinstance(v, int)},
         },
+        arg_slices=_arg_slice_handoff,
     )
 
     if os.environ.get("WARP_METAL_DUMP_IR"):
