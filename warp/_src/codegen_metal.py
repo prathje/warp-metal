@@ -1040,7 +1040,9 @@ def _emit_big_mat_struct(name: str, rows: int, cols: int, msl_scalar: str) -> st
     body.append(f"inline {name} {name}_make({name} m) {{ return m; }}")
     # Negative row/col wrap like ``warp/native/mat.h``.
     wrap_r = f"if (row < 0) row += {rows}; if (col < 0) col += {cols};"
-    body.append(f"inline {msl_scalar} wp_mat_extract({name} m, int row, int col) {{ {wrap_r} return m.c[row * {cols} + col]; }}")
+    body.append(
+        f"inline {msl_scalar} wp_mat_extract({name} m, int row, int col) {{ {wrap_r} return m.c[row * {cols} + col]; }}"
+    )
     body.append(f"inline {msl_scalar} wp_mat_flat_elem({name} m, int i) {{ return m.c[i]; }}")
     body.append(
         f"inline void wp_mat_elem_store(thread {name}& m, int row, int col, {msl_scalar} v) "
@@ -1353,8 +1355,7 @@ def _emit_native_mat_extract_overloads(source: str) -> str:
             f"{{ if (row < 0) row += {rows}; if (col < 0) col += {cols}; return m[col][row]; }}"
         )
         parts.append(
-            f"inline {scalar} wp_mat_flat_elem({scalar}{rows}x{cols} m, int i) "
-            f"{{ return m[i % {cols}][i / {cols}]; }}"
+            f"inline {scalar} wp_mat_flat_elem({scalar}{rows}x{cols} m, int i) {{ return m[i % {cols}][i / {cols}]; }}"
         )
         # MSL matrices have no unary minus, and ``wp::neg`` lowers to ``(-x)``.
         if scalar in _MSL_NATIVE_MAT_SCALARS:
