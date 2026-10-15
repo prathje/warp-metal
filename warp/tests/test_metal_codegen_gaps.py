@@ -222,18 +222,18 @@ class TestMetalCodegenGaps(unittest.TestCase):
             cpu, metal = both(launch)
             assert_same(cpu, metal)
 
-            from warp._src.codegen_metal import MetalCodegenError
-            d = Data()
-            d.n = 1
-            d.xs = wp.zeros(1, dtype=wp.vec3, device="metal:0")
-            try:
-                wp.launch(k, 2, [wp.array([0, 1], dtype=int, device="metal:0"),
-                                 wp.array([d], dtype=Data, device="metal:0")],
-                          [wp.zeros(2, dtype=wp.vec3, device="metal:0")], device="metal:0")
-            except MetalCodegenError as e:
-                assert "array members" in str(e)
-            else:
-                raise AssertionError("expected a non-empty struct array with array fields to be rejected")
+            # A constant element index binds the element's arrays at launch.
+            def launch_full(dev):
+                d = Data()
+                d.n = 2
+                d.xs = wp.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=wp.vec3, device=dev)
+                out = wp.zeros(2, dtype=wp.vec3, device=dev)
+                wp.launch(k, 2, [wp.array([7, 1], dtype=int, device=dev), wp.array([d], dtype=Data, device=dev)],
+                          [out], device=dev)
+                return out.numpy()
+
+            cpu, metal = both(launch_full)
+            assert_same(cpu, metal)
             """,
         )
 

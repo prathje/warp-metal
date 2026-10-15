@@ -1454,6 +1454,18 @@ def _build_function_overload_table(adj) -> dict[str, list[Any]]:
     def _overloads(fn) -> tuple:
         return tuple(getattr(fn, "user_overloads", {}).values())
 
+    # The exact functions this body called during ``build``. ``wp.static``
+    # call targets are re-evaluated per call site, so two calls through the
+    # same factory expression (warp_nn's ``wp.static(tile_gemm(shape))(...)``
+    # twice in one kernel) resolve to two distinct ``Function`` objects whose
+    # ``native_func`` names differ only by suffix; the static-expression
+    # table and the module sweep below keep only the last of them.
+    for fn in getattr(adj, "called_user_functions", None) or ():
+        if isinstance(fn, Function) and not fn.is_builtin():
+            for overload in _overloads(fn):
+                _add(overload)
+            _add(fn)
+
     refs = adj.get_references()
     fn_table = refs[2]
     for fn in fn_table:
@@ -1809,9 +1821,20 @@ def _inline_one_call(
             continue
         arg_var = fn_overload.adj.args[i]
         ctype = arg_var.ctype()
+        copy_label = f"{inline_id}__argcopy_{pname}"
+        if ctype.startswith("wp::array_t<") and any(
+            re.match(rf"^\s*wp::assign\s*\(\s*var_{pname}\s*,", ln) for ln in fn_lines
+        ):
+            # The callee REBINDS the array param (``a, b = b, a`` in a
+            # loop): bind a local handle so the rebinding stays inside the
+            # callee. ``codegen_metal_locals.fold_dynamic_array_locals``
+            # lowers the rebinding.
+            param_copy_decls.extend(parse([f"    var_{copy_label} = {caller_arg};"]))
+            subs[f"var_{pname}"] = f"var_{copy_label}"
+            var_types[copy_label] = ctype
+            continue
         if ctype.endswith("*") or "array_t" in ctype or "tile_t" in ctype:
             continue
-        copy_label = f"{inline_id}__argcopy_{pname}"
         if isinstance(arg_var.type, Struct):
             # Struct locals are split into per-field MSL locals; register
             # the copy so declarations are emitted, and let the whole-
@@ -2881,12 +2904,24 @@ _SA_ADDR_PAT = re.compile(r"^\s*var_(?P<lhs>\w+)\s*=\s*wp::address\s*\(\s*var_(?
 
 
 def fold_struct_array_array_fields(
-    nodes: list[Node], adj, extra_var_ctypes: dict[str, str] | None = None
+    nodes: list[Node],
+    adj,
+    extra_var_ctypes: dict[str, str] | None = None,
+    const_ints: dict[str, int] | None = None,
+    synthetic_out: dict[str, tuple[str, tuple[str, ...]]] | None = None,
 ) -> tuple[list[Node], set[str], set[str]]:
-    """Stub reads of array fields through ``wp.array[Struct]`` elements.
+    """Bind or stub reads of array fields through ``wp.array[Struct]`` elements.
+
+    When the element index is a non-negative constant (Newton's VBD kernels
+    read ``collision_info_array[0].<field>``) and ``synthetic_out`` is given,
+    each array field becomes a synthetic array input
+    ``<arg>__e<k>__<field>`` recorded in ``synthetic_out`` as
+    ``(arg, ("[k]", field))``; the launcher binds it from the element's
+    array record. Reads through any other element are stubbed.
 
     Returns ``(nodes, skip_decls, arg_labels)`` where ``arg_labels`` names
-    the struct-array kernel args whose array fields are read.
+    the struct-array kernel args whose array fields are read through a
+    stub.
     """
     from warp._src.codegen import Struct  # noqa: PLC0415
     from warp._src.codegen_metal import (  # noqa: PLC0415
@@ -2913,9 +2948,41 @@ def fold_struct_array_array_fields(
     ctypes_of.update(extra_var_ctypes or {})
 
     elem: dict[str, str] = {}  # element ptr / struct copy label -> arg label
+    elem_idx: dict[str, int] = {}  # element ptr / copy label -> constant element index
     fptr: dict[str, str] = {}  # array-field ptr / array value label -> arg label
     eptr: dict[str, str] = {}  # element-of-array-field ptr label -> arg label
+    syn_ptr: dict[str, str] = {}  # array-field ptr label -> synthetic array label
+    syn_val: dict[str, str] = {}  # loaded array-field value label -> synthetic array label
+    # Dynamic element index: a per-field pointer table (see
+    # ``_struct_array_ptr_table``). Values are ``(table label, index local,
+    # field type)``.
+    elem_dyn: dict[str, str] = {}  # element ptr / copy label -> captured index local
+    pt_ptr: dict[str, tuple[str, str, Any]] = {}
+    pt_val: dict[str, tuple[str, str, Any]] = {}
+    pt_shape: dict[str, tuple[str, str, Any]] = {}
+    pt_elem: dict[str, tuple[str, str, Any, list[str]]] = {}
+    pt_decls: list[Node] = []
     used: set[str] = set()
+    consts = dict(const_ints or {})
+    for v in adj.variables:
+        if isinstance(v.constant, int) and not isinstance(v.constant, bool):
+            consts.setdefault(str(v.label), v.constant)
+
+    def _const_index(rest: str) -> int | None:
+        parts = [p.strip() for p in _split_top_level_args(rest)]
+        if len(parts) != 1:
+            return None
+        p = parts[0]
+        if re.fullmatch(r"\d+", p):
+            return int(p)
+        if p.startswith("var_") and isinstance(consts.get(p[4:]), int) and consts[p[4:]] >= 0:
+            return consts[p[4:]]
+        return None
+
+    def _sub_syn(text: str) -> str:
+        if not syn_val:
+            return text
+        return re.sub(r"\bvar_(\w+)\b", lambda mm: f"var_{syn_val.get(mm.group(1), mm.group(1))}", text)
 
     def rewrite_leaf(n: Node) -> list[Node]:
         raw = getattr(n, "raw", "") or ""
@@ -2924,12 +2991,35 @@ def fold_struct_array_array_fields(
         m = _SA_ADDR_PAT.match(raw)
         if m and m.group("arr") in struct_args:
             elem[m.group("lhs")] = m.group("arr")
+            k = _const_index(m.group("rest"))
+            if k is not None and synthetic_out is not None:
+                elem_idx[m.group("lhs")] = k
+            elif synthetic_out is not None and len(_split_top_level_args(m.group("rest"))) == 1:
+                cap = f"{m.group('lhs')}__ptidx"
+                pt_decls.append(_RawLine(raw=f"    int var_{cap} = 0;"))
+                elem_dyn[m.group("lhs")] = cap
+                return [n, _RawLine(raw=f"{_leading_indent(raw)}var_{cap} = {m.group('rest').strip()};")]
             return [n]
         m = _MESH_LOAD_PAT.match(raw)
         if m:
             src, lhs = m.group("src"), m.group("lhs")
+            if src in syn_ptr:
+                syn_val[lhs] = syn_ptr[src]
+                return []
+            if src in pt_ptr:
+                pt_val[lhs] = pt_ptr[src]
+                return []
+            if src in pt_shape:
+                pt_shape[lhs] = pt_shape[src]
+                return []
+            if src in pt_elem:
+                return [_RawLine(raw=f"{m.group('indent')}var_{lhs} = {_pt_read(*pt_elem[src])};")]
             if src in elem:
                 elem[lhs] = elem[src]
+                if src in elem_idx:
+                    elem_idx[lhs] = elem_idx[src]
+                if src in elem_dyn:
+                    elem_dyn[lhs] = elem_dyn[src]
                 return [n]
             if src in fptr:
                 fptr[lhs] = fptr[src]
@@ -2947,14 +3037,43 @@ def fold_struct_array_array_fields(
         m = _MESH_COPY_PAT.match(raw)
         if m and m.group("src") in elem:
             elem[m.group("lhs")] = elem[m.group("src")]
+            if m.group("src") in elem_idx:
+                elem_idx[m.group("lhs")] = elem_idx[m.group("src")]
+            if m.group("src") in elem_dyn:
+                elem_dyn[m.group("lhs")] = elem_dyn[m.group("src")]
             return [n]
+        if m and m.group("src") in pt_val:
+            pt_val[m.group("lhs")] = pt_val[m.group("src")]
+            return []
         if m and m.group("src") in fptr:
             fptr[m.group("lhs")] = fptr[m.group("src")]
             return []
+        if m and m.group("src") in syn_val:
+            syn_val[m.group("lhs")] = syn_val[m.group("src")]
+            return []
         m = _MESH_FIELD_PTR_PAT.match(raw)
         if m and m.group("root") in elem and m.group("field") in struct_args[elem[m.group("root")]]:
-            fptr[m.group("lhs")] = elem[m.group("root")]
+            root = m.group("root")
+            if root in elem_idx and synthetic_out is not None:
+                arg, k, field = elem[root], elem_idx[root], m.group("field")
+                syn = f"{arg}__e{k}__{field}"
+                synthetic_out[syn] = (arg, (f"[{k}]", field))
+                syn_ptr[m.group("lhs")] = syn
+                return []
+            if root in elem_dyn and synthetic_out is not None:
+                arg, field = elem[root], m.group("field")
+                syn = f"{arg}__pt__{field}"
+                synthetic_out[syn] = (arg, ("[*]", field))
+                ftype = next(a.type for a in adj.args if a.label == arg).dtype.vars[field].type
+                pt_ptr[m.group("lhs")] = (syn, elem_dyn[root], ftype)
+                return []
+        if m and (m.group("root") in pt_ptr or m.group("root") in pt_val) and m.group("field") == "shape":
+            pt_shape[m.group("lhs")] = pt_ptr.get(m.group("root")) or pt_val[m.group("root")]
             return []
+            fptr[m.group("lhs")] = elem[root]
+            return []
+        if m and m.group("root") in syn_ptr and m.group("field") == "shape":
+            return parse([f"{_leading_indent(raw)}var_{m.group('lhs')} = &(var_{syn_ptr[m.group('root')]}.shape);"])
         if m and m.group("root") in fptr and m.group("field") == "shape":
             fptr[m.group("lhs")] = fptr[m.group("root")]
             used.add(fptr[m.group("root")])
@@ -2963,7 +3082,31 @@ def fold_struct_array_array_fields(
         if m and m.group("arr") in fptr:
             eptr[m.group("lhs")] = fptr[m.group("arr")]
             return []
-        stubbed = fptr.keys() | eptr.keys()
+        if m and m.group("arr") in pt_val:
+            syn, cap, ftype = pt_val[m.group("arr")]
+            pt_elem[m.group("lhs")] = (syn, cap, ftype, [x.strip() for x in _split_top_level_args(m.group("rest"))])
+            return []
+        if pt_shape or pt_val:
+
+            def _sub_pt(mm: re.Match[str]) -> str:
+                info = pt_shape.get(mm.group(1))
+                if info is None:
+                    return mm.group(0)
+                k = mm.group(0)[mm.group(0).index(",") + 1 : -1].strip()
+                return f"int(var_{info[0]}[(var_{info[1]}) * 5 + 1 + ({k})])"
+
+            def _sub_len(mm: re.Match[str]) -> str:
+                info = pt_val.get(mm.group(1))
+                return mm.group(0) if info is None else f"int(var_{info[0]}[(var_{info[1]}) * 5 + 1])"
+
+            new_pt = _MESH_LEN_PAT.sub(_sub_len, _MESH_SHAPE_EXTRACT_PAT.sub(_sub_pt, raw))
+            if new_pt != raw:
+                for ref in re.findall(r"\bvar_(\w+)\b", new_pt):
+                    if ref in pt_val or ref in pt_ptr or ref in pt_elem or ref in pt_shape:
+                        break
+                else:
+                    return [_RawLine(raw=new_pt)]
+        stubbed = fptr.keys() | eptr.keys() | pt_ptr.keys() | pt_val.keys() | pt_elem.keys() | pt_shape.keys()
 
         def _sub_extract(mm: re.Match[str]) -> str:
             if mm.group(1) in fptr:
@@ -2971,12 +3114,17 @@ def fold_struct_array_array_fields(
                 return "0"
             return mm.group(0)
 
-        new_raw = _MESH_SHAPE_EXTRACT_PAT.sub(_sub_extract, raw)
+        new_raw = _sub_syn(_MESH_SHAPE_EXTRACT_PAT.sub(_sub_extract, raw))
         for ref in re.findall(r"\bvar_(\w+)\b", new_raw):
+            if ref in syn_ptr:
+                raise MetalCodegenError(
+                    f"Kernel {adj.fun_name!r}: unsupported use of an array field of a wp.array[Struct] "
+                    f"element on Metal: {raw.strip()!r}"
+                )
             if ref in stubbed:
                 raise MetalCodegenError(
-                    f"Kernel {adj.fun_name!r}: array fields of wp.array[Struct] elements are not supported on "
-                    f"Metal (only reads are stubbed): {raw.strip()!r}"
+                    f"Kernel {adj.fun_name!r}: array fields of wp.array[Struct] elements are read-only on "
+                    f"Metal: {raw.strip()!r}"
                 )
         return [n] if new_raw == raw else parse([new_raw])
 
@@ -3007,8 +3155,62 @@ def fold_struct_array_array_fields(
                 out.extend(rewrite_leaf(n))
         return out
 
+    def _pt_read(syn: str, cap: str, ftype, idx: list[str]) -> str:
+        """Element ``idx`` of the array field whose pointer-table row is ``cap``."""
+        from warp._src.codegen import Var  # noqa: PLC0415
+        from warp._src.codegen_metal import (  # noqa: PLC0415
+            _SCALAR_CTYPE_TO_MSL,
+            _mat_native,
+            _msl_mat_name,
+            _msl_vec_ctor,
+        )
+
+        dtype = ftype.dtype
+        scalar_t = getattr(dtype, "_wp_scalar_type_", dtype)
+        scalar = _SCALAR_CTYPE_TO_MSL.get(Var.dtype_to_ctype(scalar_t))
+        if scalar is None or scalar in ("double",):
+            raise MetalCodegenError(
+                f"Kernel {adj.fun_name!r}: array field of {Var.dtype_to_ctype(dtype)!r} elements read through a "
+                "wp.array[Struct] element is not supported on Metal"
+            )
+        row = f"(var_{cap}) * 5"  # ``_PTAB_ROW`` in codegen_metal
+        dims = [f"int(var_{syn}[{row} + {1 + d}])" for d in range(len(idx))]
+        flat = ""
+        for d, i in enumerate(idx):
+            wrapped = i if re.fullmatch(r"\d+", i) else f"wp_wrap_index({i}, {dims[d]})"
+            flat = wrapped if not flat else f"({flat}) * {dims[d]} + {wrapped}"
+        p = f"reinterpret_cast<device const {scalar}*>(var_{syn}[{row}])"
+        gen = getattr(dtype, "_wp_generic_type_str_", None)
+        if gen is None:
+            return f"{p}[{flat}]"
+        if gen in ("vec_t", "quat_t", "transform_t"):
+            n = 7 if gen == "transform_t" else int(dtype._length_)
+            comps = ", ".join(f"{p}[({flat}) * {n} + {k}]" for k in range(n))
+            return f"{_msl_vec_ctor(n, scalar)}({comps})"
+        if gen == "mat_t":
+            rows, cols = (int(x) for x in dtype._shape_)
+            if not _mat_native(rows, cols, scalar):
+                raise MetalCodegenError(
+                    f"Kernel {adj.fun_name!r}: {rows}x{cols} matrix array field read through a wp.array[Struct] "
+                    "element is not supported on Metal"
+                )
+            base = f"({flat}) * {rows * cols}"
+            colv = [
+                f"{_msl_vec_ctor(rows, scalar)}({', '.join(f'{p}[{base} + {r * cols + c}]' for r in range(rows))})"
+                for c in range(cols)
+            ]
+            return f"{_msl_mat_name(rows, cols, scalar)}({', '.join(colv)})"
+        raise MetalCodegenError(
+            f"Kernel {adj.fun_name!r}: array field of {dtype!r} elements read through a wp.array[Struct] element "
+            "is not supported on Metal"
+        )
+
     out = walk(nodes)
-    return out, set(fptr) | set(eptr), used
+    if pt_decls:
+        out = [*pt_decls, *out]
+    skip_out = set(fptr) | set(eptr) | set(syn_ptr) | set(syn_val)
+    skip_out |= set(pt_ptr) | set(pt_val) | set(pt_shape) | set(pt_elem)
+    return out, skip_out, used
 
 
 # ---------------------------------------------------------------------------

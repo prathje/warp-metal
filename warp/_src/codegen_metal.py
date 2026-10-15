@@ -167,6 +167,13 @@ from warp._src.codegen_metal_ast import lower_reverse_ranges as _ast_lower_rever
 from warp._src.codegen_metal_ast import parse as _ast_parse
 from warp._src.codegen_metal_ast import query_iterator_vars as _ast_query_iterator_vars
 from warp._src.codegen_metal_ast import wrap_negative_array_indices as _ast_wrap_negative_array_indices
+from warp._src.codegen_metal_locals import check_struct_copy_field_stores as _check_struct_copy_field_stores
+from warp._src.codegen_metal_locals import fold_arg_slice_views as _fold_arg_slice_views
+from warp._src.codegen_metal_locals import fold_array_copy_aliases as _fold_array_copy_aliases
+from warp._src.codegen_metal_locals import fold_dynamic_array_locals as _fold_dynamic_array_locals
+from warp._src.codegen_metal_locals import fold_empty_struct_array_fields as _fold_empty_struct_array_fields
+from warp._src.codegen_metal_locals import fold_local_arrays as _fold_local_arrays
+from warp._src.codegen_metal_locals import lower_inlined_array_slots as _lower_inlined_array_slots
 from warp.config import DeterministicMode
 
 if TYPE_CHECKING:
@@ -6427,6 +6434,15 @@ _MISC_MATH_HELPERS: dict[str, str] = {
     "wp_wrap_index": (
         "template <typename T, typename S>\ninline T wp_wrap_index(T i, S n) { return i < T(0) ? T(i + T(n)) : i; }"
     ),
+    # Thread-local array index: the value goes through a ``volatile`` local
+    # first. Apple's compiler miscompiles a loop-carried index that wraps
+    # negative values into a private array when a second private array is
+    # written in the same loop (metal-port/rev_r3_locals/msl_bug_neg5.metal);
+    # hiding the index value from its range analysis avoids it.
+    "wp_wrap_index_local": (
+        "template <typename T, typename S>\n"
+        "inline T wp_wrap_index_local(T i, S n) { volatile T v = i; T k = v; return k < T(0) ? T(k + T(n)) : k; }"
+    ),
     "wp_frac": ("template <typename T>\ninline T wp_frac(T x) { return x - metal::trunc(x); }"),
     "wp_degrees": ("template <typename T>\ninline T wp_degrees(T x) { return x * T(57.29577951308232087679); }"),
     "wp_radians": ("template <typename T>\ninline T wp_radians(T x) { return x * T(0.01745329251994329577); }"),
@@ -12642,6 +12658,16 @@ def _translate_tile_intrinsics(
         #       + c] = var_Y.c[c].
         #   (b) Source is 2-D, target is 2-D, target rows == 1 — collapse.
         # We support (a); fall back to identity for other shapes.
+        if in_cols == 1 and in_label in tile_2d_labels and in_rows == l_rows:
+            # A genuine 2-D ``(R, 1)`` column (not a 1-D ``(R,)`` tile,
+            # which shares the storage shape) repeats along the columns:
+            # ``X[r, c] = Y[r]``. With a square target the 1-D rule below
+            # would silently transpose it (warp_nn's RNN/GRU bias add).
+            return (
+                f"{{ for (int _bc_r = 0; _bc_r < {l_rows}; ++_bc_r) "
+                f"for (int _bc_c = 0; _bc_c < {l_cols}; ++_bc_c) "
+                f"var_{lhs}.c[_bc_r * {l_cols} + _bc_c] = var_{in_label}.c[_bc_r]; }}"
+            )
         if in_cols == 1 and in_rows == l_cols:
             # Source shape (l_cols, 1) tiled along ``r``.
             return (
@@ -14062,6 +14088,7 @@ def _lower_array_slot_ir(lines: list[str], adj, all_lines: list[str]) -> list[st
         return lines
     kinds: dict[str, tuple] = {}
     f64_arrays: set[str] = set()
+    arg_array_labels = {arg.label for arg in adj.args if _is_array_arg(arg)}
     for arg in adj.args:
         if not _is_array_arg(arg):
             continue
@@ -14181,6 +14208,13 @@ def _lower_array_slot_ir(lines: list[str], adj, all_lines: list[str]) -> list[st
             or re.search(r"\bwp::adj_array_\w+_slot\(", ln)
         ):
             m_any = re.search(r"var_(\w+)", ln.split("(", 1)[1] if "(" in ln else ln)
+            if m_any is not None and m_any.group(1) not in arg_array_labels:
+                # Not a kernel array argument: a thread-local array (lowered
+                # by ``codegen_metal_locals``) or an alias a later fold
+                # resolves. Anything left unresolved fails as a remaining
+                # intrinsic.
+                out.append(ln)
+                continue
             what = f"array {m_any.group(1)!r}" if m_any else "an array"
             raise MetalCodegenError(
                 f"Kernel {adj.fun_name!r}: assigning to or atomically updating a component/field of an element "
@@ -14582,15 +14616,36 @@ def _artifact_display_name(kernel, adj) -> str:
     return name
 
 
+def _struct_field_path_type(root_type, fpath: tuple[str, ...]):
+    """Type at ``fpath`` below a struct (or struct-array) kernel arg type.
+
+    A ``"[k]"`` component selects element ``k`` of a ``wp.array[Struct]``
+    (see ``fold_struct_array_array_fields``); any other names a field.
+    """
+    if fpath and fpath[0] == "[*]":
+        # Per-element pointer table of a wp.array[Struct] array field.
+        from warp._src.types import array as _wp_array  # noqa: PLC0415
+        from warp._src.types import uint64 as _wp_uint64  # noqa: PLC0415
+
+        return _wp_array(dtype=_wp_uint64)
+    t = root_type
+    for comp in fpath:
+        if comp.startswith("["):
+            t = t.dtype
+        else:
+            t = t.vars[comp].type
+    return t
+
+
 def _struct_arg_array_ndims(adj, fields: dict[str, tuple[str, tuple[str, ...]]]) -> dict[str, int]:
     """ndim of each flattened struct-arg array field (synthetic label -> ndim)."""
     arg_types = {a.label: a.type for a in adj.args}
     out: dict[str, int] = {}
     for label, (arg_label, path) in fields.items():
-        t = arg_types.get(arg_label)
-        for name in path:
-            field = getattr(t, "vars", {}).get(name)
-            t = getattr(field, "type", None)
+        try:
+            t = _struct_field_path_type(arg_types.get(arg_label), path)
+        except (AttributeError, KeyError):
+            t = None
         ndim = getattr(t, "ndim", None)
         if isinstance(ndim, int) and ndim > 0:
             out[label] = ndim
@@ -14712,8 +14767,9 @@ def _generate_msl_kernel_uncached(
     _coop_n_early = getattr(adj, "_metal_coop_block_n", 0)
     _coop_plan_early = getattr(adj, "_metal_coop_plan", None) if _coop_n_early > 0 else None
     _coop_coldist_early: dict[str, int] = dict(_coop_plan_early.coldist) if _coop_plan_early is not None else {}
-    for _v in adj.variables:
-        _parsed = _parse_tile_ctype(_v.ctype())
+
+    def _add_tile_elem_info(label, ctype) -> None:
+        _parsed = _parse_tile_ctype(ctype)
         if _parsed is not None:
             _elem, _rows, _cols = _parsed[1], _parsed[2], _parsed[3]
             # Distributed tiles (coop-block mode) are one element per lane,
@@ -14722,35 +14778,101 @@ def _generate_msl_kernel_uncached(
                 _rows = 1
             # Column-distributed tiles are one column per lane: the mapped
             # function runs over the lane's R elements.
-            if _coop_n_early > 0 and _v.label in _coop_coldist_early:
-                _rows, _cols = _coop_coldist_early[_v.label], 1
-            _tile_elem_info[_v.label] = (_elem, _rows, _cols)
+            if _coop_n_early > 0 and label in _coop_coldist_early:
+                _rows, _cols = _coop_coldist_early[label], 1
+            _tile_elem_info[label] = (_elem, _rows, _cols)
+
+    for _v in adj.variables:
+        _add_tile_elem_info(_v.label, _v.ctype())
     _ast_nodes, _tile_map_var_types = _expand_user_tile_map(_ast_nodes, adj, _tile_elem_info)
     _ast_nodes, _tile_map_adj_var_types = _expand_user_tile_map_adj(_ast_nodes, adj, _tile_elem_info)
     _tile_map_var_types = {**_tile_map_var_types, **_tile_map_adj_var_types}
     _ast_nodes, _inlined_const_ints, _inlined_struct_locals, _inlined_var_ctypes = _ast_inline(
         _ast_nodes, adj, extra_var_types=_tile_map_var_types
     )
+    # A ``wp.tile_map(user_fn, ...)`` inside an inlined ``@wp.func`` only
+    # appears once that body is spliced in (mujoco_warp's
+    # ``solve_search_sums`` map, reached through a ``wp.static`` factory):
+    # expand those too and inline the calls they produce.
+    for _round in range(4):
+        if not any("tile_map" in _ln for _ln in _ast_emit(_ast_nodes)):
+            break
+        for _lbl, _ct in _inlined_var_ctypes.items():
+            if _lbl not in _tile_elem_info:
+                _add_tile_elem_info(_lbl, _ct)
+        _ast_nodes, _tm_more = _expand_user_tile_map(_ast_nodes, adj, _tile_elem_info)
+        if not _tm_more:
+            break
+        _ast_nodes, _c_more, _s_more, _v_more = _ast_inline(
+            _ast_nodes, adj, extra_var_types={**_inlined_var_ctypes, **_tm_more}
+        )
+        _inlined_const_ints.update(_c_more)
+        _inlined_struct_locals.update(_s_more)
+        _inlined_var_ctypes.update(_v_more)
+        _inlined_var_ctypes.update(_tm_more)
+    # Component stores into array elements inside inlined ``@wp.func``
+    # bodies (``arr[i][j, k] = x`` on an array the function was passed).
+    _ast_nodes = _lower_inlined_array_slots(_ast_nodes, adj)
     # Drop statically-dead branches (geom-type constants baked by kernel
     # builders) BEFORE the view/field folds — dead mesh-only branches
     # reference array struct fields that are never assigned for the live
     # geom types.
     _ast_nodes = _ast_fold_const_branches(_ast_nodes, adj, _inlined_const_ints)
     _ast_nodes, _tuple_skip = _ast_fold_tuples(_ast_nodes, adj, _inlined_var_ctypes)
+    # Thread-local ``wp.zeros(shape, dtype)`` arrays (``wp::fixedarray_t``)
+    # and the array locals derived from them -> MSL thread arrays.
+    _ast_nodes, _local_arr_skip = _fold_local_arrays(
+        _ast_nodes,
+        adj,
+        {**{str(_v.label): _v.ctype() for _v in adj.variables}, **_inlined_var_ctypes},
+        {**_const_ints, **_inlined_const_ints},
+        adjoint=adjoint,
+    )
+    # Array locals rebound at runtime (``a, b = b, a`` in a dynamic loop).
+    _ast_nodes, _dyn_arr_skip = _fold_dynamic_array_locals(
+        _ast_nodes, adj, {**{str(_v.label): _v.ctype() for _v in adj.variables}, **_inlined_var_ctypes}
+    )
+    _local_arr_skip = _local_arr_skip | _dyn_arr_skip
+    # ``b = a`` for array handles: alias the copy to its source.
+    _ast_nodes, _arr_copy_skip = _fold_array_copy_aliases(
+        _ast_nodes, adj, {**{str(_v.label): _v.ctype() for _v in adj.variables}, **_inlined_var_ctypes}
+    )
+    _local_arr_skip = _local_arr_skip | _arr_copy_skip
+    _check_struct_copy_field_stores(_ast_nodes, adj, _inlined_struct_locals)
+    # Array fields of default-constructed struct locals (empty arrays).
+    _ast_nodes, _empty_field_skip = _fold_empty_struct_array_fields(
+        _ast_nodes,
+        adj,
+        _inlined_struct_locals,
+        {**{str(_v.label): _v.ctype() for _v in adj.variables}, **_inlined_var_ctypes},
+    )
+    _local_arr_skip = _local_arr_skip | _empty_field_skip
+    # Range-slice views of array arguments (``arr[a:b]``).
+    _ast_nodes, _slice_view_skip = _fold_arg_slice_views(_ast_nodes, adj, {**_const_ints, **_inlined_const_ints})
+    _local_arr_skip = _local_arr_skip | _slice_view_skip
     _ast_nodes, _mesh_skip = _ast_fold_mesh_get(_ast_nodes, adj, _inlined_var_ctypes)
-    _ast_nodes, _sa_skip, _sa_field_reads = _ast_fold_struct_array_fields(_ast_nodes, adj, _inlined_var_ctypes)
+    # Array fields of constant-index ``wp.array[Struct]`` elements become
+    # synthetic array inputs (``(arg, ("[k]", field))``), bound at launch.
+    _sa_synthetic: dict[str, tuple[str, tuple[str, ...]]] = {}
+    _ast_nodes, _sa_skip, _sa_field_reads = _ast_fold_struct_array_fields(
+        _ast_nodes,
+        adj,
+        _inlined_var_ctypes,
+        const_ints={**_const_ints, **_inlined_const_ints},
+        synthetic_out=_sa_synthetic,
+    )
     _has_print = _ast_has_print_calls(_ast_nodes)
     if _has_print:
         _handle_metal_print(adj.fun_name)
     _ast_nodes, _drop_skip = _ast_fold_drop(_ast_nodes, adj, _inlined_var_ctypes)
-    _drop_skip = _drop_skip | _tuple_skip | _mesh_skip | _sa_skip
+    _drop_skip = _drop_skip | _tuple_skip | _mesh_skip | _sa_skip | _local_arr_skip
     # ``_struct_arg_array_fields``: synthetic label -> (arg label, field
     # path) for every ``wp.array`` field of a struct-typed kernel arg the
     # body reads. The fold rewrites those accesses against the synthetic
     # array name (``qp_arg__points``); below we add a matching read-only
     # array input to the signature and the launcher binds the field's
     # buffer by walking the struct instance.
-    _struct_arg_array_fields: dict[str, tuple[str, tuple[str, ...]]] = {}
+    _struct_arg_array_fields: dict[str, tuple[str, tuple[str, ...]]] = dict(_sa_synthetic)
     # Native Warp wraps a negative index once (``arr[-1]`` is the last
     # element); the flat-offset translators do not. Wrap every index of a
     # kernel-array access (and of views of one) before the view fold
@@ -14972,9 +15094,7 @@ def _generate_msl_kernel_uncached(
 
         for syn_label, (root_label, fpath) in _struct_arg_array_fields.items():
             field_desc = f"struct arg {root_label!r} array field {'.'.join(fpath)!r}"
-            ftype = next(a.type for a in adj.args if a.label == root_label)
-            for comp in fpath:
-                ftype = ftype.vars[comp].type
+            ftype = _struct_field_path_type(next(a.type for a in adj.args if a.label == root_label), fpath)
             if isinstance(ftype, _wp_indexedarray) or getattr(ftype, "_wp_generic_type_str_", None) == "indexedarray_t":
                 raise MetalCodegenError(
                     f"Kernel {adj.fun_name!r}: {field_desc} is a wp.indexedarray, which is not "
@@ -15832,7 +15952,12 @@ def _generate_msl_kernel_uncached(
             # FK reads parent slots from a table indexed by the lane).
             if re.match(r"(?:\(\s*)?(?:&\s*)?wp::(?:address|view|load|index|array_load)\b", rhs.strip()):
                 continue
-            if "builtin_block_dim" in rhs or any(f"var_{t}" in rhs for t in _bd_tainted):
+            # Whole-token match: a substring test made ``var_1`` taint
+            # ``var_12`` and, with one probe per tainted label, went
+            # quadratic on Newton's ~200k-line narrow-phase kernel.
+            if "builtin_block_dim" in rhs or (
+                _bd_tainted and not _bd_tainted.isdisjoint(re.findall(r"\bvar_(\w+)\b", rhs))
+            ):
                 _bd_tainted.add(m_def.group(1))
         if _bd_tainted:
             for raw in forward_lines:
@@ -17257,6 +17382,18 @@ def _generate_msl_kernel_uncached(
                     )
                 body_lines.extend(_finalize(w) for w in writes)
                 continue
+            _val_label = value[len("var_") :] if value.startswith("var_") else None
+            if addr in struct_ptr_locals and op == "=" and _val_label in struct_local_layouts:
+                # ``s.inner = t`` with ``s`` and ``t`` struct locals: copy
+                # leaf by leaf into the nested field's per-field locals.
+                prefix, dst_layout = struct_ptr_locals[addr]
+                src_leaves = {p for p, _o, _f in _iter_scalar_leaves(struct_local_layouts[_val_label])}
+                for fpath, _off, _finfo in _iter_scalar_leaves(dst_layout):
+                    if fpath in src_leaves:
+                        body_lines.append(
+                            f"{indent}{_per_field_local(prefix, fpath)} = {_per_field_local(_val_label, fpath)};"
+                        )
+                continue
             if addr in subscript_map:
                 lhs = subscript_map[addr]
                 if addr in f64_scalar_alias:
@@ -18343,9 +18480,10 @@ def _codegen_source_hash() -> str:
         import hashlib  # noqa: PLC0415
 
         import warp._src.codegen_metal_ast as _ast_mod  # noqa: PLC0415
+        import warp._src.codegen_metal_locals as _locals_mod  # noqa: PLC0415
 
         h = hashlib.sha256()
-        for mod_file in (__file__, _ast_mod.__file__, _mtiles.__file__, _mtex.__file__):
+        for mod_file in (__file__, _ast_mod.__file__, _mtiles.__file__, _mtex.__file__, _locals_mod.__file__):
             with open(mod_file, "rb") as f:
                 h.update(f.read())
         _codegen_source_hash_cached = h.hexdigest()
@@ -18495,10 +18633,7 @@ def _load_cached_artifact(key: str, adj) -> MetalKernelArtifact | None:
             from warp._src.codegen import Var as _WpVar  # noqa: PLC0415
 
             root, fpath = sfa_paths[label]
-            ftype = by_label[root].type
-            for comp in fpath:
-                ftype = ftype.vars[comp].type
-            return _WpVar(label, ftype)
+            return _WpVar(label, _struct_field_path_type(by_label[root].type, fpath))
 
         input_args = [_arg_for(label) for label in payload["input_arg_labels"]]
         output_args = [_arg_for(label) for label in payload["output_arg_labels"]]
@@ -19411,13 +19546,169 @@ def _struct_field_launch_value(fwd_args, arg_by_name, root_label: str, fpath: tu
     caller binds a placeholder buffer in that case, matching how empty
     top-level arrays are handled.
     """
-    idx, _ = arg_by_name[root_label]
+    idx, arg = arg_by_name[root_label]
     value = fwd_args[idx]
+    if fpath and fpath[0].startswith("["):
+        from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
+
+        if get_dispatcher()._record_state is not None:
+            # The element records are resolved to buffers on the host at
+            # launch; a replay would keep reading the arrays bound at
+            # capture time even after ``data.assign(...)`` rebinds them.
+            raise RuntimeError(
+                f"Metal: kernel reads array fields of the elements of {root_label!r} (a wp.array of a struct "
+                "with array members), which cannot be captured into a Metal graph; launch it outside "
+                "wp.ScopedCapture"
+            )
+    if fpath and fpath[0] == "[*]":
+        return _struct_array_ptr_table(value, arg.type.dtype, fpath[1:])
+    if fpath and fpath[0].startswith("["):
+        return _struct_array_elem_field_value(value, arg.type.dtype, int(fpath[0][1:-1]), fpath[1:])
     for comp in fpath:
         if value is None:
             return None
         value = getattr(value, comp, None)
     return value
+
+
+# Pointer-table row: field GPU address, then all four extents (Warp arrays
+# have at most four dims).
+_PTAB_ROW = 5
+_PTAB_RESIDENT_REFS: dict[int, int] = {}
+
+
+def _ptab_release(dispatcher, bufs) -> None:
+    for buf in bufs:
+        n = _PTAB_RESIDENT_REFS.get(id(buf), 0) - 1
+        if n <= 0:
+            _PTAB_RESIDENT_REFS.pop(id(buf), None)
+            dispatcher.remove_resident_resource(buf)
+        else:
+            _PTAB_RESIDENT_REFS[id(buf)] = n
+
+
+def _struct_array_ptr_table(arr, struct_type, fpath: tuple[str, ...]):
+    """Pointer table for array field ``fpath`` of every element of struct array ``arr``.
+
+    One row of five ``uint64`` per element: the field's GPU address and its
+    four extents, resolved from the element records in the array's
+    host-visible storage at every launch (so a record rebound to a new
+    array, even one reusing a freed array's address, is seen). The field
+    buffers are declared GPU-resident until the next launch rebuilds the
+    table or ``arr`` is collected. Graph capture is rejected by the caller:
+    a replay could not re-resolve the records.
+    """
+    import ctypes  # noqa: PLC0415
+    import weakref  # noqa: PLC0415
+
+    import numpy as np  # noqa: PLC0415
+
+    import warp as wp  # noqa: PLC0415
+    from warp._src.context import _metal_find_buffer  # noqa: PLC0415
+    from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
+
+    if arr is None or getattr(arr, "ptr", None) is None or arr.size == 0:
+        return None
+    if not arr.is_contiguous:
+        raise RuntimeError("Metal: struct arrays with array members must be contiguous")
+    np_dtype = np.dtype(struct_type.numpy_dtype())
+    n = int(arr.shape[0])
+    # The records may have just been written by queued GPU work
+    # (``data.assign(...)``): wait for it before reading them on the host.
+    get_dispatcher().sync()
+    raw = bytes((ctypes.c_char * (n * np_dtype.itemsize)).from_address(int(arr.ptr)))
+    recs = np.frombuffer(raw, dtype=np_dtype)
+    t = struct_type
+    for comp in fpath[:-1]:
+        t = t.vars[comp].type
+    field_type = t.vars[fpath[-1]].type
+    elem_size = wp.types.type_size_in_bytes(field_type.dtype)
+    table = np.zeros(n * _PTAB_ROW, dtype=np.uint64)
+    bufs = []
+    for e in range(n):
+        a = recs[e]
+        for comp in fpath:
+            a = a[comp]
+        data = int(a["data"])
+        if data == 0:
+            continue
+        ndim = int(a["ndim"])
+        shape = [int(x) for x in a["shape"][:ndim]]
+        strides = [int(x) for x in a["strides"][:ndim]]
+        expect = elem_size
+        for d in reversed(range(ndim)):
+            if shape[d] > 1 and strides[d] != expect:
+                raise RuntimeError(
+                    f"Metal: array field {'.'.join(fpath)!r} of a wp.array[Struct] element must be contiguous"
+                )
+            expect *= shape[d]
+        buf, off = _metal_find_buffer(data)
+        if buf is None:
+            raise RuntimeError(
+                f"Metal: array field {'.'.join(fpath)!r} of a wp.array[Struct] element is not a Metal allocation"
+            )
+        table[e * _PTAB_ROW] = int(buf.gpuAddress()) + int(off)
+        for d in range(ndim):
+            table[e * _PTAB_ROW + 1 + d] = shape[d]
+        if all(b is not buf for b in bufs):
+            bufs.append(buf)
+    cache = arr.__dict__.setdefault("_metal_ptab_cache", {})
+    hit = cache.get(fpath)
+    key = table.tobytes()
+    if hit is not None and hit[0] == key:
+        return hit[1]
+    dispatcher = get_dispatcher()
+    for buf in bufs:
+        if _PTAB_RESIDENT_REFS.get(id(buf), 0) == 0:
+            dispatcher.add_resident_resource(buf)
+        _PTAB_RESIDENT_REFS[id(buf)] = _PTAB_RESIDENT_REFS.get(id(buf), 0) + 1
+    tab = wp.array(table, dtype=wp.uint64, device=arr.device)
+    if hit is not None:
+        hit[2]()  # release the previous table's residency now
+    fin = weakref.finalize(arr, _ptab_release, dispatcher, bufs)
+    cache[fpath] = (key, tab, fin)
+    return tab
+
+
+def _struct_array_elem_field_value(arr, struct_type, k: int, fpath: tuple[str, ...]):
+    """The ``wp.array`` stored in field ``fpath`` of element ``k`` of struct array ``arr``.
+
+    The element's array record (``array_t``: data pointer, shape, strides)
+    is read straight from the array's host-visible storage, so this sees
+    whatever the host last wrote; struct arrays of array handles are built
+    on the host and not rewritten by kernels.
+    """
+    import ctypes  # noqa: PLC0415
+
+    import numpy as np  # noqa: PLC0415
+
+    if arr is None or getattr(arr, "ptr", None) is None or k >= arr.shape[0]:
+        return None
+    if not arr.is_contiguous:
+        raise RuntimeError("Metal: struct arrays with array members must be contiguous")
+    from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
+
+    # Wait for queued writes to the records (``data.assign(...)``).
+    get_dispatcher().sync()
+    np_dtype = struct_type.numpy_dtype()
+    nbytes = np.dtype(np_dtype).itemsize
+    raw = (ctypes.c_char * nbytes).from_address(int(arr.ptr) + k * int(arr.strides[0]))
+    rec = np.frombuffer(bytes(raw), dtype=np_dtype)[0]
+    t = struct_type
+    for comp in fpath[:-1]:
+        rec = rec[comp]
+        t = t.vars[comp].type
+    field_type = t.vars[fpath[-1]].type
+    a = rec[fpath[-1]]
+    data = int(a["data"])
+    if data == 0:
+        return None
+    ndim = int(a["ndim"])
+    shape = tuple(int(x) for x in a["shape"][:ndim])
+    strides = tuple(int(x) for x in a["strides"][:ndim])
+    import warp as wp  # noqa: PLC0415
+
+    return wp.array(ptr=data, shape=shape, strides=strides, dtype=field_type.dtype, device=arr.device)
 
 
 def _iter_struct_array_grads(struct_type, adj_instance, _path: tuple[str, ...] = ()):
