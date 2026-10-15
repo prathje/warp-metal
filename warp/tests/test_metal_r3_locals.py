@@ -782,6 +782,50 @@ class TestMetalR3Locals(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet, timeout=120)
 
+    def test_fixed_array_ptr_of_view_and_misaligned_offset(self):
+        # ``.ptr`` of a row view is the row's byte address (the element size,
+        # not the element count, scales the offset); a constant ``ptr``
+        # offset that is not a multiple of the element size raises instead
+        # of being truncated.
+        snippet = _snippet(
+            """
+            @wp.kernel
+            def k(out: wp.array2d[float]):
+                tid = wp.tid()
+                m = wp.zeros(shape=(3, 4), dtype=float)
+                for i in range(3):
+                    for j in range(4):
+                        m[i, j] = float(i * 4 + j + tid)
+                r = m[1]
+                sub = wp.array(ptr=r.ptr + wp.uint64(4), shape=(2,), dtype=float)
+                out[tid, 0] = sub[0]
+                out[tid, 1] = sub[1]
+
+            def run(dev):
+                o = wp.zeros((3, 2), dtype=float, device=dev)
+                wp.launch(k, 3, [o], device=dev)
+                return (o.numpy(),)
+
+            res = compare(run)
+            np.testing.assert_allclose(res["metal:0"][0][0], [5.0, 6.0])
+
+            @wp.kernel
+            def k_misaligned(out: wp.array[float]):
+                buf = wp.zeros(shape=(4,), dtype=wp.int32)
+                sub = wp.array(ptr=buf.ptr + wp.uint64(2), shape=(2,), dtype=wp.int32)
+                out[0] = float(sub[0])
+
+            from warp._src.codegen_metal import MetalCodegenError
+            try:
+                wp.launch(k_misaligned, 1, [wp.zeros(1, dtype=float, device="metal:0")], device="metal:0")
+            except MetalCodegenError as e:
+                assert "multiple of" in str(e), e
+            else:
+                raise AssertionError("misaligned ptr offset was not rejected")
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

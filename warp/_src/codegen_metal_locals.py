@@ -205,15 +205,53 @@ def fold_local_arrays(
 
     nonneg = _nonneg_locals(nodes, const_ints)
 
+    # Integer constants folded through casts and arithmetic (``wp.uint64(5 * 8)``
+    # byte offsets), so constant ``ptr`` offsets can be checked statically.
+    folded: dict[str, int] = {}
+    for _v in getattr(adj, "variables", ()):
+        _c = getattr(_v, "constant", None)
+        if _c is not None and not isinstance(_c, (bool, float)) and str(_v.label) not in const_ints:
+            try:
+                folded[str(_v.label)] = int(getattr(_c, "value", _c))
+            except (TypeError, ValueError):
+                pass
+
     def const_of(expr: str) -> int | None:
         e = expr.strip()
+        mm = re.fullmatch(r"int\((.*)\)", e)
+        if mm:
+            e = mm.group(1).strip()
         if _INT_LIT_PAT.match(e):
             return int(e)
         if e.startswith("var_"):
+            if e[4:] in folded:
+                return folded[e[4:]]
             v = const_ints.get(e[4:])
             if isinstance(v, int) and not isinstance(v, bool):
                 return v
         return None
+
+    def fold_const(raw: str) -> None:
+        lit = re.match(r"^\s*var_(\w+)\s*=\s*(-?\d+)(?:[uU]?[lL]{0,2}|[lL]{0,2}[uU]?)\s*;\s*$", raw)
+        if lit:
+            folded[lit.group(1)] = int(lit.group(2))
+            return
+        m = _ASSIGN_CALL_PAT.match(raw)
+        if m is None:
+            return
+        fn = m.group("fn")
+        if fn not in ("uint64", "int64", "uint32", "int32", "int", "mul", "add", "sub"):
+            return
+        vals = [const_of(a) for a in _split_top_level_args(m.group("args"))]
+        if not vals or any(v is None for v in vals):
+            return
+        if fn in ("mul", "add", "sub"):
+            if len(vals) == 2:
+                folded[m.group("lhs")] = {"mul": vals[0] * vals[1], "add": vals[0] + vals[1], "sub": vals[0] - vals[1]}[
+                    fn
+                ]
+        elif len(vals) == 1:
+            folded[m.group("lhs")] = vals[0]
 
     def dim_expr(expr: str) -> str:
         c = const_of(expr)
@@ -411,6 +449,7 @@ def fold_local_arrays(
         return _to_nodes(out)
 
     def rewrite_line(raw: str) -> list[str] | None:
+        fold_const(raw)
         m = _FIXEDARRAY_CTOR_PAT.match(raw)
         if m:
             lhs = m.group("lhs")
@@ -452,6 +491,12 @@ def fold_local_arrays(
                 dims = tuple(dim_expr(a) for a in args[1:]) or ("0",)
                 off = pv.byte_offset
                 c = const_of(off)
+                if c is not None and c % elem_size:
+                    raise fail(
+                        f"wp.array(ptr=...) over a thread-local array at byte offset {c}, which is not a "
+                        f"multiple of the {elem_size}-byte element size",
+                        raw,
+                    )
                 elem_off = str(c // elem_size) if c is not None else f"int(({off}) / {elem_size})"
                 bind(m.group("lhs"), _LocalArray(pv.storage, m.group("elem").strip(), elem_msl, elem_off, dims), raw)
                 return []
@@ -472,10 +517,8 @@ def fold_local_arrays(
                 src = first[4:]
                 if src in data_ptrs:
                     arr = arrays[data_ptrs[src]]
-                    _msl, esz = storages[arr.storage]
-                    ptr_values[lhs] = _PtrValue(
-                        arr.storage, arr.elem_msl, elem_info(arr.elem_ctype, raw)[1], _mul_off(arr.offset, esz)
-                    )
+                    esz = elem_info(arr.elem_ctype, raw)[1]
+                    ptr_values[lhs] = _PtrValue(arr.storage, arr.elem_msl, esz, _mul_off(arr.offset, esz))
                     return []
                 if src in shape_ptrs:
                     shape_values[lhs] = shape_ptrs[src]
@@ -484,12 +527,18 @@ def fold_local_arrays(
                 a, b = args
                 if a.startswith("var_") and a[4:] in ptr_values:
                     pv = ptr_values[a[4:]]
-                    off = b if fn == "add" else f"-({b})"
-                    ptr_values[lhs] = dataclasses.replace(pv, byte_offset=_add_exprs(pv.byte_offset, f"int({off})"))
+                    cb = const_of(b)
+                    if cb is not None:
+                        off = str(cb if fn == "add" else -cb)
+                    else:
+                        off = f"int({b})" if fn == "add" else f"-int({b})"
+                    ptr_values[lhs] = dataclasses.replace(pv, byte_offset=_add_exprs(pv.byte_offset, off))
                     return []
                 if fn == "add" and b.startswith("var_") and b[4:] in ptr_values:
                     pv = ptr_values[b[4:]]
-                    ptr_values[lhs] = dataclasses.replace(pv, byte_offset=_add_exprs(pv.byte_offset, f"int({a})"))
+                    ca = const_of(a)
+                    off = str(ca) if ca is not None else f"int({a})"
+                    ptr_values[lhs] = dataclasses.replace(pv, byte_offset=_add_exprs(pv.byte_offset, off))
                     return []
             if fn in ("uint64", "int64") and len(args) == 1 and first.startswith("var_") and first[4:] in ptr_values:
                 ptr_values[lhs] = ptr_values[first[4:]]
