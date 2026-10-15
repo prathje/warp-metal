@@ -5534,12 +5534,14 @@ def _metal_mark_shared_buffer(mtl_buf) -> None:
 
 
 def _metal_unmark_shared_buffer(mtl_buf) -> None:
-    if mtl_buf is None or not warp.config.metal_native_dispatch:
+    if mtl_buf is None:
         return
-    import warp._src.metal_dispatch as _md  # noqa: PLC0415
-
-    if _md._dispatcher_singleton is not None:
-        _md._dispatcher_singleton.unmark_shared(mtl_buf)
+    # No import here: this runs from array finalizers, also during
+    # interpreter shutdown when imports fail.
+    _md = sys.modules.get("warp._src.metal_dispatch")
+    disp = getattr(_md, "_dispatcher_singleton", None) if _md is not None else None
+    if disp is not None:
+        disp.unmark_shared(mtl_buf)
 
 
 def _metal_register_foreign_buffer(ptr: int, owner) -> None:
