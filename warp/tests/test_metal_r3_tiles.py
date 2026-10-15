@@ -443,6 +443,51 @@ class TestMetalR3Tiles(unittest.TestCase):
             """,
         )
 
+    def test_bsr_from_triplets_device(self):
+        # Built on the GPU (sort / scan / scatter), so it also records into a
+        # Metal graph capture: out-of-range, duplicate and zero blocks, a device
+        # ``count``, and the padded topology.
+        _run(
+            self,
+            """
+            import warp.sparse as sp
+
+            rng = np.random.default_rng(0)
+            n = 300
+            rows = rng.integers(-2, 40, n).astype(np.int32)
+            cols = rng.integers(0, 33, n).astype(np.int32)
+            vals = rng.standard_normal((n, 2, 2)).astype(np.float32)
+            vals[::7] = 0.0
+
+            def run(dev):
+                r, c = wp.array(rows, device=dev), wp.array(cols, device=dev)
+                v = wp.array(vals, dtype=wp.mat22, device=dev)
+                a = sp.bsr_zeros(40, 32, wp.mat22, device=dev)
+                sp.bsr_set_from_triplets(a, r, c, v, count=wp.array([250], dtype=int, device=dev))
+                a.nnz_sync()
+                b = sp.bsr_zeros(40, 32, wp.mat22, device=dev)
+                sp.bsr_set_from_triplets(b, r, c, v)
+                if dev != "cpu":
+                    with wp.ScopedCapture(device=dev) as cap:
+                        sp.bsr_set_from_triplets(b, r, c, v)
+                    b.offsets.zero_()
+                    b.values.zero_()
+                    wp.capture_launch(cap.graph)
+                b.nnz_sync()
+                p = sp.bsr_zeros(40, 32, wp.mat22, device=dev, row_capacity=16)
+                sp.bsr_set_from_triplets(p, r, c, v, topology="padded")
+                po, pc, cols_p, vals_p = p.offsets.numpy(), p.row_counts.numpy(), p.columns.numpy(), p.values.numpy()
+                act = np.concatenate([np.arange(po[i], po[i] + pc[i]) for i in range(40)]).astype(int)
+                return [
+                    pc, cols_p[act], vals_p[act],
+                    a.offsets.numpy(), a.columns.numpy()[: a.nnz], a.values.numpy()[: a.nnz],
+                    b.offsets.numpy(), b.columns.numpy()[: b.nnz], b.values.numpy()[: b.nnz],
+                ]
+
+            assert_same(both(run))
+            """,
+        )
+
     def test_strided_copy_in_capture(self):
         # Strided Metal<->Metal copies are device kernels, so they replay.
         _run(
