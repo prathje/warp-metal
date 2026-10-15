@@ -906,6 +906,33 @@ class TestMetalR3Locals(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet, timeout=120)
 
+    def test_rebound_array_view_site_reuse(self):
+        # ``prev = cur; cur = src[i]``: the view site re-executes each
+        # iteration, and ``prev`` must keep the row it was bound to.
+        snippet = _snippet(
+            """
+            @wp.kernel
+            def k(src: wp.array2d[float], out: wp.array2d[float], n: int):
+                t = wp.tid()
+                cur = src[0]
+                prev = cur
+                for i in range(n):
+                    prev = cur
+                    cur = src[i]
+                    out[t, i] = prev[0] * 100.0 + cur[0]
+
+            def run(dev):
+                s = wp.array(np.arange(5 * 2, dtype=np.float32).reshape(5, 2), device=dev)
+                o = wp.zeros((2, 5), dtype=float, device=dev)
+                wp.launch(k, 2, [s, o, 5], device=dev)
+                return (o.numpy(),)
+
+            res = compare(run)
+            np.testing.assert_allclose(res["metal:0"][0][0], [0.0, 2.0, 204.0, 406.0, 608.0])
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

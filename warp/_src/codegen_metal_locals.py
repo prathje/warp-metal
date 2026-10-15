@@ -1127,15 +1127,17 @@ def fold_dynamic_array_locals(nodes: list[Node], adj, var_ctypes: dict[str, str]
     dyn_roots = {find(x) for x in rebound}
     members = {x for x in list(parent) if find(x) in dyn_roots and x in array_labels and x not in arg_ndim}
 
-    # Candidates, numbered per group: every view of a kernel argument taken
-    # into a member (indices captured into fresh locals at the view) and
-    # every whole argument copied into one.
+    # Candidates, numbered per group: ``(argument, number of leading view
+    # indices)`` for every view of a kernel argument taken into a member and
+    # every whole argument copied into one. Each member owns its selector
+    # AND its own copy of the leading indices (``var_<m>__i<k>``): a view
+    # site that re-executes (``prev = cur; cur = src[i]`` in a loop) must
+    # not move members bound by an earlier execution.
     decls: list[Node] = []
-    counter = [0]
-    cands: dict[str, list[tuple[str, tuple[str, ...]]]] = {}
-    cand_at: dict[int, tuple[int, tuple[str, ...]]] = {}  # id(node) -> (candidate, captured index locals)
+    cands: dict[str, list[tuple[str, int]]] = {}
+    cand_at: dict[int, int] = {}  # id(node) -> candidate
 
-    def add_cand(group: str, cand: tuple[str, tuple[str, ...]]) -> int:
+    def add_cand(group: str, cand: tuple[str, int]) -> int:
         lst = cands.setdefault(group, [])
         if cand in lst:
             return lst.index(cand)
@@ -1149,28 +1151,39 @@ def fold_dynamic_array_locals(nodes: list[Node], adj, var_ctypes: dict[str, str]
             args = [x.strip() for x in _split_top_level_args(m.group("args"))]
             if not args[0].startswith("var_") or args[0][4:] not in arg_ndim:
                 raise fail("views of runtime-rebound arrays are not supported on Metal", raw)
-            captured = []
-            for _ in args[1:]:
-                counter[0] += 1
-                captured.append(f"var_dyn{counter[0]}")
-                decls.append(_RawLine(raw=f"    int var_dyn{counter[0]} = 0;"))
-            cand_at[id(n)] = (add_cand(find(m.group("lhs")), (args[0][4:], tuple(captured))), tuple(captured))
+            cand_at[id(n)] = add_cand(find(m.group("lhs")), (args[0][4:], len(args) - 1))
             continue
         m = _COPY_ANY_PAT.match(raw)
         if m and m.group("lhs") in members and m.group("src") in arg_ndim:
-            cand_at[id(n)] = (add_cand(find(m.group("lhs")), (m.group("src"), ())), ())
+            cand_at[id(n)] = add_cand(find(m.group("lhs")), (m.group("src"), 0))
+    nlead = {g: max((k for _b, k in lst), default=0) for g, lst in cands.items()}
     for mlabel in sorted(members):
         decls.append(_RawLine(raw=f"    int var_{mlabel}__sel = -1;"))
+        for k in range(nlead.get(find(mlabel), 0)):
+            decls.append(_RawLine(raw=f"    int var_{mlabel}__i{k} = 0;"))
+
+    def lead_of(member: str, n_lead: int) -> list[str]:
+        return [f"var_{member}__i{k}" for k in range(n_lead)]
+
+    def copy_member(indent: str, dst: str, src: str) -> list[str]:
+        out = [f"{indent}var_{dst}__sel = var_{src}__sel;"]
+        out += [f"{indent}var_{dst}__i{k} = var_{src}__i{k};" for k in range(nlead.get(find(dst), 0))]
+        return out
 
     skip: set[str] = set(members)
     dyn_ptrs: dict[str, str] = {}  # element pointer label -> member it points into
     shape_ptrs: dict[str, str] = {}
     shape_vals: dict[str, str] = {}
 
-    def dispatch(indent: str, sel: str, group: str, make) -> list[Node]:
-        """One ``if (sel == c) { ... }`` per candidate of ``group``."""
+    def dispatch(indent: str, sel: str, group: str, make, member: str | None = None) -> list[Node]:
+        """One ``if (sel == c) { ... }`` per candidate of ``group``.
+
+        ``make(c, base, lead)`` gets ``member``'s leading indices for the
+        candidate (empty without a member).
+        """
         out: list[Node] = []
-        for c, (base, lead) in enumerate(cands.get(group, [])):
+        for c, (base, n_lead) in enumerate(cands.get(group, [])):
+            lead = lead_of(member, n_lead) if member else ["0"] * n_lead
             cond = f"({sel} == {c})"
             out.append(
                 If(
@@ -1196,25 +1209,25 @@ def fold_dynamic_array_locals(nodes: list[Node], adj, var_ctypes: dict[str, str]
                 return []
             return [n]
         if id(n) in cand_at:
-            c, captured = cand_at[id(n)]
+            c = cand_at[id(n)]
             m = _ASSIGN_CALL_PAT.match(raw) or _COPY_ANY_PAT.match(raw)
-            indent = m.group("indent")
+            indent, lhs = m.group("indent"), m.group("lhs")
             out = []
-            if captured:
+            if "args" in m.groupdict():
                 args = [x.strip() for x in _split_top_level_args(m.group("args"))]
-                out = [f"{indent}{t} = {a};" for t, a in zip(captured, args[1:], strict=True)]
-            out.append(f"{indent}var_{m.group('lhs')}__sel = {c};")
+                out = [f"{indent}var_{lhs}__i{k} = {a};" for k, a in enumerate(args[1:])]
+            out.append(f"{indent}var_{lhs}__sel = {c};")
             return _to_nodes(out)
         m = _ASSIGN_VOID_PAT.match(raw)
         if m and m.group("dst") in members:
             if m.group("src") not in members:
                 raise fail("unsupported source for a runtime-rebound array local", raw)
-            return _to_nodes([f"{m.group('indent')}var_{m.group('dst')}__sel = var_{m.group('src')}__sel;"])
+            return _to_nodes(copy_member(m.group("indent"), m.group("dst"), m.group("src")))
         m = _COPY_ANY_PAT.match(raw)
         if m and m.group("lhs") in members:
             if m.group("src") not in members:
                 raise fail("unsupported source for a runtime-rebound array local", raw)
-            return _to_nodes([f"{m.group('indent')}var_{m.group('lhs')}__sel = var_{m.group('src')}__sel;"])
+            return _to_nodes(copy_member(m.group("indent"), m.group("lhs"), m.group("src")))
         m = _ASSIGN_CALL_PAT.match(raw)
         if m:
             fn, lhs, indent = m.group("fn"), m.group("lhs"), m.group("indent")
@@ -1226,8 +1239,8 @@ def fold_dynamic_array_locals(nodes: list[Node], adj, var_ctypes: dict[str, str]
                 skip.add(lhs)
                 decls.append(_RawLine(raw=f"    int var_{lhs}__s = -1;"))
                 out = [
-                    f"{indent}var_{lhs}__c{c} = wp::address({', '.join([f'var_{base}', *lead, *args[1:]])});"
-                    for c, (base, lead) in enumerate(cands.get(find(mem), []))
+                    f"{indent}var_{lhs}__c{c} = wp::address({', '.join([f'var_{base}', *lead_of(mem, k), *args[1:]])});"
+                    for c, (base, k) in enumerate(cands.get(find(mem), []))
                 ]
                 out.append(f"{indent}var_{lhs}__s = var_{mem}__sel;")
                 return _to_nodes(out)
@@ -1244,12 +1257,16 @@ def fold_dynamic_array_locals(nodes: list[Node], adj, var_ctypes: dict[str, str]
                 mem = shape_vals[first[4:]]
                 k = args[1]
                 return dispatch(
-                    indent, f"var_{mem}__sel", find(mem), lambda c, b, ld: [f"var_{lhs} = {b}_shape[{len(ld)} + {k}];"]
+                    indent,
+                    f"var_{mem}__sel",
+                    find(mem),
+                    lambda c, b, ld: [f"var_{lhs} = {b}_shape[{len(ld)} + {k}];"],
+                    mem,
                 )
             if fn == "len" and is_member(first):
                 mem = first[4:]
                 return dispatch(
-                    indent, f"var_{mem}__sel", find(mem), lambda c, b, ld: [f"var_{lhs} = {b}_shape[{len(ld)}];"]
+                    indent, f"var_{mem}__sel", find(mem), lambda c, b, ld: [f"var_{lhs} = {b}_shape[{len(ld)}];"], mem
                 )
             if fn.startswith("atomic_") and is_member(first):
                 mem = first[4:]
@@ -1258,6 +1275,7 @@ def fold_dynamic_array_locals(nodes: list[Node], adj, var_ctypes: dict[str, str]
                     f"var_{mem}__sel",
                     find(mem),
                     lambda c, b, ld: [f"var_{lhs} = wp::{fn}({', '.join([f'var_{b}', *ld, *args[1:]])});"],
+                    mem,
                 )
         m = _SHAPE_PTR_PAT.match(raw)
         if m and m.group("arr") in members:
@@ -1276,6 +1294,7 @@ def fold_dynamic_array_locals(nodes: list[Node], adj, var_ctypes: dict[str, str]
                     f"var_{mem}__sel",
                     find(mem),
                     lambda c, b, ld: [f"wp::{fn}({', '.join([f'var_{b}', *ld, *args[1:]])});"],
+                    mem,
                 )
             if fn == "store" and first.startswith("var_") and first[4:] in dyn_ptrs:
                 p = first[4:]
@@ -1295,7 +1314,7 @@ def fold_dynamic_array_locals(nodes: list[Node], adj, var_ctypes: dict[str, str]
                 new = _raw[:_lo] + ", ".join([f"var_{b}", *ld, _m.group("idx")]) + _raw[_hi:]
                 return [ln.strip() for ln in _lower_array_slot_ir([new], adj, [new])]
 
-            return dispatch(m.group("indent"), f"var_{mem}__sel", find(mem), mk)
+            return dispatch(m.group("indent"), f"var_{mem}__sel", find(mem), mk, mem)
         for tok in _VAR_TOKEN_PAT.finditer(raw):
             if tok.group(0).startswith("var_") and (
                 tok.group(1) in members or tok.group(1) in dyn_ptrs or tok.group(1) in shape_ptrs
