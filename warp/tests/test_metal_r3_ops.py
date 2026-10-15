@@ -505,6 +505,37 @@ class TestMetalR3Ops(unittest.TestCase):
             """,
         )
 
+    def test_tile_inplace_add_sub_adjoints(self):
+        _run(
+            self,
+            """
+            @wp.kernel
+            def k(a: wp.array2d[float], b: wp.array2d[float], out: wp.array2d[float]):
+                i, j = wp.tid()
+                t = wp.tile_load(a, shape=(2, 4), offset=(i * 2, 0))
+                u = wp.tile_load(b, shape=(2, 4), offset=(i * 2, 0))
+                t += u * u
+                t -= u
+                wp.tile_store(out, t * t, offset=(i * 2, 0))
+
+            def launch(dev):
+                a = wp.array(np.arange(8, dtype=np.float32).reshape(2, 4) * 0.5, dtype=float, device=dev,
+                             requires_grad=True)
+                b = wp.array(np.arange(8, dtype=np.float32).reshape(2, 4) * -0.25, dtype=float, device=dev,
+                             requires_grad=True)
+                out = wp.zeros((2, 4), dtype=float, device=dev, requires_grad=True)
+                tape = wp.Tape()
+                with tape:
+                    wp.launch_tiled(k, dim=(1, 1), inputs=[a, b], outputs=[out],
+                                    block_dim=1 if dev == "cpu" else 32, device=dev)
+                tape.backward(grads={out: wp.ones((2, 4), dtype=float, device=dev)})
+                return out.numpy(), a.grad.numpy(), b.grad.numpy()
+
+            cpu, metal = both(launch)
+            assert_same(cpu, metal, rtol=1e-6)
+            """,
+        )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

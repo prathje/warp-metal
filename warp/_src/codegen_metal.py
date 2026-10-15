@@ -11109,6 +11109,7 @@ _TILE_OP_NOTPL_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_(add|sub|mul_elemen
 # In-place compound forms ``wp::tile_add_inplace(dst, src)`` etc. —
 # accumulates ``src`` into ``dst`` element-wise.
 _TILE_OP_INPLACE_PAT = re.compile(r"\bwp::tile_(add|sub|mul|div)_inplace\s*\(([^)]*)\)")
+_ADJ_TILE_INPLACE_PAT = re.compile(r"\bwp::adj_tile_(add|sub)_inplace\s*\(([^)]*)\)")
 # ``wp::tile_sort(keys, values)`` — cooperative key/value sort, in place,
 # ascending by key. mujoco_warp's ``segmented_sort`` (broadphase contact
 # sort) and ``contact_sensor_sort`` use this. With our default
@@ -12143,6 +12144,28 @@ def _translate_tile_intrinsics(
         return f"for (int _ats_i = 0; _ats_i < {n}; ++_ats_i) {adj_in}.c[_ats_i] += {adj_ret}"
 
     line = _ADJ_TILE_SUM_PAT.sub(repl_adj_tile_sum, line)
+
+    def repl_adj_tile_inplace(m: re.Match[str]) -> str:
+        # ``wp::adj_tile_{add,sub}_inplace(var_A, var_B, adj_A, adj_B)`` for
+        # ``A += B`` / ``A -= B`` on two same-shape tiles (``tile.h``): A's
+        # dual passes through and B's dual gains +/- A's. Element-wise on
+        # the per-lane storage, like the forward in-place loop.
+        args = [a.strip() for a in m.group(2).split(",")]
+        if len(args) != 4:
+            return m.group(0)
+        dst, src, adj_dst, adj_src = args
+        dst_label = dst[len("var_") :] if dst.startswith("var_") else dst
+        src_label = src[len("var_") :] if src.startswith("var_") else src
+        dst_dims = tile_var_dims.get(dst_label)
+        if dst_dims is None or tile_var_dims.get(src_label) is None:
+            return m.group(0)
+        n = dst_dims[0] * dst_dims[1] * max(tile_var_vec_n.get(dst_label, 0), 1)
+        sym = "+" if m.group(1) == "add" else "-"
+        if n == 1 and tile_var_vec_n.get(dst_label, 0) == 0:
+            return f"{adj_src} {sym}= {adj_dst}"
+        return f"for (int _aip_i = 0; _aip_i < {n}; ++_aip_i) {adj_src}.c[_aip_i] {sym}= {adj_dst}.c[_aip_i]"
+
+    line = _ADJ_TILE_INPLACE_PAT.sub(repl_adj_tile_inplace, line)
 
     def repl_adj_tile_op(m: re.Match[str]) -> str:
         op = m.group(1)
