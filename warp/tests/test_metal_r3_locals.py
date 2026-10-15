@@ -962,6 +962,65 @@ class TestMetalR3Locals(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet, timeout=120)
 
+    def test_struct_copy_then_field_store(self):
+        # ``q = p; p.data = a``: natively ``q`` keeps the empty field. Storing
+        # into the copy (or a by-value parameter) works; storing into the
+        # source after copying raises instead of aliasing ``q`` to ``a``.
+        snippet = _snippet(
+            """
+            @wp.struct
+            class P:
+                data: wp.array[float]
+                n: int
+
+            @wp.func
+            def read(p: P) -> float:
+                if p.data.shape[0] > 1:
+                    return p.data[1]
+                return -1.0
+
+            @wp.func
+            def set_inplace(p: P, a: wp.array[float]):
+                p.data = a
+
+            @wp.kernel
+            def k_ok(a: wp.array[float], out: wp.array2d[float]):
+                t = wp.tid()
+                p3 = P()
+                q3 = p3
+                q3.data = a
+                out[t, 0] = read(q3) * 10.0 + read(p3)
+                p6 = P()
+                set_inplace(p6, a)
+                out[t, 1] = read(p6)
+
+            @wp.kernel
+            def k_bad(a: wp.array[float], out: wp.array[float]):
+                t = wp.tid()
+                p8 = P()
+                q8 = p8
+                p8.data = a
+                out[t] = read(q8) * 10.0 + read(p8)
+
+            def run(dev):
+                a = wp.array(np.array([3, 4, 5], np.float32), device=dev)
+                o = wp.zeros((2, 2), dtype=float, device=dev)
+                wp.launch(k_ok, 2, [a, o], device=dev)
+                return (o.numpy(),)
+
+            compare(run)
+            from warp._src.codegen_metal import MetalCodegenError
+            try:
+                wp.launch(k_bad, 2, [wp.zeros(3, dtype=float, device="metal:0"), wp.zeros(2, dtype=float, device="metal:0")],
+                          device="metal:0")
+            except MetalCodegenError as e:
+                assert "diverges" in str(e), e
+            else:
+                raise AssertionError("diverging struct copy was not rejected")
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

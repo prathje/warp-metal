@@ -1568,6 +1568,71 @@ def fold_array_copy_aliases(nodes: list[Node], adj, var_ctypes: dict[str, str]) 
     return _map_leaves(nodes, rewrite), set(alias)
 
 
+def check_struct_copy_field_stores(nodes: list[Node], adj, struct_locals: dict[str, object]) -> None:
+    """Reject a struct copy that diverges in an array field.
+
+    ``q = p; p.data = a; ... q.data`` (or the mirror, storing into ``q``):
+    natively ``q`` keeps the field value from the copy, but the array-field
+    backing fold resolves fields flow-insensitively along copy edges and
+    would hand ``q`` the array stored into ``p`` later. Raise rather than
+    return the wrong array. A side that is redefined after the copy (e.g.
+    the by-value parameter copy of an inlined function whose result is
+    assigned back) is not a reader of the stale value and is ignored.
+    """
+    from warp._src.codegen import Struct  # noqa: PLC0415
+    from warp._src.codegen_metal import MetalCodegenError, _is_array_arg_type  # noqa: PLC0415
+
+    types: dict[str, object] = {str(v.label): v.type for v in adj.variables if isinstance(v.type, Struct)}
+    types.update({k: v for k, v in struct_locals.items() if isinstance(v, Struct)})
+    arr_fields = {lbl: {f for f, v in st.vars.items() if _is_array_arg_type(v.type)} for lbl, st in types.items()}
+    arr_fields = {k: v for k, v in arr_fields.items() if v}
+    if not arr_fields:
+        return
+    leaves = [n.raw for n in _iter_leaves(nodes) if not isinstance(n, (Comment, Empty, Pragma, _RawLine))]
+    copies: list[tuple[int, str, str]] = []  # (position, dst, src)
+    defs: dict[str, list[int]] = {}
+    ptr_field: dict[str, tuple[str, str]] = {}
+    stores: list[tuple[int, str, str]] = []
+    reads: list[tuple[int, str, str]] = []
+    for pos, raw in enumerate(leaves):
+        m = _COPY_ANY_PAT.match(raw)
+        if m and m.group("lhs") in arr_fields and m.group("src") in arr_fields:
+            copies.append((pos, m.group("lhs"), m.group("src")))
+        m = re.match(r"^\s*var_(\w+)\s*=", raw)
+        if m and m.group(1) in arr_fields:
+            defs.setdefault(m.group(1), []).append(pos)
+        m = _ASSIGN_VOID_PAT.match(raw)
+        if m and m.group("dst") in arr_fields:
+            defs.setdefault(m.group("dst"), []).append(pos)
+        m = _FIELD_PTR_PAT.match(raw)
+        if m and m.group("root") in arr_fields and m.group("field") in arr_fields[m.group("root")]:
+            ptr_field[m.group("lhs")] = (m.group("root"), m.group("field"))
+            continue
+        for mm in re.finditer(r"\bwp::(store|load)\s*\(\s*var_(\w+)", raw):
+            if mm.group(2) in ptr_field:
+                root, field = ptr_field[mm.group(2)]
+                (stores if mm.group(1) == "store" else reads).append((pos, root, field))
+    kname = getattr(adj, "fun_name", "?")
+    for cpos, dst, src in copies:
+        for spos, sroot, field in stores:
+            if spos <= cpos or sroot not in (dst, src):
+                continue
+            other = src if sroot == dst else dst
+            if sroot == dst and not any(r == src and f == field for _p, r, f in stores):
+                # Only the copy was reassigned and the source's field was
+                # never set: the empty-field fold keeps the source empty.
+                continue
+            if any(cpos < d <= spos for d in defs.get(other, ())) or any(cpos < d for d in defs.get(other, ())):
+                continue
+            if any(rpos > spos and rroot == other and rfield == field for rpos, rroot, rfield in reads):
+                raise MetalCodegenError(
+                    f"Kernel {kname!r}: a copy of a struct with array fields diverges from its source when the "
+                    f"array field {field!r} is reassigned after the copy; Metal resolves array fields of struct "
+                    "locals by alias and cannot keep the two apart. Assign the field before copying, or use "
+                    "separate struct locals"
+                )
+
+
 def _to_nodes(lines: list[str]) -> list[Node]:
     out: list[Node] = []
     for ln in lines:
@@ -1640,6 +1705,7 @@ def _ctype_size(ctype: str) -> int:
 
 
 __all__ = [
+    "check_struct_copy_field_stores",
     "fold_arg_slice_views",
     "fold_array_copy_aliases",
     "fold_dynamic_array_locals",

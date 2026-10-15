@@ -167,6 +167,7 @@ from warp._src.codegen_metal_ast import lower_reverse_ranges as _ast_lower_rever
 from warp._src.codegen_metal_ast import parse as _ast_parse
 from warp._src.codegen_metal_ast import query_iterator_vars as _ast_query_iterator_vars
 from warp._src.codegen_metal_ast import wrap_negative_array_indices as _ast_wrap_negative_array_indices
+from warp._src.codegen_metal_locals import check_struct_copy_field_stores as _check_struct_copy_field_stores
 from warp._src.codegen_metal_locals import fold_arg_slice_views as _fold_arg_slice_views
 from warp._src.codegen_metal_locals import fold_array_copy_aliases as _fold_array_copy_aliases
 from warp._src.codegen_metal_locals import fold_dynamic_array_locals as _fold_dynamic_array_locals
@@ -14828,6 +14829,7 @@ def _generate_msl_kernel_uncached(
         _ast_nodes, adj, {**{str(_v.label): _v.ctype() for _v in adj.variables}, **_inlined_var_ctypes}
     )
     _local_arr_skip = _local_arr_skip | _arr_copy_skip
+    _check_struct_copy_field_stores(_ast_nodes, adj, _inlined_struct_locals)
     # Array fields of default-constructed struct locals (empty arrays).
     _ast_nodes, _empty_field_skip = _fold_empty_struct_array_fields(
         _ast_nodes,
