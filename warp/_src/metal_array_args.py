@@ -16,7 +16,8 @@ directly. :func:`stage_launch_args` makes such launches work by staging:
 3. arguments the kernel writes are scattered back through the same
    strides / indices.
 
-All steps are ordinary dispatches, so a staged launch is asynchronous and
+Reverse-mode launches stage the paired gradient arrays the same way (gather
+before, scatter back after). All steps are ordinary dispatches, so a staged launch is asynchronous and
 records into a Metal graph capture like any other launch.
 
 A staged argument whose memory overlaps another array argument, where
@@ -84,6 +85,34 @@ kernel void wp_stage_copy(device U* view [[buffer(0)]],
     }
 }
 
+// Accumulating scatter for float gradients: ``view[off] += dense - orig``
+// (atomically, so elements of a self-aliasing view each keep their share).
+kernel void wp_stage_accum_f32(device atomic_float* view [[buffer(0)]],
+                               device const float* dense [[buffer(1)]],
+                               device const int* i0 [[buffer(2)]],
+                               device const int* i1 [[buffer(3)]],
+                               device const int* i2 [[buffer(4)]],
+                               device const int* i3 [[buffer(5)]],
+                               constant StageParams& p [[buffer(6)]],
+                               device const float* orig [[buffer(7)]],
+                               uint tid [[thread_position_in_grid]]) {
+    const uint e = tid / p.elem_units;
+    const uint u = tid % p.elem_units;
+    const long off = wp_stage_offset(p, e, i0, i1, i2, i3) / 4 + long(u);
+    const float o = orig[tid];
+    const float d = dense[tid];
+    if (metal::isfinite(o)) {
+        const float delta = d - o;
+        if (delta != 0.0f) {
+            atomic_fetch_add_explicit(&view[off], delta, memory_order_relaxed);
+        }
+    } else if (!(d == o)) {
+        // A non-finite original has no meaningful difference (inf - inf is
+        // NaN): store the new value instead.
+        atomic_store_explicit(&view[off], d, memory_order_relaxed);
+    }
+}
+
 template [[host_name("wp_stage_copy_4")]] kernel void wp_stage_copy<uint>(
     device uint*, device uint*, device const int*, device const int*, device const int*, device const int*,
     constant StageParams&, uint);
@@ -110,7 +139,7 @@ def _view_layout(value):
     return value, list(value.strides), [None] * value.ndim
 
 
-def _stage_copy(value, dense, direction: int) -> None:
+def _stage_copy(value, dense, direction: int, orig=None) -> None:
     from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
 
     base, strides, indices = _view_layout(value)
@@ -138,9 +167,13 @@ def _stage_copy(value, dense, direction: int) -> None:
     params = _mu._bytes("<4I4I4q", ndim, idx_mask, elem_units, direction, *shape, *full_strides)
     n = value.size * elem_units
     view_mode, dense_mode = ("r", "w") if direction == 0 else ("w", "r")
+    entry, extra, extra_modes = f"wp_stage_copy_{unit}", [], []
+    if orig is not None:
+        # Accumulating scatter (see ``_accumulates``): float32 words only.
+        entry, extra, extra_modes, view_mode = "wp_stage_accum_f32", [_mu._slice(orig)], ["r"], "rw"
     _mu._dispatch(
-        f"wp_stage_copy_{unit}",
-        [view_slice, _mu._slice(dense), *idx_bindings, params],
+        entry,
+        [view_slice, _mu._slice(dense), *idx_bindings, params, *extra],
         [
             view_mode,
             dense_mode,
@@ -149,11 +182,68 @@ def _stage_copy(value, dense, direction: int) -> None:
             "r" if idx_mask & 4 else None,
             "r" if idx_mask & 8 else None,
             None,
+            *extra_modes,
         ],
         (n, 1, 1),
         (min(256, n), 1, 1),
         source=_MSL_SOURCE,
     )
+
+
+def _is_dense(value) -> bool:
+    return isinstance(value, wp._src.types.array) and value.is_contiguous
+
+
+def metal_device_strided_copy(dest, src) -> bool:
+    """``wp.copy`` between two Metal arrays of equal shape where at least one
+    is strided or indexed, as device dispatches of the staging kernel.
+
+    Returns ``False`` (caller falls back to the host strided copy) for
+    anything other than ``wp.array`` / ``wp.indexedarray`` views of up to
+    four dimensions. The dispatches order after pending kernels on the same
+    queue and record into an active Metal graph capture, so the copy replays
+    with the graph (the host path cannot).
+    """
+    from warp._src.context import runtime  # noqa: PLC0415
+
+    kinds = (wp._src.types.array, wp._src.types.indexedarray)
+    if not isinstance(src, kinds) or not isinstance(dest, kinds):
+        return False
+    if src.ndim > 4 or dest.ndim > 4 or src.size == 0:
+        return src.size == 0
+    for v in (src, dest):
+        base = v.data if isinstance(v, wp._src.types.indexedarray) else v
+        if base is None or base.ptr is None:
+            return False
+    device = dest.device
+    if _is_dense(dest):
+        _stage_copy(src, dest, 0)
+    elif _is_dense(src):
+        _stage_copy(dest, src, 1)
+    else:
+        tmp = wp.empty(src.shape, dtype=src.dtype, device=device)
+        if device.is_capturing:
+            runtime._metal_capture_graph._metal_retain.append(tmp)
+        _stage_copy(src, tmp, 0)
+        _stage_copy(dest, tmp, 1)
+    return True
+
+
+def _is_injective(value) -> bool:
+    """Whether distinct elements of ``value`` occupy distinct memory.
+
+    Index arrays are not inspected (that would read them on the host), so an
+    indexed array counts as possibly aliasing.
+    """
+    if isinstance(value, wp._src.types.indexedarray):
+        return False
+    dims = sorted((abs(st), sh) for sh, st in zip(value.shape, value.strides, strict=True) if sh > 1)
+    extent = wp._src.types.type_size_in_bytes(value.dtype)
+    for stride, size in dims:
+        if stride < extent:
+            return False
+        extent = stride * size
+    return True
 
 
 def _array_variant(kernel):
@@ -234,52 +324,119 @@ def _written_arg_labels(kernel, block_dim) -> frozenset:
     return labels
 
 
+def _native_view_arg_labels(kernel) -> frozenset:
+    """Array arguments the kernel hands to a native snippet as raw memory."""
+    import re  # noqa: PLC0415
+
+    labels = kernel.__dict__.get("_metal_native_view_args")
+    if labels is None:
+        from warp._src.codegen_metal import generate_msl_kernel  # noqa: PLC0415
+
+        src = generate_msl_kernel(kernel).source
+        labels = frozenset(re.findall(r"wp_native_array<[^<>]*>::make\(reinterpret_cast<ulong>\((\w+)\)", src))
+        kernel._metal_native_view_args = labels
+    return labels
+
+
 class StagedLaunch:
     """A launch whose strided / indexed arguments were replaced by
     contiguous temporaries; :meth:`run` launches and scatters back."""
 
-    def __init__(self, kernel, inputs, outputs, staged):
+    def __init__(self, kernel, inputs, outputs, staged, adj_inputs=(), adj_outputs=(), adj_staged=()):
         self.kernel = kernel
         self.inputs = inputs
         self.outputs = outputs
+        self.adj_inputs = adj_inputs
+        self.adj_outputs = adj_outputs
         self._staged = staged  # [(arg_index, original, temporary)]
+        self._adj_staged = adj_staged  # [(original, temporary, gathered copy or None)]
 
     def run(self, launch_fn, block_dim=None):
-        result = launch_fn(self.kernel, self.inputs, self.outputs)
+        result = launch_fn(self.kernel, self.inputs, self.outputs, self.adj_inputs, self.adj_outputs)
         written = _written_arg_labels(self.kernel, block_dim)
         args = self.kernel.adj.args
         for i, original, tmp in self._staged:
             if args[i].label in written:
                 _stage_copy(original, tmp, 1)
+        # Gradient arrays are read-modify-written by the adjoint kernel
+        # (accumulated, or consumed and zeroed for stored outputs). float32
+        # gradients scatter back the change atomically, so a view whose
+        # elements alias (an index array repeating an index, overlapping
+        # strides) keeps every contribution; others copy back.
+        for original, tmp, orig in self._adj_staged:
+            _stage_copy(original, tmp, 1, orig)
         return result
 
 
-def stage_launch_args(kernel, inputs, outputs, device, adjoint: bool = False) -> StagedLaunch | None:
-    """Return a :class:`StagedLaunch` if any argument needs staging, else ``None``."""
+def stage_launch_args(
+    kernel, inputs, outputs, device, adjoint: bool = False, adj_inputs=(), adj_outputs=()
+) -> StagedLaunch | None:
+    """Return a :class:`StagedLaunch` if any argument needs staging, else ``None``.
+
+    In reverse mode the gradient arrays paired with the arguments are staged
+    too: gathered before the adjoint launch and scattered back after it.
+    """
     values = [*inputs, *outputs]
-    if not any(_needs_staging(v) for v in values):
+    adj_values = [*adj_inputs, *adj_outputs] if adjoint else []
+    if not any(_needs_staging(v) for v in (*values, *adj_values)):
         return None
-    if adjoint:
-        raise RuntimeError(
-            f"Kernel '{kernel.key}': reverse-mode launches with strided or indexed array arguments "
-            "are not supported on Metal; pass contiguous arrays."
-        )
     from warp._src.context import runtime  # noqa: PLC0415
 
     variant = _array_variant(kernel)
     staged_indices = {i for i, v in enumerate(values) if _needs_staging(v)}
     _check_staged_aliasing(variant, values, staged_indices, _written_arg_labels(variant, None))
     graph = runtime._metal_capture_graph if device.is_capturing else None
+
+    def _stage(value):
+        tmp = wp.empty(value.shape, dtype=value.dtype, device=device)
+        if graph is not None:
+            graph._metal_retain.append(tmp)
+        _stage_copy(value, tmp, 0)
+        return tmp
+
+    native_args = _native_view_arg_labels(variant)
     staged = []
     new_values = list(values)
     for i, value in enumerate(values):
         if not _needs_staging(value):
             continue
-        tmp = wp.empty(value.shape, dtype=value.dtype, device=device)
-        if graph is not None:
-            graph._metal_retain.append(tmp)
-        _stage_copy(value, tmp, 0)
+        if variant.adj.args[i].label in native_args:
+            raise RuntimeError(
+                f"Kernel '{kernel.key}': strided or indexed argument {variant.adj.args[i].label!r} is passed to a "
+                "@wp.func_native snippet; on Metal the kernel sees a dense copy, which a snippet reading raw "
+                "memory would index differently than on CPU/CUDA. Pass a contiguous array."
+            )
+        tmp = _stage(value)
         new_values[i] = tmp
         staged.append((i, value, tmp))
+    adj_staged = []
+    new_adj = list(adj_values)
+    for i, value in enumerate(adj_values):
+        if not _needs_staging(value):
+            continue
+        tmp = _stage(value)
+        new_adj[i] = tmp
+        orig = None
+        if wp._src.types.type_scalar_type(value.dtype) is wp.float32:
+            orig = wp.clone(tmp)
+            if graph is not None:
+                graph._metal_retain.append(orig)
+        elif not _is_injective(value):
+            raise RuntimeError(
+                f"Kernel '{kernel.key}': the gradient array for a strided or indexed argument has dtype "
+                f"{wp._src.types.type_repr(value.dtype)} and elements that alias (zero or overlapping strides, or "
+                "an index array); on Metal only float32 gradients of such views can be accumulated. Pass a "
+                "contiguous gradient array."
+            )
+        adj_staged.append((value, tmp, orig))
     n_in = len(inputs)
-    return StagedLaunch(variant, new_values[:n_in], new_values[n_in:], staged)
+    n_adj_in = len(adj_inputs) if adjoint else 0
+    return StagedLaunch(
+        variant,
+        new_values[:n_in],
+        new_values[n_in:],
+        staged,
+        adj_inputs=tuple(new_adj[:n_adj_in]) if adjoint else adj_inputs,
+        adj_outputs=tuple(new_adj[n_adj_in:]) if adjoint else adj_outputs,
+        adj_staged=adj_staged,
+    )

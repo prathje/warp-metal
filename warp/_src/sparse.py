@@ -1026,6 +1026,183 @@ _zero_value_masks = {
 }
 
 
+@wp.kernel(module="unique")
+def _bsr_triplet_keys_metal(
+    nnz: int,
+    count: wp.array(dtype=int),
+    has_count: int,
+    row_count: int,
+    col_count: int,
+    rows: wp.array(dtype=int),
+    columns: wp.array(dtype=int),
+    values: wp.array3d(dtype=Any),
+    has_values: int,
+    sentinel: Any,
+    keys: wp.array(dtype=Any),
+    indices: wp.array(dtype=int),
+):
+    i = wp.tid()
+    key = sentinel
+    n = nnz
+    if has_count != 0:
+        n = wp.min(count[0], nnz)
+    if i < n:
+        row = rows[i]
+        col = columns[i]
+        if row >= 0 and row < row_count and col >= 0 and col < col_count:
+            nonzero = has_values == 0
+            if has_values != 0:
+                for a in range(values.shape[1]):
+                    for b in range(values.shape[2]):
+                        v = values[i, a, b]
+                        if v != type(v)(0):
+                            nonzero = True
+            if nonzero:
+                key = type(sentinel)(row) * type(sentinel)(col_count) + type(sentinel)(col)
+    keys[i] = key
+    indices[i] = i
+
+
+@wp.kernel(module="unique")
+def _bsr_triplet_heads_metal(nnz: int, sentinel: Any, keys: wp.array(dtype=Any), heads: wp.array(dtype=int)):
+    i = wp.tid()
+    head = 0
+    if keys[i] != sentinel and (i == 0 or keys[i] != keys[i - 1]):
+        head = 1
+    heads[i] = head
+
+
+@wp.kernel(module="unique")
+def _bsr_triplet_emit_metal(
+    nnz: int,
+    col_count: int,
+    sentinel: Any,
+    keys: wp.array(dtype=Any),
+    sorted_indices: wp.array(dtype=int),
+    block_ids: wp.array(dtype=int),
+    has_summed: int,
+    summed_offsets: wp.array(dtype=int),
+    summed_indices: wp.array(dtype=int),
+    row_ends: wp.array(dtype=int),
+    bsr_columns: wp.array(dtype=int),
+):
+    i = wp.tid()
+    key = keys[i]
+    if key == sentinel:
+        return
+    block = block_ids[i] - 1
+    row = int(key / type(sentinel)(col_count))
+    col = int(key - type(sentinel)(row) * type(sentinel)(col_count))
+    if has_summed != 0:
+        summed_indices[i] = sorted_indices[i]
+    last = i + 1 == nnz
+    if not last:
+        last = keys[i + 1] != key
+    if last:
+        bsr_columns[block] = col
+        if has_summed != 0:
+            summed_offsets[block] = i + 1
+        # The last block of a row records the row's end offset.
+        row_last = i + 1 == nnz
+        if not row_last:
+            nxt = keys[i + 1]
+            row_last = nxt == sentinel or int(nxt / type(sentinel)(col_count)) != row
+        if row_last:
+            row_ends[row] = block + 1
+
+
+@wp.kernel(module="unique")
+def _bsr_triplet_offsets_metal(row_count: int, row_ends: wp.array(dtype=int), bsr_offsets: wp.array(dtype=int)):
+    # ``row_ends`` holds each non-empty row's end offset (else -1);
+    # its inclusive max-scan is not available, so walk back to the
+    # previous non-empty row (rows are processed independently).
+    r = wp.tid()
+    if r == 0:
+        bsr_offsets[0] = 0
+    end = row_ends[r]
+    k = r
+    while end < 0 and k > 0:
+        k -= 1
+        end = row_ends[k]
+    bsr_offsets[r + 1] = wp.max(end, 0)
+
+
+def _bsr_set_from_triplets_metal(
+    dest, rows, columns, values, count, nnz, zero_value_mask, summed_offsets, summed_indices, dest_offsets, dest_columns
+) -> None:
+    """Device-side ``wp_bsr_matrix_from_triplets`` for Metal (compact topology).
+
+    Sorts the valid triplets by ``row * ncol + col`` with the Metal radix
+    sort, flags run heads, numbers blocks with a scan and scatters columns,
+    row offsets and the summed-triplet ranges. Every step is a dispatch, so
+    the build records into a Metal graph capture and needs no host sync.
+    """
+    from warp._src import metal_utils as _mu  # noqa: PLC0415
+
+    device = dest.device
+    span = dest.nrow * dest.ncol
+    key_type = wp.uint32 if span < 2**32 - 1 else wp.uint64
+    sentinel = key_type(span)
+    end_bit = max(int(span).bit_length(), 1)
+    keys = wp.empty(2 * nnz, dtype=key_type, device=device)
+    indices = wp.empty(2 * nnz, dtype=int, device=device)
+    has_values = values is not None and zero_value_mask != 0
+    values_3d = (
+        _as_3d_array(values, dest.block_shape)
+        if has_values
+        else wp.empty((0, 1, 1), dtype=dest.scalar_type, device=device)
+    )
+    count_arr = count if count is not None else wp.empty(1, dtype=int, device=device)
+    wp.launch(
+        _bsr_triplet_keys_metal,
+        dim=nnz,
+        device=device,
+        inputs=[
+            nnz,
+            count_arr,
+            int(count is not None),
+            dest.nrow,
+            dest.ncol,
+            rows,
+            columns,
+            values_3d,
+            int(has_values),
+            sentinel,
+            keys,
+            indices,
+        ],
+    )
+    _mu.radix_sort_pairs(keys, indices, nnz, 0, end_bit)
+    heads = wp.empty(nnz, dtype=int, device=device)
+    wp.launch(_bsr_triplet_heads_metal, dim=nnz, device=device, inputs=[nnz, sentinel, keys, heads])
+    _mu.array_scan(heads, heads, True)
+    row_ends = wp.full(dest.nrow, -1, dtype=int, device=device)
+    has_summed = summed_offsets is not None
+    dummy = wp.empty(1, dtype=int, device=device)
+    wp.launch(
+        _bsr_triplet_emit_metal,
+        dim=nnz,
+        device=device,
+        inputs=[
+            nnz,
+            dest.ncol,
+            sentinel,
+            keys,
+            indices,
+            heads,
+            int(has_summed),
+            summed_offsets if has_summed else dummy,
+            summed_indices if has_summed else dummy,
+            row_ends,
+            dest_columns,
+        ],
+    )
+    wp.launch(_bsr_triplet_offsets_metal, dim=dest.nrow, device=device, inputs=[dest.nrow, row_ends, dest_offsets])
+    if device.is_capturing:
+        graph = wp._src.context.runtime._metal_capture_graph
+        graph._metal_retain.extend((keys, indices, heads, row_ends, dummy, values_3d, count_arr))
+
+
 def _bsr_set_from_triplets_native(
     dest: BsrMatrix,
     rows: wp.array,
@@ -1086,6 +1263,30 @@ def _bsr_set_from_triplets_native(
             apic_capture.track_array(array)
         if device.is_cpu:
             _mark_apic_deferred_nnz_update(dest, apic_capture)
+
+    if (
+        getattr(device, "is_metal", False)
+        and not masked
+        and dest_row_counts is None
+        and (summed_triplet_offsets is None) == (summed_triplet_indices is None)
+        and wp.config.metal_native_dispatch
+    ):
+        _bsr_set_from_triplets_metal(
+            dest,
+            rows,
+            columns,
+            values,
+            count,
+            nnz,
+            zero_value_mask,
+            summed_triplet_offsets,
+            summed_triplet_indices,
+            dest_offsets,
+            dest_columns,
+        )
+        if refresh_nnz_transfer:
+            dest._refresh_nnz_transfer_if_pending()
+        return
 
     if _use_host_native_op(device):
         native_func = runtime.core.wp_bsr_matrix_from_triplets_host

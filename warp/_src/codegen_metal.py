@@ -7717,6 +7717,21 @@ def _emit_tile_struct(rows: int, cols: int, msl_scalar: str) -> str:
     parts.append("        }")
     parts.append("    }")
     parts.append("}")
+    # Bounds-checked overload: skips elements outside ``[0, n_rows) x [0, n_cols)``.
+    parts.append(
+        f"inline void {name}_store(device {msl_scalar}* arr, "
+        f"int base, int row_stride, int row_off, int col_off, {name} t, int n_rows, int n_cols) {{"
+    )
+    parts.append(f"    for (int i = 0; i < {rows}; ++i) {{")
+    parts.append("        int r = row_off + i;")
+    parts.append(f"        for (int j = 0; j < {cols}; ++j) {{")
+    parts.append("            int c = col_off + j;")
+    parts.append("            if (r >= 0 && r < n_rows && c >= 0 && c < n_cols) {")
+    parts.append(f"                arr[base + r * row_stride + c] = t.c[i * {cols} + j];")
+    parts.append("            }")
+    parts.append("        }")
+    parts.append("    }")
+    parts.append("}")
     return "\n".join(parts)
 
 
@@ -8557,18 +8572,48 @@ def _coop_tiles_enabled() -> bool:
 # and ``threadgroup == simdgroup`` (no extra smem staging needed).
 _COOP_BLOCK_DIM = 32
 
+_COOP_SCATTER_MASKED_PAT = re.compile(r"\bwp::tile_scatter_masked\s*\(([^;]*)\)\s*;")
 _COOP_TILE_CTOR_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile\s*<")
 _COOP_TILE_REDUCE_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_reduce\s*\(\s*([\w:]+)\s*,\s*var_(\w+)\s*\)")
 _COOP_TILE_OTHER_PAT = re.compile(r"\bwp::tile_(\w+)")
 # ``wp::min``/``wp::max`` may already be rewritten to ``metal::`` forms
 # by the time a line reaches the tile translator — accept both.
-_COOP_REDUCE_OPS = ("wp::add", "wp::min", "wp::max", "metal::min", "metal::max")
+_COOP_REDUCE_OPS = (
+    "wp::add",
+    "wp::min",
+    "wp::max",
+    "metal::min",
+    "metal::max",
+    "wp::mul",
+    "wp::bit_and",
+    "wp::bit_or",
+    "wp::bit_xor",
+)
 _COOP_SIMD_FN = {
     "wp::add": "simd_sum",
     "wp::min": "simd_min",
     "wp::max": "simd_max",
     "metal::min": "simd_min",
     "metal::max": "simd_max",
+    "wp::mul": "simd_product",
+    # Integer-only on CUDA too (``wp.bit_or`` has no float overload).
+    "wp::bit_and": "simd_and",
+    "wp::bit_or": "simd_or",
+    "wp::bit_xor": "simd_xor",
+}
+# Serial (one thread per block) ``tile_reduce`` combiners for builtin ops,
+# keyed like ``_COOP_SIMD_FN``. ``{a}`` is the accumulator, ``{b}`` the next
+# element; both scalars, native MSL vectors, or (vec tiles) components.
+_SERIAL_REDUCE_COMB = {
+    "wp::add": "{a} + {b}",
+    "wp::mul": "{a} * {b}",
+    "wp::min": "metal::min({a}, {b})",
+    "metal::min": "metal::min({a}, {b})",
+    "wp::max": "metal::max({a}, {b})",
+    "metal::max": "metal::max({a}, {b})",
+    "wp::bit_and": "({a} & {b})",
+    "wp::bit_or": "({a} | {b})",
+    "wp::bit_xor": "({a} ^ {b})",
 }
 _COOP_NATIVE_ELEM_PAT = re.compile(r"^(float|half|int|uint|short|ushort)([234])?$")
 _COOP_NATIVE_MAT_PAT = re.compile(r"^(float|half)([234])x([234])$")
@@ -8755,6 +8800,9 @@ def _coop_block_classify(adj, honest: bool = False) -> _CoopPlan | None:
         if m.group(1) not in ctor_labels and m.group(1) not in tile_vars:
             return None
 
+    # The lane index ``j`` of ``i, j = wp.tid()`` (2-D form only).
+    _lane_m = re.search(r"builtin_tid2d\s*\(\s*var_\w+\s*,\s*var_(\w+)\s*\)", text)
+    lane_label = _lane_m.group(1) if _lane_m else None
     reduce_labels: set[str] = set()
     for raw in lines:
         lhs_m = re.match(r"\s*var_(\w+)\s*=", raw)
@@ -8859,6 +8907,13 @@ def _coop_block_classify(adj, honest: bool = False) -> _CoopPlan | None:
                 distributed.add(lhs)
             elif op in ("zeros", "ones", "full", "arange"):
                 if lhs not in distributed:
+                    return None
+            elif op == "scatter_masked":
+                # ``tile_scatter_masked(t, lane, value, mask)``: each lane
+                # writes its own element of a distributed tile.
+                if len(args) != 4 or _label(args[0]) not in distributed or lane_label is None:
+                    return None
+                if _label(args[1]) != lane_label:
                     return None
             else:
                 return None
@@ -11133,11 +11188,17 @@ _TILE_SCAN_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_scan_(inclusive|exclusi
 # ``wp::tile_zeros<dtype, ...>()`` / ``wp::tile_ones<dtype, ...>()`` —
 # constant-fill register tile. With block_dim=1 it's the corresponding
 # scalar 0 / 1 (or vec ``T(0)`` / ``T(1)``).
-_TILE_ZEROS_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_zeros\s*<\s*(?:wp::)?(\w+)\s*[^>]*>\s*\(\s*\)")
-_TILE_ONES_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_ones\s*<\s*(?:wp::)?(\w+)\s*[^>]*>\s*\(\s*\)")
+_TILE_ZEROS_PAT = re.compile(
+    r"\bvar_(\w+)\s*=\s*wp::tile_zeros\s*<\s*(?:wp::)?(\w+(?:\s*<[^<>]*>)?)\s*[^<>]*>\s*\(\s*\)"
+)
+_TILE_ONES_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_ones\s*<\s*(?:wp::)?(\w+(?:\s*<[^<>]*>)?)\s*[^<>]*>\s*\(\s*\)")
 # ``wp::tile_full<dtype, ...>(value)`` — the same constant fill with a
 # runtime value instead of a literal 0 / 1.
-_TILE_FULL_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_full\s*<\s*(?:wp::)?(\w+)\s*[^>]*>\s*\(([^)]*)\)")
+# Matrix element dtype of a fill (``wp::mat_t<R, C, wp::float32>``).
+_MAT_FILL_DTYPE_PAT = re.compile(r"^wp::mat_t\s*<\s*(\d+)\s*,\s*(\d+)\s*,\s*[\w:]+\s*>$")
+_TILE_FULL_PAT = re.compile(
+    r"\bvar_(\w+)\s*=\s*wp::tile_full\s*<\s*(?:wp::)?(\w+(?:\s*<[^<>]*>)?)\s*[^<>]*>\s*\(([^)]*)\)"
+)
 # ``wp::tile_from_thread<dtype, N>(value, thread_idx)`` — broadcast the
 # ``value`` held by lane ``thread_idx`` to every element of an N-tile. The
 # serial model runs one lane per tile, so that lane's ``value`` is the only
@@ -11225,6 +11286,15 @@ _TILE_MATMUL_ASSIGN_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_matmul\s*\(([^
 # factorization. Two args after the LTO seg pad: the placeholder and the
 # tile to factor. ``upper`` template arg selects upper- vs lower-fill.
 _TILE_CHOLESKY_INPLACE_PAT = re.compile(r"\bwp::tile_cholesky_inplace\s*<[^()]*>\s*\(([^)]*)\)")
+
+
+def _cholesky_tpl_upper(call: str) -> bool:
+    """Whether a ``wp::tile_cholesky*<Upper, ...>(...)`` call is the upper
+    (``fill_mode="upper"``) variant: its first template argument is ``true``."""
+    m = re.search(r"<\s*(\w+)", call)
+    return m is not None and m.group(1) in ("true", "1")
+
+
 # ``tile_lower_solve_inplace(0, L_tile, B_tile)`` — solve ``L X = B``
 # for X, mutating B. The CPU/no-MathDx dispatch returns
 # ``(0, L, y)`` with empty templates, so the IR emits this builtin
@@ -11292,7 +11362,7 @@ _TILE_LOAD_PAT = re.compile(
 _TILE_STORE_PAT = re.compile(
     r"\bwp::tile_store\s*<\s*"
     r"(wp::vec_t<\d+,\s*wp::\w+>|wp::\w+|wp_vec\d+_\w+|wp_mat\d+x\d+_\w+)"
-    r"\s*,\s*\w+\s*,\s*\w+\s*>\s*\(([^)]*)\)"
+    r"\s*,\s*(\w+)\s*,\s*\w+\s*>\s*\(([^)]*)\)"
 )
 # ``wp::tile_store_indexed(dest, indices, axis, offset, src)`` — scatter
 # ``src`` into ``dest`` at the positions named by the ``indices`` tile. Emitted
@@ -11651,7 +11721,10 @@ def _translate_tile_intrinsics(
             msl_scalar = _SCALAR_CTYPE_TO_MSL.get(dtype_token)
         if msl_scalar is None:
             return m.group(0)
-        args = [a.strip() for a in m.group(2).split(",")]
+        # ``tile_store<T, BoundsCheck, Aligned>``: CUDA skips out-of-range
+        # elements unless the check is compiled out.
+        bounds_check = m.group(2) != "false"
+        args = [a.strip() for a in m.group(3).split(",")]
         # Last arg is the source tile, first is the destination array,
         # everything between is leading-slice indices + tile offsets.
         arr = args[0]
@@ -11677,6 +11750,26 @@ def _translate_tile_intrinsics(
         else:
             row_stride = "1"
             row_off, col_off = offsets[0], "0"
+        # ``tile_store<T, BoundsCheck>`` skips elements outside the
+        # destination on CPU/CUDA: guard every write (leading indices, rows
+        # and columns) when the destination's extents are known.
+        checked = bounds_check and arr_name in shaped_array_names
+        n_lead = len(lead_idx_args)
+        if two_d:
+            n_rows_expr = f"(int){arr_name}_shape[{n_lead}]"
+            n_cols_expr = f"(int){arr_name}_shape[{n_lead + 1}]"
+        else:
+            n_rows_expr, n_cols_expr = f"(int){arr_name}_shape[{n_lead}]", "1"
+        lead_ok = " && ".join(
+            f"({ix}) >= 0 && ({ix}) < (int){arr_name}_shape[{d}]" for d, ix in enumerate(lead_idx_args)
+        )
+        lead_ok = lead_ok if checked and lead_ok else "true"
+
+        def _ok(r: str, c: str) -> str:
+            if not checked:
+                return "true"
+            return f"({lead_ok}) && ({r}) >= 0 && ({r}) < {n_rows_expr} && ({c}) >= 0 && ({c}) < {n_cols_expr}"
+
         is_f64_dst = arr_name in f64_arr_names
         if is_f64_dst and (tile_label in distributed_tiles or tile_label in smem_tiles):
             raise MetalCodegenError(
@@ -11698,22 +11791,35 @@ def _translate_tile_intrinsics(
             )
             return (
                 f"{{ const int _ds_i = ({row_off}) + {_COOP_LANE}; "
-                f"if (_ds_i >= 0 && _ds_i < (int){arr_name}_shape[{len(lead_idx_args)}]) {{ {write} }} }}"
+                f"if (({lead_ok}) && _ds_i >= 0 && _ds_i < (int){arr_name}_shape[{len(lead_idx_args)}]) "
+                f"{{ {write} }} }}"
             )
         # Shape (1,1) tile is a scalar local — store with a direct subscript.
         if rows == 1 and cols == 1:
             value = f"wp_f32_to_f64({tile_var})" if is_f64_dst else tile_var
-            return f"{arr}[{base_expr} + ({row_off}) * ({row_stride}) + ({col_off})] = {value}"
+            target = f"{arr}[{base_expr} + ({row_off}) * ({row_stride}) + ({col_off})]"
+            if arr_name in atomic_output_names:
+                write = f"atomic_store_explicit(&{target}, {value}, memory_order_relaxed);"
+            else:
+                write = f"{target} = {value};"
+            return f"if ({_ok(row_off, col_off)}) {{ {write} }}"
         if vec_n_elem > 0:
-            if is_f64_dst:
+            if is_f64_dst or checked or arr_name in atomic_output_names:
+                conv = "wp_f32_to_f64" if is_f64_dst else ""
+                vtgt = f"{arr}[{base_expr} + _ts_e + _ts_k]"
+                vval = f"{conv}({tile_var}.c[(_ts_i * {cols} + _ts_j) * {vec_n_elem} + _ts_k])"
+                vwrite = (
+                    f"atomic_store_explicit(&{vtgt}, {vval}, memory_order_relaxed);"
+                    if arr_name in atomic_output_names
+                    else f"{vtgt} = {vval};"
+                )
                 # Demoted destination: write each component's double bits
                 # (the ``_store`` helper takes ``device float*``).
                 return (
                     f"{{ for (int _ts_i = 0; _ts_i < {rows}; ++_ts_i) for (int _ts_j = 0; _ts_j < {cols}; ++_ts_j) {{ "
+                    f"if (!({_ok(f'({row_off}) + _ts_i', f'({col_off}) + _ts_j')})) continue; "
                     f"const int _ts_e = ((({row_off}) + _ts_i) * ({row_stride}) + (({col_off}) + _ts_j)) * {vec_n_elem}; "
-                    f"for (int _ts_k = 0; _ts_k < {vec_n_elem}; ++_ts_k) "
-                    f"{arr}[{base_expr} + _ts_e + _ts_k] = "
-                    f"wp_f32_to_f64({tile_var}.c[(_ts_i * {cols} + _ts_j) * {vec_n_elem} + _ts_k]); }} }}"
+                    f"for (int _ts_k = 0; _ts_k < {vec_n_elem}; ++_ts_k) {vwrite} }} }}"
                 )
             helper = f"wp_tile_{rows}x{cols}_vec{vec_n_elem}_{msl_scalar}_store"
             return f"{helper}({arr}, {base_expr}, {row_stride}, {row_off}, {col_off}, {tile_var})"
@@ -11737,6 +11843,7 @@ def _translate_tile_intrinsics(
                 if arr_name in atomic_output_names
                 else f"{target} = {slot}[_ts_e];"
             )
+            write = f"if ({_ok(f'({row_off}) + (int)_ts_i', f'({col_off}) + (int)_ts_j')}) {{ {write} }}"
             return (
                 "do { threadgroup_barrier(metal::mem_flags::mem_threadgroup); "
                 f"for (uint _ts_e = _coop_lane; _ts_e < {n}u; _ts_e += 32u) {{ "
@@ -11752,6 +11859,7 @@ def _translate_tile_intrinsics(
             return (
                 f"{{ for (int _ts_i = 0; _ts_i < {rows}; ++_ts_i) "
                 f"for (int _ts_j = 0; _ts_j < {cols}; ++_ts_j) "
+                f"if ({_ok('(' + row_off + ') + _ts_i', '(' + col_off + ') + _ts_j')}) "
                 f"atomic_store_explicit("
                 f"&{arr}[{base_expr} + (({row_off}) + _ts_i) * ({row_stride}) + (({col_off}) + _ts_j)], "
                 f"{tile_var}.c[_ts_i * {cols} + _ts_j], memory_order_relaxed); }}"
@@ -11764,10 +11872,17 @@ def _translate_tile_intrinsics(
         if is_f64_dst:
             return (
                 f"{{ for (int _ts_i = 0; _ts_i < {rows}; ++_ts_i) for (int _ts_j = 0; _ts_j < {cols}; ++_ts_j) "
+                f"if ({_ok('(' + row_off + ') + _ts_i', '(' + col_off + ') + _ts_j')}) "
                 f"{arr}[{base_expr} + (({row_off}) + _ts_i) * ({row_stride}) + (({col_off}) + _ts_j)] = "
                 f"wp_f32_to_f64({tile_var}.c[_ts_i * {cols} + _ts_j]); }}"
             )
         helper = f"wp_tile_{rows}x{cols}_{msl_scalar}_store"
+        if checked:
+            call = (
+                f"{helper}({arr}, {base_expr}, {row_stride}, {row_off}, {col_off}, {tile_var}, "
+                f"{n_rows_expr}, {n_cols_expr})"
+            )
+            return call if lead_ok == "true" else f"if ({lead_ok}) {{ {call}; }}"
         return f"{helper}({arr}, {base_expr}, {row_stride}, {row_off}, {col_off}, {tile_var})"
 
     def repl_tile_atomic_add(m: re.Match[str]) -> str:
@@ -11982,7 +12097,9 @@ def _translate_tile_intrinsics(
             # lanes, matching CUDA's broadcast-result semantics.
             simd_fn = _COOP_SIMD_FN.get(op_fn)
             if simd_fn is None:
-                raise MetalCodegenError(f"distributed tile_reduce only supports wp.add/wp.min/wp.max; got {op_fn!r}")
+                raise MetalCodegenError(
+                    f"distributed tile_reduce supports wp.add/mul/min/max/bit_and/bit_or/bit_xor; got {op_fn!r}"
+                )
             return f"var_{lhs} = {_coop_reduce_expr(f'var_{in_label}', distributed_tiles[in_label], simd_fn)}"
         dims = tile_var_dims.get(in_label)
         if dims is None:
@@ -11995,14 +12112,7 @@ def _translate_tile_intrinsics(
         if vec_n > 0:
             # Vec-element tile: ``c[]`` holds ``n * vec_n`` scalars, element-
             # major. Reduce component-wise; the result is one vector.
-            comb = {
-                "wp::add": "{a} + {b}",
-                "wp::mul": "{a} * {b}",
-                "wp::min": "metal::min({a}, {b})",
-                "metal::min": "metal::min({a}, {b})",
-                "wp::max": "metal::max({a}, {b})",
-                "metal::max": "metal::max({a}, {b})",
-            }.get(op_fn)
+            comb = _SERIAL_REDUCE_COMB.get(op_fn)
             if comb is None:
                 raise MetalCodegenError(
                     f"MSL codegen: tile_reduce({op_fn}) over a vec-element tile is not supported on Metal"
@@ -12016,22 +12126,12 @@ def _translate_tile_intrinsics(
                 )
             return f"var_{lhs} = {_msl_vec_ctor(vec_n, _scalar)}({', '.join(parts)})"
         # Map known builtin op names to their accumulation expression.
-        if op_fn == "wp::add":
-            op_expr = "_tr_acc + var_{lhs}_in.c[_tr_i]"
-        elif op_fn == "wp::max":
-            op_expr = "metal::max(_tr_acc, var_{lhs}_in.c[_tr_i])"
-        elif op_fn == "wp::min":
-            op_expr = "metal::min(_tr_acc, var_{lhs}_in.c[_tr_i])"
-        elif op_fn == "wp::mul":
-            op_expr = "_tr_acc * var_{lhs}_in.c[_tr_i]"
-        else:
+        comb = _SERIAL_REDUCE_COMB.get(op_fn)
+        if comb is None:
             # Unknown op — leave the original (will trigger
             # unsupported-intrinsic error with the function name visible).
             return m.group(0)
-        # Substitute ``var_{lhs}_in`` placeholder with the actual tile
-        # var name; we don't actually need a separate name, but keeping
-        # the placeholder readable.
-        op_expr = op_expr.replace("{lhs}_in", in_label)
+        op_expr = comb.format(a="_tr_acc", b=f"var_{in_label}.c[_tr_i]")
         return (
             f"var_{lhs} = ({{ "
             f"auto _tr_acc = var_{in_label}.c[0]; "
@@ -12303,16 +12403,45 @@ def _translate_tile_intrinsics(
     line = _TILE_SCAN_PAT.sub(repl_tile_scan, line)
 
     def repl_zeros(m: re.Match[str]) -> str:
-        return _emit_tile_const_fill(m.group(1), m.group(2), "0")
+        out = _emit_tile_const_fill(m.group(1), m.group(2), "0")
+        return m.group(0) if out is None else out
 
     def repl_ones(m: re.Match[str]) -> str:
-        return _emit_tile_const_fill(m.group(1), m.group(2), "1")
+        out = _emit_tile_const_fill(m.group(1), m.group(2), "1")
+        return m.group(0) if out is None else out
+
+    def _emit_mat_tile_fill(lhs: str, mat_ctype: str, rows: int, cols: int, value: str) -> str:
+        """Fill a single-element matrix tile, which ``_msl_var_type``
+        collapses to a plain matrix local (``float3x3`` / ``wp_matRxC_*``).
+
+        Matches ``tile.h``: ``tile_zeros`` / ``tile_ones`` construct the
+        element as ``T(0)`` / ``T(1)`` (every entry set), and ``tile_full``
+        copies its (matrix-typed) value.
+        """
+        msl = _msl_scalar_type(mat_ctype)
+        if value == "0":
+            return f"var_{lhs} = {_msl_zero_init(msl)}"
+        if value != "1":
+            return f"var_{lhs} = {value}"
+        if msl.startswith("wp_"):
+            return (
+                f"var_{lhs} = ({{ {msl} _tf = {msl}(); "
+                f"for (int _tf_i = 0; _tf_i < {rows * cols}; ++_tf_i) _tf.c[_tf_i] = 1; _tf; }})"
+            )
+        col = f"{msl.split('x')[0][:-1]}{rows}(1)"
+        return f"var_{lhs} = {msl}({', '.join([col] * cols)})"
 
     def _emit_tile_const_fill(lhs: str, scalar_token: str, value: str) -> str:
         # ``wp::tile_zeros`` / ``wp::tile_ones`` may target a single-
         # element tile (which collapses to a scalar local) or a multi-
         # element tile. For multi-element, fill all slots.
         scalar_ctype = scalar_token if scalar_token.startswith("wp::") else f"wp::{scalar_token}"
+        if tile_var_vec_n.get(lhs, 0) > 0:
+            # Vec-element fill: lowered by ``codegen_metal_tiles``.
+            return None
+        mat = _MAT_FILL_DTYPE_PAT.match(scalar_ctype)
+        if mat is not None and lhs not in tile_var_dims:
+            return _emit_mat_tile_fill(lhs, scalar_ctype, int(mat.group(1)), int(mat.group(2)), value)
         msl = _SCALAR_CTYPE_TO_MSL.get(scalar_ctype, "float")
         dims = tile_var_dims.get(lhs)
         if dims is None:
@@ -12327,7 +12456,8 @@ def _translate_tile_intrinsics(
         value = m.group(3).strip()
         if not value:
             return m.group(0)
-        return _emit_tile_const_fill(m.group(1), m.group(2), f"({value})")
+        out = _emit_tile_const_fill(m.group(1), m.group(2), f"({value})")
+        return m.group(0) if out is None else out
 
     def repl_from_thread(m: re.Match[str]) -> str:
         args = [a.strip() for a in _split_top_level_args(m.group(3))]
@@ -12337,7 +12467,8 @@ def _translate_tile_intrinsics(
             # Distributed tile: every lane takes lane ``thread_idx``'s value.
             msl = distributed_tiles[m.group(1)]
             return f"var_{m.group(1)} = simd_shuffle(({msl})({args[0]}), (ushort)({args[1]}))"
-        return _emit_tile_const_fill(m.group(1), m.group(2), f"({args[0]})")
+        out = _emit_tile_const_fill(m.group(1), m.group(2), f"({args[0]})")
+        return m.group(0) if out is None else out
 
     line = _TILE_ZEROS_PAT.sub(repl_zeros, line)
     line = _TILE_ONES_PAT.sub(repl_ones, line)
@@ -12766,6 +12897,22 @@ def _translate_tile_intrinsics(
         if rows == 1:
             return f"{tile_arg} = metal::precise::sqrt(metal::max({tile_arg}, {_sc_lit(scalar, 1e-30)}))"
         helper = f"wp_tile_{rows}x{cols}_{scalar}_cholesky_inplace"
+        if _cholesky_tpl_upper(m.group(0)):
+            # ``fill_mode="upper"``: A = U^T U with U upper-triangular (lower
+            # part zeroed), read from A's upper triangle. Factor A^T in lower
+            # mode and transpose back: chol_lower(A^T)^T == U.
+            if tile_label in smem_tiles:
+                raise MetalCodegenError(
+                    "MSL codegen: tile_cholesky_inplace(fill_mode='upper') on a threadgroup-resident tile "
+                    "is not supported on Metal"
+                )
+            tr = (
+                f"for (int _ct_i = 0; _ct_i < {rows}; ++_ct_i) for (int _ct_j = _ct_i + 1; _ct_j < {rows}; ++_ct_j) "
+                f"{{ auto _ct_t = {tile_arg}.c[_ct_i * {rows} + _ct_j]; "
+                f"{tile_arg}.c[_ct_i * {rows} + _ct_j] = {tile_arg}.c[_ct_j * {rows} + _ct_i]; "
+                f"{tile_arg}.c[_ct_j * {rows} + _ct_i] = _ct_t; }}"
+            )
+            return f"{{ {tr} {helper}({tile_arg}); {tr} }}"
         return f"{helper}({tile_arg})"
 
     line = _TILE_CHOLESKY_INPLACE_PAT.sub(repl_cholesky_inplace, line)
@@ -13105,7 +13252,17 @@ def _translate_tile_intrinsics(
     line = _TILE_STORE_PAT.sub(repl_store, line)
     line = _TILE_STORE_INDEXED_PAT.sub(repl_store_indexed, line)
     line = _TILE_ATOMIC_ADD_PAT.sub(repl_tile_atomic_add, line)
+    for _um in _TILE_CHOLESKY_PAT.finditer(line):
+        if _cholesky_tpl_upper(_um.group(0)):
+            raise MetalCodegenError(
+                f"MSL codegen: fill_mode='upper' is not supported for this tile Cholesky op on Metal ({_um.group(0)!r})"
+            )
     line = _TILE_CHOLESKY_PAT.sub(repl_cholesky, line)
+    for _um in _TILE_CHOLESKY_SOLVE_PAT.finditer(line):
+        if _cholesky_tpl_upper(_um.group(0)):
+            raise MetalCodegenError(
+                f"MSL codegen: fill_mode='upper' is not supported for this tile Cholesky op on Metal ({_um.group(0)!r})"
+            )
     line = _TILE_CHOLESKY_SOLVE_PAT.sub(repl_cholesky_solve, line)
 
     def repl_cholesky_solve_inplace(m: re.Match[str]) -> str:
@@ -13133,6 +13290,11 @@ def _translate_tile_intrinsics(
             return f"{call};\n{wb}"
         return call
 
+    for _um in _TILE_CHOLESKY_SOLVE_INPLACE_PAT.finditer(line):
+        if _cholesky_tpl_upper(_um.group(0)):
+            raise MetalCodegenError(
+                f"MSL codegen: fill_mode='upper' is not supported for this tile Cholesky op on Metal ({_um.group(0)!r})"
+            )
     line = _TILE_CHOLESKY_SOLVE_INPLACE_PAT.sub(repl_cholesky_solve_inplace, line)
     return line
 
@@ -13291,6 +13453,80 @@ def _native_snippet_value_type(t, what: str, key: str) -> str:
     )
 
 
+# ``(float*)`` / ``(const int *)`` C-style pointer casts in a native snippet.
+_NATIVE_PTR_CAST_PAT = re.compile(r"\(\s*((?:const\s+)?[A-Za-z_][\w:]*)\s*\*\s*\)")
+# ``float* p = ...`` / ``const int *q;`` pointer declarations of builtin
+# scalar types (keywords only, so ``a * b`` products never match).
+_NATIVE_PTR_DECL_PAT = re.compile(
+    r"(?<![\w:])(?<!device )(?<!thread )(?<!constant )((?:const\s+)?"
+    r"(?:float|double|half|int|unsigned|uint|short|ushort|char|uchar|long|ulong|bool|"
+    r"u?int(?:8|16|32|64)_t))\s*\*\s*(?=[A-Za-z_]\w*\s*[=;,)\[])"
+)
+# MSL view of a ``wp.array`` handed to a native snippet (see
+# ``_native_snippet_call``). Strides are in bytes, as in ``wp::array_t``;
+# Metal binds arrays densely, so they follow from the shape.
+_NATIVE_ARRAY_VIEW_MSL = """\
+#ifndef WP_METAL_NATIVE_ARRAY_VIEW
+#define WP_METAL_NATIVE_ARRAY_VIEW
+template <typename T>
+struct wp_native_array {
+    device T* data;
+    int shape[4];
+    int strides[4];
+    int ndim;
+    static wp_native_array make(ulong addr, int nd, int s0, int s1, int s2, int s3) {
+        wp_native_array a;
+        a.data = reinterpret_cast<device T*>(addr);
+        a.ndim = nd;
+        a.shape[0] = s0; a.shape[1] = s1; a.shape[2] = s2; a.shape[3] = s3;
+        int stride = int(sizeof(T));
+        for (int d = 3; d >= 0; --d) {
+            a.strides[d] = d < nd ? stride : 0;
+            if (d < nd) stride *= a.shape[d];
+        }
+        return a;
+    }
+};
+#endif
+"""
+# Caller-side construction of the view; the launcher binds the array named
+# here read-write (a raw pointer may be written through).
+_NATIVE_ARRAY_VIEW_ARG_PAT = re.compile(
+    r"\bwp_native_array<[^<>]*>::make\(\s*reinterpret_cast<ulong>\(\s*var_(\w+)\s*\)"
+)
+
+
+def _native_snippet_array_elem(arg, key: str) -> str | None:
+    """MSL element type of a ``wp.array`` native-snippet parameter, or None
+    if ``arg`` is not a plain array."""
+    elem_ctype = arg.ctype()
+    m = re.match(r"^wp::array_t<\s*(.+?)\s*>$", elem_ctype)
+    if m is None:
+        return None
+    t = arg.type
+    inner = m.group(1)
+    msl = _SCALAR_CTYPE_TO_MSL.get(inner)
+    if msl is None or msl == "wp_f64" or t.ndim > 4:
+        raise MetalCodegenError(
+            f"@wp.func_native {key!r}: parameter {arg.label!r} of type {elem_ctype!r} is not supported on Metal "
+            "(array parameters of native snippets must have a 32-bit-or-narrower scalar dtype and at most 4 dims)"
+        )
+    return msl
+
+
+def _native_array_view_expr(caller_arg: str, elem_msl: str, ndim: int) -> str:
+    """``wp_native_array<T>::make(...)`` for the array ``caller_arg``
+    (``var_<label>``); its shape comes from ``<label>_shape``."""
+    m = re.match(r"^\s*var_(\w+)\s*$", caller_arg)
+    if m is None:
+        raise MetalCodegenError(
+            f"@wp.func_native: cannot pass array expression {caller_arg!r} to a native snippet on Metal"
+        )
+    label = m.group(1)
+    dims = [f"(int){label}_shape[{d}]" if d < ndim else "0" for d in range(4)]
+    return f"wp_native_array<{elem_msl}>::make(reinterpret_cast<ulong>(var_{label}), {ndim}, {', '.join(dims)})"
+
+
 def _native_snippet_call(fn_overload, caller_args, return_value_dst):
     """Lower a call to a ``@wp.func_native`` function to an MSL helper call.
 
@@ -13307,7 +13543,19 @@ def _native_snippet_call(fn_overload, caller_args, return_value_dst):
             default_builder_options={"enable_backward": False, "output_arch": None, "block_dim": 256},
         )
     params = []
-    for a in adj.args:
+    caller_args = list(caller_args)
+    array_labels = []
+    for i, a in enumerate(adj.args):
+        elem_msl = _native_snippet_array_elem(a, key)
+        if elem_msl is not None:
+            # ``wp.array`` parameter: a ``wp_native_array<T>`` view (device
+            # pointer, shape, byte strides) so ``arr.data`` / ``arr.shape[i]``
+            # / ``arr.strides[i]`` read as in the CUDA snippet.
+            params.append(f"wp_native_array<{elem_msl}> {a.label}")
+            array_labels.append(a.label)
+            if i < len(caller_args):
+                caller_args[i] = _native_array_view_expr(caller_args[i], elem_msl, a.type.ndim)
+            continue
         params.append(f"{_native_snippet_value_type(a.ctype(), f'parameter {a.label!r}', key)} {a.label}")
     ret = adj.arg_types.get("return")
     ret_msl = "void" if ret is None else _native_snippet_value_type(ret, "the return value", key)
@@ -13320,6 +13568,12 @@ def _native_snippet_call(fn_overload, caller_args, return_value_dst):
     ).hexdigest()[:10]
     name = f"{_NATIVE_SNIPPET_PREFIX}{fn_overload.native_func}_{digest}"
     body = _NATIVE_REINTERPRET_WRITE_PAT.sub(r"reinterpret_cast<thread \1&>\2", fn_overload.native_snippet)
+    if array_labels:
+        # ``(T*)arr.data + off``: an unqualified pointer is ``thread`` in
+        # MSL, so give pointer casts in array-taking snippets the ``device``
+        # space the array storage lives in.
+        body = _NATIVE_PTR_CAST_PAT.sub(r"(device \1*)", body)
+        body = _NATIVE_PTR_DECL_PAT.sub(r"device \1* ", body)
     body = _NATIVE_REINTERPRET_REF_PAT.sub(r"as_type<\1>(\2)", body)
     body = _NATIVE_GUARDED_SYNC_PAT.sub(lambda m: m.group("body"), body)
     _NATIVE_SNIPPET_DEFS[name] = f"inline {ret_msl} {name}({', '.join(params)}) {{\n{body}\n}}"
@@ -13347,6 +13601,7 @@ def _emit_referenced_user_funcs(source: str) -> str:
     parts = [_USER_FUNC_MSL_DEFS[n] for n in sorted(seen)]
     if native:
         parts.append(_NATIVE_SNIPPET_SHIMS)
+        parts.append(_NATIVE_ARRAY_VIEW_MSL)
         parts.extend(_NATIVE_SNIPPET_DEFS[n] for n in native)
     return "\n".join(parts) + "\n"
 
@@ -13967,6 +14222,10 @@ class MetalKernelArtifact:
     # kernels — and ONLY these: folding a genuine N-wide launch whose last
     # dim happens to equal ``block_dim`` would silently drop N-1 threads.
     tile_block_fold: bool = True
+    # Serial-model kernel that indexes a tile op with the lane (``j`` of
+    # ``i, j = wp.tid()``), e.g. ``tile_scatter_masked(t, j, v, m)``: folding
+    # the lane dim would run lane 0 only, so such launches raise instead.
+    lane_tile_index: bool = False
     # ``True`` when the kernel calls a ``@wp.func_native`` snippet that uses
     # CUDA intra-block primitives (shuffles, barriers, ...). Those only have
     # a faithful lowering in the serial (folded) and distributed-tile models;
@@ -14099,6 +14358,212 @@ def _guard_struct_field_writes(lines: list[str], arrays: set[str]) -> list[str]:
         indent = ln[: len(ln) - len(ln.lstrip())]
         out.append(f"{indent}if ({m.group('arr')}_shape[0] != 0) {body}")
     return out
+
+
+# ``var_B = wp::array_t<T>(var_ptr, d0[, d1, ...]);`` — an array built
+# in-kernel from a raw ``uint64`` address (``wp.array(ptr=..., shape=...)``).
+_PTR_ARRAY_CTOR_PAT = re.compile(
+    r"^(?P<indent>\s*)var_(?P<lbl>\w+)\s*=\s*wp::array_t<\s*(?P<dt>[\w:]+)\s*>\s*"
+    r"\(\s*var_(?P<ptr>\w+)\s*,(?P<dims>[^;]*)\)\s*;\s*$"
+)
+# Prefix of the MSL locals standing in for such arrays (``__pa<label>`` is
+# the device pointer, ``__pa<label>_shape[k]`` its extents).
+_PTR_ARRAY_PREFIX = "__pa"
+
+
+# ``var_S = wp::slice_t(start, stop, step);`` and ``var_V = wp::view(var_A, var_S);``
+# — ``arr[start:stop]`` on an array.
+_SLICE_T_PAT = re.compile(r"^\s*var_(?P<lbl>\w+)\s*=\s*wp::slice_t\s*\((?P<args>[^;]*)\)\s*;\s*$")
+_SLICE_VIEW_PAT = re.compile(
+    r"^(?P<indent>\s*)var_(?P<lbl>\w+)\s*=\s*wp::view\s*\(\s*var_(?P<src>\w+)\s*,\s*var_(?P<sl>\w+)\s*\)\s*;\s*$"
+)
+
+
+_ASSIGN_LINE_PAT = re.compile(r"^\s*var_(\w+)\s*=\s*(.*?)\s*;\s*$")
+_ADDR_PASS_PAT = re.compile(
+    r"^(?:var_(?P<a>\w+)|wp::(?:copy|uint64|int64)\(\s*var_(?P<b>\w+)\s*\)|"
+    r"wp::(?:add|sub)\(\s*var_(?P<c>\w+)\s*,[^;]*\)|wp::add\([^,;]*,\s*var_(?P<d>\w+)\s*\))$"
+)
+
+
+def _gpu_address_locals(lines: list[str]) -> set[str]:
+    """Locals that hold a Metal device address: the ``uint64`` result of a
+    native snippet handed an array (``(uint64_t)arr.data``), and values
+    derived from one by copies, casts and ``+`` / ``-`` offsets. A local is
+    included only when every assignment to it is such a value."""
+    sources: dict[str, list[str]] = {}
+    for ln in lines:
+        m = _ASSIGN_LINE_PAT.match(ln)
+        if m is not None:
+            sources.setdefault(m.group(1), []).append(m.group(2))
+    addr: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        for lbl, exprs in sources.items():
+            if lbl in addr:
+                continue
+            ok = True
+            for e in exprs:
+                if e.startswith(_NATIVE_SNIPPET_PREFIX) and "wp_native_array<" in e:
+                    continue
+                pm = _ADDR_PASS_PAT.match(e)
+                src = pm and next((g for g in pm.groups() if g), None)
+                if src is None or src not in addr:
+                    ok = False
+                    break
+            if ok:
+                addr.add(lbl)
+                changed = True
+    return addr
+
+
+def _lower_pointer_arrays(
+    lines: list[str], adj, adjoint: bool, consts: dict[str, int] | None = None
+) -> tuple[list[str], set[str], set[str], dict[str, str]]:
+    """Lower arrays built in-kernel to MSL pointer locals.
+
+    Two forms:
+
+    - ``wp.array(ptr=<base + offset>, shape=(n, n), dtype=float)`` over an
+      address a native snippet took (``(uint64_t)arr.data``) — Kamino's
+      per-problem matrix views. On Metal a ``uint64`` holding a buffer's
+      ``gpuAddress`` converts back to a ``device T*``.
+    - ``arr[start:stop]`` (a unit-step slice of the leading dim of a scalar
+      array argument), which stays contiguous.
+
+    Each becomes a pointer local plus an ``int`` shape array, and every use
+    is renamed to the label ``__pa<label>`` — which the rest of the
+    translator treats like a dense (row-major, contiguous) array argument:
+    indexing, ``.shape``, ``array_store`` and ``tile_load`` / ``tile_store``
+    resolve through ``__pa<label>[...]`` / ``__pa<label>_shape[k]``.
+
+    Returns ``(lines, original labels to skip declaring, new labels,
+    {new label: kernel argument it views})``.
+    """
+    consts = consts or {}
+    arg_types = {a.label: a for a in adj.args}
+    gpu_addrs = _gpu_address_locals(lines)
+    # label -> (msl scalar, ndim, source arg label or None)
+    arrays: dict[str, tuple[str, int, str | None]] = {}
+    slices: dict[str, list[str]] = {}
+    for ln in lines:
+        m = _SLICE_T_PAT.match(ln)
+        if m is not None:
+            slices[m.group("lbl")] = [a.strip() for a in _split_top_level_args(m.group("args"))]
+            continue
+        m = _PTR_ARRAY_CTOR_PAT.match(ln)
+        if m is not None:
+            msl = _SCALAR_CTYPE_TO_MSL.get(m.group("dt"))
+            dims = [d.strip() for d in _split_top_level_args(m.group("dims")) if d.strip()]
+            if msl is None or msl == "wp_f64" or not 1 <= len(dims) <= 4:
+                raise MetalCodegenError(
+                    f"Kernel {adj.fun_name!r}: wp.array(ptr=...) of dtype {m.group('dt')!r} with {len(dims)} dims "
+                    "is not supported on Metal (scalar dtypes of at most 32 bits, 1-4 dims)"
+                )
+            if m.group("ptr") not in gpu_addrs:
+                # On Metal ``wp.array.ptr`` (a host value passed in as a
+                # ``uint64``) is the buffer's host address, which the GPU
+                # cannot dereference; only addresses a native snippet read
+                # from ``arr.data`` (a ``gpuAddress``) are device pointers.
+                raise MetalCodegenError(
+                    f"Kernel {adj.fun_name!r}: wp.array(ptr=...) on Metal needs a device address taken in the "
+                    "kernel by a @wp.func_native snippet from an array's ``.data`` (plus an offset); a pointer "
+                    "passed in from the host (e.g. ``wp.array.ptr``) is a host address on Metal. Pass the "
+                    "array itself instead."
+                )
+            entry = (msl, len(dims), None)
+        else:
+            m = _SLICE_VIEW_PAT.match(ln)
+            if m is None or m.group("sl") not in slices:
+                continue
+            src = m.group("src")
+            sl = slices[m.group("sl")]
+            if src in arrays:
+                msl, nd, root = arrays[src]
+            elif src in arg_types and _is_array_arg(arg_types[src]):
+                arg = arg_types[src]
+                msl = _SCALAR_CTYPE_TO_MSL.get(_ARRAY_CTYPE_ELEM_PAT.sub(r"\1", arg.ctype()))
+                nd, root = arg.type.ndim, src
+                if msl is None or msl == "wp_f64" or type(arg.type).__name__ not in ("array", "_ArrayAnnotation"):
+                    continue
+            else:
+                continue
+            step = sl[2] if len(sl) == 3 else "1"
+            step_val = consts.get(step[4:]) if step.startswith("var_") else None
+            if step_val is None and re.fullmatch(r"\d+", step):
+                step_val = int(step)
+            if step_val != 1:
+                continue  # strided slices stay unsupported
+            entry = (msl, nd, root)
+        prev = arrays.get(m.group("lbl"))
+        if prev is not None and prev[:2] != entry[:2]:
+            raise MetalCodegenError(f"Kernel {adj.fun_name!r}: array local var_{m.group('lbl')} changes type")
+        arrays[m.group("lbl")] = entry
+    if not arrays:
+        return lines, set(), set(), {}
+    if adjoint:
+        raise MetalCodegenError(
+            f"Kernel {adj.fun_name!r}: reverse mode through arrays built in-kernel (wp.array(ptr=...) or "
+            "array slices) is not supported on Metal"
+        )
+
+    def _name(lbl: str) -> str:
+        return f"{_PTR_ARRAY_PREFIX}{lbl}"
+
+    _alt = "|".join(re.escape(lbl) for lbl in sorted(arrays, key=len, reverse=True))
+    rename = re.compile(r"\bvar_(" + _alt + r")\b")
+    rename_shape = re.compile(r"(?<![\w])(" + _alt + r")_shape\[")
+    out = []
+    for lbl, (msl, nd, _root) in arrays.items():
+        out.append(f"    device {msl}* {_name(lbl)} = nullptr;")
+        out.append(f"    int {_name(lbl)}_shape[{nd}] = {{{', '.join(['0'] * nd)}}};")
+    for ln in lines:
+        m = _PTR_ARRAY_CTOR_PAT.match(ln)
+        if m is not None and m.group("lbl") in arrays:
+            lbl = m.group("lbl")
+            msl = arrays[lbl][0]
+            dims = [d.strip() for d in _split_top_level_args(m.group("dims")) if d.strip()]
+            stmts = [f"{_name(lbl)} = reinterpret_cast<device {msl}*>(var_{m.group('ptr')});"]
+            stmts += [f"{_name(lbl)}_shape[{k}] = (int)({d});" for k, d in enumerate(dims)]
+            out.append(m.group("indent") + " ".join(stmts))
+            continue
+        m = _SLICE_VIEW_PAT.match(ln)
+        if m is not None and m.group("lbl") in arrays:
+            lbl, src = m.group("lbl"), m.group("src")
+            msl, nd, _root = arrays[lbl]
+            sl = slices[m.group("sl")]
+            if src in arrays:
+                src_ptr, src_shape = _name(src), f"{_name(src)}_shape"
+            else:
+                src_ptr, src_shape = f"var_{src}", f"{src}_shape"
+            inner = " * ".join(f"{src_shape}[{k}]" for k in range(1, nd)) or "1"
+            # ``slice_adjust_indices`` (clamped, negative-wrapping, with the
+            # SLICE_BEGIN / SLICE_END sentinels of omitted bounds).
+            stmts = [
+                f"{{ const int _sl_n = {src_shape}[0];",
+                f"int _sl_a = (int)({sl[0]}); int _sl_b = (int)({sl[1]});",
+                "_sl_a = _sl_a == 2147483647 ? 0 : metal::clamp(_sl_a, -_sl_n, _sl_n);",
+                "_sl_a = _sl_a < 0 ? _sl_a + _sl_n : _sl_a;",
+                "_sl_b = _sl_b == (-2147483647 - 1) ? _sl_n : metal::clamp(_sl_b, -_sl_n, _sl_n);",
+                "_sl_b = _sl_b < 0 ? _sl_b + _sl_n : _sl_b;",
+                f"{_name(lbl)} = reinterpret_cast<device {msl}*>(reinterpret_cast<ulong>({src_ptr})) "
+                f"+ (long)_sl_a * (long)({inner});",
+                f"{_name(lbl)}_shape[0] = metal::max(_sl_b - _sl_a, 0);",
+            ]
+            stmts += [f"{_name(lbl)}_shape[{k}] = {src_shape}[{k}];" for k in range(1, nd)]
+            stmts.append("}")
+            out.append(m.group("indent") + " ".join(stmts))
+            continue
+        ln = rename.sub(lambda mm: f"var_{_name(mm.group(1))}", ln)
+        # ``<label>_shape[k]`` references (native-snippet array views and
+        # negative-index wraps emitted against the original label).
+        out.append(rename_shape.sub(lambda mm: f"{_name(mm.group(1))}_shape[", ln))
+    roots = {_name(lbl): root for lbl, (_m, _n, root) in arrays.items() if root is not None}
+    return out, set(arrays), {_name(lbl) for lbl in arrays}, roots
+
+
+_ARRAY_CTYPE_ELEM_PAT = re.compile(r"^wp::array_t<\s*(.+?)\s*>$")
 
 
 def _materialize_for_loop_vars(lines: list[str]) -> list[str]:
@@ -15188,9 +15653,30 @@ def _generate_msl_kernel_uncached(
         },
     }
     _wrap_consts = {str(_l): _c for _l, _c in {**_const_ints, **_inlined_const_ints}.items() if isinstance(_c, int)}
+    # Arrays built from snippet addresses (``wp.array(ptr=...)``, lowered by
+    # ``_lower_pointer_arrays``) wrap against their own ``<label>_shape``.
+    _pre_lines = _ast_emit(_ast_nodes)
+    _ptr_array_ndims = {
+        _m.group("lbl"): len([d for d in _split_top_level_args(_m.group("dims")) if d.strip()])
+        for _ln in _pre_lines
+        for _m in [_PTR_ARRAY_CTOR_PAT.match(_ln)]
+        if _m is not None
+    }
+    # 1-D slices (``a[s:e]``) likewise wrap against the slice's own length.
+    _slice_labels = {m.group("lbl") for ln in _pre_lines for m in [_SLICE_T_PAT.match(ln)] if m is not None}
+    _arg_ndims = {a.label: a.type.ndim for a in adj.args if _is_array_arg_type(a.type) and hasattr(a.type, "ndim")}
+    for _ln in _pre_lines:
+        _m = _SLICE_VIEW_PAT.match(_ln)
+        if _m is not None and _m.group("sl") in _slice_labels:
+            _src_nd = _arg_ndims.get(_m.group("src"), _ptr_array_ndims.get(_m.group("src")))
+            if _src_nd == 1:
+                _ptr_array_ndims[_m.group("lbl")] = 1
     _ast_nodes = _ast_wrap_negative_array_indices(
         _ast_nodes,
-        {a.label: a.type.ndim for a in adj.args if _is_array_arg_type(a.type) and hasattr(a.type, "ndim")},
+        {
+            **{a.label: a.type.ndim for a in adj.args if _is_array_arg_type(a.type) and hasattr(a.type, "ndim")},
+            **_ptr_array_ndims,
+        },
         _wrap_msl_types,
         _wrap_consts,
     )
@@ -15272,6 +15758,16 @@ def _generate_msl_kernel_uncached(
     forward_lines = _fix_negative_step_for_loops(forward_lines, adj=adj, extra_const_ints=_inlined_const_ints)
     # A loop variable read after its loop keeps its last iteration value.
     forward_lines = _materialize_for_loop_vars(forward_lines)
+    # ``wp.array(ptr=...)`` locals -> device pointer + shape locals.
+    forward_lines, _ptr_array_skip, ptr_array_labels, ptr_array_roots = _lower_pointer_arrays(
+        forward_lines,
+        adj,
+        adjoint,
+        {
+            **{str(v.label): v.constant for v in adj.variables if isinstance(getattr(v, "constant", None), int)},
+            **{str(k): v for k, v in _inlined_const_ints.items() if isinstance(v, int)},
+        },
+    )
 
     if os.environ.get("WARP_METAL_DUMP_IR"):
         _dump = os.path.join(os.environ["WARP_METAL_DUMP_IR"], f"{adj.fun_name}{'__adj' if adjoint else ''}.ir")
@@ -15279,7 +15775,7 @@ def _generate_msl_kernel_uncached(
         with open(_dump, "w") as _f:
             _f.write("\n".join(forward_lines))
 
-    vars_to_skip_decl: set[str] = _struct_skip | _drop_skip | _view_skip | _indexref_skip
+    vars_to_skip_decl: set[str] = _struct_skip | _drop_skip | _view_skip | _indexref_skip | _ptr_array_skip
 
     # Classify each array arg as input or output by scanning the IR strings.
     # MLX inputs are ``const device T*`` (read-only) — verified empirically —
@@ -15328,7 +15824,18 @@ def _generate_msl_kernel_uncached(
     raw_atomic_pat = re.compile(
         r"(?:atomic_fetch_(add|sub|min|max|and|or|xor)_explicit|wp_atomic_(min|max|cas|exch))\s*\(\s*&\s*(\w+)\["
     )
+    _native_array_ok = {a.label for a in adj.args if _is_array_arg(a)} | ptr_array_labels
     for raw in forward_lines:
+        for m in _NATIVE_ARRAY_VIEW_ARG_PAT.finditer(raw):
+            # Handed to a native snippet as a raw pointer: may be written.
+            if m.group(1) not in _native_array_ok:
+                raise MetalCodegenError(
+                    f"Kernel {adj.fun_name!r}: a @wp.func_native snippet on Metal takes only kernel array "
+                    f"arguments or arrays built in the kernel with wp.array(ptr=...) / slicing; got the array "
+                    f"local 'var_{m.group(1)}' (e.g. a struct field). Pass the array as a kernel argument."
+                )
+            written_arg_names.add(m.group(1))
+            plain_store_arg_names.add(m.group(1))
         m = array_store_pat.match(raw)
         if m:
             written_arg_names.add(m.group(1))
@@ -15364,6 +15871,18 @@ def _generate_msl_kernel_uncached(
             written_arg_names.add(arr_name)
             atomic_arg_names.add(arr_name)
             atomic_op_kinds.setdefault(arr_name, set()).add(op_kind)
+    # In-kernel array locals (see ``_lower_pointer_arrays``) are plain
+    # ``device T*`` pointers: a write through a slice view is a write to the
+    # argument it views, and atomics on them have no ``atomic<T>`` typing.
+    for _pa in ptr_array_labels & atomic_arg_names:
+        raise MetalCodegenError(
+            f"Kernel {adj.fun_name!r}: atomic operations on an in-kernel array view "
+            f"(wp.array(ptr=...) or an array slice) are not supported on Metal"
+        )
+    for _pa in ptr_array_labels & written_arg_names:
+        if _pa in ptr_array_roots:
+            written_arg_names.add(ptr_array_roots[_pa])
+            plain_store_arg_names.add(ptr_array_roots[_pa])
 
     # MLX's ``atomic_outputs`` flag is per-kernel, not per-output: when set,
     # *every* output is typed ``device atomic<T>*``. We can still support
@@ -15519,7 +16038,10 @@ def _generate_msl_kernel_uncached(
     # mismatches in MLX-generated wrappers. So we emit per-component reads
     # ``floatN(arr[i*N+0], arr[i*N+1], ...)`` instead of any cast trick.
     arg_label_set = (
-        {a.label for a in adj.args} | {v.label for v in struct_field_array_vars} | {v.label for v in grad_array_vars}
+        {a.label for a in adj.args}
+        | {v.label for v in struct_field_array_vars}
+        | {v.label for v in grad_array_vars}
+        | ptr_array_labels
     )
     # Map argname -> (vec_size, msl_scalar) for each vec-typed array arg,
     # argname -> (rows, cols, msl_scalar) for each mat-typed array arg, and
@@ -15948,6 +16470,17 @@ def _generate_msl_kernel_uncached(
             # ``_coop_block_eligible`` for the ops that keep them per-lane.
             if (label in _ctor_labels and kind == "register") or dtype_ctype in _SCALAR_CTYPE_TO_MSL:
                 distributed_tiles[label] = _msl_scalar_type(dtype_ctype)
+    if distributed_tiles:
+        # Lane-indexed masked scatter into a distributed tile (only form the
+        # classifier admits): the lane updates its own element.
+        def _repl_coop_scatter(m: re.Match[str]) -> str:
+            args = [a.strip() for a in _split_top_level_args(m.group(1))]
+            t = args[0][len("var_") :] if args[0].startswith("var_") else args[0]
+            if t not in distributed_tiles or len(args) != 4:
+                return m.group(0)
+            return f"if ({args[3]}) {{ var_{t} = ({distributed_tiles[t]})({args[2]}); }}"
+
+        forward_lines = [_COOP_SCATTER_MASKED_PAT.sub(_repl_coop_scatter, ln) for ln in forward_lines]
     # Column-distributed 2-D tiles (``(R, block_dim)``, column ``j`` on lane
     # ``j``): label → (rows, element MSL scalar). Each lane owns an R-vector,
     # declared and translated as an ``(R, 1)`` private tile struct. ``full``
@@ -16599,6 +17132,7 @@ def _generate_msl_kernel_uncached(
             *(arg.label for arg in adj.args),
             *(v.label for v in struct_field_array_vars),
             *(v.label for v in grad_array_vars),
+            *sorted(ptr_array_labels),
         ]
     )
     _arg_rename_pat = re.compile(rf"\bvar_({_arg_label_alt})\b") if _arg_label_alt else None
@@ -18767,6 +19301,7 @@ def _generate_msl_kernel_uncached(
         # NB: ``builtin_block_dim`` is checked on the kernel's own IR — a
         # ``wp.block_dim()`` buried in a non-inlined wp.func would be
         # missed, but tile/block kernels call it at kernel scope.
+        lane_tile_index=coop_block_n == 0 and _lane_indexes_tile_op(forward_lines),
         tile_block_fold=(
             "builtin_block_dim" in "\n".join(adj.blocks[0].body_forward)
             or "wp_tile_" in source
@@ -20963,6 +21498,49 @@ def _maybe_staged_arg(value) -> bool:
     return type(value).__name__ == "indexedarray"
 
 
+_TILE_LANE_OP_PAT = re.compile(r"\bwp::tile_scatter_(?:masked|add)\s*(?:<[^()]*>)?\s*\(\s*var_\w+\s*,\s*var_(\w+)\s*,")
+
+
+def _lane_indexes_tile_op(lines: list[str]) -> bool:
+    """Whether a tile scatter is indexed by the lane of a 2-D ``wp.tid()``."""
+    text = "\n".join(lines)
+    m = re.search(r"builtin_tid2d\s*\(\s*var_\w+\s*,\s*var_(\w+)\s*\)", text)
+    return m is not None and any(lm.group(1) == m.group(1) for lm in _TILE_LANE_OP_PAT.finditer(text))
+
+
+def _lane_tile_launch_error(kernel, block_dim: int) -> str:
+    return (
+        f"Kernel '{kernel.key}' indexes a tile scatter with the lane of wp.tid(). On Metal tile kernels run "
+        "one thread per block (the lane always reads as 0) unless every tile op has a per-lane lowering and "
+        f"the launch uses block_dim=32 (got block_dim={block_dim}); restructure the kernel or launch with "
+        "block_dim=32."
+    )
+
+
+def _fold_tiled_block_dim(artifact, dims: tuple, block_dim: int) -> tuple:
+    """Drop the trailing lane dim of a 4-D+ ``wp.launch_tiled`` launch.
+
+    ``wp.launch_tiled(dim=(a, b, c), block_dim=B)`` launches ``(a, b, c, B)``
+    and the kernel reads ``a, b, c = wp.tid()`` — on CUDA the first three
+    coordinates of the 4-D index. A serial (one thread per block) tile kernel
+    on Metal ignores the lane dim, so folding it away here leaves a 3-D grid
+    whose ``thread_position_in_grid`` already yields those coordinates. The
+    general fold below also drops it for <= 3-D launches; this one only runs
+    ahead of the 3-D limit check, and leaves 4-D-``wp.tid()`` and
+    distributed-lane kernels to their own handling.
+    """
+    if (
+        len(dims) > 3
+        and not artifact.tid4
+        and getattr(artifact, "coop_block_n", 0) == 0
+        and getattr(artifact, "tile_block_fold", True)
+        and block_dim > 1
+        and dims[-1] == block_dim
+    ):
+        return dims[:-1]
+    return dims
+
+
 def launch_metal_kernel_native(
     kernel,
     dim,
@@ -21010,13 +21588,13 @@ def launch_metal_kernel_native(
 
     # Strided / indexed array arguments run through contiguous staging
     # copies (see ``warp._src.metal_array_args``).
-    if any(_maybe_staged_arg(v) for v in (*inputs, *outputs)):
+    if any(_maybe_staged_arg(v) for v in (*inputs, *outputs, *((*adj_inputs, *adj_outputs) if adjoint else ()))):
         from warp._src.metal_array_args import stage_launch_args  # noqa: PLC0415
 
-        staged = stage_launch_args(kernel, inputs, outputs, device, adjoint)
+        staged = stage_launch_args(kernel, inputs, outputs, device, adjoint, adj_inputs, adj_outputs)
         if staged is not None:
             return staged.run(
-                lambda k, i, o: launch_metal_kernel_native(
+                lambda k, i, o, ai, ao: launch_metal_kernel_native(
                     k,
                     dim,
                     i,
@@ -21024,8 +21602,8 @@ def launch_metal_kernel_native(
                     device,
                     block_dim=block_dim,
                     adjoint=adjoint,
-                    adj_inputs=adj_inputs,
-                    adj_outputs=adj_outputs,
+                    adj_inputs=ai,
+                    adj_outputs=ao,
                 )
             )
 
@@ -21586,6 +22164,7 @@ def launch_metal_kernel_native(
         dims = tuple(dim)
     if len(dims) == 0:
         return
+    dims = _fold_tiled_block_dim(artifact, dims, block_dim)
     if len(dims) == 4 and artifact.tid4:
         # 4-D tid: fold the last two launch dims into grid z; the kernel
         # decomposes via the ``__tid4_dim3`` input bound above.
@@ -21621,6 +22200,8 @@ def launch_metal_kernel_native(
             tg = (1, coop_block_n, 1)
     else:
         if getattr(artifact, "tile_block_fold", True) and len(dims) > 1 and dims[-1] == block_dim and block_dim > 1:
+            if getattr(artifact, "lane_tile_index", False):
+                raise RuntimeError(_lane_tile_launch_error(kernel, block_dim))
             dims = dims[:-1]
         elif artifact.native_lane_dependent and len(dims) > 1 and dims[-1] == block_dim and block_dim > 1:
             raise RuntimeError(_native_lane_launch_error(kernel, block_dim))
@@ -22265,6 +22846,7 @@ def launch_metal_kernel(
         dims = tuple(dim)
     if len(dims) == 0:
         return
+    dims = _fold_tiled_block_dim(artifact, dims, block_dim)
     if len(dims) == 4 and artifact.tid4:
         # 4-D tid: fold the last two launch dims into grid z; the kernel
         # decomposes via the ``__tid4_dim3`` input bound above.
@@ -22310,6 +22892,8 @@ def launch_metal_kernel(
         else:
             dims = (dims[0], coop_block_n)
     elif getattr(artifact, "tile_block_fold", True) and len(dims) > 1 and dims[-1] == block_dim and block_dim > 1:
+        if getattr(artifact, "lane_tile_index", False):
+            raise RuntimeError(_lane_tile_launch_error(kernel, block_dim))
         dims = dims[:-1]
     elif (
         getattr(artifact, "native_lane_dependent", False) and len(dims) > 1 and dims[-1] == block_dim and block_dim > 1

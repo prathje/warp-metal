@@ -1487,6 +1487,26 @@ def _build_function_overload_table(adj) -> dict[str, list[Any]]:
                 _add(overload)
             _add(obj)
 
+    # Functions passed by value to a builtin (``wp.tile_map(fn, t)``): the
+    # builtin call doesn't register its callable args in ``get_references``,
+    # and a closure ``fn`` from a factory called more than once is shadowed
+    # in the module sweep below by the last instance (Kamino's
+    # ``make_1d_tile_based_kernels(...)._isnan``). Resolve every free name
+    # in the kernel body through the kernel's own closure instead.
+    try:
+        import ast as _py_ast  # noqa: PLC0415
+
+        local_names = adj.assigned_name_ids()
+        for node in adj.reference_nodes():
+            if isinstance(node, _py_ast.Name) and node.id not in local_names:
+                obj = adj.resolve_external_reference(node.id)
+                if isinstance(obj, Function) and not obj.is_builtin():
+                    for overload in _overloads(obj):
+                        _add(overload)
+                    _add(obj)
+    except Exception:
+        pass
+
     func = getattr(adj, "func", None)
     globals_dict = getattr(func, "__globals__", None) if func is not None else None
     if globals_dict is not None:

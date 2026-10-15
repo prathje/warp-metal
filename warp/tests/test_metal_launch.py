@@ -7994,7 +7994,7 @@ class TestMetalTorchInterop(unittest.TestCase):
         host address. They wrap under a synthetic pointer key: kernels bind
         them in place (reads and writes visible on both sides after a sync),
         while ``numpy()``, ``fill_``, and host copies stage through the GPU.
-        Non-host-capable paths (strided copies, wp.utils host ops, BVH
+        Strided copies run as device kernels; non-host-capable paths (wp.utils host ops, BVH
         builds) refuse with a clear error instead of dereferencing the key."""
         snippet = textwrap.dedent(
             """
@@ -8097,14 +8097,16 @@ class TestMetalTorchInterop(unittest.TestCase):
             a3 = wp.from_torch(t3)
             assert ctx._metal_is_private_ptr(a3.ptr)
 
-            # paths that must run on the host refuse clearly
+            # a strided copy into a private-storage view runs as a device
+            # gather/scatter kernel, so it needs no host address
             t4 = torch.zeros(8, 8, device='mps')
             a4 = wp.from_torch(t4)
-            try:
-                wp.copy(a4[:, 1:3], wp.zeros((8, 2), dtype=wp.float32, device=dev))
-                raise AssertionError('expected RuntimeError')
-            except RuntimeError as e:
-                assert 'private-storage' in str(e), e
+            wp.copy(a4[:, 1:3], wp.full((8, 2), 3.0, dtype=wp.float32, device=dev))
+            wp.synchronize_device(dev)
+            expect4 = np.zeros((8, 8), dtype=np.float32)
+            expect4[:, 1:3] = 3.0
+            assert np.array_equal(t4.cpu().numpy(), expect4), t4
+            # paths that must run on the host refuse clearly
             try:
                 wp.utils.array_sum(a3)
                 raise AssertionError('expected RuntimeError')
