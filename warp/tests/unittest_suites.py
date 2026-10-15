@@ -236,6 +236,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
         TestMetalAsyncFill,
         TestMetalAutoflush,
         TestMetalForLoopMaterialize,
+        TestMetalNestedCaptureWhileReplay,
         TestMetalTileBroadcast,
     )
     from warp.tests.test_metal_runtime import TestMetalRuntime, TestMetalRuntimeSubprocess
@@ -450,6 +451,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
         TestMetalAsyncFill,
         TestMetalAutoflush,
         TestMetalForLoopMaterialize,
+        TestMetalNestedCaptureWhileReplay,
         TestMetalTileBroadcast,
         TestMetalMujocoWarp,
         TestMetalMeshWinding,

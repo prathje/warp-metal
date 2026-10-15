@@ -89,64 +89,54 @@ kernel void wp_tile1(device const uchar* pat [[buffer(0)]],
     dst[off + tid] = pat[tid % patlen];
 }
 
-// Gate for conditionally-executed graph regions. One thread per chunk of
-// the gated region: copies the chunk's full execution range, zeroing its
-// length unless every condition holds. Condition k is the int32 at
-// ``flag<k>`` (nonzero = true), inverted when bit k of ``negmask`` is set
-// (the else-branch of a capture_if). The replay encoder points each chunk's
-// ``executeCommandsInBuffer:indirectBuffer:`` at ``ranges``, so the command
-// processor resolves skip-vs-run on the GPU timeline -- the Metal
-// equivalent of a CUDA conditional graph node. Nested conditionals pass
-// the whole chain of enclosing conditions (up to WP_ICB_MAX_CONDS).
+// Conditional replay programs (``capture_if`` / ``capture_while`` on Metal):
+// every gated run of graph commands executes through
+// ``executeCommandsInBuffer:indirectBuffer:`` from a ``WpExecRange`` that a
+// control op writes on the GPU timeline -- the full range when every
+// enclosing condition holds, length 0 otherwise. A condition is the int32 at
+// a flag address (nonzero = true), inverted when its ``negmask`` bit is set
+// (the else-branch of a capture_if); nested conditionals pass the chain of
+// enclosing conditions (up to WP_ICB_MAX_CONDS). Snapshots latch a flag into
+// a graph-owned word at the start of a region / loop iteration, so kernels
+// inside it that rewrite the condition do not change which of its later
+// runs execute (CUDA evaluates a conditional node's condition once per
+// entry). A loop-budget check records whether an unrolled capture_while was
+// still running when its iteration budget ran out.
 struct WpExecRange { uint location; uint length; };
-struct WpGateParams { uint nflags; uint negmask; };
 #define WP_ICB_MAX_CONDS 8
-inline bool wp_icb_conds_hold(device const int* f0, device const int* f1, device const int* f2,
-                              device const int* f3, device const int* f4, device const int* f5,
-                              device const int* f6, device const int* f7, WpGateParams p) {
-    device const int* f[WP_ICB_MAX_CONDS] = {f0, f1, f2, f3, f4, f5, f6, f7};
-    for (uint k = 0; k < p.nflags; ++k) {
-        bool c = f[k][0] != 0;
-        if ((p.negmask >> k) & 1u) { c = !c; }
-        if (!c) { return false; }
-    }
-    return true;
-}
-kernel void wp_icb_gate(device const int* f0 [[buffer(0)]], device const int* f1 [[buffer(1)]],
-                        device const int* f2 [[buffer(2)]], device const int* f3 [[buffer(3)]],
-                        device const int* f4 [[buffer(4)]], device const int* f5 [[buffer(5)]],
-                        device const int* f6 [[buffer(6)]], device const int* f7 [[buffer(7)]],
-                        device WpExecRange* ranges [[buffer(8)]],
-                        const device WpExecRange* full [[buffer(9)]],
-                        constant WpGateParams& p [[buffer(10)]],
+
+// All control ops of a conditional replay program in one kernel, driven by a
+// per-op descriptor (see ``MetalDispatcher._encode_control_ops``) so replay
+// binds one buffer offset per op instead of a pipeline plus every flag
+// buffer. Kinds: 0 gate, 1 snapshot, 2 snapshot then gate (a loop
+// iteration's prologue; the latched word is one of the gate's flags),
+// 3 loop-budget check. Pointers are buffer gpuAddresses.
+struct WpCtrlOp {
+    uint kind; uint nflags; uint negmask; uint pad;
+    ulong flags[WP_ICB_MAX_CONDS];
+    ulong ranges; ulong full; ulong src; ulong dst;
+};
+kernel void wp_icb_ctrl(const device WpCtrlOp& op [[buffer(0)]],
                         uint tid [[thread_position_in_grid]]) {
-    WpExecRange r = full[tid];
-    if (!wp_icb_conds_hold(f0, f1, f2, f3, f4, f5, f6, f7, p)) { r.length = 0u; }
-    ranges[tid] = r;
+    if (op.kind == 1u || op.kind == 2u) {
+        *reinterpret_cast<device int*>(op.dst) = *reinterpret_cast<const device int*>(op.src);
+        if (op.kind == 1u) { return; }
+    }
+    bool hold = true;
+    for (uint k = 0; k < op.nflags; ++k) {
+        bool c = *reinterpret_cast<const device int*>(op.flags[k]) != 0;
+        if ((op.negmask >> k) & 1u) { c = !c; }
+        if (!c) { hold = false; break; }
+    }
+    if (op.kind == 3u) {
+        if (hold) { *reinterpret_cast<device int*>(op.dst) = 1; }
+        return;
+    }
+    WpExecRange r = *reinterpret_cast<const device WpExecRange*>(op.full);
+    if (!hold) { r.length = 0u; }
+    *reinterpret_cast<device WpExecRange*>(op.ranges) = r;
 }
 
-// Snapshot a condition flag into a graph-owned word at the start of a
-// conditional region / loop iteration, so kernels inside the region that
-// rewrite the condition do not change which of the region's later chunks
-// run (CUDA evaluates a conditional node's condition once per entry).
-kernel void wp_icb_snapshot(device const int* src [[buffer(0)]],
-                            device int* dst [[buffer(1)]],
-                            uint tid [[thread_position_in_grid]]) {
-    dst[0] = src[0];
-}
-
-// After an unrolled capture_while: record in ``out`` whether the loop was
-// still running (enclosing conditions true and loop condition nonzero) when
-// the iteration budget ran out.
-kernel void wp_icb_loop_check(device const int* f0 [[buffer(0)]], device const int* f1 [[buffer(1)]],
-                              device const int* f2 [[buffer(2)]], device const int* f3 [[buffer(3)]],
-                              device const int* f4 [[buffer(4)]], device const int* f5 [[buffer(5)]],
-                              device const int* f6 [[buffer(6)]], device const int* f7 [[buffer(7)]],
-                              device int* out [[buffer(8)]],
-                              constant WpGateParams& p [[buffer(10)]],
-                              uint tid [[thread_position_in_grid]]) {
-    if (wp_icb_conds_hold(f0, f1, f2, f3, f4, f5, f6, f7, p)) { out[0] = 1; }
-}
 """
 
 
@@ -156,6 +146,36 @@ _OP_GATE = 1
 _OP_EXEC_IND = 2
 _OP_SNAPSHOT = 3
 _OP_LOOP_CHECK = 4
+_OP_SNAP_GATE = 5
+_OP_CTRL = 6
+# Build-time only: loop-execution begin / end markers, stripped by
+# ``_build_program`` into ``MetalGraph._loop_spans``.
+_OP_MARK = 7
+# Replay keeps at most this many committed-but-unfinished command buffers
+# of a program while inside an unrolled loop, so it can see a loop latch
+# false and stop encoding iterations that would all be skipped.
+_REPLAY_MAX_INFLIGHT = 3
+# ``WpCtrlOp`` layout: 4 x uint32, 8 flag addresses, ranges, full, src, dst.
+_CTRL_OP_FMT = "<4I8Q4Q"
+_CTRL_OP_SIZE = struct.calcsize(_CTRL_OP_FMT)
+# Replay commits the command buffer every this many program ops, so the GPU
+# starts on a long (unrolled ``capture_while``) program while the rest is
+# still being encoded instead of after all of it.
+_REPLAY_COMMIT_OPS = 512
+
+
+def _ctrl_op_buffers(op) -> tuple:
+    """MTLBuffers a control op reaches through descriptor addresses."""
+    code = op[0]
+    if code == _OP_SNAPSHOT:
+        return (op[1], op[3])
+    bufs = [buf for buf, _off, _neg in op[1]]
+    bufs.append(op[3])
+    if code != _OP_LOOP_CHECK:
+        bufs.append(op[4])
+    if code == _OP_SNAP_GATE:
+        bufs.extend((op[5], op[7]))
+    return tuple(bufs)
 
 
 def _u32(value: int) -> tuple[bytes, int]:
@@ -195,8 +215,9 @@ class MetalGraph:
         "_chunks",
         "_count",
         "_icb",
-        "_names",
         "_loop_checks",
+        "_loop_spans",
+        "_names",
         "_owned_buffers",
         "_program",
         "_resources",
@@ -217,6 +238,10 @@ class MetalGraph:
     ):
         self._icb = icb
         self._count = count
+        # ``(start, end, snap_addr)`` per unrolled ``capture_while``
+        # execution in ``program`` (see ``_build_program``); set by
+        # ``end_record``.
+        self._loop_spans = None
         # MTLBuffers referenced by the recorded commands. The replay
         # encoder must call ``useResource:usage:`` on each so Metal
         # makes them resident before the dispatch starts. Bindings are
@@ -246,12 +271,11 @@ class MetalGraph:
         # ``begin_loop``). ``None`` for a graph without conditionals;
         # otherwise the flattened replay program -- a list of ops built by
         # ``_build_program``: ``(_OP_EXEC, start, length)`` executes a
-        # chunk, ``(_OP_GATE, ...)`` dispatches ``wp_icb_gate`` to resolve a
-        # gated run of chunks into ``ranges_buf``, ``(_OP_EXEC_IND,
-        # ranges_buf, offset)`` executes one of those chunks through
-        # ``executeCommandsInBuffer:indirectBuffer:``, ``(_OP_SNAPSHOT,
-        # ...)`` latches a condition flag and ``(_OP_LOOP_CHECK, ...)``
-        # records whether an unrolled loop ran out of iterations.
+        # command run, ``(_OP_CTRL, desc_buf, offset)`` dispatches
+        # ``wp_icb_ctrl`` on one ``WpCtrlOp`` descriptor (gate a run into its
+        # range word, latch a condition, check a loop budget), and
+        # ``(_OP_EXEC_IND, ranges_buf, offset)`` executes a gated run through
+        # ``executeCommandsInBuffer:indirectBuffer:``.
         self._program = program
         # ``(overflow_buf, overflow_addr, max_iters)`` per unrolled loop;
         # :meth:`MetalDispatcher.replay` polls the host-visible word to
@@ -1609,7 +1633,18 @@ class MetalDispatcher:
                 # regions still map onto executable ranges.
                 chunks = [(i, 1) for i in range(st["count"])]
             loop_checks = []
-            program = self._build_program(st["root"], chunks, st["owned_buffers"], loop_checks)
+            ctrl_resident: dict = {}
+            loop_spans: list = []
+            program = self._build_program(
+                st["root"], chunks, st["owned_buffers"], loop_checks, ctrl_resident, loop_spans
+            )
+            # Buffers the control ops reach only through descriptor
+            # addresses (flags, range tables, snapshots, the descriptor
+            # table itself) must be declared resident on replay.
+            for buf in [*ctrl_resident.values(), *(op[1] for op in program if op[0] == _OP_CTRL)]:
+                if id(buf) not in st["resources_set"]:
+                    st["resources_set"].add(id(buf))
+                    st["resources"].append(buf)
             # Conditional replay executes whole command runs as single
             # ranges; ICB command barriers keep the dependency order that
             # chunk boundaries describe (verified to serialize dependent
@@ -1618,7 +1653,7 @@ class MetalDispatcher:
             for start, _length in chunks:
                 if start > 0:
                     icb.indirectComputeCommandAtIndex_(start).setBarrier()
-        return MetalGraph(
+        graph = MetalGraph(
             icb=st["icb"],
             count=st["count"],
             resources=st["resources"],
@@ -1629,6 +1664,9 @@ class MetalDispatcher:
             names=st["names"],
             loop_checks=loop_checks or None,
         )
+        if program is not None and loop_spans:
+            graph._loop_spans = loop_spans
+        return graph
 
     def pause_record(self) -> None:
         """Suspend the active recording; dispatches run live until
@@ -1763,7 +1801,15 @@ class MetalDispatcher:
         else:
             block.append(["cmds", idx, idx + 1])
 
-    def _build_program(self, root: list, chunks: list, owned_buffers: list, loop_checks: list) -> list:
+    def _build_program(
+        self,
+        root: list,
+        chunks: list,
+        owned_buffers: list,
+        loop_checks: list,
+        resident: dict | None = None,
+        loop_spans: list | None = None,
+    ) -> list:
         """Flatten the recorded conditional tree into a replay program.
 
         Loops are unrolled ``max_iters`` times here, so replay is a single
@@ -1773,6 +1819,10 @@ class MetalDispatcher:
         by barriers.
         """
         program: list = []
+        if resident is None:
+            resident = {}
+        if loop_spans is None:
+            loop_spans = []
 
         def owned_word():
             buf, addr = self.alloc(4)
@@ -1825,23 +1875,27 @@ class MetalDispatcher:
                     if snapshot:
                         snap = snapshots.get(id(node))
                         if snap is None:
-                            snap = owned_word()[0]
+                            snap = owned_word()
                             snapshots[id(node)] = snap
+                        snap = snap[0]
                         program.append((_OP_SNAPSHOT, flag_buf, flag_off, snap))
                         emit(body, [*conds, (snap, 0, negate)])
                     else:
                         emit(body, [*conds, (flag_buf, flag_off, negate)])
                 elif kind == "loop":
                     _k, flag_buf, flag_off, max_iters, body = node
-                    snap = snapshots.get(id(node))
-                    if snap is None:
-                        snap = owned_word()[0]
-                        snapshots[id(node)] = snap
+                    snap_word = snapshots.get(id(node))
+                    if snap_word is None:
+                        snap_word = owned_word()
+                        snapshots[id(node)] = snap_word
+                    snap, snap_addr = snap_word
                     inner = [*conds, (snap, 0, False)]
+                    program.append((_OP_MARK, 0, snap_addr))
                     for _ in range(max_iters):
                         program.append((_OP_SNAPSHOT, flag_buf, flag_off, snap))
                         if body:
                             emit(body, inner)
+                    program.append((_OP_MARK, 1, snap_addr))
                     # Budget exhausted while the loop still wanted to run?
                     check_buf, check_addr = owned_word()
                     loop_checks.append((check_buf, check_addr, max_iters))
@@ -1849,7 +1903,110 @@ class MetalDispatcher:
                     program.append((_OP_LOOP_CHECK, tuple(check_conds), conds_params(check_conds), check_buf))
 
         emit(root, [])
-        return program
+        # Fuse each snapshot with an immediately following gate that reads
+        # the latched word (the common loop-iteration prologue): one
+        # dispatch and one barrier fewer per unrolled iteration.
+        fused: list = []
+        i = 0
+        while i < len(program):
+            op = program[i]
+            nxt = program[i + 1] if i + 1 < len(program) else None
+            if (
+                op[0] == _OP_SNAPSHOT
+                and nxt is not None
+                and nxt[0] == _OP_GATE
+                and any(buf is op[3] and off == 0 for buf, off, _neg in nxt[1])
+            ):
+                fused.append((_OP_SNAP_GATE, nxt[1], nxt[2], nxt[3], nxt[4], op[1], op[2], op[3]))
+                i += 2
+                continue
+            fused.append(op)
+            i += 1
+        # Strip the loop markers into ``loop_spans`` (op index ranges of
+        # each unrolled loop execution in the final program).
+        stripped: list = []
+        open_spans: list = []
+        for op in fused:
+            if op[0] == _OP_MARK:
+                if op[1] == 0:
+                    open_spans.append(len(stripped))
+                else:
+                    loop_spans.append((open_spans.pop(), len(stripped), op[2]))
+                continue
+            stripped.append(op)
+        loop_spans.sort()
+        return self._encode_control_ops(stripped, owned_buffers, resident)
+
+    def _encode_control_ops(self, program: list, owned_buffers: list, resident: dict) -> list:
+        """Replace the control ops of ``program`` with ``(_OP_CTRL,
+        desc_buf, offset)`` entries pointing at packed ``WpCtrlOp``
+        descriptors in one graph-owned buffer. Every buffer a descriptor
+        points at is added to ``resident`` (``id -> buffer``): replay must
+        declare it with ``useResource`` since no argument slot binds it."""
+        ctrl = [op for op in program if op[0] not in (_OP_EXEC, _OP_EXEC_IND)]
+        if not ctrl:
+            return program
+        stride = (_CTRL_OP_SIZE + 15) & ~15
+        desc_buf, desc_addr = self.alloc(stride * len(ctrl))
+        owned_buffers.append(desc_buf)
+        addr_cache: dict[int, int] = {}
+
+        def addr(buf, off=0):
+            base = addr_cache.get(id(buf))
+            if base is None:
+                base = int(buf.gpuAddress())
+                addr_cache[id(buf)] = base
+            return base + int(off)
+
+        out = []
+        k = 0
+        for op in program:
+            code = op[0]
+            if code in (_OP_EXEC, _OP_EXEC_IND):
+                out.append(op)
+                continue
+            flags = [0] * 8
+            nflags = negmask = 0
+            ranges = full = src = dst = 0
+            if code == _OP_SNAPSHOT:
+                kind = 1
+                src, dst = addr(op[1], op[2]), addr(op[3])
+            else:
+                slots = op[1]
+                nflags = len(slots)
+                for j, (buf, off, neg) in enumerate(slots):
+                    flags[j] = addr(buf, off)
+                    if neg:
+                        negmask |= 1 << j
+                if code == _OP_LOOP_CHECK:
+                    kind = 3
+                    dst = addr(op[3])
+                else:
+                    ranges, full = addr(op[3]), addr(op[4])
+                    if code == _OP_SNAP_GATE:
+                        kind = 2
+                        src, dst = addr(op[5], op[6]), addr(op[7])
+                    else:
+                        kind = 0
+            struct.pack_into(
+                _CTRL_OP_FMT,
+                (ctypes.c_char * stride).from_address(desc_addr + k * stride),
+                0,
+                kind,
+                nflags,
+                negmask,
+                0,
+                *flags,
+                ranges,
+                full,
+                src,
+                dst,
+            )
+            for buf in _ctrl_op_buffers(op):
+                resident.setdefault(id(buf), buf)
+            out.append((_OP_CTRL, desc_buf, k * stride))
+            k += 1
+        return out
 
     def replay(self, graph: MetalGraph) -> None:
         """Execute ``graph`` on the GPU (fire-and-forget).
@@ -1878,6 +2035,41 @@ class MetalDispatcher:
                 self._armed_loop_checks[check[1]] = check
         if graph.count == 0 and graph._program is None:
             return
+        encoder = self._open_replay_encoder(graph)
+        # Chunked range execution: one ``executeCommandsInBuffer``
+        # per chunk of mutually-independent commands, with a barrier
+        # only BETWEEN chunks. Without chunks (caller never passed
+        # ``binding_modes``), fall back to per-command ranges + per-
+        # command barriers. See :class:`MetalGraph` docstring for the
+        # correctness argument.
+        nsrange = self._NSMakeRange
+        scope = self._barrier_scope_buffers
+        icb = graph._icb
+        chunks = graph._chunks
+        if graph._program is not None:
+            self._replay_program(encoder, graph)
+        elif chunks is not None:
+            last = len(chunks) - 1
+            for i, (start, length) in enumerate(chunks):
+                encoder.executeCommandsInBuffer_withRange_(icb, nsrange(start, length))
+                if i < last:
+                    encoder.memoryBarrierWithScope_(scope)
+        else:
+            for i in range(graph.count):
+                encoder.executeCommandsInBuffer_withRange_(icb, nsrange(i, 1))
+                encoder.memoryBarrierWithScope_(scope)
+        # Count this as ``graph.count`` logical dispatches against
+        # the autoflush threshold so the in-flight cmd buffer commits
+        # at the same cadence as direct ``dispatch`` use.
+        self._dispatch_count += graph.count
+        if self._dispatch_count >= self._autoflush_every or self._gpu_idle():
+            self.flush()
+            self._dispatch_count = 0
+
+    def _open_replay_encoder(self, graph: MetalGraph):
+        """Return the live compute encoder, opening a command buffer /
+        encoder if needed, with ``graph``'s resources declared on it and
+        the graph pinned until the command buffer completes."""
         Metal = self._Metal
         if self._cmd_buf is None:
             self._cmd_buf = self._command_queue.commandBuffer()
@@ -1908,78 +2100,97 @@ class MetalDispatcher:
         self._inflight_refs.append(graph._icb)
         if graph._owned_buffers:
             self._inflight_refs.extend(graph._owned_buffers)
-        # Chunked range execution: one ``executeCommandsInBuffer``
-        # per chunk of mutually-independent commands, with a barrier
-        # only BETWEEN chunks. Without chunks (caller never passed
-        # ``binding_modes``), fall back to per-command ranges + per-
-        # command barriers. See :class:`MetalGraph` docstring for the
-        # correctness argument.
-        nsrange = self._NSMakeRange
-        scope = self._barrier_scope_buffers
-        icb = graph._icb
-        chunks = graph._chunks
-        if graph._program is not None:
-            self._replay_program(encoder, graph)
-        elif chunks is not None:
-            last = len(chunks) - 1
-            for i, (start, length) in enumerate(chunks):
-                encoder.executeCommandsInBuffer_withRange_(icb, nsrange(start, length))
-                if i < last:
-                    encoder.memoryBarrierWithScope_(scope)
-        else:
-            for i in range(graph.count):
-                encoder.executeCommandsInBuffer_withRange_(icb, nsrange(i, 1))
-                encoder.memoryBarrierWithScope_(scope)
-        # Count this as ``graph.count`` logical dispatches against
-        # the autoflush threshold so the in-flight cmd buffer commits
-        # at the same cadence as direct ``dispatch`` use.
-        self._dispatch_count += graph.count
-        if self._dispatch_count >= self._autoflush_every:
-            self.flush()
-            self._dispatch_count = 0
+        return encoder
 
     def _replay_program(self, encoder, graph: MetalGraph) -> None:
         """Encode a conditional graph's flattened program (see
-        :meth:`_build_program`), one barrier between consecutive ops."""
+        :meth:`_build_program`), one barrier between consecutive ops.
+
+        Unrolled ``capture_while`` loops make these programs long (tens of
+        thousands of ops for nested solver loops), so the command buffer is
+        committed every ``_REPLAY_COMMIT_OPS`` ops: the GPU then executes
+        the program while the remainder is still being encoded. Commands
+        on one queue run in commit order, so the split does not change
+        ordering or the gate semantics.
+        """
         nsrange = self._NSMakeRange
         scope = self._barrier_scope_buffers
         icb = graph._icb
-        barrier = encoder.memoryBarrierWithScope_
-        exec_range = encoder.executeCommandsInBuffer_withRange_
-        exec_indirect = encoder.executeCommandsInBuffer_indirectBuffer_indirectBufferOffset_
-        set_pso = encoder.setComputePipelineState_
-        set_buffer = encoder.setBuffer_offset_atIndex_
-        set_bytes = encoder.setBytes_length_atIndex_
-        dispatch = encoder.dispatchThreads_threadsPerThreadgroup_
-        gate_pso = self._device_op("wp_icb_gate")
-        snap_pso = self._device_op("wp_icb_snapshot")
-        check_pso = self._device_op("wp_icb_loop_check")
+        ctrl_pso = self._device_op("wp_icb_ctrl")
         one = self._Metal.MTLSizeMake(1, 1, 1)
         program = graph._program
-        last = len(program) - 1
-        for i, op in enumerate(program):
-            code = op[0]
-            if code == _OP_EXEC:
-                exec_range(icb, nsrange(op[1], op[2]))
-            elif code == _OP_EXEC_IND:
-                exec_indirect(icb, op[1], op[2])
-            elif code == _OP_GATE or code == _OP_LOOP_CHECK:
-                params, slots = op[2]
-                set_pso(gate_pso if code == _OP_GATE else check_pso)
-                for k, (buf, off, _neg) in enumerate(slots):
-                    set_buffer(buf, off, k)
-                set_buffer(op[3], 0, 8)
-                if code == _OP_GATE:
-                    set_buffer(op[4], 0, 9)
-                set_bytes(params, 8, 10)
-                dispatch(one, one)
-            elif code == _OP_SNAPSHOT:
-                set_pso(snap_pso)
-                set_buffer(op[1], op[2], 0)
-                set_buffer(op[3], 0, 1)
-                dispatch(one, one)
-            if i < last:
-                barrier(scope)
+        n_ops = len(program)
+        spans = graph._loop_spans or ()
+        n_spans = len(spans)
+        next_span = 0
+        active: list = []  # enclosing loop executions at op ``i``, outermost first
+        inflight: list = []  # (command buffer, last op index) of this replay
+        done_idx = -1  # every op up to here has finished on the GPU
+        i = 0
+        while i < n_ops:
+            if i:
+                # Commit what is encoded so far and continue in a fresh
+                # command buffer (graph resources re-declared on its encoder).
+                inflight.append((self._cmd_buf, i - 1))
+                self.flush()
+                if active:
+                    # Early exit: a loop execution whose latched condition
+                    # already read false on the GPU skips every remaining
+                    # iteration (the flag only changes inside the body, which
+                    # no longer runs), so stop encoding them. Bound the
+                    # commands in flight so the GPU can report the latch
+                    # before the whole unrolled budget has been encoded.
+                    while inflight and (len(inflight) >= _REPLAY_MAX_INFLIGHT or inflight[0][0].status() >= 4):
+                        cb, last = inflight.pop(0)
+                        if cb.status() < 4:
+                            cb.waitUntilCompleted()
+                        done_idx = last
+                    for k, (start, end, addr) in enumerate(active):
+                        if done_idx >= start and ctypes.c_int32.from_address(addr).value == 0:
+                            i = end
+                            del active[k:]
+                            break
+                    if i >= n_ops:
+                        break
+                encoder = self._open_replay_encoder(graph)
+            barrier = encoder.memoryBarrierWithScope_
+            exec_range = encoder.executeCommandsInBuffer_withRange_
+            exec_indirect = encoder.executeCommandsInBuffer_indirectBuffer_indirectBufferOffset_
+            set_pso = encoder.setComputePipelineState_
+            set_buffer = encoder.setBuffer_offset_atIndex_
+            set_offset = encoder.setBufferOffset_atIndex_
+            dispatch = encoder.dispatchThreads_threadsPerThreadgroup_
+            # Executing ICB commands leaves the encoder's own pipeline and
+            # bindings unspecified, so control ops rebind after any.
+            bound = None
+            end = min(n_ops, i + _REPLAY_COMMIT_OPS)
+            while i < end:
+                while active and active[-1][1] <= i:
+                    active.pop()
+                while next_span < n_spans and spans[next_span][0] <= i:
+                    span = spans[next_span]
+                    next_span += 1
+                    if span[1] > i:
+                        active.append(span)
+                op = program[i]
+                code = op[0]
+                if i:
+                    barrier(scope)
+                if code == _OP_CTRL:
+                    if bound is op[1]:
+                        set_offset(op[2], 0)
+                    else:
+                        set_pso(ctrl_pso)
+                        set_buffer(op[1], op[2], 0)
+                        bound = op[1]
+                    dispatch(one, one)
+                elif code == _OP_EXEC_IND:
+                    exec_indirect(icb, op[1], op[2])
+                    bound = None
+                else:
+                    exec_range(icb, nsrange(op[1], op[2]))
+                    bound = None
+                i += 1
 
     def _check_loop_overflow(self, checks) -> None:
         """Report unrolled ``capture_while`` loops that exhausted their

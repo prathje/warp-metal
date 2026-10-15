@@ -344,5 +344,73 @@ class TestMetalAutoflush(unittest.TestCase):
         _run_with_metal_enabled(self, snippet, timeout=120)
 
 
+@unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
+@unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
+class TestMetalNestedCaptureWhileReplay(unittest.TestCase):
+    def test_nested_loops_with_varying_exits(self):
+        # Replay stops encoding a loop's iterations once the GPU has latched
+        # its condition false; iterations that did run (and inner loops that
+        # restart per outer iteration) must still all execute, replay after
+        # replay.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            @wp.kernel
+            def body(x: wp.array[float], idx: int):
+                x[idx] += 1.0
+
+            @wp.kernel
+            def count_down(flag: wp.array[int], cnt: wp.array[int]):
+                cnt[0] = cnt[0] - 1
+                if cnt[0] <= 0:
+                    flag[0] = 0
+
+            @wp.kernel
+            def arm(flag: wp.array[int], cnt: wp.array[int], k: wp.array[int]):
+                flag[0] = 1
+                cnt[0] = k[0]
+                k[0] = k[0] % 5 + 1  # next execution of this loop runs a different count
+
+            dev = "metal:0"
+            x = wp.zeros(2, dtype=float, device=dev)
+            flags = [wp.zeros(1, dtype=int, device=dev) for _ in range(2)]
+            cnts = [wp.zeros(1, dtype=int, device=dev) for _ in range(2)]
+            ks = [wp.array([3], dtype=int, device=dev), wp.array([2], dtype=int, device=dev)]
+
+            def inner():
+                wp.launch(body, dim=1, inputs=[x, 1], device=dev)
+                wp.launch(count_down, dim=1, inputs=[flags[1], cnts[1]], device=dev)
+
+            def outer():
+                wp.launch(body, dim=1, inputs=[x, 0], device=dev)
+                wp.launch(arm, dim=1, inputs=[flags[1], cnts[1], ks[1]], device=dev)
+                with wp.ScopedMetalCaptureWhileBudget(16):
+                    wp.capture_while(flags[1], while_body=inner)
+                wp.launch(count_down, dim=1, inputs=[flags[0], cnts[0]], device=dev)
+
+            with wp.ScopedCapture(device=dev) as cap:
+                wp.launch(arm, dim=1, inputs=[flags[0], cnts[0], ks[0]], device=dev)
+                with wp.ScopedMetalCaptureWhileBudget(300):
+                    wp.capture_while(flags[0], while_body=outer)
+
+            # Host model of the same counters.
+            k = [3, 2]
+            expected = np.zeros(2)
+            def model():
+                n_outer = k[0]; k[0] = k[0] % 5 + 1
+                for _ in range(n_outer):
+                    expected[0] += 1
+                    n_inner = k[1]; k[1] = k[1] % 5 + 1
+                    expected[1] += n_inner
+            for _ in range(4):
+                wp.capture_launch(cap.graph)
+                model()
+            np.testing.assert_array_equal(x.numpy(), expected)
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
