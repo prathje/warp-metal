@@ -328,10 +328,8 @@ class TestMetalR3Tiles(unittest.TestCase):
             def k(vals: wp.array[int], out: wp.array2d[int]):
                 block_id, lane = wp.tid()
                 bits = wp.tile_zeros(shape=BD, dtype=int, storage="shared")
-                b = int(0)
-                if lane < 8:
-                    b = vals[block_id * 8 + lane]
-                wp.tile_scatter_masked(bits, lane, b, True)
+                for e in range(8):
+                    wp.tile_scatter_masked(bits, e, vals[block_id * 8 + e], lane == 0)
                 loaded = wp.tile_load(vals, shape=8, offset=block_id * 8)
                 if lane == 0:
                     out[block_id, 0] = wp.tile_reduce(wp.bit_or, bits)[0]
@@ -613,6 +611,182 @@ class TestMetalR3Tiles(unittest.TestCase):
             expect2[:, 1:2] = h[:, 4:5]
             np.testing.assert_array_equal(dst.numpy(), h[:, 2:5])
             np.testing.assert_array_equal(dst2.numpy(), expect2)
+            """,
+        )
+
+    def test_review_rejects_silently_wrong_cases(self):
+        # Cases that used to compile or launch and give wrong results on Metal
+        # must now raise.
+        _run(
+            self,
+            """
+            from warp._src.codegen_metal import MetalCodegenError
+
+            def raises(fn, exc, text):
+                try:
+                    fn()
+                except exc as e:
+                    assert text in str(e), str(e)
+                    return
+                raise AssertionError(f"expected {exc.__name__} containing {text!r}")
+
+            d = "metal:0"
+
+            # Host ``wp.array.ptr`` handed in as a uint64 is not a device address.
+            @wp.kernel
+            def from_host_ptr(p: wp.uint64, out: wp.array[float]):
+                i = wp.tid()
+                out[i] = wp.array(ptr=p, shape=(4,), dtype=float)[i]
+
+            buf = wp.array(np.arange(8, dtype=np.float32), device=d)
+            raises(lambda: wp.launch(from_host_ptr, dim=4, inputs=[buf.ptr, wp.zeros(4, dtype=float, device=d)],
+                                     device=d), MetalCodegenError, "device address")
+
+            # A struct-field array handed to a native snippet.
+            @wp.func_native("((float*)arr.data)[i] += 1.0f;")
+            def inc(arr: wp.array[wp.float32], i: int): ...
+
+            @wp.struct
+            class S:
+                arr: wp.array[wp.float32]
+
+            @wp.kernel
+            def via_struct(s: S):
+                inc(s.arr, wp.tid())
+
+            st = S()
+            st.arr = wp.zeros(4, dtype=float, device=d)
+            raises(lambda: wp.launch(via_struct, dim=4, inputs=[st], device=d), MetalCodegenError, "kernel array")
+
+            # A staged (strided) argument handed to a native snippet.
+            @wp.kernel
+            def via_arg(a: wp.array[wp.float32]):
+                inc(a, wp.tid())
+
+            raises(lambda: wp.launch(via_arg, dim=4, inputs=[wp.zeros(8, dtype=float, device=d)[::2]], device=d),
+                   RuntimeError, "func_native")
+
+            # Lane-indexed scatter at a block_dim without real lanes.
+            @wp.kernel(module="unique")
+            def lane_scatter(out: wp.array[int]):
+                b, lane = wp.tid()
+                t = wp.tile_zeros(shape=64, dtype=int, storage="shared")
+                wp.tile_scatter_masked(t, lane, lane, True)
+                if lane == 0:
+                    out[b] = wp.tile_reduce(wp.add, t)[0]
+
+            raises(lambda: wp.launch_tiled(lane_scatter, dim=1, inputs=[wp.zeros(1, dtype=int, device=d)],
+                                           block_dim=64, device=d), RuntimeError, "block_dim=32")
+
+            # Non-float32 gradients of an aliasing view cannot be accumulated.
+            @wp.kernel
+            def half_sum(src: wp.array2d[wp.float16], loss: wp.array[wp.float16]):
+                i, j = wp.tid()
+                wp.atomic_add(loss, 0, src[i, j])
+
+            base = wp.zeros(4, dtype=wp.float16, device=d, requires_grad=True)
+            v = wp.array(ptr=base.ptr, shape=(2, 3), strides=(2, 2), dtype=wp.float16, device=d)
+            v.grad = wp.array(ptr=base.grad.ptr, shape=(2, 3), strides=(2, 2), dtype=wp.float16, device=d)
+            v.requires_grad = True
+            loss = wp.zeros(1, dtype=wp.float16, device=d, requires_grad=True)
+            tape = wp.Tape()
+            with tape:
+                wp.launch(half_sum, dim=(2, 3), inputs=[v], outputs=[loss], device=d)
+            raises(lambda: tape.backward(loss), RuntimeError, "float32")
+
+            # A grouped BVH cannot be rebuilt inside a capture (a refit cannot
+            # follow new group ids).
+            lo = wp.array(np.zeros((8, 3), np.float32), dtype=wp.vec3, device=d)
+            up = wp.array(np.ones((8, 3), np.float32), dtype=wp.vec3, device=d)
+            grouped = wp.Bvh(lo, up, groups=wp.array(np.arange(8) % 2, dtype=int, device=d))
+
+            def capture_rebuild():
+                with wp.ScopedCapture(device=d):
+                    grouped.rebuild()
+
+            raises(capture_rebuild, RuntimeError, "grouped")
+            """,
+        )
+
+    def test_review_pointer_views_and_gradients(self):
+        _run(
+            self,
+            """
+            @wp.func_native("return (uint64_t)arr.data;")
+            def ptr(arr: wp.array[wp.float32]) -> wp.uint64: ...
+
+            # Negative indices on wp.array(ptr=...) views and slices wrap.
+            @wp.kernel
+            def neg(a: wp.array[float], out: wp.array[float]):
+                i = wp.tid()
+                v = wp.array(ptr=ptr(a) + wp.uint64(8), shape=(2, 3), dtype=float)
+                j = -1 - i
+                s = a[3:7]
+                out[i] = v[-1, j] + v[0, -3] + s[-1]
+                v[-2, j] = 100.0 + float(i)
+
+            def run_neg(dev):
+                a = wp.array(np.arange(10, dtype=np.float32), device=dev)
+                o = wp.zeros(3, dtype=float, device=dev)
+                wp.launch(neg, dim=3, inputs=[a, o], device=dev)
+                return o.numpy(), a.numpy()
+
+            assert_same(both(run_neg))
+
+            # A non-finite gradient already in a staged strided view survives.
+            @wp.kernel
+            def dbl(x: wp.array[float], y: wp.array[float]):
+                i = wp.tid()
+                y[i] = x[i] * 2.0
+
+            def run_inf(dev):
+                base = wp.array(np.arange(12, dtype=np.float32), device=dev, requires_grad=True)
+                g = np.zeros(12, dtype=np.float32)
+                g[2] = np.inf
+                g[4] = 1e8
+                base.grad.assign(g)
+                y = wp.zeros(6, dtype=float, device=dev, requires_grad=True)
+                tape = wp.Tape()
+                with tape:
+                    wp.launch(dbl, dim=6, inputs=[base[::2]], outputs=[y], device=dev)
+                y.grad = wp.ones(6, dtype=float, device=dev)
+                tape.backward()
+                return base.grad.numpy()
+
+            assert_same(both(run_inf))
+            """,
+        )
+
+    def test_review_tile_store_bounds(self):
+        # Every tile_store lowering drops out-of-range elements: leading
+        # (3-D) indices, vec elements, (1, 1) tiles, atomic-typed and
+        # threadgroup-resident sources.
+        _run(
+            self,
+            """
+            @wp.kernel(module="unique")
+            def k(a: wp.array2d[float], o: wp.array2d[float], o3: wp.array3d[float], ov: wp.array2d[wp.vec3],
+                  oa: wp.array2d[float], r: int):
+                i, lane = wp.tid()
+                wp.tile_store(o, wp.tile_load(a, shape=(4, 4), storage="shared"), offset=(1, 1))
+                wp.tile_store(o3, wp.tile_ones(shape=(1, 2, 2), dtype=float), offset=(r, 1, 1))
+                wp.tile_store(o3, wp.tile_ones(shape=(1, 2, 2), dtype=float), offset=(0, 2, 2))
+                wp.tile_store(ov, wp.tile_ones(shape=(2, 2), dtype=wp.vec3), offset=(2, 2))
+                wp.tile_store(o, wp.tile_ones(shape=(1, 1), dtype=float), offset=(r, 0))
+                wp.tile_store(oa, wp.tile_ones(shape=(2, 2), dtype=float), offset=(2, 2))
+                wp.atomic_add(oa, 0, 0, 1.0)
+
+            def run(dev):
+                b1 = wp.zeros(30, dtype=float, device=dev)
+                b3 = wp.zeros(40, dtype=float, device=dev)
+                bv = wp.zeros(20, dtype=wp.vec3, device=dev)
+                ba = wp.zeros(20, dtype=float, device=dev)
+                wp.launch_tiled(k, dim=1, inputs=[wp.ones((4, 4), dtype=float, device=dev), b1[:9].reshape((3, 3)),
+                                b3[:18].reshape((2, 3, 3)), bv[:9].reshape((3, 3)), ba[:9].reshape((3, 3)), 4],
+                                block_dim=32, device=dev)
+                return b1.numpy(), b3.numpy(), bv.numpy(), ba.numpy()
+
+            assert_same(both(run))
             """,
         )
 

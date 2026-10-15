@@ -11526,6 +11526,26 @@ def _translate_tile_intrinsics(
         else:
             row_stride = "1"
             row_off, col_off = offsets[0], "0"
+        # ``tile_store<T, BoundsCheck>`` skips elements outside the
+        # destination on CPU/CUDA: guard every write (leading indices, rows
+        # and columns) when the destination's extents are known.
+        checked = bounds_check and arr_name in shaped_array_names
+        n_lead = len(lead_idx_args)
+        if two_d:
+            n_rows_expr = f"(int){arr_name}_shape[{n_lead}]"
+            n_cols_expr = f"(int){arr_name}_shape[{n_lead + 1}]"
+        else:
+            n_rows_expr, n_cols_expr = f"(int){arr_name}_shape[{n_lead}]", "1"
+        lead_ok = " && ".join(
+            f"({ix}) >= 0 && ({ix}) < (int){arr_name}_shape[{d}]" for d, ix in enumerate(lead_idx_args)
+        )
+        lead_ok = lead_ok if checked and lead_ok else "true"
+
+        def _ok(r: str, c: str) -> str:
+            if not checked:
+                return "true"
+            return f"({lead_ok}) && ({r}) >= 0 && ({r}) < {n_rows_expr} && ({c}) >= 0 && ({c}) < {n_cols_expr}"
+
         is_f64_dst = arr_name in f64_arr_names
         if is_f64_dst and (tile_label in distributed_tiles or tile_label in smem_tiles):
             raise MetalCodegenError(
@@ -11547,22 +11567,35 @@ def _translate_tile_intrinsics(
             )
             return (
                 f"{{ const int _ds_i = ({row_off}) + {_COOP_LANE}; "
-                f"if (_ds_i >= 0 && _ds_i < (int){arr_name}_shape[{len(lead_idx_args)}]) {{ {write} }} }}"
+                f"if (({lead_ok}) && _ds_i >= 0 && _ds_i < (int){arr_name}_shape[{len(lead_idx_args)}]) "
+                f"{{ {write} }} }}"
             )
         # Shape (1,1) tile is a scalar local — store with a direct subscript.
         if rows == 1 and cols == 1:
             value = f"wp_f32_to_f64({tile_var})" if is_f64_dst else tile_var
-            return f"{arr}[{base_expr} + ({row_off}) * ({row_stride}) + ({col_off})] = {value}"
+            target = f"{arr}[{base_expr} + ({row_off}) * ({row_stride}) + ({col_off})]"
+            if arr_name in atomic_output_names:
+                write = f"atomic_store_explicit(&{target}, {value}, memory_order_relaxed);"
+            else:
+                write = f"{target} = {value};"
+            return f"if ({_ok(row_off, col_off)}) {{ {write} }}"
         if vec_n_elem > 0:
-            if is_f64_dst:
+            if is_f64_dst or checked or arr_name in atomic_output_names:
+                conv = "wp_f32_to_f64" if is_f64_dst else ""
+                vtgt = f"{arr}[{base_expr} + _ts_e + _ts_k]"
+                vval = f"{conv}({tile_var}.c[(_ts_i * {cols} + _ts_j) * {vec_n_elem} + _ts_k])"
+                vwrite = (
+                    f"atomic_store_explicit(&{vtgt}, {vval}, memory_order_relaxed);"
+                    if arr_name in atomic_output_names
+                    else f"{vtgt} = {vval};"
+                )
                 # Demoted destination: write each component's double bits
                 # (the ``_store`` helper takes ``device float*``).
                 return (
                     f"{{ for (int _ts_i = 0; _ts_i < {rows}; ++_ts_i) for (int _ts_j = 0; _ts_j < {cols}; ++_ts_j) {{ "
+                    f"if (!({_ok(f'({row_off}) + _ts_i', f'({col_off}) + _ts_j')})) continue; "
                     f"const int _ts_e = ((({row_off}) + _ts_i) * ({row_stride}) + (({col_off}) + _ts_j)) * {vec_n_elem}; "
-                    f"for (int _ts_k = 0; _ts_k < {vec_n_elem}; ++_ts_k) "
-                    f"{arr}[{base_expr} + _ts_e + _ts_k] = "
-                    f"wp_f32_to_f64({tile_var}.c[(_ts_i * {cols} + _ts_j) * {vec_n_elem} + _ts_k]); }} }}"
+                    f"for (int _ts_k = 0; _ts_k < {vec_n_elem}; ++_ts_k) {vwrite} }} }}"
                 )
             helper = f"wp_tile_{rows}x{cols}_vec{vec_n_elem}_{msl_scalar}_store"
             return f"{helper}({arr}, {base_expr}, {row_stride}, {row_off}, {col_off}, {tile_var})"
@@ -11586,6 +11619,7 @@ def _translate_tile_intrinsics(
                 if arr_name in atomic_output_names
                 else f"{target} = {slot}[_ts_e];"
             )
+            write = f"if ({_ok(f'({row_off}) + (int)_ts_i', f'({col_off}) + (int)_ts_j')}) {{ {write} }}"
             return (
                 "do { threadgroup_barrier(metal::mem_flags::mem_threadgroup); "
                 f"for (uint _ts_e = _coop_lane; _ts_e < {n}u; _ts_e += 32u) {{ "
@@ -11601,6 +11635,7 @@ def _translate_tile_intrinsics(
             return (
                 f"{{ for (int _ts_i = 0; _ts_i < {rows}; ++_ts_i) "
                 f"for (int _ts_j = 0; _ts_j < {cols}; ++_ts_j) "
+                f"if ({_ok('(' + row_off + ') + _ts_i', '(' + col_off + ') + _ts_j')}) "
                 f"atomic_store_explicit("
                 f"&{arr}[{base_expr} + (({row_off}) + _ts_i) * ({row_stride}) + (({col_off}) + _ts_j)], "
                 f"{tile_var}.c[_ts_i * {cols} + _ts_j], memory_order_relaxed); }}"
@@ -11613,24 +11648,17 @@ def _translate_tile_intrinsics(
         if is_f64_dst:
             return (
                 f"{{ for (int _ts_i = 0; _ts_i < {rows}; ++_ts_i) for (int _ts_j = 0; _ts_j < {cols}; ++_ts_j) "
+                f"if ({_ok('(' + row_off + ') + _ts_i', '(' + col_off + ') + _ts_j')}) "
                 f"{arr}[{base_expr} + (({row_off}) + _ts_i) * ({row_stride}) + (({col_off}) + _ts_j)] = "
                 f"wp_f32_to_f64({tile_var}.c[_ts_i * {cols} + _ts_j]); }}"
             )
         helper = f"wp_tile_{rows}x{cols}_{msl_scalar}_store"
-        if bounds_check and arr_name in shaped_array_names:
-            # Partial trailing blocks drop their out-of-range elements, as
-            # ``wp.tile_store`` does on CPU/CUDA, instead of writing past the
-            # row (into the next row, or past the end of the buffer).
-            n_lead = len(lead_idx_args)
-            if two_d:
-                n_rows_expr = f"(int){arr_name}_shape[{n_lead}]"
-                n_cols_expr = f"(int){arr_name}_shape[{n_lead + 1}]"
-            else:
-                n_rows_expr, n_cols_expr = f"(int){arr_name}_shape[{n_lead}]", "1"
-            return (
+        if checked:
+            call = (
                 f"{helper}({arr}, {base_expr}, {row_stride}, {row_off}, {col_off}, {tile_var}, "
                 f"{n_rows_expr}, {n_cols_expr})"
             )
+            return call if lead_ok == "true" else f"if ({lead_ok}) {{ {call}; }}"
         return f"{helper}({arr}, {base_expr}, {row_stride}, {row_off}, {col_off}, {tile_var})"
 
     def repl_tile_atomic_add(m: re.Match[str]) -> str:
@@ -13931,6 +13959,10 @@ class MetalKernelArtifact:
     # kernels — and ONLY these: folding a genuine N-wide launch whose last
     # dim happens to equal ``block_dim`` would silently drop N-1 threads.
     tile_block_fold: bool = True
+    # Serial-model kernel that indexes a tile op with the lane (``j`` of
+    # ``i, j = wp.tid()``), e.g. ``tile_scatter_masked(t, j, v, m)``: folding
+    # the lane dim would run lane 0 only, so such launches raise instead.
+    lane_tile_index: bool = False
     # ``True`` when the kernel calls a ``@wp.func_native`` snippet that uses
     # CUDA intra-block primitives (shuffles, barriers, ...). Those only have
     # a faithful lowering in the serial (folded) and distributed-tile models;
@@ -14081,6 +14113,45 @@ _SLICE_VIEW_PAT = re.compile(
 )
 
 
+_ASSIGN_LINE_PAT = re.compile(r"^\s*var_(\w+)\s*=\s*(.*?)\s*;\s*$")
+_ADDR_PASS_PAT = re.compile(
+    r"^(?:var_(?P<a>\w+)|wp::(?:copy|uint64|int64)\(\s*var_(?P<b>\w+)\s*\)|"
+    r"wp::(?:add|sub)\(\s*var_(?P<c>\w+)\s*,[^;]*\)|wp::add\([^,;]*,\s*var_(?P<d>\w+)\s*\))$"
+)
+
+
+def _gpu_address_locals(lines: list[str]) -> set[str]:
+    """Locals that hold a Metal device address: the ``uint64`` result of a
+    native snippet handed an array (``(uint64_t)arr.data``), and values
+    derived from one by copies, casts and ``+`` / ``-`` offsets. A local is
+    included only when every assignment to it is such a value."""
+    sources: dict[str, list[str]] = {}
+    for ln in lines:
+        m = _ASSIGN_LINE_PAT.match(ln)
+        if m is not None:
+            sources.setdefault(m.group(1), []).append(m.group(2))
+    addr: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        for lbl, exprs in sources.items():
+            if lbl in addr:
+                continue
+            ok = True
+            for e in exprs:
+                if e.startswith(_NATIVE_SNIPPET_PREFIX) and "wp_native_array<" in e:
+                    continue
+                pm = _ADDR_PASS_PAT.match(e)
+                src = pm and next((g for g in pm.groups() if g), None)
+                if src is None or src not in addr:
+                    ok = False
+                    break
+            if ok:
+                addr.add(lbl)
+                changed = True
+    return addr
+
+
 def _lower_pointer_arrays(
     lines: list[str], adj, adjoint: bool, consts: dict[str, int] | None = None
 ) -> tuple[list[str], set[str], set[str], dict[str, str]]:
@@ -14106,6 +14177,7 @@ def _lower_pointer_arrays(
     """
     consts = consts or {}
     arg_types = {a.label: a for a in adj.args}
+    gpu_addrs = _gpu_address_locals(lines)
     # label -> (msl scalar, ndim, source arg label or None)
     arrays: dict[str, tuple[str, int, str | None]] = {}
     slices: dict[str, list[str]] = {}
@@ -14122,6 +14194,17 @@ def _lower_pointer_arrays(
                 raise MetalCodegenError(
                     f"Kernel {adj.fun_name!r}: wp.array(ptr=...) of dtype {m.group('dt')!r} with {len(dims)} dims "
                     "is not supported on Metal (scalar dtypes of at most 32 bits, 1-4 dims)"
+                )
+            if m.group("ptr") not in gpu_addrs:
+                # On Metal ``wp.array.ptr`` (a host value passed in as a
+                # ``uint64``) is the buffer's host address, which the GPU
+                # cannot dereference; only addresses a native snippet read
+                # from ``arr.data`` (a ``gpuAddress``) are device pointers.
+                raise MetalCodegenError(
+                    f"Kernel {adj.fun_name!r}: wp.array(ptr=...) on Metal needs a device address taken in the "
+                    "kernel by a @wp.func_native snippet from an array's ``.data`` (plus an offset); a pointer "
+                    "passed in from the host (e.g. ``wp.array.ptr``) is a host address on Metal. Pass the "
+                    "array itself instead."
                 )
             entry = (msl, len(dims), None)
         else:
@@ -14162,7 +14245,9 @@ def _lower_pointer_arrays(
     def _name(lbl: str) -> str:
         return f"{_PTR_ARRAY_PREFIX}{lbl}"
 
-    rename = re.compile(r"\bvar_(" + "|".join(re.escape(lbl) for lbl in sorted(arrays, key=len, reverse=True)) + r")\b")
+    _alt = "|".join(re.escape(lbl) for lbl in sorted(arrays, key=len, reverse=True))
+    rename = re.compile(r"\bvar_(" + _alt + r")\b")
+    rename_shape = re.compile(r"(?<![\w])(" + _alt + r")_shape\[")
     out = []
     for lbl, (msl, nd, _root) in arrays.items():
         out.append(f"    device {msl}* {_name(lbl)} = nullptr;")
@@ -14204,7 +14289,10 @@ def _lower_pointer_arrays(
             stmts.append("}")
             out.append(m.group("indent") + " ".join(stmts))
             continue
-        out.append(rename.sub(lambda mm: f"var_{_name(mm.group(1))}", ln))
+        ln = rename.sub(lambda mm: f"var_{_name(mm.group(1))}", ln)
+        # ``<label>_shape[k]`` references (native-snippet array views and
+        # negative-index wraps emitted against the original label).
+        out.append(rename_shape.sub(lambda mm: f"{_name(mm.group(1))}_shape[", ln))
     roots = {_name(lbl): root for lbl, (_m, _n, root) in arrays.items() if root is not None}
     return out, set(arrays), {_name(lbl) for lbl in arrays}, roots
 
@@ -15146,9 +15234,30 @@ def _generate_msl_kernel_uncached(
         },
     }
     _wrap_consts = {str(_l): _c for _l, _c in {**_const_ints, **_inlined_const_ints}.items() if isinstance(_c, int)}
+    # Arrays built from snippet addresses (``wp.array(ptr=...)``, lowered by
+    # ``_lower_pointer_arrays``) wrap against their own ``<label>_shape``.
+    _pre_lines = _ast_emit(_ast_nodes)
+    _ptr_array_ndims = {
+        _m.group("lbl"): len([d for d in _split_top_level_args(_m.group("dims")) if d.strip()])
+        for _ln in _pre_lines
+        for _m in [_PTR_ARRAY_CTOR_PAT.match(_ln)]
+        if _m is not None
+    }
+    # 1-D slices (``a[s:e]``) likewise wrap against the slice's own length.
+    _slice_labels = {m.group("lbl") for ln in _pre_lines for m in [_SLICE_T_PAT.match(ln)] if m is not None}
+    _arg_ndims = {a.label: a.type.ndim for a in adj.args if _is_array_arg_type(a.type) and hasattr(a.type, "ndim")}
+    for _ln in _pre_lines:
+        _m = _SLICE_VIEW_PAT.match(_ln)
+        if _m is not None and _m.group("sl") in _slice_labels:
+            _src_nd = _arg_ndims.get(_m.group("src"), _ptr_array_ndims.get(_m.group("src")))
+            if _src_nd == 1:
+                _ptr_array_ndims[_m.group("lbl")] = 1
     _ast_nodes = _ast_wrap_negative_array_indices(
         _ast_nodes,
-        {a.label: a.type.ndim for a in adj.args if _is_array_arg_type(a.type) and hasattr(a.type, "ndim")},
+        {
+            **{a.label: a.type.ndim for a in adj.args if _is_array_arg_type(a.type) and hasattr(a.type, "ndim")},
+            **_ptr_array_ndims,
+        },
         _wrap_msl_types,
         _wrap_consts,
     )
@@ -15263,9 +15372,16 @@ def _generate_msl_kernel_uncached(
     raw_atomic_pat = re.compile(
         r"(?:atomic_fetch_(add|sub|min|max|and|or|xor)_explicit|wp_atomic_(min|max|cas|exch))\s*\(\s*&\s*(\w+)\["
     )
+    _native_array_ok = {a.label for a in adj.args if _is_array_arg(a)} | ptr_array_labels
     for raw in forward_lines:
         for m in _NATIVE_ARRAY_VIEW_ARG_PAT.finditer(raw):
             # Handed to a native snippet as a raw pointer: may be written.
+            if m.group(1) not in _native_array_ok:
+                raise MetalCodegenError(
+                    f"Kernel {adj.fun_name!r}: a @wp.func_native snippet on Metal takes only kernel array "
+                    f"arguments or arrays built in the kernel with wp.array(ptr=...) / slicing; got the array "
+                    f"local 'var_{m.group(1)}' (e.g. a struct field). Pass the array as a kernel argument."
+                )
             written_arg_names.add(m.group(1))
             plain_store_arg_names.add(m.group(1))
         m = array_store_pat.match(raw)
@@ -18703,6 +18819,7 @@ def _generate_msl_kernel_uncached(
         # NB: ``builtin_block_dim`` is checked on the kernel's own IR — a
         # ``wp.block_dim()`` buried in a non-inlined wp.func would be
         # missed, but tile/block kernels call it at kernel scope.
+        lane_tile_index=coop_block_n == 0 and _lane_indexes_tile_op(forward_lines),
         tile_block_fold=(
             "builtin_block_dim" in "\n".join(adj.blocks[0].body_forward)
             or "wp_tile_" in source
@@ -20554,6 +20671,25 @@ def _maybe_staged_arg(value) -> bool:
     return type(value).__name__ == "indexedarray"
 
 
+_TILE_LANE_OP_PAT = re.compile(r"\bwp::tile_scatter_(?:masked|add)\s*(?:<[^()]*>)?\s*\(\s*var_\w+\s*,\s*var_(\w+)\s*,")
+
+
+def _lane_indexes_tile_op(lines: list[str]) -> bool:
+    """Whether a tile scatter is indexed by the lane of a 2-D ``wp.tid()``."""
+    text = "\n".join(lines)
+    m = re.search(r"builtin_tid2d\s*\(\s*var_\w+\s*,\s*var_(\w+)\s*\)", text)
+    return m is not None and any(lm.group(1) == m.group(1) for lm in _TILE_LANE_OP_PAT.finditer(text))
+
+
+def _lane_tile_launch_error(kernel, block_dim: int) -> str:
+    return (
+        f"Kernel '{kernel.key}' indexes a tile scatter with the lane of wp.tid(). On Metal tile kernels run "
+        "one thread per block (the lane always reads as 0) unless every tile op has a per-lane lowering and "
+        f"the launch uses block_dim=32 (got block_dim={block_dim}); restructure the kernel or launch with "
+        "block_dim=32."
+    )
+
+
 def _fold_tiled_block_dim(artifact, dims: tuple, block_dim: int) -> tuple:
     """Drop the trailing lane dim of a 4-D+ ``wp.launch_tiled`` launch.
 
@@ -21237,6 +21373,8 @@ def launch_metal_kernel_native(
             tg = (1, coop_block_n, 1)
     else:
         if getattr(artifact, "tile_block_fold", True) and len(dims) > 1 and dims[-1] == block_dim and block_dim > 1:
+            if getattr(artifact, "lane_tile_index", False):
+                raise RuntimeError(_lane_tile_launch_error(kernel, block_dim))
             dims = dims[:-1]
         elif artifact.native_lane_dependent and len(dims) > 1 and dims[-1] == block_dim and block_dim > 1:
             raise RuntimeError(_native_lane_launch_error(kernel, block_dim))
@@ -21927,6 +22065,8 @@ def launch_metal_kernel(
         else:
             dims = (dims[0], coop_block_n)
     elif getattr(artifact, "tile_block_fold", True) and len(dims) > 1 and dims[-1] == block_dim and block_dim > 1:
+        if getattr(artifact, "lane_tile_index", False):
+            raise RuntimeError(_lane_tile_launch_error(kernel, block_dim))
         dims = dims[:-1]
     elif (
         getattr(artifact, "native_lane_dependent", False) and len(dims) > 1 and dims[-1] == block_dim and block_dim > 1
