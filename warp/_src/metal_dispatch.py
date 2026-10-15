@@ -178,6 +178,20 @@ def _ctrl_op_buffers(op) -> tuple:
     return tuple(bufs)
 
 
+def _autoflush_from_env() -> int:
+    """Launch batch size from ``WARP_METAL_AUTOFLUSH`` (default 64)."""
+    raw = os.environ.get("WARP_METAL_AUTOFLUSH", "").strip()
+    if not raw:
+        return 64
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        import warnings  # noqa: PLC0415
+
+        warnings.warn(f"Ignoring WARP_METAL_AUTOFLUSH={raw!r}: expected a positive integer; using 64.", stacklevel=2)
+        return 64
+
+
 def _u32(value: int) -> tuple[bytes, int]:
     """Pack an int as a 4-byte setBytes binding tuple."""
     return ((value & 0xFFFFFFFF).to_bytes(4, "little"), 4)
@@ -483,7 +497,16 @@ class MetalDispatcher:
         # until ``_autoflush_every`` dispatches.
         # ``WARP_METAL_AUTOFLUSH=<n>`` overrides the batch size;
         # ``WARP_METAL_AUTOFLUSH=1`` restores the strict per-launch commit.
-        self._autoflush_every = max(1, int(os.environ.get("WARP_METAL_AUTOFLUSH", "64") or "64"))
+        self._autoflush_every = _autoflush_from_env()
+        # ``id()``s of MTLBuffers shared with another framework (exported via
+        # ``wp.to_torch`` / DLPack, or imported from Torch / DLPack). That
+        # framework runs on its own command queue, and Metal orders work
+        # across queues only once it is *committed*: a batched, uncommitted
+        # launch touching such a buffer would run after the other
+        # framework's later reads / writes (stale reads, or a Torch write
+        # clobbering a pending launch's input). Any dispatch or replay that
+        # binds one commits immediately, as with ``autoflush=1``.
+        self._shared_ids: set[int] = set()
         # Cache the NSRange constructor — avoids one PyObjC lookup per
         # batch-bind.
         self._NSMakeRange = Metal.NSMakeRange
@@ -1335,6 +1358,7 @@ class MetalDispatcher:
         set_buffer = encoder.setBuffer_offset_atIndex_
         set_bytes = encoder.setBytes_length_atIndex_
         inflight = self._inflight_refs
+        n_inflight = len(inflight)
         for idx, entry in enumerate(bindings):
             if isinstance(entry, tuple) and len(entry) == 2:
                 data, length = entry
@@ -1345,6 +1369,11 @@ class MetalDispatcher:
             else:
                 set_buffer(entry, 0, idx)
                 inflight.append(entry)
+        shared = self._shared_ids
+        touches_shared = bool(shared) and (
+            any(id(b) in shared for b in inflight[n_inflight:])
+            or any(id(b) in shared for b, _m in (extra_resources or ()))
+        )
 
         gx, gy, gz = grid
         tx, ty, tz = threadgroup
@@ -1365,7 +1394,7 @@ class MetalDispatcher:
         # slower on G1).
         encoder.memoryBarrierWithScope_(self._barrier_scope_buffers)
         self._dispatch_count += 1
-        if self._dispatch_count >= self._autoflush_every or self._gpu_idle():
+        if touches_shared or self._dispatch_count >= self._autoflush_every or self._gpu_idle():
             # Bounded-memory dispatch: commit periodically so transient
             # refs in ``_inflight_refs`` get released by the GPU
             # completion handler. Doesn't block — a fresh cmd buffer
@@ -1376,6 +1405,21 @@ class MetalDispatcher:
             self._dispatch_count = 0
         if self._profile_dispatch:
             self._bump_stats(pso, grid, _time.perf_counter_ns() - _prof_t0)
+
+    def mark_shared(self, mtl_buf) -> None:
+        """Record that ``mtl_buf`` is shared with another framework's command
+        queue; work binding it is committed without batching (see
+        ``_shared_ids``). Commits pending work so that work already queued
+        on it is ordered before the other framework's next access."""
+        if mtl_buf is None:
+            return
+        self._shared_ids.add(id(mtl_buf))
+        self.flush()
+
+    def unmark_shared(self, mtl_buf) -> None:
+        """Forget a buffer registered with :meth:`mark_shared` (released)."""
+        if mtl_buf is not None:
+            self._shared_ids.discard(id(mtl_buf))
 
     def _gpu_idle(self) -> bool:
         """Whether every committed command buffer has finished executing
@@ -2062,7 +2106,12 @@ class MetalDispatcher:
         # the autoflush threshold so the in-flight cmd buffer commits
         # at the same cadence as direct ``dispatch`` use.
         self._dispatch_count += graph.count
-        if self._dispatch_count >= self._autoflush_every or self._gpu_idle():
+        shared = self._shared_ids
+        if (
+            self._dispatch_count >= self._autoflush_every
+            or self._gpu_idle()
+            or (shared and any(id(r) in shared for r in graph._resources))
+        ):
             self.flush()
             self._dispatch_count = 0
 

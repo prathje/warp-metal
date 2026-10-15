@@ -306,6 +306,9 @@ def to_dlpack(wp_array: warp.array):
                     "allocation (offset views cannot be described as an MTLBuffer + offset "
                     "here). Export the base array, or make a contiguous copy first."
                 )
+            # The consumer (e.g. Torch MPS) uses the buffer from its own
+            # command queue from now on: stop batching launches that bind it.
+            warp._src.context._metal_mark_shared_buffer(mtl_buf)
             import objc  # noqa: PLC0415
 
             data_value = objc.pyobjc_id(mtl_buf)

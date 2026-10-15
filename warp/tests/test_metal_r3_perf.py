@@ -452,5 +452,112 @@ class TestMetalAcosAsinDomain(unittest.TestCase):
             _run_metal_script(self, _ACOS_SNIPPET, cache, env_extra={"WARP_METAL_FP64": "emulate"})
 
 
+def _has_torch_mps() -> bool:
+    try:
+        import torch  # noqa: PLC0415
+
+        return torch.backends.mps.is_available()
+    except Exception:
+        return False
+
+
+_TORCH_ORDER_SNIPPET = """
+import numpy as np
+import torch
+
+dev = "metal:0"
+N = 1 << 16
+
+@wp.kernel
+def busy(a: wp.array[float], iters: int):
+    i = wp.tid()
+    x = a[i]
+    for _k in range(iters):
+        x = wp.sin(x) * 0.5 + 0.25
+    a[i] = x
+
+@wp.kernel
+def setv(a: wp.array[float], v: float):
+    a[wp.tid()] = v
+
+@wp.kernel
+def copyk(a: wp.array[float], b: wp.array[float]):
+    b[wp.tid()] = a[wp.tid()]
+
+scratch = wp.zeros(N, dtype=float, device=dev)
+def make_busy():
+    # Keeps the GPU busy so later launches are batched, not committed.
+    wp.launch(busy, dim=N, inputs=[scratch, 2000], device=dev)
+
+make_busy(); wp.synchronize_device(dev)
+
+# Warp writes, Torch reads without wp.synchronize (CUDA same-stream habit).
+a = wp.zeros(N, dtype=float, device=dev)
+t = wp.to_torch(a)
+for it in range(10):
+    make_busy()
+    wp.launch(setv, dim=N, inputs=[a, float(it + 1)], device=dev)
+    assert float(t.sum().item()) == N * (it + 1), ("stale torch read", it)
+
+# zero_() / fill_() on the exported array, read by Torch.
+for it in range(5):
+    make_busy()
+    wp.launch(setv, dim=N, inputs=[a, 7.0], device=dev)
+    a.zero_()
+    assert float(t.abs().sum().item()) == 0.0, ("stale zero_", it)
+    make_busy()
+    a.fill_(3.0)
+    assert float(t.sum().item()) == 3.0 * N, ("stale fill_", it)
+
+# Torch overwrites a buffer that a pending Warp launch reads.
+tt = torch.zeros(N, device="mps")
+w = wp.from_torch(tt)
+out = wp.zeros(N, dtype=float, device=dev)
+for it in range(10):
+    tt.fill_(float(it + 1))
+    torch.mps.synchronize()
+    make_busy()
+    wp.launch(copyk, dim=N, inputs=[w, out], device=dev)
+    tt.fill_(-1.0)
+    torch.mps.synchronize()
+    np.testing.assert_array_equal(out.numpy(), np.full(N, it + 1, np.float32))
+"""
+
+
+@unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
+@unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
+@unittest.skipUnless(_has_torch_mps(), "Torch with MPS is not installed")
+class TestMetalSharedBufferOrdering(unittest.TestCase):
+    # Batched launches stay uncommitted while the GPU is busy; Metal orders
+    # work across command queues (Warp's vs Torch's) only once committed, so
+    # launches binding a buffer shared with Torch must commit immediately.
+    def test_torch_interop_without_sync(self):
+        _run_with_metal_enabled(self, _TORCH_ORDER_SNIPPET, timeout=300)
+
+
+@unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
+@unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
+class TestMetalDispatcherRobustness(unittest.TestCase):
+    def test_bad_autoflush_env_falls_back(self):
+        import warnings  # noqa: PLC0415
+
+        from warp._src.metal_dispatch import _autoflush_from_env  # noqa: PLC0415
+
+        old = os.environ.get("WARP_METAL_AUTOFLUSH")
+        try:
+            os.environ["WARP_METAL_AUTOFLUSH"] = "lots"
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                self.assertEqual(_autoflush_from_env(), 64)
+            self.assertTrue(any("WARP_METAL_AUTOFLUSH" in str(w.message) for w in caught))
+            os.environ["WARP_METAL_AUTOFLUSH"] = "8"
+            self.assertEqual(_autoflush_from_env(), 8)
+        finally:
+            if old is None:
+                os.environ.pop("WARP_METAL_AUTOFLUSH", None)
+            else:
+                os.environ["WARP_METAL_AUTOFLUSH"] = old
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

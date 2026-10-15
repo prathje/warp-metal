@@ -5509,8 +5509,9 @@ def _metal_get_buffer(ptr: int):
 
 def _metal_release_buffer(ptr: int) -> None:
     with _metal_buffer_lock:
-        _metal_buffer_registry.pop(ptr, None)
+        released = _metal_buffer_registry.pop(ptr, None)
         _metal_unindex_buffer(ptr)
+    _metal_unmark_shared_buffer(released)
 
 
 # Foreign (externally owned) Metal buffers — e.g. a Torch MPS tensor's
@@ -5520,6 +5521,27 @@ def _metal_release_buffer(ptr: int) -> None:
 _metal_foreign_refcounts: dict[int, int] = {}
 
 
+def _metal_mark_shared_buffer(mtl_buf) -> None:
+    """Tell the native dispatcher that ``mtl_buf`` is also used from another
+    framework's command queue (Torch / DLPack interop), so launches binding
+    it are committed immediately instead of batched (see
+    ``MetalDispatcher._shared_ids``)."""
+    if mtl_buf is None or not warp.config.metal_native_dispatch:
+        return
+    from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
+
+    get_dispatcher().mark_shared(mtl_buf)
+
+
+def _metal_unmark_shared_buffer(mtl_buf) -> None:
+    if mtl_buf is None or not warp.config.metal_native_dispatch:
+        return
+    import warp._src.metal_dispatch as _md  # noqa: PLC0415
+
+    if _md._dispatcher_singleton is not None:
+        _md._dispatcher_singleton.unmark_shared(mtl_buf)
+
+
 def _metal_register_foreign_buffer(ptr: int, owner) -> None:
     with _metal_buffer_lock:
         if ptr in _metal_buffer_registry and ptr not in _metal_foreign_refcounts:
@@ -5527,12 +5549,17 @@ def _metal_register_foreign_buffer(ptr: int, owner) -> None:
             # array round-tripped through an external framework and wrapped
             # back). The allocator entry outlives any foreign wrapper —
             # leave it alone so releasing the wrapper can't unregister it.
-            return
-        n = _metal_foreign_refcounts.get(ptr, 0)
-        _metal_foreign_refcounts[ptr] = n + 1
-        if n == 0:
-            _metal_buffer_registry[ptr] = owner
-            _metal_index_buffer(ptr, owner)
+            shared = _metal_buffer_registry[ptr]
+        else:
+            n = _metal_foreign_refcounts.get(ptr, 0)
+            _metal_foreign_refcounts[ptr] = n + 1
+            if n == 0:
+                _metal_buffer_registry[ptr] = owner
+                _metal_index_buffer(ptr, owner)
+            shared = _metal_buffer_registry[ptr]
+    _metal_mark_shared_buffer(shared)
+    if shared is not owner:
+        _metal_mark_shared_buffer(owner)
 
 
 def _metal_release_foreign_buffer(ptr: int) -> None:
@@ -5545,8 +5572,9 @@ def _metal_release_foreign_buffer(ptr: int) -> None:
             _metal_foreign_refcounts[ptr] = n - 1
             return
         _metal_foreign_refcounts.pop(ptr, None)
-        _metal_buffer_registry.pop(ptr, None)
+        released = _metal_buffer_registry.pop(ptr, None)
         _metal_unindex_buffer(ptr)
+        _metal_unmark_shared_buffer(released)
         objc_id = _metal_private_owners.pop(ptr, None)
         if objc_id is not None:
             _metal_private_keys.pop(objc_id, None)
@@ -5610,6 +5638,7 @@ def _metal_register_private_buffer(objc_id: int, mtl_buf) -> int:
         if n == 0:
             _metal_buffer_registry[ptr] = mtl_buf
             _metal_index_buffer(ptr, mtl_buf)
+    _metal_mark_shared_buffer(_metal_buffer_registry.get(ptr, mtl_buf))
     return ptr
 
 
