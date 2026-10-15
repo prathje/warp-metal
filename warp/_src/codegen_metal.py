@@ -19548,6 +19548,9 @@ def _struct_field_launch_value(fwd_args, arg_by_name, root_label: str, fpath: tu
     return value
 
 
+# Pointer-table row: field GPU address, then all four extents (Warp arrays
+# have at most four dims).
+_PTAB_ROW = 5
 _PTAB_RESIDENT_REFS: dict[int, int] = {}
 
 
@@ -19564,8 +19567,8 @@ def _ptab_release(dispatcher, bufs) -> None:
 def _struct_array_ptr_table(arr, struct_type, fpath: tuple[str, ...]):
     """Pointer table for array field ``fpath`` of every element of struct array ``arr``.
 
-    One row of four ``uint64`` per element: the field's GPU address and its
-    first three extents. The field buffers are declared GPU-resident (the
+    One row of five ``uint64`` per element: the field's GPU address and its
+    four extents. The field buffers are declared GPU-resident (the
     kernel reaches them through the addresses) for as long as ``arr`` lives.
     The table is cached on ``arr`` and rebuilt when the element records
     change; it is read from the array's host-visible storage like
@@ -19597,7 +19600,7 @@ def _struct_array_ptr_table(arr, struct_type, fpath: tuple[str, ...]):
         t = t.vars[comp].type
     field_type = t.vars[fpath[-1]].type
     elem_size = wp.types.type_size_in_bytes(field_type.dtype)
-    table = np.zeros(n * 4, dtype=np.uint64)
+    table = np.zeros(n * _PTAB_ROW, dtype=np.uint64)
     dispatcher = get_dispatcher()
     bufs = []
     for e in range(n):
@@ -19622,9 +19625,9 @@ def _struct_array_ptr_table(arr, struct_type, fpath: tuple[str, ...]):
             raise RuntimeError(
                 f"Metal: array field {'.'.join(fpath)!r} of a wp.array[Struct] element is not a Metal allocation"
             )
-        table[e * 4] = int(buf.gpuAddress()) + int(off)
-        for d in range(min(ndim, 3)):
-            table[e * 4 + 1 + d] = shape[d]
+        table[e * _PTAB_ROW] = int(buf.gpuAddress()) + int(off)
+        for d in range(ndim):
+            table[e * _PTAB_ROW + 1 + d] = shape[d]
         if all(b is not buf for b in bufs):
             bufs.append(buf)
     for buf in bufs:

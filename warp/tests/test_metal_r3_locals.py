@@ -826,6 +826,42 @@ class TestMetalR3Locals(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet, timeout=120)
 
+    def test_struct_array_4d_field_runtime_index(self):
+        # Pointer-table rows carry all four extents; a 4-D field indexed its
+        # last dim with a garbage extent.
+        snippet = _snippet(
+            """
+            @wp.struct
+            class G4:
+                m: wp.array4d[float]
+
+            @wp.kernel
+            def k(ids: wp.array[int], data: wp.array[G4], out: wp.array2d[float]):
+                t = wp.tid()
+                g = ids[t]
+                out[t, 0] = data[g].m[1, 0, 1, 2]
+                out[t, 1] = float(data[g].m.shape[3])
+                out[t, 2] = data[g].m[-1, -1, -1, -1]
+
+            def run(dev):
+                items = []
+                for gi in range(2):
+                    x = G4()
+                    x.m = wp.array(
+                        (np.arange(2 * 2 * 2 * (3 + gi), dtype=np.float32) + 100 * gi).reshape(2, 2, 2, 3 + gi),
+                        device=dev,
+                    )
+                    items.append(x)
+                data = wp.array(items, dtype=G4, device=dev)
+                o = wp.zeros((2, 3), dtype=float, device=dev)
+                wp.launch(k, 2, [wp.array([1, 0], dtype=int, device=dev), data, o], device=dev)
+                return (o.numpy(),)
+
+            compare(run)
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

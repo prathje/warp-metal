@@ -3093,11 +3093,11 @@ def fold_struct_array_array_fields(
                 if info is None:
                     return mm.group(0)
                 k = mm.group(0)[mm.group(0).index(",") + 1 : -1].strip()
-                return f"int(var_{info[0]}[(var_{info[1]}) * 4 + 1 + ({k})])"
+                return f"int(var_{info[0]}[(var_{info[1]}) * 5 + 1 + ({k})])"
 
             def _sub_len(mm: re.Match[str]) -> str:
                 info = pt_val.get(mm.group(1))
-                return mm.group(0) if info is None else f"int(var_{info[0]}[(var_{info[1]}) * 4 + 1])"
+                return mm.group(0) if info is None else f"int(var_{info[0]}[(var_{info[1]}) * 5 + 1])"
 
             new_pt = _MESH_LEN_PAT.sub(_sub_len, _MESH_SHAPE_EXTRACT_PAT.sub(_sub_pt, raw))
             if new_pt != raw:
@@ -3173,7 +3173,7 @@ def fold_struct_array_array_fields(
                 f"Kernel {adj.fun_name!r}: array field of {Var.dtype_to_ctype(dtype)!r} elements read through a "
                 "wp.array[Struct] element is not supported on Metal"
             )
-        row = f"(var_{cap}) * 4"
+        row = f"(var_{cap}) * 5"  # ``_PTAB_ROW`` in codegen_metal
         dims = [f"int(var_{syn}[{row} + {1 + d}])" for d in range(len(idx))]
         flat = ""
         for d, i in enumerate(idx):
