@@ -132,6 +132,8 @@ pointer to the offending statement):
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import os
 import re
 from dataclasses import dataclass, field
@@ -1543,11 +1545,44 @@ _DIAG_HELPERS = (
 # parameters ride in the ValueStruct) are read as their raw 64 bits and
 # converted here. Truncating (round-toward-zero) mantissa conversion;
 # handles inf/NaN, overflow to inf, and flushes underflow/denormals to 0.
+# Per-module float64 mode (``wp.set_module_options({"metal_fp64": ...})``) of
+# the kernel being generated or launched; ``None`` defers to the global config.
+_FP64_MODULE_MODE: contextvars.ContextVar[str | None] = contextvars.ContextVar("_FP64_MODULE_MODE", default=None)
+
+
+@contextlib.contextmanager
+def _kernel_fp64_mode(kernel):
+    """Apply the kernel module's ``metal_fp64`` option while generating or launching it.
+
+    Lets a module that needs real double precision for its ``float64`` locals
+    (e.g. a residual evaluated in fp64 to avoid cancellation) choose
+    ``"emulate"`` without switching every kernel in the process to software
+    fp64. Modules without the option use :data:`warp.config.metal_fp64`.
+    """
+    module = getattr(kernel, "module", None)
+    options = getattr(module, "options", None) or {}
+    mode = options.get("metal_fp64") if isinstance(options, dict) else None
+    if mode is None:
+        yield
+        return
+    if mode not in ("error", "demote", "emulate"):
+        raise MetalCodegenError(f"module option metal_fp64 must be one of 'error', 'demote', 'emulate' (got {mode!r})")
+    token = _FP64_MODULE_MODE.set(mode)
+    try:
+        yield
+    finally:
+        _FP64_MODULE_MODE.reset(token)
+
+
 def _fp64_mode() -> str:
     """Resolve :data:`warp.config.metal_fp64` (``"error"`` / ``"demote"`` /
-    ``"emulate"``), honouring the deprecated ``metal_demote_fp64`` alias."""
+    ``"emulate"``), honouring the deprecated ``metal_demote_fp64`` alias and
+    the ``metal_fp64`` module option of the kernel being processed."""
     import warp.config as _wp_cfg  # noqa: PLC0415
 
+    module_mode = _FP64_MODULE_MODE.get()
+    if module_mode is not None:
+        return module_mode
     mode = getattr(_wp_cfg, "metal_fp64", "error")
     if mode == "error" and getattr(_wp_cfg, "metal_demote_fp64", False):
         return "demote"
@@ -20226,6 +20261,14 @@ def _store_cached_failure(key: str, exc: Exception) -> None:
 def generate_msl_kernel(
     kernel, block_dim: int | None = None, adjoint: bool = False, grad_args: tuple[str, ...] = ()
 ) -> MetalKernelArtifact:
+    """Return the MSL artifact for a Warp ``Kernel`` (see ``_generate_msl_kernel_cached``)."""
+    with _kernel_fp64_mode(kernel):
+        return _generate_msl_kernel_cached(kernel, block_dim=block_dim, adjoint=adjoint, grad_args=grad_args)
+
+
+def _generate_msl_kernel_cached(
+    kernel, block_dim: int | None = None, adjoint: bool = False, grad_args: tuple[str, ...] = ()
+) -> MetalKernelArtifact:
     """Return the MSL artifact for a Warp ``Kernel``, using the on-disk
     cache when possible. Translation failures are cached as well (see
     ``_load_cached_failure``).
@@ -23053,6 +23096,32 @@ class MetalLaunch:
 
 
 def launch_metal_kernel(
+    kernel,
+    dim,
+    inputs,
+    outputs,
+    device,
+    block_dim: int = 256,
+    adjoint: bool = False,
+    adj_inputs=(),
+    adj_outputs=(),
+):
+    """Dispatch a Warp kernel on a Metal device (see ``_launch_metal_kernel``)."""
+    with _kernel_fp64_mode(kernel):
+        return _launch_metal_kernel(
+            kernel,
+            dim,
+            inputs,
+            outputs,
+            device,
+            block_dim=block_dim,
+            adjoint=adjoint,
+            adj_inputs=adj_inputs,
+            adj_outputs=adj_outputs,
+        )
+
+
+def _launch_metal_kernel(
     kernel,
     dim,
     inputs,
