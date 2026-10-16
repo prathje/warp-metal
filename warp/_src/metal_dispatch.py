@@ -499,14 +499,26 @@ class MetalDispatcher:
         # ``WARP_METAL_AUTOFLUSH=1`` restores the strict per-launch commit.
         self._autoflush_every = _autoflush_from_env()
         # ``id()``s of MTLBuffers shared with another framework (exported via
-        # ``wp.to_torch`` / DLPack, or imported from Torch / DLPack). That
-        # framework runs on its own command queue, and Metal orders work
-        # across queues only once it is *committed*: a batched, uncommitted
-        # launch touching such a buffer would run after the other
-        # framework's later reads / writes (stale reads, or a Torch write
-        # clobbering a pending launch's input). Any dispatch or replay that
-        # binds one commits immediately, as with ``autoflush=1``.
+        # ``wp.to_torch`` / DLPack, or imported from Torch / DLPack). Work
+        # binding one is committed when the launch returns, as with
+        # ``autoflush=1``, so the other framework's later work can be ordered
+        # after it. Metal does not order command buffers across queues, so
+        # with Torch, Warp also moves onto Torch's queue (see
+        # ``metal_torch_sync`` and ``_torch_mode`` below).
         self._shared_ids: set[int] = set()
+        # Ordering against Torch's MPS queue (see ``metal_torch_sync``):
+        # resolved on the first buffer shared while Torch has an MPS device.
+        # ``"gpu"`` = Warp encodes on Torch's queue and commits Torch's
+        # pending command buffer before each of its own that touches a
+        # shared buffer; ``"cpu"`` = CPU fences around those command
+        # buffers; ``"off"`` / ``None`` = commit shared launches at once only.
+        self._torch_mode: str | None = None
+        self._torch_stream = None
+        # Whether the open command buffer holds work on a shared buffer.
+        self._cb_shared = False
+        # ``> 0`` inside :meth:`begin_torch_batch`: shared launches stay
+        # batched until the batch ends.
+        self._torch_batch_depth = 0
         # Cache the NSRange constructor — avoids one PyObjC lookup per
         # batch-bind.
         self._NSMakeRange = Metal.NSMakeRange
@@ -1394,7 +1406,14 @@ class MetalDispatcher:
         # slower on G1).
         encoder.memoryBarrierWithScope_(self._barrier_scope_buffers)
         self._dispatch_count += 1
-        if touches_shared or self._dispatch_count >= self._autoflush_every or self._gpu_idle():
+        if touches_shared:
+            self._cb_shared = True
+            if not self._torch_batch_depth:
+                # Torch may read or write the buffer as soon as the launch
+                # returns: commit now (see ``metal_torch_sync``).
+                self._flush_shared()
+                self._dispatch_count = 0
+        if self._cmd_buf is not None and (self._dispatch_count >= self._autoflush_every or self._gpu_idle()):
             # Bounded-memory dispatch: commit periodically so transient
             # refs in ``_inflight_refs`` get released by the GPU
             # completion handler. Doesn't block — a fresh cmd buffer
@@ -1407,14 +1426,112 @@ class MetalDispatcher:
             self._bump_stats(pso, grid, _time.perf_counter_ns() - _prof_t0)
 
     def mark_shared(self, mtl_buf) -> None:
-        """Record that ``mtl_buf`` is shared with another framework's command
-        queue; work binding it is committed without batching (see
-        ``_shared_ids``). Commits pending work so that work already queued
-        on it is ordered before the other framework's next access."""
+        """Record that ``mtl_buf`` is shared with another framework; work
+        binding it is committed without batching (see ``_shared_ids``).
+        Binds Torch's queue on the first call with Torch in use, and commits
+        pending work so that work already queued on the buffer is ordered
+        before the other framework's next access."""
         if mtl_buf is None:
             return
         self._shared_ids.add(id(mtl_buf))
+        self._bind_torch_queue()
         self.flush()
+
+    def _bind_torch_queue(self) -> None:
+        """Resolve the Torch ordering mode once Torch has an MPS device and
+        move Warp's command buffers onto Torch's queue (``"gpu"`` mode)."""
+        if self._torch_mode is not None:
+            return
+        from warp._src import metal_torch_sync  # noqa: PLC0415
+
+        if not metal_torch_sync.torch_mps_in_use():
+            return
+        mode = metal_torch_sync.requested_mode()
+        if mode == "gpu":
+            reason = None
+            stream = metal_torch_sync.get_torch_stream()
+            queue = None
+            if stream is None:
+                reason = metal_torch_sync.unavailable_reason()
+            else:
+                try:
+                    queue = stream.command_queue()
+                    if int(queue.device().registryID()) != int(self._device.registryID()):
+                        reason = "Torch's MPS device is not Warp's Metal device"
+                except Exception as e:
+                    reason = f"{type(e).__name__}: {e}"
+            if reason is not None:
+                import warnings  # noqa: PLC0415
+
+                warnings.warn(
+                    "Warp could not bind Torch's MPS command queue "
+                    f"({reason}); ordering Torch and Warp work with CPU fences instead (slower).",
+                    stacklevel=3,
+                )
+                mode = "cpu"
+            else:
+                # Work already committed to Warp's own queue is not ordered
+                # against Torch's queue: drain it once before switching.
+                self.sync()
+                self._command_queue = queue
+                self._torch_stream = stream
+        self._torch_mode = mode
+
+    def orders_with_torch(self) -> bool:
+        """Whether Warp encodes on Torch's MPS queue (``"gpu"`` mode)."""
+        return self._torch_mode == "gpu"
+
+    def _commit_cmd_buf(self, cmd_buf) -> None:
+        """Commit ``cmd_buf``; if it touches a shared buffer, Torch's pending
+        work is committed (``"gpu"``) or drained (``"cpu"``) first, so it runs
+        before this command buffer."""
+        if self._cb_shared:
+            self._cb_shared = False
+            mode = self._torch_mode
+            if mode == "gpu":
+                self._torch_stream.commit()
+            elif mode == "cpu":
+                import torch  # noqa: PLC0415
+
+                torch.mps.synchronize()
+        cmd_buf.commit()
+
+    def _flush_shared(self) -> None:
+        """Commit work on a shared buffer so Torch work issued after this
+        call is ordered after it (on the shared queue, by commit order; in
+        ``"cpu"`` mode, by waiting for it)."""
+        self.flush()
+        if self._torch_mode == "cpu":
+            self.sync()
+
+    def begin_torch_batch(self) -> None:
+        """Keep launches on Torch-shared buffers batched until the matching
+        :meth:`end_torch_batch` (see ``wp.metal_torch_batch``)."""
+        self._torch_batch_depth += 1
+
+    def end_torch_batch(self) -> None:
+        if self._torch_batch_depth <= 0:
+            raise MetalDispatchError("end_torch_batch() without begin_torch_batch()")
+        self._torch_batch_depth -= 1
+        if not self._torch_batch_depth and self._cb_shared:
+            self._flush_shared()
+            self._dispatch_count = 0
+
+    def torch_fence(self) -> None:
+        """Order all Warp work issued so far before Torch work issued
+        afterwards, and Torch work issued so far before later Warp work."""
+        if self._torch_mode is None:
+            self._bind_torch_queue()
+        if self._cmd_buf is not None:
+            self._cb_shared = True
+            self._flush_shared()
+            self._dispatch_count = 0
+        elif self._torch_mode == "gpu":
+            self._torch_stream.commit()
+        elif self._torch_mode == "cpu":
+            import torch  # noqa: PLC0415
+
+            torch.mps.synchronize()
 
     def unmark_shared(self, mtl_buf) -> None:
         """Forget a buffer registered with :meth:`mark_shared` (released)."""
@@ -1485,13 +1602,13 @@ class MetalDispatcher:
         # MTLCommandBufferStatus: 4 = Completed, 5 = Error.
         self._inflight_refs_by_buf = [(cb, r) for cb, r in self._inflight_refs_by_buf if cb.status() < 4]
         self._inflight_refs_by_buf.append((cmd_buf, refs))
-        cmd_buf.commit()
+        self._commit_cmd_buf(cmd_buf)
         # Remember every fire-and-forget commit so :meth:`sync` can
         # block until *each* one has finished. See ``_pending_commits``
         # docstring for why a single newest-only tracker is not enough.
         self._pending_commits.append(cmd_buf)
 
-    def sync(self) -> None:
+    def sync(self, _at_exit: bool = False) -> None:
         """Block until every committed command buffer is complete.
 
         Call before any host read of buffer contents (``.numpy()``,
@@ -1505,13 +1622,19 @@ class MetalDispatcher:
         prior cmd buffer (observed empirically: 1-2 step lag on mjw step
         before this loop was added).
         """
+        if self._torch_mode in ("gpu", "cpu") and self._shared_ids and not _at_exit:
+            # Like ``cudaDeviceSynchronize``, wait for Torch's work too: a
+            # host read after this must see Torch's writes to shared buffers.
+            import torch  # noqa: PLC0415
+
+            torch.mps.synchronize()
         if self._cmd_buf is not None:
             self._end_encoder()
             cmd_buf = self._cmd_buf
             refs = self._inflight_refs
             self._cmd_buf = None
             self._inflight_refs = []
-            cmd_buf.commit()
+            self._commit_cmd_buf(cmd_buf)
             self._pending_commits.append(cmd_buf)
             del refs
         # Drain every fire-and-forget cmd buffer the dispatcher has
@@ -1544,7 +1667,7 @@ class MetalDispatcher:
         bad state (e.g. a command buffer erred out).
         """
         try:
-            self.sync()
+            self.sync(_at_exit=True)
         except Exception:
             pass
 
@@ -2116,11 +2239,12 @@ class MetalDispatcher:
         # at the same cadence as direct ``dispatch`` use.
         self._dispatch_count += graph.count
         shared = self._shared_ids
-        if (
-            self._dispatch_count >= self._autoflush_every
-            or self._gpu_idle()
-            or (shared and any(id(r) in shared for r in graph._resources))
-        ):
+        if shared and any(id(r) in shared for r in graph._resources):
+            self._cb_shared = True
+            if not self._torch_batch_depth:
+                self._flush_shared()
+                self._dispatch_count = 0
+        if self._cmd_buf is not None and (self._dispatch_count >= self._autoflush_every or self._gpu_idle()):
             self.flush()
             self._dispatch_count = 0
 

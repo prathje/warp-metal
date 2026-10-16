@@ -225,12 +225,10 @@ def _from_torch_mps(t, dtype, shape, strides, requires_grad, grad, return_ctype,
     as ``t.grad`` via ``wp.to_torch`` (zero-copy), so Torch's autograd and
     Warp's adjoint launches share one buffer.
 
-    Coherency contract: pending Torch GPU work is drained here so the wrapped
-    array's initial contents are visible; after that, callers must synchronize
-    the writing side before the other side reads (``torch.mps.synchronize()``
-    for Torch writes, ``wp.synchronize_device()`` for Warp writes) — the two
-    frameworks dispatch on separate MTLCommandQueues with no cross-queue
-    ordering. ``wp.to_torch`` drains Warp's queue itself.
+    Ordering: Warp work on the wrapped array runs in program order with
+    Torch work, as on one CUDA stream, without CPU synchronization: Warp
+    encodes on Torch's MPS command queue (see ``warp._src.metal_torch_sync``).
+    Until that queue is bound (first call), pending Torch work is drained.
     """
     import numpy as np  # noqa: PLC0415
     import objc  # noqa: PLC0415
@@ -277,8 +275,12 @@ def _from_torch_mps(t, dtype, shape, strides, requires_grad, grad, return_ctype,
         )
 
     # Drain pending Torch GPU work so the wrapped array's initial contents
-    # are coherent (see the coherency contract in the docstring).
-    torch.mps.synchronize()
+    # are coherent - unless Warp already encodes on Torch's queue, where
+    # Torch's pending work is committed before Warp's next launch on it.
+    from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
+
+    if not get_dispatcher().orders_with_torch():
+        torch.mps.synchronize()
 
     if storage_mode == 0:  # MTLStorageModeShared: host-addressable unified memory
         mv = mtl_buf.contents().as_buffer(buf_nbytes)
@@ -341,11 +343,10 @@ def from_torch(
     path. Torch's own MPS allocations live in private-storage ``MTLBuffer`` objects
     with no host address: kernels read and write them in place, while
     host-side operations on the wrapper (``numpy()``, ``fill_``, copies to or
-    from host memory) are staged through the GPU. Torch and Warp dispatch on
-    separate Metal command queues: synchronize the writing side
-    (``torch.mps.synchronize()`` / ``wp.synchronize_device()``) before the
-    other side reads. ``retain_grad`` and ``return_ctype`` are not supported
-    for MPS tensors.
+    from host memory) are staged through the GPU. Warp and PyTorch work on
+    the shared memory is ordered as on one CUDA stream, without CPU
+    synchronization (see :func:`metal_torch_fence`). ``retain_grad`` and
+    ``return_ctype`` are not supported for MPS tensors.
 
     Args:
         t: The PyTorch tensor to wrap.
@@ -562,7 +563,14 @@ def to_torch(a: warp.array, requires_grad: bool | None = None):
         if warp.config.metal_native_dispatch and not (requires_grad and a.requires_grad):
             mtl_buf = warp._src.context._metal_get_buffer(a.ptr)
             if mtl_buf is not None:
-                t = torch.from_dlpack(warp.to_dlpack(a))
+                import warp._src.dlpack as _dlpack  # noqa: PLC0415
+
+                _dlpack._metal_export_to_torch = True
+                try:
+                    capsule = warp.to_dlpack(a)
+                finally:
+                    _dlpack._metal_export_to_torch = False
+                t = torch.from_dlpack(capsule)
                 # Torch's MPS DLPack import normalises stride metadata, which
                 # erases Warp's zero strides (mujoco_warp's per-world
                 # broadcast convention — see the long comment on the copy

@@ -249,6 +249,11 @@ def strides_to_dlpack(strides, dtype):
     return a
 
 
+# Set by ``wp.to_torch`` while it exports a Metal array to Torch (see
+# ``to_dlpack``).
+_metal_export_to_torch = False
+
+
 def to_dlpack(wp_array: warp.array):
     """Convert a Warp array to another type of DLPack-compatible array.
 
@@ -291,14 +296,9 @@ def to_dlpack(wp_array: warp.array):
     # ``kDLMetal`` convention.
     data_value = wp_array.ptr
     if getattr(wp_array.device, "is_metal", False):
-        # Flush + wait on outstanding Warp GPU work so the consumer sees the
-        # array's current bytes. Ongoing coherency across the two frameworks'
-        # command queues remains the caller's responsibility (synchronize the
-        # writing side before the other side reads).
         if warp.config.metal_native_dispatch:
             from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
 
-            get_dispatcher().sync()
             mtl_buf = warp._src.context._metal_get_buffer(wp_array.ptr)
             if mtl_buf is None:
                 raise RuntimeError(
@@ -309,6 +309,13 @@ def to_dlpack(wp_array: warp.array):
             # The consumer (e.g. Torch MPS) uses the buffer from its own
             # command queue from now on: stop batching launches that bind it.
             warp._src.context._metal_mark_shared_buffer(mtl_buf)
+            # Flush + wait on outstanding Warp GPU work so the consumer sees
+            # the array's current bytes. ``wp.to_torch`` skips the wait when
+            # Warp is on Torch's queue: queue order already puts the pending
+            # work first (see ``metal_torch_sync``).
+            disp = get_dispatcher()
+            if not (_metal_export_to_torch and disp.orders_with_torch()):
+                disp.sync()
             import objc  # noqa: PLC0415
 
             data_value = objc.pyobjc_id(mtl_buf)
