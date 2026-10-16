@@ -26,17 +26,29 @@ Warp's work gets exactly Torch's own same-stream semantics. A cross-queue
 round trip between the queues (~140 us per launch measured on an M-series GPU,
 against ~1.5 us for a commit), so the shared queue is used instead.
 
-Torch exposes neither its queue nor a commit in Python. ``at::mps`` exports
-both as ``TORCH_API`` C++ symbols, which this module calls through ctypes (no
-compiler needed):
+Torch exposes neither its queue nor a commit in Python. ``at::mps::MPSHooks``
+exports both as ``TORCH_API`` C++ symbols (Torch 2.8 to 2.14), which this
+module calls through ctypes (no compiler needed):
 
-* ``at::mps::getCurrentMPSStream()``
-* ``at::mps::MPSStream::commandBuffer()`` (its ``commandQueue`` is the queue)
-* ``at::mps::MPSStream::synchronize(SyncType::COMMIT)``
+* ``MPSHooks::commitStream()``: ``synchronize(SyncType::COMMIT)`` on the
+  default stream (Torch keeps encoding into a fresh command buffer).
+* ``MPSHooks::getDispatchQueue()``: the stream's serial dispatch queue.
+* ``MPSHooks::getCommandBuffer()``: the stream's ``MPSCommandBuffer``, whose
+  ``commandQueue`` is the queue Warp encodes on.
 
-If any of them cannot be resolved (another Torch build or version), Warp
-falls back to CPU fences (``torch.mps.synchronize()`` before, and a Warp
-device sync after, every command buffer that touches a shared buffer):
+Torch encodes only on its serial dispatch queue, and ``MPSStream`` itself
+takes no lock, so every call into the stream runs on that queue through
+``dispatch_sync_f`` (calling ``commitStream`` from another thread while a
+Torch op encodes crashed). Code already running on the queue calls directly
+(``dispatch_get_specific``), as ``dispatch_sync`` onto the current serial
+queue would deadlock. A CPU wait for Torch's work goes through a
+``torch.mps.Event`` (record, then synchronize): Torch records it on its queue
+and reports device errors as Python exceptions.
+
+Binding runs a canary: a Torch op, a commit, and a check that the command
+buffer holding the op was committed. If any of this fails (another Torch
+build or version), Warp falls back to CPU fences (a Torch wait before, and a
+Warp device sync after, every command buffer that touches a shared buffer):
 correct but slower. ``WARP_METAL_TORCH_SYNC`` selects the mode:
 
 * ``gpu`` (default): the shared queue, falling back to ``cpu`` if unavailable.
@@ -51,17 +63,21 @@ import ctypes
 import os
 import re
 import sys
+import threading
 import warnings
 
 _MODES = ("gpu", "cpu", "off")
 
-# at::mps::SyncType::COMMIT in ATen/mps/MPSStream.h
-# (NONE, COMMIT, COMMIT_AND_WAIT, COMMIT_AND_CONTINUE, COMMIT_ADAPTIVE).
-_SYNC_TYPE_COMMIT_DEFAULT = 1
+# Torch releases with the MPSHooks entry points verified to match (symbols,
+# no locking in ``MPSStream::synchronize``, ``commitStream`` = COMMIT).
+_VERIFIED_TORCH = ((2, 8), (2, 9), (2, 11), (2, 13), (2, 14))
 
-_SYM_GET_STREAM = "_ZN2at3mps19getCurrentMPSStreamEv"
-_SYM_COMMAND_BUFFER = "_ZN2at3mps9MPSStream13commandBufferEv"
-_SYM_SYNCHRONIZE = "_ZN2at3mps9MPSStream11synchronizeENS0_8SyncTypeE"
+_SYM_COMMIT_STREAM = "_ZNK2at3mps8MPSHooks12commitStreamEv"
+_SYM_GET_DISPATCH_QUEUE = "_ZNK2at3mps8MPSHooks16getDispatchQueueEv"
+_SYM_GET_COMMAND_BUFFER = "_ZNK2at3mps8MPSHooks16getCommandBufferEv"
+
+# MTLCommandBufferStatus: NotEnqueued, Enqueued, Committed, Scheduled, ...
+_STATUS_COMMITTED = 2
 
 
 def requested_mode() -> str:
@@ -93,87 +109,152 @@ def torch_mps_in_use() -> bool:
         return False
 
 
-def _sync_type_commit(torch_dir: str) -> int:
-    """``SyncType::COMMIT``'s value, read from the installed header when
-    present (guards against a reordered enum), else the known default."""
-    header = os.path.join(torch_dir, "include", "ATen", "mps", "MPSStream.h")
-    try:
-        with open(header, encoding="utf-8") as f:
-            text = f.read()
-    except OSError:
-        return _SYNC_TYPE_COMMIT_DEFAULT
-    m = re.search(r"enum\s+class\s+SyncType\s*\{(.*?)\}", text, re.S)
-    if m is None:
-        raise RuntimeError("at::mps::SyncType not found in MPSStream.h")
-    body = re.sub(r"//[^\n]*", "", m.group(1))
-    names = [n.strip() for n in body.split(",") if n.strip()]
-    if any("=" in n for n in names) or "COMMIT" not in names:
-        raise RuntimeError(f"unexpected at::mps::SyncType layout: {names}")
-    return names.index("COMMIT")
+def _torch_version(version: str) -> tuple[int, int] | None:
+    m = re.match(r"(\d+)\.(\d+)", version)
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+_waits = threading.local()
+
+
+def wait_for_torch() -> None:
+    """Block until Torch's MPS work issued so far has completed.
+
+    Records a per-thread ``torch.mps.Event`` (on Torch's dispatch queue) and
+    waits for it; ``torch.mps.synchronize()`` touches the stream without the
+    queue and is not safe while another thread runs Torch ops.
+    """
+    import torch  # noqa: PLC0415
+
+    ev = getattr(_waits, "event", None)
+    if ev is None:
+        ev = torch.mps.Event()
+        _waits.event = ev
+    ev.record()
+    ev.synchronize()
 
 
 class TorchMPSStream:
-    """ctypes binding to Torch's current MPS stream (see the module docstring)."""
+    """ctypes binding to Torch's default MPS stream (see the module docstring)."""
 
     def __init__(self) -> None:
         import objc  # noqa: PLC0415
         import torch  # noqa: PLC0415
 
-        torch_dir = os.path.dirname(torch.__file__)
-        lib_path = os.path.join(torch_dir, "lib", "libtorch_cpu.dylib")
-        lib = ctypes.CDLL(lib_path)
-        self._get_stream = getattr(lib, _SYM_GET_STREAM)
-        self._get_stream.restype = ctypes.c_void_p
-        self._get_stream.argtypes = []
-        self._command_buffer = getattr(lib, _SYM_COMMAND_BUFFER)
-        self._command_buffer.restype = ctypes.c_void_p
-        self._command_buffer.argtypes = [ctypes.c_void_p]
-        self._synchronize = getattr(lib, _SYM_SYNCHRONIZE)
-        self._synchronize.restype = None
-        self._synchronize.argtypes = [ctypes.c_void_p, ctypes.c_int]
-        self._commit_type = _sync_type_commit(torch_dir)
-        self._objc = objc
-        # Torch creates its MPS stream lazily; a tiny op forces it (and its
-        # device) into existence before its pointer is read.
-        torch.empty(1, device="mps")
-        self._stream = self._get_stream()
-        if not self._stream:
-            raise RuntimeError("at::mps::getCurrentMPSStream() returned null")
+        version = _torch_version(torch.__version__)
+        if version not in _VERIFIED_TORCH:
+            warnings.warn(
+                f"Warp's Metal/Torch ordering is verified with Torch "
+                f"{', '.join('.'.join(map(str, v)) for v in _VERIFIED_TORCH)}, not {torch.__version__}; "
+                "binding Torch's MPS queue anyway (a canary check falls back to CPU fences on mismatch).",
+                stacklevel=4,
+            )
+        lib = ctypes.CDLL(os.path.join(os.path.dirname(torch.__file__), "lib", "libtorch_cpu.dylib"))
+        # ``const`` member functions that ignore ``this`` (they act on the
+        # default stream), so ``dispatch_sync_f`` can call them with a null
+        # context as plain ``void (*)(void*)`` functions.
+        self._commit_fn = ctypes.cast(getattr(lib, _SYM_COMMIT_STREAM), ctypes.c_void_p).value
+        get_queue = getattr(lib, _SYM_GET_DISPATCH_QUEUE)
+        get_queue.restype = ctypes.c_void_p
+        get_queue.argtypes = [ctypes.c_void_p]
+        get_cb = getattr(lib, _SYM_GET_COMMAND_BUFFER)
+        get_cb.restype = ctypes.c_void_p
+        get_cb.argtypes = [ctypes.c_void_p]
+        self._get_cb = get_cb
 
-    def stream_ptr(self) -> int:
-        return int(self._get_stream() or 0)
+        libdispatch = ctypes.CDLL("/usr/lib/system/libdispatch.dylib")
+        self._dispatch_sync_f = libdispatch.dispatch_sync_f
+        self._dispatch_sync_f.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+        self._dispatch_sync_f.restype = None
+        self._get_specific = libdispatch.dispatch_get_specific
+        self._get_specific.argtypes = [ctypes.c_void_p]
+        self._get_specific.restype = ctypes.c_void_p
+        set_specific = libdispatch.dispatch_queue_set_specific
+        set_specific.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+        set_specific.restype = None
+        self._call_fn = ctypes.CFUNCTYPE(None, ctypes.c_void_p)(self._commit_fn)
+        self._objc = objc
+
+        # Torch creates its MPS stream lazily; a tiny op forces it into
+        # existence before its queue is read.
+        torch.empty(1, device="mps")
+        self._queue = get_queue(None)
+        if not self._queue:
+            raise RuntimeError("at::mps::MPSHooks::getDispatchQueue() returned null")
+        # Mark Torch's queue so ``_on_queue`` can tell when it already runs
+        # on it. The key is the address of a buffer this binding keeps alive.
+        self._key = ctypes.create_string_buffer(1)
+        self._key_ptr = ctypes.addressof(self._key)
+        set_specific(self._queue, self._key_ptr, self._key_ptr, None)
+
+    def _on_queue(self, fn_ptr: int, call) -> None:
+        if self._get_specific(self._key_ptr):
+            call(None)
+        else:
+            self._dispatch_sync_f(self._queue, None, fn_ptr)
+
+    def command_buffer(self):
+        """Torch's current ``MPSCommandBuffer``, read on its dispatch queue."""
+        out = []
+
+        # A Python callback on Torch's queue: needs the GIL, which Torch ops
+        # release before entering the queue. Only used while binding.
+        @ctypes.CFUNCTYPE(None, ctypes.c_void_p)
+        def read(_ctx):
+            out.append(self._get_cb(None))
+
+        fn_ptr = ctypes.cast(read, ctypes.c_void_p).value
+        self._on_queue(fn_ptr, read)
+        if not out or not out[0]:
+            raise RuntimeError("at::mps::MPSHooks::getCommandBuffer() returned null")
+        return self._objc.objc_object(c_void_p=out[0])
 
     def command_queue(self):
         """Torch's ``MTLCommandQueue`` (the queue of its MPSCommandBuffer)."""
-        cb_ptr = self._command_buffer(self._stream)
-        if not cb_ptr:
-            raise RuntimeError("at::mps::MPSStream::commandBuffer() returned null")
-        cb = self._objc.objc_object(c_void_p=cb_ptr)
-        queue = cb.commandQueue()
+        queue = self.command_buffer().commandQueue()
         if queue is None:
             raise RuntimeError("Torch's MPS command buffer has no command queue")
         return queue
 
     def commit(self) -> None:
-        """Commit Torch's pending command buffer without waiting
-        (``synchronize(SyncType::COMMIT)``; Torch keeps encoding into a fresh
-        one)."""
-        self._synchronize(self._stream, self._commit_type)
+        """Commit Torch's pending command buffer without waiting, on Torch's
+        dispatch queue."""
+        self._on_queue(self._commit_fn, self._call_fn)
+
+    def check(self) -> None:
+        """Canary: a Torch op followed by :meth:`commit` must leave the
+        command buffer that holds the op committed."""
+        import torch  # noqa: PLC0415
+
+        x = torch.ones(16, device="mps")
+        x.add_(1.0)
+        cb = self.command_buffer().commandBuffer()
+        if cb is None:
+            raise RuntimeError("Torch's MPSCommandBuffer has no underlying MTLCommandBuffer")
+        self.commit()
+        status = int(cb.status())
+        if status < _STATUS_COMMITTED:
+            raise RuntimeError(f"MPSHooks::commitStream() did not commit Torch's command buffer (status {status})")
+        wait_for_torch()
 
 
 _stream_binding: TorchMPSStream | None = None
 _stream_error: str | None = None
+_stream_lock = threading.Lock()
 
 
 def get_torch_stream() -> TorchMPSStream | None:
     """The process-wide :class:`TorchMPSStream`, or ``None`` when it cannot be
-    bound (the reason is in :func:`unavailable_reason`)."""
+    bound or its canary fails (the reason is in :func:`unavailable_reason`)."""
     global _stream_binding, _stream_error
-    if _stream_binding is None and _stream_error is None:
-        try:
-            _stream_binding = TorchMPSStream()
-        except Exception as e:
-            _stream_error = f"{type(e).__name__}: {e}"
+    with _stream_lock:
+        if _stream_binding is None and _stream_error is None:
+            try:
+                stream = TorchMPSStream()
+                stream.check()
+                _stream_binding = stream
+            except Exception as e:
+                _stream_error = f"{type(e).__name__}: {e}"
     return _stream_binding
 
 

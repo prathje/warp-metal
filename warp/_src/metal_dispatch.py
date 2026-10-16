@@ -1495,9 +1495,9 @@ class MetalDispatcher:
             if mode == "gpu":
                 self._torch_stream.commit()
             elif mode == "cpu":
-                import torch  # noqa: PLC0415
+                from warp._src.metal_torch_sync import wait_for_torch  # noqa: PLC0415
 
-                torch.mps.synchronize()
+                wait_for_torch()
         cmd_buf.commit()
 
     def _flush_shared(self) -> None:
@@ -1533,9 +1533,9 @@ class MetalDispatcher:
         elif self._torch_mode == "gpu":
             self._torch_stream.commit()
         elif self._torch_mode == "cpu":
-            import torch  # noqa: PLC0415
+            from warp._src.metal_torch_sync import wait_for_torch  # noqa: PLC0415
 
-            torch.mps.synchronize()
+            wait_for_torch()
 
     def unmark_shared(self, mtl_buf) -> None:
         """Forget a buffer registered with :meth:`mark_shared` (released)."""
@@ -1630,9 +1630,9 @@ class MetalDispatcher:
             # Like ``cudaDeviceSynchronize``, wait for Torch's work too: a
             # host read after this must see Torch's writes to shared buffers.
             # ``torch=False`` skips that when no shared buffer is involved.
-            import torch as _torch  # noqa: PLC0415
+            from warp._src.metal_torch_sync import wait_for_torch  # noqa: PLC0415
 
-            _torch.mps.synchronize()
+            wait_for_torch()
         if self._cmd_buf is not None:
             self._end_encoder()
             cmd_buf = self._cmd_buf

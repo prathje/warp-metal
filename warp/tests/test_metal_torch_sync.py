@@ -136,7 +136,7 @@ class TestMetalTorchSync(unittest.TestCase):
         code = (
             "import warnings\n"
             "import warp._src.metal_torch_sync as mts\n"
-            "mts._SYM_COMMAND_BUFFER = '_ZN2at3mps9MPSStream14noSuchSymbolEv'\n"
+            "mts._SYM_GET_COMMAND_BUFFER = '_ZNK2at3mps8MPSHooks12noSuchSymbolEv'\n"
             "warnings.simplefilter('always')\n"
             "with warnings.catch_warnings(record=True) as caught:\n"
             "    import torch\n"
@@ -270,6 +270,91 @@ class TestMetalTorchSync(unittest.TestCase):
         """
         _run(self, code)
 
+    def test_torch_ops_on_another_thread(self):
+        # Torch encodes on its serial dispatch queue, and MPSStream takes no
+        # lock: committing Torch's stream from Warp's thread outside that
+        # queue crashed (SIGSEGV) while a worker thread ran Torch ops.
+        code = """
+        import threading
+        import time
+        import torch
+        from warp._src.metal_dispatch import get_dispatcher
+
+        @wp.kernel
+        def inc(a: wp.array[float]):
+            a[wp.tid()] = a[wp.tid()] + 1.0
+
+        a = wp.zeros(1 << 12, dtype=float, device="metal:0")
+        ta = wp.to_torch(a)
+        assert get_dispatcher()._torch_mode == "gpu"
+        stop = False
+        errors = []
+
+        def worker():
+            x = torch.randn(256, 256, device="mps")
+            y = torch.randn(1 << 14, device="mps")
+            try:
+                while not stop:
+                    y = torch.sin(y * 1.0001 + 0.5)
+                    x = (x @ x).tanh()
+            except Exception as e:
+                errors.append(repr(e))
+
+        th = threading.Thread(target=worker)
+        th.start()
+        n = 0
+        t0 = time.time()
+        while time.time() - t0 < 3.0:
+            wp.launch(inc, dim=a.shape[0], inputs=[a], device="metal:0")
+            n += 1
+            if n % 500 == 0:
+                wp.synchronize_device("metal:0")  # Torch wait from this thread too
+        stop = True
+        th.join()
+        assert not errors, errors
+        assert float(ta[0].item()) == float(n), (float(ta[0].item()), n)
+        """
+        _run(self, code)
+
+    def test_commit_from_torch_queue_does_not_deadlock(self):
+        # Code already running on Torch's dispatch queue commits directly
+        # (dispatch_sync onto the current serial queue would deadlock).
+        code = """
+        import ctypes
+        import torch
+        from warp._src import metal_torch_sync as mts
+
+        _bind = wp.to_torch(wp.zeros(4, dtype=float, device="metal:0"))
+        stream = mts.get_torch_stream()
+        assert stream is not None, mts.unavailable_reason()
+        ran = []
+
+        @ctypes.CFUNCTYPE(None, ctypes.c_void_p)
+        def on_queue(_ctx):
+            stream.commit()
+            ran.append(stream.command_buffer())
+
+        stream._dispatch_sync_f(stream._queue, None, ctypes.cast(on_queue, ctypes.c_void_p).value)
+        assert len(ran) == 1
+        """
+        _run(self, code)
+
+    def test_canary_failure_falls_back_to_cpu_fences(self):
+        code = (
+            "import warnings\n"
+            "import warp._src.metal_torch_sync as mts\n"
+            "def broken_commit(self):\n"
+            "    pass\n"
+            "mts.TorchMPSStream.commit = broken_commit\n"
+            "warnings.simplefilter('always')\n"
+            "with warnings.catch_warnings(record=True) as caught:\n"
+            "    import torch\n"
+            "    _probe = wp.to_torch(wp.zeros(4, dtype=float, device='metal:0'))\n"
+            "msgs = [str(w.message) for w in caught]\n"
+            "assert any('CPU fences' in m and 'did not commit' in m for m in msgs), msgs\n"
+        ) + _INTERLEAVE.format(iters=30, mode="cpu")
+        _run(self, code)
+
 
 class TestMetalTorchSyncHost(unittest.TestCase):
     """Host-side parts that run without a Metal device."""
@@ -300,24 +385,6 @@ class TestMetalTorchSyncHost(unittest.TestCase):
                 os.environ.pop("WARP_METAL_TORCH_SYNC", None)
             else:
                 os.environ["WARP_METAL_TORCH_SYNC"] = old
-
-    def test_sync_type_from_header(self):
-        from warp._src import metal_torch_sync as mts  # noqa: PLC0415
-
-        with tempfile.TemporaryDirectory() as d:
-            os.makedirs(os.path.join(d, "include", "ATen", "mps"))
-            header = os.path.join(d, "include", "ATen", "mps", "MPSStream.h")
-            self.assertEqual(mts._sync_type_commit(d), mts._SYNC_TYPE_COMMIT_DEFAULT)
-            with open(header, "w") as f:
-                f.write("enum class SyncType {\n  NONE, // none\n  COMMIT, // commit\n  COMMIT_AND_WAIT,\n};\n")
-            self.assertEqual(mts._sync_type_commit(d), 1)
-            with open(header, "w") as f:
-                f.write("enum class SyncType {\n  COMMIT_AND_WAIT,\n  NONE,\n  COMMIT,\n};\n")
-            self.assertEqual(mts._sync_type_commit(d), 2)
-            with open(header, "w") as f:
-                f.write("enum class SyncType {\n  NONE = 3,\n  COMMIT,\n};\n")
-            with self.assertRaises(RuntimeError):
-                mts._sync_type_commit(d)
 
 
 if __name__ == "__main__":

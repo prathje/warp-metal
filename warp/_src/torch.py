@@ -232,7 +232,6 @@ def _from_torch_mps(t, dtype, shape, strides, requires_grad, grad, return_ctype,
     """
     import numpy as np  # noqa: PLC0415
     import objc  # noqa: PLC0415
-    import torch  # noqa: PLC0415
 
     from warp._src.context import (  # noqa: PLC0415
         _metal_register_foreign_buffer,
@@ -280,7 +279,9 @@ def _from_torch_mps(t, dtype, shape, strides, requires_grad, grad, return_ctype,
     from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
 
     if not get_dispatcher().orders_with_torch():
-        torch.mps.synchronize()
+        from warp._src.metal_torch_sync import wait_for_torch  # noqa: PLC0415
+
+        wait_for_torch()
 
     if storage_mode == 0:  # MTLStorageModeShared: host-addressable unified memory
         mv = mtl_buf.contents().as_buffer(buf_nbytes)
