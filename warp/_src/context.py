@@ -5713,11 +5713,17 @@ def _metal_host_memset(ptr, value, nbytes):
         from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
 
         disp = get_dispatcher()
-        if disp.has_pending_work() and disp._record_state is None and not _metal_is_private_ptr(ptr):
-            buf, off = _metal_find_buffer(ptr) if ptr and nbytes > 0 else (None, 0)
-            if buf is not None:
-                disp.device_fill(buf, value, nbytes, offset=off)
-                return True
+        buf, off = _metal_find_buffer(ptr) if ptr and nbytes > 0 else (None, 0)
+        # On Torch's queue a buffer shared with Torch is also filled on the
+        # device, ordered with Torch's work instead of draining it.
+        if (
+            buf is not None
+            and (disp.has_pending_work() or (disp.orders_with_torch() and disp.is_shared(buf)))
+            and disp._record_state is None
+            and not _metal_is_private_ptr(ptr)
+        ):
+            disp.device_fill(buf, value, nbytes, offset=off)
+            return True
         if disp._record_state is not None or _metal_is_private_ptr(ptr):
             if not ptr or nbytes <= 0:
                 return True
@@ -5729,7 +5735,8 @@ def _metal_host_memset(ptr, value, nbytes):
                 )
             disp.device_fill(buf, value, nbytes, offset=off)
             return True
-        disp.sync()
+        # Drain Torch too only if it can access the buffer.
+        disp.sync(torch=disp.is_shared(buf))
     return runtime.core.wp_memset_host(ptr, value, nbytes)
 
 
@@ -5740,11 +5747,15 @@ def _metal_host_memtile(ptr, src_ptr, srcsize, reps):
         from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
 
         disp = get_dispatcher()
-        if disp.has_pending_work() and disp._record_state is None and not _metal_is_private_ptr(ptr):
-            buf, off = _metal_find_buffer(ptr) if ptr and srcsize > 0 and reps > 0 else (None, 0)
-            if buf is not None:
-                disp.device_memtile(buf, ctypes.string_at(src_ptr, srcsize), reps, offset=off)
-                return None
+        buf, off = _metal_find_buffer(ptr) if ptr and srcsize > 0 and reps > 0 else (None, 0)
+        if (
+            buf is not None
+            and (disp.has_pending_work() or (disp.orders_with_torch() and disp.is_shared(buf)))
+            and disp._record_state is None
+            and not _metal_is_private_ptr(ptr)
+        ):
+            disp.device_memtile(buf, ctypes.string_at(src_ptr, srcsize), reps, offset=off)
+            return None
         if disp._record_state is not None or _metal_is_private_ptr(ptr):
             if not ptr or srcsize <= 0 or reps <= 0:
                 return None
@@ -5757,7 +5768,8 @@ def _metal_host_memtile(ptr, src_ptr, srcsize, reps):
             pattern = ctypes.string_at(src_ptr, srcsize)
             disp.device_memtile(buf, pattern, reps, offset=off)
             return None
-        disp.sync()
+        # Drain Torch too only if it can access the buffer.
+        disp.sync(torch=disp.is_shared(buf))
     return runtime.core.wp_memtile_host(ptr, src_ptr, srcsize, reps)
 
 

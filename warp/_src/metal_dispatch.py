@@ -1477,6 +1477,10 @@ class MetalDispatcher:
                 self._torch_stream = stream
         self._torch_mode = mode
 
+    def is_shared(self, mtl_buf) -> bool:
+        """Whether ``mtl_buf`` is shared with another framework (see :meth:`mark_shared`)."""
+        return mtl_buf is not None and id(mtl_buf) in self._shared_ids
+
     def orders_with_torch(self) -> bool:
         """Whether Warp encodes on Torch's MPS queue (``"gpu"`` mode)."""
         return self._torch_mode == "gpu"
@@ -1608,7 +1612,7 @@ class MetalDispatcher:
         # docstring for why a single newest-only tracker is not enough.
         self._pending_commits.append(cmd_buf)
 
-    def sync(self, _at_exit: bool = False) -> None:
+    def sync(self, torch: bool = True) -> None:
         """Block until every committed command buffer is complete.
 
         Call before any host read of buffer contents (``.numpy()``,
@@ -1622,12 +1626,13 @@ class MetalDispatcher:
         prior cmd buffer (observed empirically: 1-2 step lag on mjw step
         before this loop was added).
         """
-        if self._torch_mode in ("gpu", "cpu") and self._shared_ids and not _at_exit:
+        if torch and self._torch_mode in ("gpu", "cpu") and self._shared_ids:
             # Like ``cudaDeviceSynchronize``, wait for Torch's work too: a
             # host read after this must see Torch's writes to shared buffers.
-            import torch  # noqa: PLC0415
+            # ``torch=False`` skips that when no shared buffer is involved.
+            import torch as _torch  # noqa: PLC0415
 
-            torch.mps.synchronize()
+            _torch.mps.synchronize()
         if self._cmd_buf is not None:
             self._end_encoder()
             cmd_buf = self._cmd_buf
@@ -1667,7 +1672,7 @@ class MetalDispatcher:
         bad state (e.g. a command buffer erred out).
         """
         try:
-            self.sync(_at_exit=True)
+            self.sync(torch=False)
         except Exception:
             pass
 
