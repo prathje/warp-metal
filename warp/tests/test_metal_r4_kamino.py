@@ -154,6 +154,69 @@ class TestMetalR4Kamino(unittest.TestCase):
             """,
         )
 
+    def test_module_fp64_emulate(self):
+        # ``metal_fp64="emulate"`` as a module option gives that module's
+        # float64 locals real double precision while the process-wide mode
+        # stays ``"error"`` (Kamino's APGD natural-map residual).
+        _run(
+            self,
+            """
+            wp.set_module_options({"metal_fp64": "emulate"})
+
+            @wp.kernel
+            def k(a: wp.array[float], out: wp.array[float]):
+                i = wp.tid()
+                x = wp.float64(a[i]) * wp.float64(1.0e8) + wp.float64(1.0)
+                out[i] = wp.float32(x - wp.float64(a[i]) * wp.float64(1.0e8))
+
+            def run(dev):
+                a = wp.array([1.0, 3.0, 7.0], dtype=float, device=dev)
+                o = wp.zeros(3, dtype=float, device=dev)
+                wp.launch(k, dim=3, inputs=[a, o], device=dev)
+                return o.numpy()
+
+            assert wp.config.metal_fp64 == "error"
+            res = both(run)
+            assert_same(res, rtol=0.0, atol=0.0)
+            np.testing.assert_array_equal(res["metal:0"], 1.0)
+            """,
+        )
+
+    def test_graph_replay_after_large_private_kernel(self):
+        # Once an ICB-capable pipeline with a large private tile has run, the
+        # Apple GPU driver fails every later indirect-command-buffer execution
+        # with "Insufficient Memory". Such kernels dispatch eagerly through a
+        # direct-only pipeline.
+        _run(
+            self,
+            """
+            R = 128
+
+            @wp.kernel
+            def big(idx: wp.array[int], out: wp.array2d[float]):
+                _b, _l = wp.tid()
+                t = wp.tile_load(out, shape=(R, 64))
+                for i in range(idx.shape[0]):
+                    t[idx[i] % R, idx[i] % 64] = float(i)
+                wp.tile_store(out, t)
+
+            @wp.kernel
+            def inc(a: wp.array[float]):
+                a[wp.tid()] += 1.0
+
+            dev = "metal:0"
+            a = wp.zeros(16, dtype=float, device=dev)
+            with wp.ScopedCapture(device=dev) as c:
+                wp.launch(inc, dim=16, inputs=[a], device=dev)
+            wp.capture_launch(c.graph)
+            o = wp.zeros((R, 64), dtype=float, device=dev)
+            wp.launch_tiled(big, dim=1, inputs=[wp.array(np.arange(7), dtype=int, device=dev), o], block_dim=1, device=dev)
+            wp.capture_launch(c.graph)
+            np.testing.assert_array_equal(a.numpy(), 2.0)
+            assert o.numpy()[6, 6] == 6.0
+            """,
+        )
+
     def test_transposed_matmul_operands(self):
         # ``tile_matmul(transpose(a), transpose(b), c)`` with rectangular tiles,
         # and a transpose read by ``tile_store`` after a double transpose.
