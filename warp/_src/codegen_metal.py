@@ -21957,6 +21957,7 @@ def _get_or_build_metal_kernel_native(
             return artifact, None
         wrapped = _wrap_msl_for_native_dispatch(artifact)
         kernel._metal_native_wrapped_source = wrapped
+        kernel._metal_grid_only = None
         try:
             pso = get_dispatcher().compile(wrapped, f"custom_kernel_{artifact.name}")
         except Exception:
@@ -22080,6 +22081,40 @@ def _normalize_none_array_args(kernel, fwd_args: list, device) -> None:
             placeholder = warp.zeros(shape=(0,) * arr_type.ndim, dtype=arr_type.dtype, device=device)
             cache[i] = placeholder
         fwd_args[i] = placeholder
+
+
+_TG_DEPENDENT_PAT = re.compile(
+    r"\bthreadgroup_barrier\b|\bthreadgroup\s+\w|\bsimd_\w+\s*\(|\bsimdgroup_\w+\s*\(|"
+    r"\bthread_index_in_simdgroup\b|\bthreadgroup_position_in_grid\b|\bthreads_per_threadgroup\b|"
+    r"\bthread_position_in_threadgroup\b|\b_coop_lane\b|\bWP_NATIVE_BLOCK_SYNC\(\)\s*;|"
+    # Lock loops: threads that share a SIMD group can livelock on one lock,
+    # so keep the launch shape these kernels were validated with.
+    r"\batomic_compare_exchange_\w+|\bwp_a64_\w+|spin"
+)
+
+
+def _grid_only_kernel(kernel) -> bool:
+    """Whether the kernel's native MSL is independent of its threadgroup shape.
+
+    True when the body never touches threadgroup memory, barriers, SIMD-group
+    functions, threadgroup-relative indices or lock loops, so any threadgroup
+    shape gives the same result. Cached on the kernel.
+    """
+    cached = getattr(kernel, "_metal_grid_only", None)
+    if cached is not None:
+        return cached
+    src = getattr(kernel, "_metal_native_wrapped_source", None)
+    if not src:
+        return False
+    start = src.find("[[kernel]]")
+    if start < 0:
+        return False
+    # The body after the parameter list (which declares every attribute).
+    body = src[src.find(") {", start) :]
+    body = body.replace("uint _coop_lane = thread_position_in_threadgroup.x;", "")
+    ok = _TG_DEPENDENT_PAT.search(body) is None
+    kernel._metal_grid_only = ok
+    return ok
 
 
 def _native_lane_launch_error(kernel, block_dim: int) -> str:
@@ -22967,6 +23002,14 @@ def launch_metal_kernel_native(
             tg = (min(256, grid_x), 1, 1)
         else:
             tg = (min(64, grid_x), 1, 1)
+        if len(dims) >= 2 and tg[0] < 64 and _grid_only_kernel(kernel):
+            # A short leading launch dim (``dim=(num_worlds, n)`` with few
+            # worlds) would give threadgroups of one or a few threads: up to
+            # 15x slower, more so from a captured graph. Kernels that index
+            # only by ``thread_position_in_grid`` may span the other axes.
+            ty = max(1, min(grid_y, 256 // tg[0]))
+            tz = max(1, min(grid_z, 256 // (tg[0] * ty)))
+            tg = (tg[0], ty, tz)
         if artifact.coop_chol_n > 0:
             grid_x = grid_x * 32
             grid = (grid_x, grid_y, grid_z)

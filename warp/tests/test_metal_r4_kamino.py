@@ -217,6 +217,35 @@ class TestMetalR4Kamino(unittest.TestCase):
             """,
         )
 
+    def test_short_leading_dim_launch(self):
+        # ``dim=(num_worlds, n)`` with few worlds: threadgroups now span the
+        # second axis for kernels that only index by the grid position.
+        _run(
+            self,
+            """
+            @wp.kernel
+            def k(a: wp.array2d[float], s: wp.array[float]):
+                i, j = wp.tid()
+                a[i, j] = float(i * 10000 + j)
+                wp.atomic_add(s, i, 1.0)
+
+            @wp.kernel
+            def k3(a: wp.array3d[int]):
+                i, j, l = wp.tid()
+                a[i, j, l] = i * 1000000 + j * 1000 + l
+
+            def run(dev):
+                a = wp.zeros((2, 3001), dtype=float, device=dev)
+                s = wp.zeros(2, dtype=float, device=dev)
+                wp.launch(k, dim=(2, 3001), inputs=[a, s], device=dev)
+                b = wp.zeros((1, 37, 129), dtype=int, device=dev)
+                wp.launch(k3, dim=(1, 37, 129), inputs=[b], device=dev)
+                return a.numpy(), s.numpy(), b.numpy()
+
+            assert_same(both(run), rtol=0.0, atol=0.0)
+            """,
+        )
+
     def test_transposed_matmul_operands(self):
         # ``tile_matmul(transpose(a), transpose(b), c)`` with rectangular tiles,
         # and a transpose read by ``tile_store`` after a double transpose.
