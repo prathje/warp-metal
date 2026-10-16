@@ -21144,13 +21144,17 @@ def _native_scalar_param_msl(arg_var) -> str:
 _METAL_MAX_BUFFER_ARGS = 31
 
 
-def _wrap_msl_for_native_dispatch(artifact, aliases: dict[str, tuple[str, int]] | None = None) -> str:
+def _wrap_msl_for_native_dispatch(
+    artifact, aliases: dict[str, tuple[str, int]] | None = None, alias_offsets: tuple[int, ...] | None = None
+) -> str:
     """Build the full MSL kernel function string for native dispatch.
 
-    ``aliases`` maps array params to ``(root param, byte offset)`` for a
-    launch where they share memory with ``root`` (see
-    ``_alias_variant_pso``): their buffer slot stays bound, but the body
-    reads them through a pointer derived from ``root``.
+    ``aliases`` maps array params to ``(root param, k)`` for a launch where
+    they share memory with ``root`` (see ``_alias_variant_pso``): their
+    buffer slot stays bound, but the body reads them through
+    ``root + offset_k`` bytes. The offsets come from a trailing
+    ``__alias_offs`` buffer, or are baked in from ``alias_offsets`` when no
+    buffer slot is left (``artifact.native_alias_offs_slot`` says which).
 
     Mirrors what ``mx.fast.metal_kernel`` wraps around the kernel body
     (header includes + ``[[kernel]] void custom_kernel_<name>(...)``
@@ -21387,32 +21391,64 @@ def _wrap_msl_for_native_dispatch(artifact, aliases: dict[str, tuple[str, int]] 
             )
         spill_slots.sort()
     spill_set = set(spill_slots)
+    aliases = aliases or {}
+    alias_roots = {root for root, _k in aliases.values()}
+
+    def _root_type(ptype: str) -> str:
+        # A root is re-based for its members, so it must be a writable
+        # ``device`` pointer even when the param is a read-only input.
+        return ptype[len("const ") :] if ptype.startswith("const device ") else ptype
+
     for k, i in enumerate(spill_slots):
         sname, ptype = pending[i][1]
-        if aliases and sname in aliases:
-            raise MetalCodegenError(
-                f"Kernel {artifact.name!r}: array argument {sname!r} shares memory with {aliases[sname][0]!r} and "
-                "the kernel has more than 31 buffer arguments; pass separate arrays"
-            )
+        if sname in aliases:
+            continue  # derived from its root below
+        if sname in alias_roots:
+            ptype = _root_type(ptype)
         value_prologue.append(f"    {ptype} {sname} = reinterpret_cast<{ptype}>(__spill_ptrs[{k}]);")
-    alias_prologue: list[str] = []
     slot = 0
+    alias_types: dict[str, str] = {}
+    param_types = {sp[0]: sp[1] for _d, sp in pending if sp is not None}
     for i, (decl, _spill) in enumerate(pending):
+        if _spill is not None and _spill[0] in aliases:
+            alias_types[_spill[0]] = _spill[1]
         if i in spill_set:
             continue
-        if aliases and _spill is not None and _spill[0] in aliases:
-            aname, ptype = _spill
-            root, delta = aliases[aname]
+        if _spill is not None and _spill[0] in aliases:
             decl = f"{decl}__alias_src"
-            alias_prologue.append(
-                f"    {ptype} {aname} = reinterpret_cast<{ptype}>(reinterpret_cast<device char*>({root}) + ({delta}L));"
-            )
+        elif _spill is not None and _spill[0] in alias_roots and decl.startswith("const constant "):
+            decl = f"device {decl[len('const constant ') :]}"
         params.append(f"  {decl} [[buffer({slot})]]")
         slot += 1
-    value_prologue.extend(alias_prologue)
     if spill_slots:
         params.append(f"  const constant ulong* __spill_ptrs [[buffer({slot})]]")
+        slot += 1
     artifact.native_spill_slots = tuple(spill_slots)
+    alias_offs_slot = None
+
+    def _elem(ptype: str) -> str:
+        t = re.sub(r"\b(const|device|constant)\b|\*", " ", ptype)
+        t = re.sub(r"atomic<\s*(\w+)\s*>", r"\1", t)
+        return " ".join(t.split())
+
+    # A member of another element type (``wp.array(ptr=...)`` reinterpreting
+    # the root's memory) needs its offset as a literal: with a runtime offset
+    # the compiler's type-based alias analysis treats an ``int*`` and a
+    # ``float*`` as disjoint and the variant would not help.
+    mixed = any(_elem(param_types[a]) != _elem(param_types[r]) for a, (r, _k) in aliases.items())
+    if aliases:
+        if slot < _METAL_MAX_BUFFER_ARGS and not (mixed and alias_offsets is not None):
+            params.append(f"  const constant long* __alias_offs [[buffer({slot})]]")
+            alias_offs_slot = slot
+        elif alias_offsets is None:
+            raise MetalCodegenError(f"Kernel {artifact.name!r}: aliased launch needs baked offsets")
+        for aname, (root, k) in aliases.items():
+            ptype = alias_types[aname]
+            off = f"__alias_offs[{k}]" if alias_offs_slot is not None else f"({alias_offsets[k]}L)"
+            value_prologue.append(
+                f"    {ptype} {aname} = reinterpret_cast<{ptype}>(reinterpret_cast<device char*>({root}) + {off});"
+            )
+    artifact.native_alias_offs_slot = alias_offs_slot
 
     # Builtins — always include the full set so the body's references
     # resolve regardless of whether it actually uses them. Apple's
@@ -21769,79 +21805,120 @@ def _array_byte_span(value) -> tuple[int, int] | None:
     return ptr, ptr + extent
 
 
-def _array_params_aliasing(inputs: list, outputs: list) -> tuple[tuple[str, str, int], ...]:
-    """``(param, root output, byte offset)`` for each array param (read-only
-    input, or output after the first) whose memory overlaps an output's."""
-    roots: list[tuple[str, int, int]] = []
-    found: list[tuple[str, str, int]] = []
+def _array_params_aliasing(inputs: list, outputs: list):
+    """Group the array params of a launch whose memory overlaps.
 
-    def root_of(lo: int, hi: int) -> tuple[str, int] | None:
-        for rname, rlo, rhi in roots:
-            if lo < rhi and rlo < hi:
-                return rname, rlo
-        return None
-
+    Spans of read-only inputs and outputs are swept in address order; each
+    connected group of overlapping spans (overlap is transitive here: an
+    input covering two outputs, or a chain of outputs, is one group) that
+    contains an output gets one root, its lowest-address member. Returns
+    ``(topology, offsets)`` with ``topology`` the ``(param, root, k)``
+    triples and ``offsets[k]`` the param's byte offset from its root (>= 0),
+    or ``None`` when nothing overlaps.
+    """
+    out_spans = []
     for name, value in outputs:
         sp = _array_byte_span(value)
-        if sp is None:
-            continue
-        r = root_of(*sp)
-        if r is None:
-            roots.append((name, sp[0], sp[1]))
-        else:
-            found.append((name, r[0], sp[0] - r[1]))
-    if not roots:
-        return ()
-    lo_min = min(r[1] for r in roots)
-    hi_max = max(r[2] for r in roots)
+        if sp is not None:
+            out_spans.append((sp[0], sp[1], 0, name))
+    if not out_spans:
+        return None
+    lo_min = min(sp[0] for sp in out_spans)
+    hi_max = max(sp[1] for sp in out_spans)
+    spans = out_spans
     for name, value in inputs:
         p = value.ptr
-        # Cheap reject (an input starting past every output) before the
-        # span computation; this runs on every launch.
+        # Cheap reject before the span computation (runs on every launch):
+        # an input starting past every output.
         if not p or p >= hi_max:
             continue
         sp = _array_byte_span(value)
         if sp is None or sp[1] <= lo_min:
             continue
-        r = root_of(*sp)
-        if r is not None:
-            found.append((name, r[0], sp[0] - r[1]))
-    return tuple(found)
+        spans.append((sp[0], sp[1], 1, name))
+    if len(spans) < 2:
+        return None
+    # Outputs before inputs at the same address, so an output roots a group
+    # where it can.
+    spans.sort()
+    topology: list[tuple[str, str, int]] = []
+    offsets: list[int] = []
+    group = [spans[0]]
+    reach = spans[0][1]
+
+    def flush(g) -> None:
+        if len(g) < 2 or all(m[2] for m in g):
+            return
+        root_lo, _rhi, _kind, root = g[0]
+        for lo, _hi, _kind2, name in g[1:]:
+            topology.append((name, root, len(offsets)))
+            offsets.append(lo - root_lo)
+
+    for sp in spans[1:]:
+        if sp[0] < reach:
+            group.append(sp)
+            reach = max(reach, sp[1])
+        else:
+            flush(group)
+            group = [sp]
+            reach = sp[1]
+    flush(group)
+    if not topology:
+        return None
+    return tuple(topology), tuple(offsets)
 
 
-def _alias_variant_pso(kernel, artifact, aliases: tuple[tuple[str, str, int], ...], adjoint: bool,
-                       grad_args: tuple[str, ...]):
-    """PSO for a launch that binds overlapping memory to several array params.
+_ALIAS_VARIANT_CACHE_MAX = 64
+
+
+def _alias_variant_pso(kernel, artifact, topology: tuple[tuple[str, str, int], ...], offsets: tuple[int, ...],
+                       adjoint: bool, grad_args: tuple[str, ...]):
+    """``(pso, offsets binding or None)`` for a launch that binds overlapping
+    memory to several array params.
 
     Apple's compiler treats distinct kernel buffer arguments as
     non-aliasing: with ``wp.launch(k, inputs=[a, a])`` a read through one
     param may be served from before the kernel's own store through the
-    other (CPU and CUDA read the stored value). For such a launch each
-    overlapping param is re-derived in the body from the first output it
-    overlaps (``aliases``: ``(param, root output, byte offset)``), so the
-    compiler sees one pointer.
+    other (CPU and CUDA read the stored value). In this variant every
+    overlapping param is re-derived from its group's root plus a byte
+    offset, so the compiler sees one pointer. The offsets are bound at
+    launch, so there is one variant per alias topology; only a kernel with
+    no buffer slot left bakes them in (one variant per offset set).
     """
+    import numpy as np  # noqa: PLC0415
+
     from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
 
     cache = getattr(kernel, "_metal_alias_psos", None)
     if cache is None:
         cache = {}
         kernel._metal_alias_psos = cache
-    key = (adjoint, grad_args, aliases, id(artifact))
+    key = (adjoint, grad_args, topology, id(artifact))
     hit = cache.get(key)
+    if hit is None:
+        baked = cache.get(key + (offsets,))
+        if baked is not None:
+            return baked[1], None
     if hit is not None:
-        return hit[1]
-    wrapped = _wrap_msl_for_native_dispatch(artifact, {name: (root, off) for name, root, off in aliases})
+        return hit[1], np.asarray(offsets, dtype=np.int64).tobytes()
+    aliases = {name: (root, k) for name, root, k in topology}
+    wrapped = _wrap_msl_for_native_dispatch(artifact, aliases, offsets)
+    use_buffer = getattr(artifact, "native_alias_offs_slot", None) is not None
     try:
         pso = get_dispatcher().compile(wrapped, f"custom_kernel_{artifact.name}")
     except Exception as exc:
         raise MetalCodegenError(
-            f"Kernel '{kernel.key}': argument(s) {', '.join(a[0] for a in aliases)} share memory with another "
+            f"Kernel '{kernel.key}': argument(s) {', '.join(a[0] for a in topology)} share memory with another "
             f"array argument and the Metal variant for that failed to compile ({exc}). Pass separate arrays."
         ) from exc
+    if len(cache) >= _ALIAS_VARIANT_CACHE_MAX:
+        cache.pop(next(iter(cache)))
     # The artifact is kept with its PSO so ``id(artifact)`` stays unique.
-    cache[key] = (artifact, pso)
-    return pso
+    if use_buffer:
+        cache[key] = (artifact, pso)
+        return pso, np.asarray(offsets, dtype=np.int64).tobytes()
+    cache[key + (offsets,)] = (artifact, pso)
+    return pso, None
 
 
 def launch_metal_kernel_native(
@@ -22468,10 +22545,11 @@ def launch_metal_kernel_native(
         # init-shadow ``r`` on the same buffer collapse to RW).
         binding_modes.append("rw")
 
+    alias_offs_data = None
     if alias_out and (alias_in or len(alias_out) > 1):
         aliased = _array_params_aliasing(alias_in, alias_out)
         if aliased:
-            pso = _alias_variant_pso(kernel, artifact, aliased, adjoint, grad_args)
+            pso, alias_offs_data = _alias_variant_pso(kernel, artifact, aliased[0], aliased[1], adjoint, grad_args)
 
     # ---- Compute grid + threadgroup (mirrors MLX path's logic) ----
     if isinstance(dim, int):
@@ -22555,6 +22633,11 @@ def launch_metal_kernel_native(
         binding_modes = [m for i, m in enumerate(binding_modes) if i not in spill_set]
         data = table.tobytes()
         bindings.append((data, len(data)))
+        binding_modes.append(None)
+
+    if alias_offs_data is not None:
+        # ``__alias_offs`` follows the spill table (see ``_wrap_msl_for_native_dispatch``).
+        bindings.append((alias_offs_data, len(alias_offs_data)))
         binding_modes.append(None)
 
     # ---- Dispatch (fire and forget) ----

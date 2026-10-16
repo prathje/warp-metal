@@ -544,6 +544,83 @@ class TestMetalR3Tiles(unittest.TestCase):
             """,
         )
 
+    def test_aliased_array_groups(self):
+        # Overlap is transitive: an input spanning two outputs, a chain of
+        # outputs, mixed element types, spilled (>31 buffer) params, and one
+        # PSO variant for every offset of a sliding window.
+        _run(
+            self,
+            """
+            import importlib.util, os, tempfile
+            import warp._src.codegen_metal as cm
+
+            @wp.kernel
+            def span(a: wp.array[float], b: wp.array[float], c: wp.array[float]):
+                i = wp.tid()
+                if i == 0:
+                    for j in range(4):
+                        b[j] = float(j) + 10.0
+                        c[j] = a[j] + a[j + 4] + 100.0
+                        c[j] = c[j] + a[j + 4]
+
+            @wp.kernel
+            def three(o1: wp.array[float], o2: wp.array[float], o3: wp.array[float]):
+                i = wp.tid()
+                if i == 0:
+                    for j in range(4):
+                        o3[j] = float(j + 1)
+                        o2[4 + j] = o2[4 + j] + 5.0
+                        o3[j] = o3[j] * 3.0
+                        o1[0] = o1[0] + o2[0]
+
+            @wp.kernel
+            def pun(a: wp.array[wp.int32], b: wp.array[float]):
+                i = wp.tid()
+                if i == 0:
+                    b[0] = 1.0
+                    b[1] = float(a[0])
+
+            @wp.kernel
+            def chain(a: wp.array[float], b: wp.array[float]):
+                i = wp.tid()
+                if i == 0:
+                    for j in range(4):
+                        b[j + 1] = a[j] * 2.0
+
+            n = 33
+            NL = chr(10)
+            src = "import warp as wp" + NL + "@wp.kernel" + NL + "def many(" + ", ".join(f"a{k}: wp.array[float]" for k in range(n))
+            src += ", x: wp.array[float], y: wp.array[float]):" + NL + "    i = wp.tid()" + NL + "    s = float(0.0)" + NL
+            src += "".join(f"    s += a{k}[i]" + NL for k in range(n))
+            src += "    if i == 0:" + NL + "        for j in range(4):" + NL + "            y[j + 1] = x[j] * 2.0 + s" + NL
+            path = os.path.join(tempfile.mkdtemp(), "_alias_many.py")
+            open(path, "w").write(src)
+            spec = importlib.util.spec_from_file_location("_alias_many", path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+
+            def run(dev):
+                with wp.ScopedDevice(dev):
+                    y = wp.zeros(8, dtype=float)
+                    wp.launch(span, dim=1, inputs=[y, y[0:4], y[4:8]])
+                    z = wp.zeros(14, dtype=float)
+                    wp.launch(three, dim=1, inputs=[z[0:6], z[4:12], z[8:14]])
+                    f = wp.zeros(4, dtype=float)
+                    wp.launch(pun, dim=1, inputs=[wp.array(ptr=f.ptr, dtype=wp.int32, shape=(4,), device=dev), f])
+                    w = wp.array(np.arange(1, 30, dtype=np.float32))
+                    for off in range(8):
+                        wp.launch(chain, dim=1, inputs=[w[off + 1 : off + 6], w[off + 2 : off + 7]])
+                    m = wp.array(np.arange(1, 9, dtype=np.float32))
+                    ones = [wp.ones(1, dtype=float) for _ in range(n)]
+                    wp.launch(mod.many, dim=1, inputs=[*ones, m, m])
+                    return y.numpy(), z.numpy(), f.numpy(), w.numpy(), m.numpy()
+
+            assert_same(both(run))
+            variants = [k for k in chain._metal_alias_psos]
+            assert len(variants) == 1, variants
+            """,
+        )
+
     def test_tile_store_bounds_on_arguments(self):
         # A partial trailing tile must not write past the array's rows.
         _run(
