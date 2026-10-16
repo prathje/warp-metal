@@ -622,6 +622,68 @@ def to_torch(a: warp.array, requires_grad: bool | None = None):
         raise RuntimeError("Unsupported device")
 
 
+def _metal_native_dispatcher(device):
+    """The Metal dispatcher if ``device`` is a native-dispatch Metal device, else ``None``."""
+    device = warp._src.context.get_device(device)
+    if not device.is_metal or not warp.config.metal_native_dispatch:
+        return None
+    from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
+
+    return get_dispatcher()
+
+
+def metal_torch_fence(device=None) -> None:
+    """Order Warp and PyTorch (MPS) work on an Apple GPU without blocking the CPU.
+
+    Warp work issued before the call runs before PyTorch work issued after
+    it, and PyTorch work issued before the call runs before later Warp work.
+    Launches, fills and copies on arrays shared with PyTorch (through
+    :func:`from_torch`, :func:`to_torch` or DLPack) are already ordered this
+    way, like work on one CUDA stream. Call this only when the two frameworks
+    also share memory that Warp does not know about.
+
+    A no-op on devices other than a Metal device.
+
+    Args:
+        device: The Warp device. Defaults to the current device.
+    """
+    disp = _metal_native_dispatcher(device)
+    if disp is not None:
+        disp.torch_fence()
+
+
+class metal_torch_batch:
+    """Context manager that batches Warp launches on arrays shared with PyTorch (MPS).
+
+    On a Metal device, each launch that touches an array shared with PyTorch
+    is committed to the GPU before :func:`launch` returns, so that PyTorch
+    work issued afterwards runs after it. Inside this context such launches
+    are batched like any other, and the ordering is established once on
+    exit. PyTorch must not access the shared arrays inside the context:
+    PyTorch work issued there may run before the batched Warp launches.
+
+    A no-op on devices other than a Metal device.
+
+    Args:
+        device: The Warp device. Defaults to the current device.
+    """
+
+    def __init__(self, device=None):
+        self._device = device
+        self._disp = None
+
+    def __enter__(self):
+        self._disp = _metal_native_dispatcher(self._device)
+        if self._disp is not None:
+            self._disp.begin_torch_batch()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if self._disp is not None:
+            self._disp.end_torch_batch()
+            self._disp = None
+
+
 def stream_from_torch(stream_or_device=None):
     """Convert from a Torch CUDA stream to a Warp CUDA stream.
 

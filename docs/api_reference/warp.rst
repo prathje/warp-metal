@@ -555,6 +555,8 @@ PyTorch Interop
    dtype_from_torch
    dtype_to_torch
    from_torch
+   metal_torch_batch
+   metal_torch_fence
    stream_from_torch
    stream_to_torch
    to_torch

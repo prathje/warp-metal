@@ -545,6 +545,8 @@ from warp._src.torch import device_from_torch as device_from_torch
 from warp._src.torch import device_to_torch as device_to_torch
 from warp._src.torch import stream_from_torch as stream_from_torch
 from warp._src.torch import stream_to_torch as stream_to_torch
+from warp._src.torch import metal_torch_fence as metal_torch_fence
+from warp._src.torch import metal_torch_batch as metal_torch_batch
 
 
 # category: Omniverse Runtime Fabric Interop
