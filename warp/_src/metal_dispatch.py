@@ -1385,6 +1385,9 @@ class MetalDispatcher:
         touches_shared = bool(shared) and (
             any(id(b) in shared for b in inflight[n_inflight:])
             or any(id(b) in shared for b, _m in (extra_resources or ()))
+            # Reached through descriptor gpuAddresses (e.g. the points of a
+            # ``wp.Mesh`` built on a ``wp.from_torch`` array).
+            or (reads_resident and self._resident_shared())
         )
 
         gx, gy, gz = grid
@@ -1476,6 +1479,11 @@ class MetalDispatcher:
                 self._command_queue = queue
                 self._torch_stream = stream
         self._torch_mode = mode
+
+    def _resident_shared(self) -> bool:
+        """Whether a resident (descriptor-reached) buffer is shared."""
+        shared = self._shared_ids
+        return bool(shared) and any(id(r) in shared for r in self._resident_resources)
 
     def is_shared(self, mtl_buf) -> bool:
         """Whether ``mtl_buf`` is shared with another framework (see :meth:`mark_shared`)."""
@@ -2244,7 +2252,7 @@ class MetalDispatcher:
         # at the same cadence as direct ``dispatch`` use.
         self._dispatch_count += graph.count
         shared = self._shared_ids
-        if shared and any(id(r) in shared for r in graph._resources):
+        if shared and (any(id(r) in shared for r in graph._resources) or self._resident_shared()):
             self._cb_shared = True
             if not self._torch_batch_depth:
                 self._flush_shared()

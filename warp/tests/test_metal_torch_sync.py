@@ -355,6 +355,35 @@ class TestMetalTorchSync(unittest.TestCase):
         ) + _INTERLEAVE.format(iters=30, mode="cpu")
         _run(self, code)
 
+    def test_mesh_points_from_torch(self):
+        # A mesh query reads the points through the mesh descriptor, not a
+        # bound argument: Torch's pending write to them must still be
+        # committed first (failed 200 of 200 iterations before).
+        code = """
+        import torch
+
+        @wp.kernel
+        def readp(mesh: wp.uint64, out: wp.array[wp.vec3]):
+            i = wp.tid()
+            out[i] = wp.mesh_get_point(mesh, i)
+
+        pts = torch.tensor([[0.0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0]], device="mps")
+        idx = wp.array([0, 1, 2, 1, 3, 2], dtype=wp.int32, device="metal:0")
+        mesh = wp.Mesh(points=wp.from_torch(pts, dtype=wp.vec3), indices=idx)
+        out = wp.zeros(4, dtype=wp.vec3, device="metal:0")
+        big = torch.randn(1024, 1024, device="mps")
+        bad = []
+        for it in range(100):
+            big = (big @ big).tanh()
+            pts[:, 2] = float(it + 1)
+            wp.launch(readp, dim=4, inputs=[mesh.id, out], device="metal:0")
+            z = out.numpy()[:, 2]
+            if (z != it + 1).any():
+                bad.append((it, z.tolist()))
+        assert not bad, bad[:5]
+        """
+        _run(self, code)
+
 
 class TestMetalTorchSyncHost(unittest.TestCase):
     """Host-side parts that run without a Metal device."""
