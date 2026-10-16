@@ -8149,23 +8149,25 @@ def _emit_tile_cholesky_inplace(n: int, msl_scalar: str) -> str:
     return "\n".join(parts)
 
 
-def _emit_tile_lower_solve_inplace(n: int, k: int, msl_scalar: str) -> str:
+def _emit_tile_lower_solve_inplace(n: int, k: int, msl_scalar: str, l_trans: bool = False) -> str:
     """Emit ``wp_tile_lower_solve_<N>x<K>_<scalar>_inplace``: solve
     ``L * X = B`` in place, where ``L`` is NxN lower-triangular and
     ``B`` is NxK. ``B`` is mutated to hold ``X``.
     """
     L_name = f"wp_tile_{n}x{n}_{msl_scalar}"
     B_name = f"wp_tile_{n}x{k}_{msl_scalar}"
-    name = f"wp_tile_lower_solve_{n}x{k}_{msl_scalar}_inplace"
+    name = f"wp_tile_lower_solve_{n}x{k}_{msl_scalar}_inplace" + ("_lt" if l_trans else "")
     # ``noinline`` for the same reason as ``cholesky_inplace``: 3+
     # inlined copies in one kernel produce silently-zero writes on
     # Metal at N=16. Out-of-lining restores correctness.
+    # ``l_trans``: the factor is passed as the tile it was transposed from.
+    off = f"L.c[kk*{n} + i]" if l_trans else f"L.c[i*{n} + kk]"
     parts: list[str] = [f"__attribute__((noinline)) void {name}(const thread {L_name}& L, thread {B_name}& B) {{"]
     parts.append("    #pragma clang loop unroll(disable)")
     parts.append(f"    for (int i = 0; i < {n}; ++i) {{")
     parts.append(f"        for (int col = 0; col < {k}; ++col) {{")
     parts.append(f"            {msl_scalar} s = B.c[i*{k} + col];")
-    parts.append(f"            for (int kk = 0; kk < i; ++kk) s = metal::fma(-L.c[i*{n} + kk], B.c[kk*{k} + col], s);")
+    parts.append(f"            for (int kk = 0; kk < i; ++kk) s = metal::fma(-{off}, B.c[kk*{k} + col], s);")
     parts.append(f"            B.c[i*{k} + col] = s / L.c[i*{n} + i];")
     parts.append("        }")
     parts.append("    }")
@@ -8173,7 +8175,7 @@ def _emit_tile_lower_solve_inplace(n: int, k: int, msl_scalar: str) -> str:
     return "\n".join(parts)
 
 
-def _emit_tile_upper_solve_inplace(n: int, k: int, msl_scalar: str) -> str:
+def _emit_tile_upper_solve_inplace(n: int, k: int, msl_scalar: str, l_trans: bool = False) -> str:
     """Emit ``wp_tile_upper_solve_<N>x<K>_<scalar>_inplace``: solve
     ``U * X = B`` where ``U`` is upper-triangular. The blocked Cholesky
     solver passes ``transpose(L)`` as ``U`` so we read above the
@@ -8182,17 +8184,17 @@ def _emit_tile_upper_solve_inplace(n: int, k: int, msl_scalar: str) -> str:
     """
     L_name = f"wp_tile_{n}x{n}_{msl_scalar}"
     B_name = f"wp_tile_{n}x{k}_{msl_scalar}"
-    name = f"wp_tile_upper_solve_{n}x{k}_{msl_scalar}_inplace"
+    name = f"wp_tile_upper_solve_{n}x{k}_{msl_scalar}_inplace" + ("_lt" if l_trans else "")
     # ``noinline`` matches ``lower_solve_inplace`` — same Metal compiler
     # inline-bug at 3+ invocations.
+    # ``l_trans``: the factor is passed as the tile it was transposed from.
+    off = f"U.c[kk*{n} + i]" if l_trans else f"U.c[i*{n} + kk]"
     parts: list[str] = [f"__attribute__((noinline)) void {name}(const thread {L_name}& U, thread {B_name}& B) {{"]
     parts.append("    #pragma clang loop unroll(disable)")
     parts.append(f"    for (int i = {n} - 1; i >= 0; --i) {{")
     parts.append(f"        for (int col = 0; col < {k}; ++col) {{")
     parts.append(f"            {msl_scalar} s = B.c[i*{k} + col];")
-    parts.append(
-        f"            for (int kk = i + 1; kk < {n}; ++kk) s = metal::fma(-U.c[i*{n} + kk], B.c[kk*{k} + col], s);"
-    )
+    parts.append(f"            for (int kk = i + 1; kk < {n}; ++kk) s = metal::fma(-{off}, B.c[kk*{k} + col], s);")
     parts.append(f"            B.c[i*{k} + col] = s / U.c[i*{n} + i];")
     parts.append("        }")
     parts.append("    }")
@@ -8200,7 +8202,7 @@ def _emit_tile_upper_solve_inplace(n: int, k: int, msl_scalar: str) -> str:
     return "\n".join(parts)
 
 
-def _emit_tile_lower_solve_inplace_transposed(n: int, k: int, msl_scalar: str) -> str:
+def _emit_tile_lower_solve_inplace_transposed(n: int, k: int, msl_scalar: str, l_trans: bool = False) -> str:
     """Emit ``wp_tile_lower_solve_<N>x<K>_<scalar>_inplace_transposed``: solve
     ``L * X = transpose(A)`` and write the result back to ``A`` such that
     ``A`` ends up holding ``A * L^{-T}``.
@@ -8217,13 +8219,15 @@ def _emit_tile_lower_solve_inplace_transposed(n: int, k: int, msl_scalar: str) -
     """
     L_name = f"wp_tile_{n}x{n}_{msl_scalar}"
     A_name = f"wp_tile_{k}x{n}_{msl_scalar}"
-    name = f"wp_tile_lower_solve_{n}x{k}_{msl_scalar}_inplace_transposed"
+    name = f"wp_tile_lower_solve_{n}x{k}_{msl_scalar}_inplace_transposed" + ("_lt" if l_trans else "")
+    # ``l_trans``: the factor is passed as the tile it was transposed from.
+    off = f"L.c[kk*{n} + i]" if l_trans else f"L.c[i*{n} + kk]"
     parts: list[str] = [f"__attribute__((noinline)) void {name}(const thread {L_name}& L, thread {A_name}& A) {{"]
     parts.append("    #pragma clang loop unroll(disable)")
     parts.append(f"    for (int row = 0; row < {k}; ++row) {{")
     parts.append(f"        for (int i = 0; i < {n}; ++i) {{")
     parts.append(f"            {msl_scalar} s = A.c[row*{n} + i];")
-    parts.append(f"            for (int kk = 0; kk < i; ++kk) s = metal::fma(-L.c[i*{n} + kk], A.c[row*{n} + kk], s);")
+    parts.append(f"            for (int kk = 0; kk < i; ++kk) s = metal::fma(-{off}, A.c[row*{n} + kk], s);")
     parts.append(f"            A.c[row*{n} + i] = s / L.c[i*{n} + i];")
     parts.append("        }")
     parts.append("    }")
@@ -8231,7 +8235,7 @@ def _emit_tile_lower_solve_inplace_transposed(n: int, k: int, msl_scalar: str) -
     return "\n".join(parts)
 
 
-def _emit_tile_upper_solve_inplace_transposed(n: int, k: int, msl_scalar: str) -> str:
+def _emit_tile_upper_solve_inplace_transposed(n: int, k: int, msl_scalar: str, l_trans: bool = False) -> str:
     """Emit ``wp_tile_upper_solve_<N>x<K>_<scalar>_inplace_transposed``: solve
     ``U * X = transpose(A)`` and write the result back to ``A`` such that
     ``A`` ends up holding ``A * U^{-T}``. The fused form mirrors the
@@ -8239,15 +8243,15 @@ def _emit_tile_upper_solve_inplace_transposed(n: int, k: int, msl_scalar: str) -
     """
     L_name = f"wp_tile_{n}x{n}_{msl_scalar}"
     A_name = f"wp_tile_{k}x{n}_{msl_scalar}"
-    name = f"wp_tile_upper_solve_{n}x{k}_{msl_scalar}_inplace_transposed"
+    name = f"wp_tile_upper_solve_{n}x{k}_{msl_scalar}_inplace_transposed" + ("_lt" if l_trans else "")
+    # ``l_trans``: the factor is passed as the tile it was transposed from.
+    off = f"U.c[kk*{n} + i]" if l_trans else f"U.c[i*{n} + kk]"
     parts: list[str] = [f"__attribute__((noinline)) void {name}(const thread {L_name}& U, thread {A_name}& A) {{"]
     parts.append("    #pragma clang loop unroll(disable)")
     parts.append(f"    for (int row = 0; row < {k}; ++row) {{")
     parts.append(f"        for (int i = {n} - 1; i >= 0; --i) {{")
     parts.append(f"            {msl_scalar} s = A.c[row*{n} + i];")
-    parts.append(
-        f"            for (int kk = i + 1; kk < {n}; ++kk) s = metal::fma(-U.c[i*{n} + kk], A.c[row*{n} + kk], s);"
-    )
+    parts.append(f"            for (int kk = i + 1; kk < {n}; ++kk) s = metal::fma(-{off}, A.c[row*{n} + kk], s);")
     parts.append(f"            A.c[row*{n} + i] = s / U.c[i*{n} + i];")
     parts.append("        }")
     parts.append("    }")
@@ -8255,13 +8259,18 @@ def _emit_tile_upper_solve_inplace_transposed(n: int, k: int, msl_scalar: str) -
     return "\n".join(parts)
 
 
-def _emit_tile_matmul(r: int, k: int, n: int, msl_scalar: str) -> str:
+def _emit_tile_matmul(r: int, k: int, n: int, msl_scalar: str, trans_a: bool = False, trans_b: bool = False) -> str:
     """Emit ``wp_tile_matmul_RxKxN_<scalar>`` — ``C = beta*C + alpha*A*B``.
 
     A is RxK, B is KxN, C is RxN. All three are passed as struct values
     (C by reference so writes propagate). Used as ``tile_matmul_acc``'s
     backing helper at single-thread block_dim=1; cooperative parallelism
     is task #19 follow-up.
+
+    ``trans_a`` / ``trans_b`` emit ``wp_tile_matmul_t{a,b,ab}_RxKxN_<scalar>``,
+    which takes that operand as the KxR / NxK tile it was transposed from
+    (see ``_fold_tile_transpose_views``). The arithmetic and summation order
+    are the same as for the plain helper on a materialised transpose.
     """
     # A 1x1 tile is a plain scalar local (see ``_msl_var_type``).
     def _ty(a: int, b: int) -> str:
@@ -8270,10 +8279,13 @@ def _emit_tile_matmul(r: int, k: int, n: int, msl_scalar: str) -> str:
     def _el(v: str, a: int, b: int, idx: str) -> str:
         return v if a == 1 and b == 1 else f"{v}.c[{idx}]"
 
-    A = _ty(r, k)
-    B = _ty(k, n)
+    A = _ty(k, r) if trans_a else _ty(r, k)
+    B = _ty(n, k) if trans_b else _ty(k, n)
     C = _ty(r, n)
-    name = f"wp_tile_matmul_{r}x{k}x{n}_{msl_scalar}"
+    flags = ("a" if trans_a else "") + ("b" if trans_b else "")
+    name = f"wp_tile_matmul_t{flags}_{r}x{k}x{n}_{msl_scalar}" if flags else f"wp_tile_matmul_{r}x{k}x{n}_{msl_scalar}"
+    a_elem = _el("A", k, r, f"kk*{r} + i") if trans_a else _el("A", r, k, f"i*{k} + kk")
+    b_elem = _el("B", n, k, f"j*{k} + kk") if trans_b else _el("B", k, n, f"kk*{n} + j")
     # ``noinline`` because mujoco_warp's blocked-Cholesky factor calls
     # this 5+ times per outer iteration. Inlining all copies tipped
     # past the Metal compiler's threshold and silently dropped writes
@@ -8289,7 +8301,7 @@ def _emit_tile_matmul(r: int, k: int, n: int, msl_scalar: str) -> str:
     # Explicit ``fma`` accumulator: ``-ffast-math`` allows reassociation,
     # and on G1's H structure the rank-1 updates lose enough precision
     # in float32 to corrupt the downstream Cholesky pivot.
-    parts.append(f"                s = metal::fma({_el('A', r, k, f'i*{k} + kk')}, {_el('B', k, n, f'kk*{n} + j')}, s);")
+    parts.append(f"                s = metal::fma({a_elem}, {b_elem}, s);")
     parts.append("            }")
     # ``beta * C + alpha * s`` is also a fused-multiply-add candidate.
     c_el = _el("C", r, n, f"i*{n} + j")
@@ -9468,6 +9480,12 @@ def _build_kernel_header(source: str) -> str:
         matmul_seen.add((r_, k_, n_, sc_))
     for r_, k_, n_, sc_ in sorted(matmul_seen):
         parts.append(_emit_tile_matmul(r_, k_, n_, sc_))
+    matmul_t_pat = re.compile(r"\bwp_tile_matmul_t(ab|a|b)_(\d+)x(\d+)x(\d+)_(\w+)\b")
+    matmul_t_seen: set[tuple[str, int, int, int, str]] = set()
+    for m in matmul_t_pat.finditer(source):
+        matmul_t_seen.add((m.group(1), int(m.group(2)), int(m.group(3)), int(m.group(4)), m.group(5)))
+    for fl_, r_, k_, n_, sc_ in sorted(matmul_t_seen):
+        parts.append(_emit_tile_matmul(r_, k_, n_, sc_, trans_a="a" in fl_, trans_b="b" in fl_))
     chol_inplace_pat = re.compile(r"\bwp_tile_(\d+)x(\d+)_(\w+)_cholesky_inplace\b")
     chol_inplace_seen: set[tuple[int, str]] = set()
     for m in chol_inplace_pat.finditer(source):
@@ -9500,6 +9518,21 @@ def _build_kernel_header(source: str) -> str:
         parts.append(_emit_tile_lower_solve_inplace_transposed(n_, k_, sc_))
     for n_, k_, sc_ in sorted(usolve_t_seen):
         parts.append(_emit_tile_upper_solve_inplace_transposed(n_, k_, sc_))
+    # ``..._lt``: the triangular factor is a folded ``tile_transpose`` read
+    # through its source tile (see ``_fold_tile_transpose_views``).
+    solve_lt_pat = re.compile(r"\bwp_tile_(lower|upper)_solve_(\d+)x(\d+)_(\w+?)_inplace(_transposed)?_lt\b")
+    solve_lt_emit = {
+        ("lower", False): _emit_tile_lower_solve_inplace,
+        ("upper", False): _emit_tile_upper_solve_inplace,
+        ("lower", True): _emit_tile_lower_solve_inplace_transposed,
+        ("upper", True): _emit_tile_upper_solve_inplace_transposed,
+    }
+    solve_lt_seen = {
+        (m.group(1), bool(m.group(5)), int(m.group(2)), int(m.group(3)), m.group(4))
+        for m in solve_lt_pat.finditer(source)
+    }
+    for kind_, tr_, n_, k_, sc_ in sorted(solve_lt_seen):
+        parts.append(solve_lt_emit[(kind_, tr_)](n_, k_, sc_, l_trans=True))
     cholesky_pat = re.compile(r"\bwp_tile_(\d+)x(\d+)_(\w+)_cholesky\b(?!_solve|_inplace|_coop)")
     cholesky_solve_pat = re.compile(r"\bwp_tile_(\d+)x(\d+)_(\w+)_cholesky_solve_(\d+)\b")
     coop_cholesky_pat = re.compile(r"\bwp_tile_(\d+)x(\d+)_(\w+)_cholesky_coop\b")
@@ -11333,6 +11366,204 @@ def _cholesky_tpl_upper(call: str) -> bool:
     return m is not None and m.group(1) in ("true", "1")
 
 
+# ``var_T = wp::tile_transpose(var_S);`` as a whole IR statement.
+_TILE_TRANSPOSE_STMT_PAT = re.compile(r"^\s*var_(\w+)\s*=\s*wp::tile_transpose\s*\(\s*var_(\w+)\s*\)\s*;\s*$")
+_TILE_STORE_SRC_PAT = re.compile(r"\bwp::tile_store\s*<[^()]*>\s*\(([^)]*)\)")
+_TILE_EXTRACT_SRC_PAT = re.compile(r"\bwp::tile_extract\s*\(\s*var_(\w+)\s*,")
+# ``var_C = wp::tile_zeros<T, R, C>();`` / ``tile_ones`` as a whole IR statement.
+_TILE_CONST_STMT_PAT = re.compile(r"^\s*var_(\w+)\s*=\s*wp::tile_(zeros|ones)\s*<[^()]*>\s*\(\s*\)\s*;\s*$")
+
+
+def _ir_call_args(line: str, pat: re.Pattern) -> list[list[str]]:
+    """Comma-split argument lists of every ``pat`` call on ``line``."""
+    return [[a.strip() for a in m.group(1).split(",")] for m in pat.finditer(line)]
+
+
+def _fold_tile_transpose_views(
+    lines: list[str],
+    tile_var_dims: dict[str, tuple[int, int, str]],
+    tile_var_vec_n: dict[str, int],
+) -> tuple[list[str], dict[str, str]]:
+    """Read ``tile_transpose`` results through their source tile.
+
+    On CUDA and CPU ``wp.tile_transpose(S)`` is a layout view of ``S``. The
+    serial Metal model holds tiles in private structs, so a transpose is a
+    full copy, and kernels that transpose large tiles (Kamino's blocked LLT
+    at ``block_size=64``: nine 16 KB tiles) exceed the per-thread stack the
+    Apple GPU compiler allows ("Compute function exceeds available stack
+    space", or an XPC crash of the compiler service).
+
+    A transpose ``T = transpose(S)`` is dropped when ``T`` has this one
+    definition and every use of ``T`` is one of:
+
+    - the ``A`` or ``B`` operand of ``tile_matmul`` (not ``C``, and ``C`` is
+      not ``S``): the translator reads ``S`` with swapped indices;
+    - the ``B`` operand of ``tile_lower/upper_solve_inplace``: the existing
+      transposed solve helper updates ``S`` in place, as the CUDA view does;
+    - the source of ``U = transpose(T)``, where ``U`` has one definition and
+      is only read (matmul ``A``/``B``, ``tile_store`` source, ``tile_extract``,
+      solve ``L``, another transpose): ``U`` is ``S`` itself, so its uses are
+      renamed to ``S``.
+
+    - the triangular factor (``L``) of a solve, or a ``tile_store`` source:
+      the translators read ``S`` with swapped indices.
+
+    Between a dropped transpose and its last use, ``S`` may only be read
+    (or updated through the ``T`` solve), so the folded reads see the values
+    the copy would have held. Scalar 2-D tiles only.
+
+    A ``tile_zeros`` / ``tile_ones`` tile whose only uses are ``tile_store``
+    sources is dropped too; the stores write the constant.
+
+    Returns the rewritten lines, ``{T: S}`` and ``{C: value}`` for the
+    translators.
+    """
+    defs: dict[str, int] = {}
+    for line in lines:
+        for m in re.finditer(r"\bvar_(\w+)\s*=(?!=)", line):
+            defs[m.group(1)] = defs.get(m.group(1), 0) + 1
+    tdefs: dict[str, tuple[int, str]] = {}
+    cdefs: dict[str, tuple[int, float]] = {}
+    for i, line in enumerate(lines):
+        m = _TILE_TRANSPOSE_STMT_PAT.match(line)
+        if m is not None:
+            tdefs[m.group(1)] = (i, m.group(2))
+        m = _TILE_CONST_STMT_PAT.match(line)
+        if m is not None:
+            cdefs[m.group(1)] = (i, 0.0 if m.group(2) == "zeros" else 1.0)
+    if not tdefs and not cdefs:
+        return lines, {}, {}
+
+    def _ref(label: str) -> re.Pattern:
+        return re.compile(rf"\bvar_{re.escape(label)}\b")
+
+    def _uses(label: str, start: int) -> list[int] | None:
+        pat = _ref(label)
+        idx = [i for i, ln in enumerate(lines) if pat.search(ln) and i != start]
+        if any(i < start for i in idx):
+            return None
+        return idx
+
+    def _scalar2d(label: str) -> bool:
+        d = tile_var_dims.get(label)
+        return d is not None and d[0] > 1 and d[1] > 1 and not tile_var_vec_n.get(label)
+
+    def _reads_only(line: str, label: str) -> bool:
+        # Every mention of ``var_label`` on ``line`` is a read position.
+        tok = f"var_{label}"
+        n = len(_ref(label).findall(line))
+        seen = 0
+        for args in _ir_call_args(line, _TILE_MATMUL_ACC_PAT) + _ir_call_args(line, _TILE_MATMUL_ASSIGN_PAT):
+            if len(args) == 8 and args[5] != tok:
+                seen += args[3:5].count(tok)
+        for args in _ir_call_args(line, _TILE_LOWER_SOLVE_INPLACE_PAT) + _ir_call_args(
+            line, _TILE_UPPER_SOLVE_INPLACE_PAT
+        ):
+            if len(args) == 3 and args[1] == tok and args[2] != tok:
+                seen += 1
+        for args in _ir_call_args(line, _TILE_STORE_SRC_PAT):
+            if args and args[-1] == tok:
+                seen += 1
+        seen += sum(1 for m in _TILE_EXTRACT_SRC_PAT.finditer(line) if m.group(1) == label)
+        m = _TILE_TRANSPOSE_STMT_PAT.match(line)
+        if m is not None and m.group(2) == label:
+            seen += 1
+        return seen == n and not re.search(rf"\b{tok}\s*(?:\.|\[|=(?!=))", line)
+
+    def _range_ok(src: str, lo: int, hi: int, allowed: set[int]) -> bool:
+        pat = _ref(src)
+        return all(i in allowed or not pat.search(lines[i]) or _reads_only(lines[i], src) for i in range(lo, hi + 1))
+
+    views: dict[str, str] = {}
+    renames: dict[str, str] = {}
+    drop: set[int] = set()
+    for t_label, (t_line, s_label) in tdefs.items():
+        if defs.get(t_label) != 1 or s_label == t_label or s_label in views or s_label in renames:
+            continue
+        if not (_scalar2d(t_label) and _scalar2d(s_label)):
+            continue
+        st, tt = tile_var_dims[s_label], tile_var_dims[t_label]
+        if (st[0], st[1], st[2]) != (tt[1], tt[0], tt[2]):
+            continue
+        uses = _uses(t_label, t_line)
+        if not uses:
+            continue
+        tok = f"var_{t_label}"
+        ok = True
+        solve_lines: set[int] = set()
+        inner: list[tuple[int, str, list[int]]] = []
+        for i in uses:
+            line = lines[i]
+            n = len(_ref(t_label).findall(line))
+            mm = [
+                a
+                for a in _ir_call_args(line, _TILE_MATMUL_ACC_PAT) + _ir_call_args(line, _TILE_MATMUL_ASSIGN_PAT)
+                if len(a) == 8
+            ]
+            if mm and all(a[5] not in (tok, f"var_{s_label}") for a in mm):
+                if sum(a[3:5].count(tok) for a in mm) == n and not re.search(rf"\b{tok}\s*=(?!=)", line):
+                    continue
+            sv = _ir_call_args(line, _TILE_LOWER_SOLVE_INPLACE_PAT) + _ir_call_args(line, _TILE_UPPER_SOLVE_INPLACE_PAT)
+            if n == 1 and len(sv) == 1 and len(sv[0]) == 3 and sv[0][2] == tok and sv[0][1] != f"var_{s_label}":
+                solve_lines.add(i)
+                continue
+            if n == 1 and len(sv) == 1 and len(sv[0]) == 3 and sv[0][1] == tok and sv[0][2] != f"var_{s_label}":
+                # The triangular factor of a solve: read only.
+                continue
+            st_args = _ir_call_args(line, _TILE_STORE_SRC_PAT)
+            if n == 1 and len(st_args) == 1 and st_args[0][-1] == tok:
+                continue
+            m = _TILE_TRANSPOSE_STMT_PAT.match(line)
+            if m is not None and m.group(2) == t_label and defs.get(m.group(1)) == 1:
+                u_label = m.group(1)
+                u_uses = _uses(u_label, i)
+                ud = tile_var_dims.get(u_label)
+                if u_uses is not None and ud is not None and ud == st and not tile_var_vec_n.get(u_label):
+                    if all(_reads_only(lines[j], u_label) for j in u_uses):
+                        inner.append((i, u_label, u_uses))
+                        continue
+            ok = False
+            break
+        if not ok:
+            continue
+        last = max([*uses, *(j for _i, _u, uu in inner for j in uu)])
+        if not _range_ok(s_label, t_line + 1, last, solve_lines):
+            continue
+        views[t_label] = s_label
+        drop.add(t_line)
+        for i, u_label, _uu in inner:
+            renames[u_label] = s_label
+            drop.add(i)
+    # ``C = tile_zeros/ones(...)`` that is only ever a ``tile_store`` source:
+    # the store writes the constant, and no tile is materialised.
+    fills: dict[str, float] = {}
+    for c_label, (c_line, value) in cdefs.items():
+        if defs.get(c_label) != 1 or not _scalar2d(c_label):
+            continue
+        uses = _uses(c_label, c_line)
+        tok = f"var_{c_label}"
+        if uses and all(
+            len(_ref(c_label).findall(lines[i])) == 1
+            and len(_ir_call_args(lines[i], _TILE_STORE_SRC_PAT)) == 1
+            and _ir_call_args(lines[i], _TILE_STORE_SRC_PAT)[0][-1] == tok
+            for i in uses
+        ):
+            fills[c_label] = value
+            drop.add(c_line)
+    if not views and not fills:
+        return lines, {}, {}
+    out: list[str] = []
+    for i, line in enumerate(lines):
+        if i in drop:
+            out.append(f"    // tile_transpose folded into its uses: {line.strip()}")
+            continue
+        new_line = line
+        for u_label, s_label in renames.items():
+            new_line = _ref(u_label).sub(f"var_{s_label}", new_line)
+        out.append(new_line)
+    return out, views, fills
+
+
 # ``tile_lower_solve_inplace(0, L_tile, B_tile)`` — solve ``L X = B``
 # for X, mutating B. The CPU/no-MathDx dispatch returns
 # ``(0, L, y)`` with empty templates, so the IR emits this builtin
@@ -11550,9 +11781,15 @@ def _translate_tile_intrinsics(
     coop_block_n: int = 0,
     f64_arr_names: set[str] | None = None,
     tile_2d_labels: set[str] | None = None,
+    transpose_views: dict[str, str] | None = None,
+    fill_tiles: dict[str, float] | None = None,
 ) -> str:
     if tile_2d_labels is None:
         tile_2d_labels = set()
+    if transpose_views is None:
+        transpose_views = {}
+    if fill_tiles is None:
+        fill_tiles = {}
     if shaped_array_names is None:
         shaped_array_names = set()
     if f64_arr_names is None:
@@ -11809,6 +12046,28 @@ def _translate_tile_intrinsics(
             return f"({lead_ok}) && ({r}) >= 0 && ({r}) < {n_rows_expr} && ({c}) >= 0 && ({c}) < {n_cols_expr}"
 
         is_f64_dst = arr_name in f64_arr_names
+        if tile_label in transpose_views or tile_label in fill_tiles:
+            # A folded ``tile_transpose`` (element ``(i, j)`` is ``(j, i)`` of
+            # its source) or a constant tile that is only ever stored (see
+            # ``_fold_tile_transpose_views``): write the elements directly.
+            if vec_n_elem > 0 or not two_d:
+                raise MetalCodegenError(f"MSL codegen: folded tile_store of a non-2-D tile (statement: {m.group(0)!r})")
+            if tile_label in fill_tiles:
+                value = _sc_lit(msl_scalar, fill_tiles[tile_label])
+            else:
+                value = f"var_{transpose_views[tile_label]}.c[_ts_j * {rows} + _ts_i]"
+            if is_f64_dst:
+                value = f"wp_f32_to_f64({value})"
+            target = f"{arr}[{base_expr} + (({row_off}) + _ts_i) * ({row_stride}) + (({col_off}) + _ts_j)]"
+            write = (
+                f"atomic_store_explicit(&{target}, {value}, memory_order_relaxed);"
+                if arr_name in atomic_output_names
+                else f"{target} = {value};"
+            )
+            return (
+                f"{{ for (int _ts_i = 0; _ts_i < {rows}; ++_ts_i) for (int _ts_j = 0; _ts_j < {cols}; ++_ts_j) "
+                f"if ({_ok('(' + row_off + ') + _ts_i', '(' + col_off + ') + _ts_j')}) {{ {write} }} }}"
+            )
         if is_f64_dst and (tile_label in distributed_tiles or tile_label in smem_tiles):
             raise MetalCodegenError(
                 f"MSL codegen: tile_store into a demoted float64 array from a lane-distributed or "
@@ -12950,7 +13209,23 @@ def _translate_tile_intrinsics(
         rC, nC, scalar = c_dims
         if kA != kB or rA != rC or nB != nC:
             return m.group(0)
-        helper = f"wp_tile_matmul_{rA}x{kA}x{nB}_{scalar}"
+        # A folded ``tile_transpose`` operand (see ``_fold_tile_transpose_views``)
+        # is read from its source tile with swapped indices.
+        t_flags = ""
+        if a_label in transpose_views:
+            a_arg = f"var_{transpose_views[a_label]}"
+            t_flags += "a"
+        if b_label in transpose_views:
+            b_arg = f"var_{transpose_views[b_label]}"
+            t_flags += "b"
+        if t_flags:
+            if a_scalar != scalar or b_scalar != scalar:
+                raise MetalCodegenError(
+                    "MSL codegen: tile_matmul on a transposed tile with mixed operand precisions is not supported"
+                )
+            helper = f"wp_tile_matmul_t{t_flags}_{rA}x{kA}x{nB}_{scalar}"
+        else:
+            helper = f"wp_tile_matmul_{rA}x{kA}x{nB}_{scalar}"
         # Mixed operand precisions (``tile_matmul(float, half, double)`` in
         # ``example_tile_matmul``): the helper is typed on the accumulator's
         # scalar, so widen the differing operand(s) into temporaries first.
@@ -13056,7 +13331,15 @@ def _translate_tile_intrinsics(
         n = L_dims[0]
         k_cols = B_dims[1]
         scalar = L_dims[2]
-        helper = f"wp_tile_{kind}_solve_{n}x{k_cols}_{scalar}_inplace"
+        lt = ""
+        if L_label in transpose_views:
+            # Folded transpose: read the factor through its source tile.
+            L_arg = f"var_{transpose_views[L_label]}"
+            lt = "_lt"
+        if B_label in transpose_views:
+            # Folded transpose: no copy of ``B`` exists to refresh.
+            return f"wp_tile_{kind}_solve_{n}x{k_cols}_{scalar}_inplace_transposed{lt}({L_arg}, var_{transpose_views[B_label]})"
+        helper = f"wp_tile_{kind}_solve_{n}x{k_cols}_{scalar}_inplace{lt}"
         call = f"{helper}({L_arg}, {B_arg})"
         if view_aliases is not None and B_label in view_aliases:
             parent_label, prows, pcols, vrows, vcols, vscalar, row_off, col_off = view_aliases[B_label]
@@ -13077,7 +13360,7 @@ def _translate_tile_intrinsics(
             src_dims = tile_var_dims.get(src_label)
             if src_dims is not None:
                 src_rows, src_cols, _src_scalar = src_dims
-                helper_t = f"wp_tile_{kind}_solve_{n}x{k_cols}_{scalar}_inplace_transposed"
+                helper_t = f"wp_tile_{kind}_solve_{n}x{k_cols}_{scalar}_inplace_transposed{lt}"
                 # The fused call updates the SOURCE tile; the transpose
                 # local ``B`` is a stale copy (on CUDA it's a layout view,
                 # so reads of it after the solve see the update). Refresh
@@ -17096,6 +17379,14 @@ def _generate_msl_kernel_uncached(
     # we emit an explicit transpose-back writeback. This map drives
     # that emission. Populated by ``repl_transpose_notpl``.
     transpose_aliases: dict[str, str] = {}
+    # Transposes read through their source tile (forward bodies of serial
+    # kernels; see ``_fold_tile_transpose_views``).
+    transpose_views: dict[str, str] = {}
+    fill_tiles: dict[str, float] = {}
+    if not adjoint and coop_block_n == 0:
+        forward_lines, transpose_views, fill_tiles = _fold_tile_transpose_views(
+            forward_lines, tile_var_dims, tile_var_vec_n
+        )
     # Pre-scan: a kernel goes "cooperative" when any of its
     # ``tile_cholesky`` / ``tile_cholesky_inplace`` calls applies to a
     # square tile in the cooperative range. Determining this *before*
@@ -17372,6 +17663,8 @@ def _generate_msl_kernel_uncached(
             coop_block_n,
             f64_arr_names=f64_arr_names,
             tile_2d_labels=tile_2d_labels,
+            transpose_views=transpose_views,
+            fill_tiles=fill_tiles,
         )
         # Inline subscripts that the address-collapse produced.
         translated = _substitute_subscripts(translated)
