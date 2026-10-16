@@ -632,6 +632,47 @@ class TestMetalR3Tiles(unittest.TestCase):
             """,
         )
 
+    def test_tile_cholesky_solve_1x1_factor(self):
+        # A 1x1 factor is a scalar local; a (1, K) right-hand side must divide
+        # element-wise (both fill modes, in- and out-of-place).
+        _run(
+            self,
+            """
+            @wp.kernel(module="unique")
+            def kl(A: wp.array2d[float], B: wp.array2d[float], X: wp.array2d[float], Y: wp.array2d[float]):
+                i, lane = wp.tid()
+                U = wp.tile_load(A, shape=(1, 1))
+                wp.tile_cholesky_inplace(U, fill_mode="lower")
+                b = wp.tile_load(B, shape=(1, 3))
+                wp.tile_store(X, wp.tile_cholesky_solve(U, b, fill_mode="lower"))
+                wp.tile_cholesky_solve_inplace(U, b, fill_mode="lower")
+                wp.tile_store(Y, b)
+
+            @wp.kernel(module="unique")
+            def ku(A: wp.array2d[float], B: wp.array2d[float], X: wp.array2d[float], Y: wp.array2d[float]):
+                i, lane = wp.tid()
+                U = wp.tile_load(A, shape=(1, 1))
+                wp.tile_cholesky_inplace(U, fill_mode="upper")
+                b = wp.tile_load(B, shape=(1, 3))
+                wp.tile_store(X, wp.tile_cholesky_solve(U, b, fill_mode="upper"))
+                wp.tile_cholesky_solve_inplace(U, b, fill_mode="upper")
+                wp.tile_store(Y, b)
+
+            def run(dev):
+                res = []
+                with wp.ScopedDevice(dev):
+                    for k in (kl, ku):
+                        X = wp.zeros((1, 3), dtype=float)
+                        Y = wp.zeros((1, 3), dtype=float)
+                        wp.launch_tiled(k, dim=1, inputs=[wp.array([[4.0]], dtype=float),
+                                        wp.array([[1.0, 2.0, 3.0]], dtype=float), X, Y], block_dim=32)
+                        res += [X.numpy(), Y.numpy()]
+                return res
+
+            assert_same(both(run))
+            """,
+        )
+
     def test_tile_store_bounds_on_arguments(self):
         # A partial trailing tile must not write past the array's rows.
         _run(

@@ -12053,6 +12053,13 @@ def _translate_tile_intrinsics(
         # L*L^T*x = b with scalar L is x = b / (L*L).
         if n == 1 and k == 1:
             return f"var_{lhs} = {b_arg} / ({L_arg} * {L_arg})"
+        if n == 1:
+            # A 1x1 factor is a scalar local (``_msl_var_type``); a (1, K)
+            # right-hand side divides element-wise.
+            return (
+                f"{{ for (int _cs_i = 0; _cs_i < {k}; ++_cs_i) "
+                f"var_{lhs}.c[_cs_i] = {b_arg}.c[_cs_i] / ({L_arg} * {L_arg}); }}"
+            )
         # Vector-RHS solves in the cooperative range distribute each
         # substitution row's dot product across the 32 lanes (simd_sum
         # reduce + broadcast; no smem). This also fires in kernels that
@@ -13440,6 +13447,16 @@ def _translate_tile_intrinsics(
         scalar = L_dims[2]
         if n == 1 and k_cols == 1:
             return f"{b_arg} = {b_arg} / ({L_arg} * {L_arg})"
+        if n == 1:
+            call = (
+                f"{{ for (int _cs_i = 0; _cs_i < {k_cols}; ++_cs_i) "
+                f"{b_arg}.c[_cs_i] = {b_arg}.c[_cs_i] / ({L_arg} * {L_arg}); }}"
+            )
+            if view_aliases is not None and b_label in view_aliases:
+                parent_label, prows, pcols, vrows, vcols, vscalar, row_off, col_off = view_aliases[b_label]
+                wb = _emit_tile_writeback(parent_label, prows, pcols, vrows, vcols, vscalar, row_off, col_off, b_arg)
+                return f"{call};\n{wb}"
+            return call
         helper = f"wp_tile_{n}x{n}_{scalar}_cholesky_solve_{k_cols}"
         call = f"{b_arg} = {helper}({L_arg}, {b_arg})"
         if view_aliases is not None and b_label in view_aliases:
