@@ -26,6 +26,7 @@ import atexit
 import ctypes
 import hashlib
 import os
+import re
 import struct
 import threading
 from typing import Any
@@ -195,6 +196,32 @@ def _autoflush_from_env() -> int:
 def _u32(value: int) -> tuple[bytes, int]:
     """Pack an int as a 4-byte setBytes binding tuple."""
     return ((value & 0xFFFFFFFF).to_bytes(4, "little"), 4)
+
+
+# Per-thread private tile storage above which a kernel's PSO is kept out of
+# indirect command buffers for eager dispatch (see ``MetalDispatcher.compile``).
+# Measured on Apple M1: a 16 KiB private tile replays from an ICB after it has
+# run, 24 KiB fails.
+_LARGE_PRIVATE_BYTES = 16 * 1024
+_TILE_DECL_PAT = re.compile(r"^\s*wp_tile_(\d+)x(\d+)_(?:vec(\d+)_)?(\w+?)\s+var_\w+\s*;", re.MULTILINE)
+_SCALAR_BYTES = {"float": 4, "int": 4, "uint": 4, "half": 2, "short": 2, "ushort": 2, "char": 1, "uchar": 1}
+
+
+def _large_private_memory(source: str) -> bool:
+    """Whether the kernel's private tile locals exceed ``_LARGE_PRIVATE_BYTES``.
+
+    Sums the ``wp_tile_RxC_<scalar>`` locals the Metal codegen declares; other
+    stack use is not counted, so this is a lower bound.
+    """
+    if "wp_tile_" not in source:
+        return False
+    total = 0
+    for m in _TILE_DECL_PAT.finditer(source):
+        rows, cols, vec, scalar = int(m.group(1)), int(m.group(2)), int(m.group(3) or 1), m.group(4)
+        total += rows * cols * vec * _SCALAR_BYTES.get(scalar, 8)
+        if total > _LARGE_PRIVATE_BYTES:
+            return True
+    return False
 
 
 class MetalGraph:
@@ -615,6 +642,8 @@ class MetalDispatcher:
         # environment; ``enable_dispatch_profile()`` toggles at runtime.
         self._profile_dispatch = bool(int(os.environ.get("WARP_METAL_PROFILE_DISPATCH", "0") or "0"))
         self._pso_name: dict[int, str] = {}
+        # Direct-dispatch PSO id -> (source, entry point) of its ICB-capable twin.
+        self._icb_twin_src: dict[int, tuple[str, str]] = {}
         # entry_point -> [count, total_ns, total_grid]
         self._dispatch_stats: dict[str, list] = {}
         # Allocation guard / canary settings — read once here rather than
@@ -633,8 +662,17 @@ class MetalDispatcher:
     # Compilation
     # ------------------------------------------------------------------
 
-    def compile(self, source: str, entry_point: str):
+    def compile(self, source: str, entry_point: str, icb: bool | None = None):
         """Return a ``MTLComputePipelineState`` for ``entry_point`` in ``source``.
+
+        ``icb`` selects whether the PSO may be encoded into an indirect
+        command buffer (graph capture). ``None`` decides from the source:
+        kernels with large per-thread private tiles (see
+        :func:`_large_private_memory`) get a direct-dispatch PSO, and
+        :meth:`_record_dispatch` swaps in an ICB-capable twin, compiled on
+        first capture. Once an ICB-capable PSO with that much private memory
+        has run, the Apple GPU driver fails every later indirect-command-
+        buffer execution in the process with "Insufficient Memory".
 
         Caches the compiled library and pipeline state — subsequent
         compiles with the same source are O(dict lookup).
@@ -644,7 +682,13 @@ class MetalDispatcher:
         the archive reload in ~0.1 ms instead of paying ~20 ms back-end
         compile each time.
         """
-        key = (self._hash(source), entry_point)
+        if icb is None:
+            icb = not _large_private_memory(source)
+            if not icb:
+                pso = self.compile(source, entry_point, icb=False)
+                self._icb_twin_src[id(pso)] = (source, entry_point)
+                return pso
+        key = (self._hash(source), entry_point) if icb else (self._hash(source), entry_point, "direct")
         cached = self._pipeline_cache.get(key)
         if cached is not None:
             return cached
@@ -698,7 +742,7 @@ class MetalDispatcher:
             # runtime perf for kernels that never end up in an ICB; we
             # measured no observable regression on the existing
             # ``test_metal_*`` suite, so enable it unconditionally.
-            pso_desc.setSupportIndirectCommandBuffers_(True)
+            pso_desc.setSupportIndirectCommandBuffers_(icb)
             if self._archive is not None:
                 pso_desc.setBinaryArchives_([self._archive])
             pso, err = self._device.newComputePipelineStateWithDescriptor_error_(pso_desc, None)
@@ -2547,6 +2591,10 @@ class MetalDispatcher:
         conflicts on any shared buffer with the still-open chunk, the
         chunk is closed and a new one starts here.
         """
+        twin = self._icb_twin_src.get(id(pso))
+        if twin is not None:
+            pso = self.compile(twin[0], twin[1], icb=True)
+
         st = self._record_state
         assert st is not None  # caller checked
         if st["count"] >= st["max"]:
