@@ -606,6 +606,15 @@ def _emit_big_vec_struct(name: str, n: int, msl_scalar: str) -> str:
             body_lines.append(f"    r.c[{i}] = s {op} a.c[{i}];")
         body_lines.append("    return r;")
         body_lines.append("}")
+    # Element-wise ``wp.abs(v)`` lowers to ``metal::abs(v)``; give the
+    # struct an overload there (``max(abs(qd))`` in Newton's example checks).
+    if msl_scalar in ("float", "half", "int", "short", "char", "long"):
+        body_lines.append(f"namespace metal {{ inline {name} abs({name} a) {{")
+        body_lines.append(f"    {name} r;")
+        for i in range(n):
+            body_lines.append(f"    r.c[{i}] = metal::abs(a.c[{i}]);")
+        body_lines.append("    return r;")
+        body_lines.append("} }")
     # Compound assignment. Defining ``operator+`` does NOT give C++ (or
     # MSL) ``operator+=``, and the generic reverse-mode templates in
     # ``_ADJ_HELPERS`` accumulate with ``+=`` / ``-=`` on whatever type
@@ -7658,6 +7667,12 @@ def _emit_tile_struct(rows: int, cols: int, msl_scalar: str) -> str:
     parts.append(f"struct {name} {{")
     parts.append(f"    {msl_scalar} c[{n}];")
     parts.append("};")
+    # Element-wise accumulate: reverse-mode IR adds one tile dual into
+    # another (``adj_a += adj_b``) when a tile value is copied.
+    parts.append(f"inline thread {name}& operator+=(thread {name}& a, {name} b) {{")
+    parts.append(f"    for (int i = 0; i < {n}; ++i) a.c[i] += b.c[i];")
+    parts.append("    return a;")
+    parts.append("}")
     # Load: read an ``rows × cols`` sub-block from a row-major array. MLX
     # selects the address space (``device`` vs ``constant``) per kernel
     # argument based on size — small read-only buffers (e.g. a 6-element
@@ -8248,9 +8263,16 @@ def _emit_tile_matmul(r: int, k: int, n: int, msl_scalar: str) -> str:
     backing helper at single-thread block_dim=1; cooperative parallelism
     is task #19 follow-up.
     """
-    A = f"wp_tile_{r}x{k}_{msl_scalar}"
-    B = f"wp_tile_{k}x{n}_{msl_scalar}"
-    C = f"wp_tile_{r}x{n}_{msl_scalar}"
+    # A 1x1 tile is a plain scalar local (see ``_msl_var_type``).
+    def _ty(a: int, b: int) -> str:
+        return msl_scalar if a == 1 and b == 1 else f"wp_tile_{a}x{b}_{msl_scalar}"
+
+    def _el(v: str, a: int, b: int, idx: str) -> str:
+        return v if a == 1 and b == 1 else f"{v}.c[{idx}]"
+
+    A = _ty(r, k)
+    B = _ty(k, n)
+    C = _ty(r, n)
     name = f"wp_tile_matmul_{r}x{k}x{n}_{msl_scalar}"
     # ``noinline`` because mujoco_warp's blocked-Cholesky factor calls
     # this 5+ times per outer iteration. Inlining all copies tipped
@@ -8267,10 +8289,11 @@ def _emit_tile_matmul(r: int, k: int, n: int, msl_scalar: str) -> str:
     # Explicit ``fma`` accumulator: ``-ffast-math`` allows reassociation,
     # and on G1's H structure the rank-1 updates lose enough precision
     # in float32 to corrupt the downstream Cholesky pivot.
-    parts.append(f"                s = metal::fma(A.c[i*{k} + kk], B.c[kk*{n} + j], s);")
+    parts.append(f"                s = metal::fma({_el('A', r, k, f'i*{k} + kk')}, {_el('B', k, n, f'kk*{n} + j')}, s);")
     parts.append("            }")
     # ``beta * C + alpha * s`` is also a fused-multiply-add candidate.
-    parts.append(f"            C.c[i*{n} + j] = metal::fma(alpha, s, beta * C.c[i*{n} + j]);")
+    c_el = _el("C", r, n, f"i*{n} + j")
+    parts.append(f"            {c_el} = metal::fma(alpha, s, beta * {c_el});")
     parts.append("        }")
     parts.append("    }")
     parts.append("}")
@@ -9709,6 +9732,7 @@ def _msl_scalar_type(ctype: str) -> str:
             "MSL has no native float64; double-precision kernels cannot be lowered to Metal "
             "(see warp.config.metal_fp64)"
         )
+    ctype = _normalize_bare_scalar_tpl_args(ctype)
     stripped = ctype.strip()
     # ``wp::quat_t<wp::TYPE>`` is laid out as a 4-element vec_t; rewrite
     # so the vec_t/mat_t handling below covers it.
@@ -9878,8 +9902,21 @@ def _demote_tile_f64_tokens(text: str) -> str:
     return "".join(out)
 
 
+# Bare C scalar names as template arguments: ``wp.transformation(...,
+# dtype=float)`` types its result ``wp::transform_t<float>``.
+_BARE_SCALAR_TPL_ARG_PAT = re.compile(r"(?<=[<,])\s*(float|double|int)\s*(?=[,>])")
+_BARE_SCALAR_TO_WP = {"float": "wp::float32", "double": "wp::float64", "int": "wp::int32"}
+
+
+def _normalize_bare_scalar_tpl_args(ctype: str) -> str:
+    if "<" not in ctype:
+        return ctype
+    return _BARE_SCALAR_TPL_ARG_PAT.sub(lambda m: " " + _BARE_SCALAR_TO_WP[m.group(1)], ctype)
+
+
 def _msl_var_type(ctype: str) -> str:
     """Translate a local variable's ctype to MSL."""
+    ctype = _normalize_bare_scalar_tpl_args(ctype)
     ext = _mtiles.msl_var_type(ctype)
     if ext is None:
         ext = _mtex.msl_var_type(ctype)
@@ -11176,6 +11213,7 @@ _ADJ_TILE_CTOR_PAT = re.compile(r"\bwp::adj_tile\s*(?:<[^()]*>)?\s*\(\s*var_(\w+
 _ADJ_TILE_SUM_PAT = re.compile(r"\bwp::adj_tile_sum\s*\(\s*var_(\w+)\s*,\s*(adj_\w+)\s*,\s*(adj_\w+)\s*\)")
 _ADJ_UNTILE_PAT = re.compile(r"\bwp::adj_untile\s*\(\s*var_(\w+)\s*,\s*(adj_\w+)\s*,\s*(adj_\w+)\s*\)")
 _ADJ_TILE_MATMUL_PAT = re.compile(r"\bwp::adj_tile_matmul\s*\(([^)]*)\)")
+_ADJ_TILE_MATMUL_ACC_PAT = re.compile(r"\bwp::adj_tile_matmul_acc\s*\(([^)]*)\)")
 _ADJ_TILE_BROADCAST_PAT = re.compile(r"\bwp::adj_tile_broadcast\s*\(\s*var_(\w+)\s*,\s*(adj_\w+)\s*,\s*(adj_\w+)\s*\)")
 # ``wp::adj_tile_<op>(a, b, adj_a, adj_b, adj_c)`` — the element-wise
 # arithmetic tile ops. ``tile.h`` routes all of them through
@@ -12276,6 +12314,85 @@ def _translate_tile_intrinsics(
 
     line = _ADJ_TILE_MATMUL_PAT.sub(repl_adj_tile_matmul, line)
 
+    def repl_adj_tile_matmul_acc(m: re.Match[str]) -> str:
+        # Serial reverse of ``tile_matmul(A, B, C, alpha, beta)``
+        # (C = alpha * A @ B + beta * C), as ``tile_matmul.h``:
+        #   adj_A += alpha * adj_C @ B^T;  adj_B += alpha * A^T @ adj_C;
+        #   adj_C *= beta.
+        args = [a.strip() for a in m.group(1).split(",")]
+        if len(args) != 16:
+            return m.group(0)
+        a_arg, b_arg, c_arg, alpha_arg, beta_arg = args[3], args[4], args[5], args[6], args[7]
+        adj_a, adj_b, adj_c = args[11], args[12], args[13]
+        labels = [x[len("var_") :] if x.startswith("var_") else x for x in (a_arg, b_arg, c_arg)]
+        dims = [tile_var_dims.get(lb) for lb in labels]
+        if any(d is None for d in dims):
+            return m.group(0)
+        if any(lb in smem_tiles or lb in coldist_tiles or lb in distributed_tiles for lb in labels) or any(
+            tile_var_vec_n.get(lb, 0) for lb in labels
+        ):
+            raise MetalCodegenError(f"MSL codegen: reverse of tile_matmul on these tiles is not supported ({m.group(0)!r})")
+        (r, k, _), (k2, n, _), (r2, n2, scalar) = dims
+        if k != k2 or r != r2 or n != n2:
+            raise MetalCodegenError(f"MSL codegen: adj_tile_matmul_acc operand shapes disagree in {m.group(0)!r}")
+
+        def el(var: str, a: int, b: int, idx: str) -> str:
+            return var if a == 1 and b == 1 else f"{var}.c[{idx}]"
+
+        al = f"(float)({alpha_arg})"
+        return (
+            f"{{ for (int _am_r = 0; _am_r < {r}; ++_am_r) for (int _am_k = 0; _am_k < {k}; ++_am_k) {{ "
+            f"float _am_s = 0.0f; for (int _am_n = 0; _am_n < {n}; ++_am_n) "
+            f"_am_s = metal::fma((float){el(adj_c, r, n, f'_am_r * {n} + _am_n')}, "
+            f"(float){el(b_arg, k, n, f'_am_k * {n} + _am_n')}, _am_s); "
+            f"{el(adj_a, r, k, f'_am_r * {k} + _am_k')} += ({scalar})({al} * _am_s); }} "
+            f"for (int _am_k = 0; _am_k < {k}; ++_am_k) for (int _am_n = 0; _am_n < {n}; ++_am_n) {{ "
+            f"float _am_s = 0.0f; for (int _am_r = 0; _am_r < {r}; ++_am_r) "
+            f"_am_s = metal::fma((float){el(a_arg, r, k, f'_am_r * {k} + _am_k')}, "
+            f"(float){el(adj_c, r, n, f'_am_r * {n} + _am_n')}, _am_s); "
+            f"{el(adj_b, k, n, f'_am_k * {n} + _am_n')} += ({scalar})({al} * _am_s); }} "
+            f"if ((float)({beta_arg}) != 1.0f) {{ for (int _am_i = 0; _am_i < {r * n}; ++_am_i) "
+            f"{el(adj_c, r, n, '_am_i')} *= ({scalar})({beta_arg}); }} }}"
+        )
+
+    line = _ADJ_TILE_MATMUL_ACC_PAT.sub(repl_adj_tile_matmul_acc, line)
+
+    def _serial_adj_tile_broadcast(m: re.Match[str], s_label: str, adj_src: str, adj_tile: str, t_label: str) -> str:
+        # Serial-model reverse of ``_repl_tile_broadcast``: each source
+        # element's dual accumulates every target element it was copied to.
+        l_dims, s_dims = tile_var_dims.get(t_label), tile_var_dims.get(s_label)
+        if l_dims is None or s_dims is None:
+            return m.group(0)
+        if s_label in smem_tiles or t_label in smem_tiles or tile_var_vec_n.get(s_label, 0):
+            raise MetalCodegenError(f"MSL codegen: adj_tile_broadcast of this tile is not supported in {m.group(0)!r}")
+        l_rows, l_cols, _ = l_dims
+        in_rows, in_cols, _ = s_dims
+        l_n, in_n = l_rows * l_cols, in_rows * in_cols
+
+        def el(var: str, n: int, idx: str) -> str:
+            return var if n == 1 else f"{var}.c[{idx}]"
+
+        if (l_rows, l_cols) == (in_rows, in_cols):
+            return (
+                f"{{ for (int _ab_i = 0; _ab_i < {l_n}; ++_ab_i) "
+                f"{el(adj_src, in_n, '_ab_i')} += {el(adj_tile, l_n, '_ab_i')}; }}"
+            )
+        if in_n == 1:
+            return f"{{ for (int _ab_i = 0; _ab_i < {l_n}; ++_ab_i) {adj_src} += {el(adj_tile, l_n, '_ab_i')}; }}"
+        loop = (
+            f"for (int _ab_r = 0; _ab_r < {l_rows}; ++_ab_r) for (int _ab_c = 0; _ab_c < {l_cols}; ++_ab_c) "
+        )
+        tgt = el(adj_tile, l_n, f"_ab_r * {l_cols} + _ab_c")
+        src_2d = s_label in tile_2d_labels
+        if src_2d and in_cols == 1 and in_rows == l_rows:
+            return f"{{ {loop}{adj_src}.c[_ab_r] += {tgt}; }}"
+        if (not src_2d and in_cols == 1 and in_rows == l_cols) or (in_rows == 1 and in_cols == l_cols):
+            return f"{{ {loop}{adj_src}.c[_ab_c] += {tgt}; }}"
+        raise MetalCodegenError(
+            f"MSL codegen: reverse of tile_broadcast from shape {(in_rows, in_cols)} to {(l_rows, l_cols)} "
+            f"is not supported on Metal ({m.group(0)!r})"
+        )
+
     def repl_adj_tile_broadcast(m: re.Match[str]) -> str:
         # ``wp::adj_tile_broadcast(var_S, adj_S, adj_T)`` with ``T`` column-
         # distributed: every lane received the same (R, 1) column, so the
@@ -12283,7 +12400,7 @@ def _translate_tile_intrinsics(
         s_label, adj_src, adj_tile = m.group(1), m.group(2), m.group(3)
         t_label = adj_tile[len("adj_") :]
         if t_label not in coldist_tiles:
-            return m.group(0)
+            return _serial_adj_tile_broadcast(m, s_label, adj_src, adj_tile, t_label)
         rows, scalar = coldist_tiles[t_label]
         s_dims = tile_var_dims.get(s_label)
         if s_dims is None or s_dims[0] != rows or s_dims[1] != 1:
@@ -13028,7 +13145,11 @@ def _translate_tile_intrinsics(
             )
         if in_n == 1:
             # Single-element source broadcast across the target tile.
-            return f"{{ for (int _bc_i = 0; _bc_i < {l_n}; ++_bc_i) var_{lhs}.c[_bc_i] = var_{in_label}.c[0]; }}"
+            # A 1x1 register tile is a plain scalar local (``_msl_var_type``).
+            src = f"var_{in_label}" if in_label not in smem_tiles else f"var_{in_label}.c[0]"
+            if l_n == 1:
+                return f"var_{lhs} = {src}"
+            return f"{{ for (int _bc_i = 0; _bc_i < {l_n}; ++_bc_i) var_{lhs}.c[_bc_i] = {src}; }}"
         # Cases (numpy broadcasting aligns trailing dims):
         #   (a) Source is 1-D ``(C,)`` (``in_cols == 1``, not a 2-D tile),
         #       target ``(R, C)`` — repeat the source along the target's

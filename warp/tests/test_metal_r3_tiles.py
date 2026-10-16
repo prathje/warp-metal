@@ -457,6 +457,93 @@ class TestMetalR3Tiles(unittest.TestCase):
             """,
         )
 
+    def test_newton_codegen_gaps_r3integ(self):
+        # wp.transformation(..., dtype=float) (``transform_t<float>``),
+        # wp.abs on spatial vectors, and 1x1 tiles in tile_matmul /
+        # tile_broadcast (mujoco_warp's dense JTDAJ with one constraint row).
+        _run(
+            self,
+            """
+            @wp.kernel
+            def xf(r: float, t0: wp.array[wp.transform], t1: wp.array[wp.transform], out: wp.array[wp.transform],
+                   qd: wp.array[wp.spatial_vector], m: wp.array[float]):
+                i = wp.tid()
+                a = t0[i]
+                b = t1[i]
+                p = wp.lerp(wp.transform_get_translation(a), wp.transform_get_translation(b), r)
+                q = wp.quat_slerp(wp.transform_get_rotation(a), wp.transform_get_rotation(b), r)
+                out[i] = wp.transformation(p, q, dtype=float)
+                m[i] = wp.max(wp.abs(qd[i])) + 10.0 * wp.min(wp.abs(qd[i]))
+
+            @wp.kernel(module="unique")
+            def one(D: wp.array[float], J: wp.array2d[float], A: wp.array2d[float], out: wp.array2d[float],
+                    out2: wp.array2d[float]):
+                i, lane = wp.tid()
+                d = wp.tile_load(D, shape=1)
+                j = wp.tile_load(J, shape=(1, 4))
+                ji = wp.tile_map(wp.mul, wp.tile_transpose(j), wp.tile_broadcast(d, shape=(4, 1)))
+                wp.tile_store(out, wp.tile_matmul(ji, j))
+                a = wp.tile_load(A, shape=(1, 1))
+                wp.tile_store(out2, wp.tile_matmul(a, a) + wp.tile_matmul(j, wp.tile_transpose(j)))
+
+            def run(dev):
+                rng = np.random.default_rng(0)
+                x0 = rng.random((4, 7)).astype(np.float32)
+                x1 = rng.random((4, 7)).astype(np.float32)
+                for x in (x0, x1):
+                    x[:, 3:] /= np.linalg.norm(x[:, 3:], axis=1, keepdims=True)
+                with wp.ScopedDevice(dev):
+                    o = wp.zeros(4, dtype=wp.transform)
+                    m = wp.zeros(4, dtype=float)
+                    qd = wp.array(rng.random((4, 6)).astype(np.float32) - 0.5, dtype=wp.spatial_vector)
+                    wp.launch(xf, 4, [0.3, wp.array(x0, dtype=wp.transform), wp.array(x1, dtype=wp.transform), o, qd, m])
+                    h = wp.zeros((4, 4), dtype=float)
+                    h2 = wp.zeros((1, 1), dtype=float)
+                    wp.launch_tiled(one, dim=1, inputs=[wp.array([0.7], dtype=float),
+                                    wp.array(rng.random((1, 4)).astype(np.float32)),
+                                    wp.array([[1.5]], dtype=float), h, h2], block_dim=32)
+                    return o.numpy(), m.numpy(), h.numpy(), h2.numpy()
+
+            assert_same(both(run))
+            """,
+        )
+
+    def test_tile_reverse_broadcast_and_matmul_acc(self):
+        # Serial reverse of tile_broadcast (row, column, scalar sources) and
+        # of the accumulating tile_matmul(a, b, c, alpha, beta).
+        _run(
+            self,
+            """
+            R, C, K = 4, 3, 2
+
+            @wp.kernel(module="unique")
+            def k(row: wp.array[float], col: wp.array2d[float], s: wp.array[float], A: wp.array2d[float],
+                  B: wp.array2d[float], out: wp.array2d[float]):
+                i, lane = wp.tid()
+                a = wp.tile_broadcast(wp.tile_load(row, shape=C), shape=(R, C))
+                b = wp.tile_broadcast(wp.tile_load(col, shape=(R, 1)), shape=(R, C))
+                c = wp.tile_broadcast(wp.tile_load(s, shape=1), shape=(R, C))
+                acc = a + b * b + c
+                wp.tile_matmul(wp.tile_load(A, shape=(R, K)), wp.tile_load(B, shape=(K, C)), acc, alpha=0.5, beta=2.0)
+                wp.tile_store(out, wp.tile_map(wp.mul, acc, acc))
+
+            def run(dev):
+                rng = np.random.default_rng(0)
+                vals = [rng.random(sh).astype(np.float32) for sh in ((C,), (R, 1), (1,), (R, K), (K, C))]
+                with wp.ScopedDevice(dev):
+                    ins = [wp.array(v, requires_grad=True) for v in vals]
+                    out = wp.zeros((R, C), dtype=float, requires_grad=True)
+                    tape = wp.Tape()
+                    with tape:
+                        wp.launch_tiled(k, dim=1, inputs=[*ins, out], block_dim=32)
+                    out.grad = wp.ones((R, C), dtype=float)
+                    tape.backward()
+                    return [out.numpy()] + [x.grad.numpy() for x in ins]
+
+            assert_same(both(run), atol=1e-4)
+            """,
+        )
+
     def test_tile_store_bounds_on_arguments(self):
         # A partial trailing tile must not write past the array's rows.
         _run(

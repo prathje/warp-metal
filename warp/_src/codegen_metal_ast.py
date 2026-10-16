@@ -399,7 +399,9 @@ _RE_ASSIGN = re.compile(r"^(?P<indent>\s*)(?P<pfx>var_|adj_)(?P<lhs>\w+)\s*=\s*(
 # Emitted by ``Adjoint.add_return`` for every value-returning ``@wp.func``, so it
 # only ever shows up inside an inlined function's reverse body. There is nothing
 # for a fold to do with it — it passes through to MSL verbatim.
-_RE_ADJ_ACCUM = re.compile(r"^\s*adj_\w+\s*(?:\+=|-=)\s*.+?;\s*$")
+# Also ``var_`` targets: an inlined adjoint's ``adj_x += adj_ret`` after its
+# dual was bound to a tile_map element temporary (``var_tm<k>_g<j>``).
+_RE_ADJ_ACCUM = re.compile(r"^\s*(?:adj_\w+|var_tm\d+_g\d+)\s*(?:\+=|-=)\s*.+?;\s*$")
 # ``adj_lights.intensities = adj_208;`` — the adjoint of a struct field,
 # emitted by ``Adjoint.emit_Attribute`` for every ``s.field`` read. Passed
 # through verbatim; the flat emitter decides what it means, since only there
