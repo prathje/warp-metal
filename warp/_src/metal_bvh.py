@@ -249,7 +249,11 @@ class MetalBvh:
                     "arrays wrapping a private-storage Metal buffer (e.g. a Torch MPS tensor) — "
                     "copy them into Warp-allocated arrays first."
                 )
-        self._dispatcher.sync()
+        from warp._src.context import _metal_ptrs_shared  # noqa: PLC0415
+
+        self._dispatcher.sync(
+            torch=_metal_ptrs_shared(*(arr.ptr for arr in (self.lowers, self.uppers, self.groups) if arr is not None))
+        )
 
         groups_ptr = ctypes.c_void_p(self.groups.ptr) if self.groups is not None else ctypes.c_void_p(0)
         host_id = runtime.core.wp_bvh_create_host(
@@ -319,7 +323,7 @@ class MetalBvh:
             self.leaf_prim_end = warp.array(leaf_end, dtype=warp.int32)
 
         self._write_descriptor()
-        self._dispatcher.sync()
+        self._dispatcher.sync(torch=False)
 
     def _desc_bytes(self) -> bytes:
         import struct  # noqa: PLC0415
@@ -463,7 +467,7 @@ class MetalMesh:
         self.id = self.bvh.id
         self._update_solid_angle_props()
         self._write_mesh_fields()
-        self.bvh._dispatcher.sync()
+        self.bvh._dispatcher.sync(torch=False)
 
     def _update_solid_angle_props(self) -> None:
         """(Re)compute the winding-number node data (host work, not capturable)."""
@@ -471,7 +475,9 @@ class MetalMesh:
             return
         from warp._src.metal_winding import compute_solid_angle_props  # noqa: PLC0415
 
-        self.bvh._dispatcher.sync()
+        from warp._src.context import _metal_ptrs_shared  # noqa: PLC0415
+
+        self.bvh._dispatcher.sync(torch=_metal_ptrs_shared(self.points.ptr, self.indices.ptr))
         props = compute_solid_angle_props(self.bvh, self.points, self.indices)
         if self.solid_angle_props is not None and self.solid_angle_props.shape == props.shape:
             ctypes.memmove(self.solid_angle_props.ptr, props.ctypes.data, props.nbytes)

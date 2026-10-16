@@ -151,7 +151,7 @@ class MetalTextureStorage:
             )
         # Unified memory: drain queued GPU work on the buffer, then write it
         # through its host mapping.
-        self._dispatcher.sync()
+        self._dispatcher.sync(torch=False)
         ctypes.memmove(self.data.ptr + self.level_offsets[level], data_np.ctypes.data, data_np.nbytes)
 
     def release(self) -> None:

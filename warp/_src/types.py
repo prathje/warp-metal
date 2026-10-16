@@ -4549,7 +4549,7 @@ class array(Array[DType, NDim]):
                             "(e.g. a wrapped Torch MPS tensor) is not supported — the strided "
                             "fill runs on the host and the buffer has no host address."
                         )
-                    dispatcher.sync()
+                    dispatcher.sync(torch=warp._src.context._metal_ptrs_shared(self.ptr))
                 warp._src.context.runtime.core.wp_array_fill_host(carr_ptr, ARRAY_TYPE_REGULAR, cvalue_ptr, cvalue_size)
 
         self.mark_init()
@@ -4592,7 +4592,7 @@ class array(Array[DType, NDim]):
             if getattr(self.device, "is_metal", False) and warp.config.metal_native_dispatch:
                 from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
 
-                get_dispatcher().sync()
+                get_dispatcher().sync(torch=warp._src.context._metal_ptrs_shared(self.ptr))
             # use the CUDA default stream for synchronous behaviour with other streams
             with warp.ScopedStream(self.device.null_stream):
                 a = self.to("cpu", requires_grad=False)

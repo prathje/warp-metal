@@ -342,7 +342,7 @@ class MetalHashGrid:
             # Kernels from earlier launches may still read the old descriptor
             # (and, after a regrow, the old tables); the host write below is
             # immediate, so drain the queue first.
-            self._dispatcher.sync()
+            self._dispatcher.sync(torch=False)
         self._retired = []
         ctypes.memmove(self._desc_ptr, data, len(data))
         self._desc_data = data

@@ -147,9 +147,11 @@ class TestMetalTorchSync(unittest.TestCase):
 
     def test_interop_does_not_drain(self):
         # On Torch's queue neither wp.to_torch nor wp.from_torch nor a launch
-        # on shared arrays waits on the CPU.
+        # on shared arrays waits on the CPU, and a host read of an array
+        # Torch cannot access does not wait for Torch.
         code = """
         import torch
+        import warp._src.metal_torch_sync as mts
         from warp._src.metal_dispatch import get_dispatcher
 
         @wp.kernel
@@ -161,7 +163,7 @@ class TestMetalTorchSync(unittest.TestCase):
         disp = get_dispatcher()
         assert disp._torch_mode == "gpu", disp._torch_mode
         calls = {"torch": 0, "warp": 0}
-        real_torch_sync, real_sync = torch.mps.synchronize, disp.sync
+        real_torch_sync, real_sync = mts.wait_for_torch, disp.sync
 
         def torch_sync():
             calls["torch"] += 1
@@ -172,8 +174,9 @@ class TestMetalTorchSync(unittest.TestCase):
             calls["warp"] += int(disp.has_pending_work())
             real_sync(*args, **kwargs)
 
-        torch.mps.synchronize = torch_sync
+        mts.wait_for_torch = torch_sync
         disp.sync = warp_sync
+        private = wp.zeros(64, dtype=float, device="metal:0")
         for _ in range(20):
             x = wp.zeros(64, dtype=float, device="metal:0")
             tx = wp.to_torch(x)
@@ -184,7 +187,11 @@ class TestMetalTorchSync(unittest.TestCase):
             wp.launch(inc, dim=64, inputs=[a], device="metal:0")
             t.mul_(2.0)
         assert calls == {"torch": 0, "warp": 0}, calls
-        torch.mps.synchronize = real_torch_sync
+        for _ in range(5):
+            wp.launch(inc, dim=64, inputs=[private], device="metal:0")
+            private.numpy()
+        assert calls["torch"] == 0, calls
+        mts.wait_for_torch = real_torch_sync
         disp.sync = real_sync
         exp = 0.0
         for _ in range(20):

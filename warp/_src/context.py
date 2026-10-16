@@ -5666,8 +5666,19 @@ def _metal_private_copy(dispatcher, dst_ptr: int, src_ptr: int, nbytes: int) -> 
     else:
         # private -> host
         dispatcher.device_copy(stage, src_buf, nbytes, 0, src_off)
-        dispatcher.sync()
+        dispatcher.sync(torch=False)  # the device copy above already ordered after Torch
         ctypes.memmove(dst_ptr, stage_ptr, nbytes)
+
+
+def _metal_ptrs_shared(*ptrs) -> bool:
+    """Whether any of ``ptrs`` lies in a Metal buffer shared with another
+    framework (Torch): a host access to it must also wait for Torch's work."""
+    from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
+
+    disp = get_dispatcher()
+    if not disp._shared_ids:
+        return False
+    return any(p and disp.is_shared(_metal_find_buffer(p)[0]) for p in ptrs)
 
 
 def _metal_host_copy_forced() -> bool:
@@ -15339,11 +15350,11 @@ def copy(
                         if src_buf is not None and dst_buf is not None:
                             dispatcher.device_copy(dst_buf, src_buf, bytes_to_copy, dst_off, src_off)
                         else:
-                            dispatcher.sync()
+                            dispatcher.sync(torch=_metal_ptrs_shared(src_ptr, dst_ptr))
                             runtime.core.wp_memcpy_h2h(dst_ptr, src_ptr, bytes_to_copy)
                         result = True
                     else:
-                        dispatcher.sync()
+                        dispatcher.sync(torch=_metal_ptrs_shared(src_ptr, dst_ptr))
                         result = runtime.core.wp_memcpy_h2h(dst_ptr, src_ptr, bytes_to_copy)
                 else:
                     result = runtime.core.wp_memcpy_h2h(dst_ptr, src_ptr, bytes_to_copy)
@@ -15483,7 +15494,7 @@ def copy(
                             "runs on the host and the buffer has no host address. Copy a contiguous "
                             "view instead, or .contiguous() the tensor before wrapping it."
                         )
-                    dispatcher.sync()
+                    dispatcher.sync(torch=_metal_ptrs_shared(src_ptr, dst_ptr))
                     result = runtime.core.wp_array_copy_host(dst_ptr, src_ptr, dst_type, src_type, src_elem_size)
             else:
                 result = runtime.core.wp_array_copy_host(dst_ptr, src_ptr, dst_type, src_type, src_elem_size)

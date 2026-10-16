@@ -20892,7 +20892,9 @@ def _struct_array_ptr_table(arr, struct_type, fpath: tuple[str, ...]):
     n = int(arr.shape[0])
     # The records may have just been written by queued GPU work
     # (``data.assign(...)``): wait for it before reading them on the host.
-    get_dispatcher().sync()
+    from warp._src.context import _metal_ptrs_shared  # noqa: PLC0415
+
+    get_dispatcher().sync(torch=_metal_ptrs_shared(int(arr.ptr)))
     raw = bytes((ctypes.c_char * (n * np_dtype.itemsize)).from_address(int(arr.ptr)))
     recs = np.frombuffer(raw, dtype=np_dtype)
     t = struct_type
@@ -20966,7 +20968,9 @@ def _struct_array_elem_field_value(arr, struct_type, k: int, fpath: tuple[str, .
     from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
 
     # Wait for queued writes to the records (``data.assign(...)``).
-    get_dispatcher().sync()
+    from warp._src.context import _metal_ptrs_shared  # noqa: PLC0415
+
+    get_dispatcher().sync(torch=_metal_ptrs_shared(int(arr.ptr)))
     np_dtype = struct_type.numpy_dtype()
     nbytes = np.dtype(np_dtype).itemsize
     raw = (ctypes.c_char * nbytes).from_address(int(arr.ptr) + k * int(arr.strides[0]))
