@@ -5,6 +5,7 @@
 # https://dmlc.github.io/dlpack/latest/python_spec.html
 
 import ctypes
+import threading
 
 import warp
 from warp._src.thirdparty.dlpack import (
@@ -249,9 +250,9 @@ def strides_to_dlpack(strides, dtype):
     return a
 
 
-# Set by ``wp.to_torch`` while it exports a Metal array to Torch (see
-# ``to_dlpack``).
-_metal_export_to_torch = False
+# ``.active`` is set by ``wp.to_torch`` while it exports a Metal array to
+# Torch on this thread (see ``to_dlpack``).
+_metal_export_to_torch = threading.local()
 
 
 def to_dlpack(wp_array: warp.array):
@@ -314,7 +315,7 @@ def to_dlpack(wp_array: warp.array):
             # Warp is on Torch's queue: queue order already puts the pending
             # work first (see ``metal_torch_sync``).
             disp = get_dispatcher()
-            if not (_metal_export_to_torch and disp.orders_with_torch()):
+            if not (getattr(_metal_export_to_torch, "active", False) and disp.orders_with_torch()):
                 disp.sync()
             import objc  # noqa: PLC0415
 

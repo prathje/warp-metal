@@ -566,11 +566,11 @@ def to_torch(a: warp.array, requires_grad: bool | None = None):
             if mtl_buf is not None:
                 import warp._src.dlpack as _dlpack  # noqa: PLC0415
 
-                _dlpack._metal_export_to_torch = True
+                _dlpack._metal_export_to_torch.active = True
                 try:
                     capsule = warp.to_dlpack(a)
                 finally:
-                    _dlpack._metal_export_to_torch = False
+                    _dlpack._metal_export_to_torch.active = False
                 t = torch.from_dlpack(capsule)
                 # Torch's MPS DLPack import normalises stride metadata, which
                 # erases Warp's zero strides (mujoco_warp's per-world
