@@ -15934,6 +15934,7 @@ def _generate_msl_kernel_uncached(
         forward_lines,
         _mtex.texture_labels(adj, {**{str(_v.label): _v.ctype() for _v in adj.variables}, **_inlined_var_ctypes}),
         adj.fun_name,
+        _mtex.texture_array_labels(adj),
     )
     # ``wp.array(ptr=...)`` locals -> device pointer + shape locals.
     forward_lines, _ptr_array_skip, ptr_array_labels, ptr_array_roots = _lower_pointer_arrays(

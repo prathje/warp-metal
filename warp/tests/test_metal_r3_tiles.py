@@ -347,6 +347,15 @@ class TestMetalR3Tiles(unittest.TestCase):
             class S:
                 t: wp.Texture2D
 
+            @wp.func
+            def elem_dims(ts: wp.array[wp.Texture2D], j: int) -> int:
+                return ts[j].width * 1000 + ts[j].height
+
+            @wp.kernel
+            def elem(ts: wp.array[wp.Texture2D], out: wp.array[int]):
+                i = wp.tid()
+                out[i] = ts[i].width + 100000 * elem_dims(ts, (i + 1) % 3)
+
             @wp.kernel
             def dims(t: wp.Texture2D, s: S, out: wp.array[int]):
                 tt = s.t
@@ -366,7 +375,9 @@ class TestMetalR3Tiles(unittest.TestCase):
                     s.t = texs[1]
                     o2 = wp.zeros(1, dtype=int)
                     wp.launch(dims, dim=1, inputs=[texs[2], s, o2])
-                    return out.numpy(), o2.numpy()
+                    o3 = wp.zeros(3, dtype=int)
+                    wp.launch(elem, dim=3, inputs=[arr, o3])
+                    return out.numpy(), o2.numpy(), o3.numpy()
 
             assert_same(both(run))
             """,

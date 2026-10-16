@@ -129,20 +129,58 @@ def texture_labels(adj, var_ctypes: dict[str, str]) -> dict[str, str]:
     return out
 
 
-def fold_field_reads(lines: list[str], tex: dict[str, str], kname: str) -> list[str]:
+def texture_array_labels(adj) -> dict[str, str]:
+    """``{label: msl struct}`` of the kernel's ``wp.array[wp.Texture*]`` args."""
+    out: dict[str, str] = {}
+    for a in adj.args:
+        info = texture_class_info(getattr(a.type, "dtype", None))
+        if info is not None:
+            out[str(a.label)] = info[1]
+    return out
+
+
+_ELEM_ADDR_PAT = re.compile(r"^\s*var_(?P<ptr>\w+)\s*=\s*wp::address\s*\(\s*var_(?P<arr>\w+)\s*,[^;]*\)\s*;\s*$")
+_ELEM_FIELD_PTR_PAT = re.compile(
+    r"^\s*var_(?P<ptr>\w+)\s*=\s*&\s*\(\s*var_(?P<elem>\w+)\s*->\s*(?P<field>\w+)\s*\)\s*;\s*$"
+)
+
+
+def fold_field_reads(
+    lines: list[str], tex: dict[str, str], kname: str, tex_arrays: dict[str, str] | None = None
+) -> list[str]:
     """``p = &(t.width); x = wp::load(p)`` on a texture value -> ``x = t.width``.
 
     Warp reads a texture's geometry (``t.width``, ``t.height``, ...) through a
     field address; the value structs here are plain MSL structs, so the read
-    becomes a member access. Any other use of such an address raises.
+    becomes a member access. ``ts[i].width`` on a texture array goes through
+    the element's address (``e = wp::address(ts, i); p = &(e->width)``); the
+    element is loaded into a local first. Any other use of such an address
+    raises.
     """
-    if not tex or not any("&" in ln for ln in lines):
+    tex_arrays = tex_arrays or {}
+    if not (tex or tex_arrays) or not any("&" in ln for ln in lines):
         return lines
     from warp._src.codegen_metal import MetalCodegenError  # noqa: PLC0415
 
     ptrs: dict[str, str] = {}
+    elem_ptrs: dict[str, str] = {}  # element address label -> msl struct
+    elem_field: dict[str, tuple[str, str]] = {}  # field address -> (element address, field)
     out: list[str] = []
     for ln in lines:
+        m = _ELEM_ADDR_PAT.match(ln)
+        if m and m.group("arr") in tex_arrays:
+            elem_ptrs[m.group("ptr")] = tex_arrays[m.group("arr")]
+            out.append(ln)
+            continue
+        m = _ELEM_FIELD_PTR_PAT.match(ln)
+        if m and m.group("elem") in elem_ptrs:
+            field = m.group("field")
+            if field not in _FIELDS[elem_ptrs[m.group("elem")]]:
+                raise MetalCodegenError(
+                    f"Kernel {kname!r}: texture field {field!r} is not available on Metal (line: {ln.strip()})"
+                )
+            elem_field[m.group("ptr")] = (m.group("elem"), field)
+            continue
         m = _FIELD_PTR_PAT.match(ln)
         if m and m.group("tex") in tex:
             field = m.group("field")
@@ -152,6 +190,20 @@ def fold_field_reads(lines: list[str], tex: dict[str, str], kname: str) -> list[
                 )
             ptrs[m.group("ptr")] = f"var_{m.group('tex')}.{field}"
             continue
+        if elem_field:
+            m = _LOAD_PAT.match(ln)
+            if m and m.group("ptr") in elem_field:
+                e, field = elem_field[m.group("ptr")]
+                ind, tmp = m.group("indent"), f"var_{m.group('lhs')}__tex"
+                out.append(f"{ind}{elem_ptrs[e]} {tmp};")
+                out.append(f"{ind}{tmp} = wp::load(var_{e});")
+                out.append(f"{ind}var_{m.group('lhs')} = {tmp}.{field};")
+                continue
+            for p in elem_field:
+                if re.search(rf"\bvar_{re.escape(p)}\b", ln):
+                    raise MetalCodegenError(
+                        f"Kernel {kname!r}: a texture's fields are read-only on Metal (line: {ln.strip()})"
+                    )
         if ptrs:
             m = _LOAD_PAT.match(ln)
             if m and m.group("ptr") in ptrs:
