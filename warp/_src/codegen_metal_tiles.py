@@ -360,7 +360,9 @@ class TileExt:
                     coords.append("0")
                     continue
                 coords.append(f"(({rem}) / {stride})" if stride != 1 else f"({rem})")
-                rem = f"(({rem}) % {stride})" if stride != 1 else rem
+                # A stride of 1 means every later dim has extent 1: their
+                # coordinates are 0 (an ``(R, 1)`` column, not a diagonal).
+                rem = f"(({rem}) % {stride})" if stride != 1 else "0"
             # right-align into the parent rank
             pc: list[str] = []
             for d in range(pd):
@@ -657,7 +659,9 @@ class TileExt:
             for i in range(sd):
                 stride = math.prod(sshape[i + 1 :])
                 coords.append(f"(({rem}) / {stride})" if stride != 1 else f"({rem})")
-                rem = f"(({rem}) % {stride})" if stride != 1 else rem
+                # A stride of 1 means every later dim has extent 1: their
+                # coordinates are 0 (an ``(R, 1)`` column, not a diagonal).
+                rem = f"(({rem}) % {stride})" if stride != 1 else "0"
             terms = []
             for d in range(pd):
                 si = d - (pd - sd)

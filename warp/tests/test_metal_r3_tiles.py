@@ -422,6 +422,41 @@ class TestMetalR3Tiles(unittest.TestCase):
             """,
         )
 
+    def test_tile_assign_column_into_2d(self):
+        # mujoco_warp's augmented blocked Cholesky writes an (R, 1) column
+        # view into a 2-D tile with tile_assign(dst, col, offset=(0, c)); it
+        # was lowered along the diagonal, which NaN'd Newton's MuJoCo solver.
+        _run(
+            self,
+            """
+            TS = wp.constant(8)
+            BS = wp.constant(7)
+
+            @wp.kernel(module="unique", enable_backward=False)
+            def k(A: wp.array2d[float], b: wp.array2d[float], out: wp.array2d[float], out2: wp.array2d[float]):
+                i = wp.tid()
+                col = wp.tile_load(b, shape=(TS, 1), storage="shared")
+                t = wp.tile_load(A, shape=(TS, TS), storage="shared")
+                wp.tile_assign(t, wp.tile_view(col, shape=(BS, 1), offset=(0, 0)), offset=(0, BS))
+                wp.tile_store(out, t)
+                r = wp.tile_zeros(shape=(TS, 2), dtype=float, storage="shared")
+                wp.tile_assign(r, wp.tile_view(t, shape=(BS, 1), offset=(1, 2)), offset=(1, 1))
+                wp.tile_store(out2, r)
+
+            def run(dev):
+                rng = np.random.default_rng(0)
+                with wp.ScopedDevice(dev):
+                    A = wp.array(rng.random((8, 8)).astype(np.float32))
+                    b = wp.array(rng.random((8, 1)).astype(np.float32))
+                    o = wp.zeros((8, 8), dtype=float)
+                    o2 = wp.zeros((8, 2), dtype=float)
+                    wp.launch_tiled(k, dim=1, inputs=[A, b, o, o2], block_dim=32)
+                    return o.numpy(), o2.numpy()
+
+            assert_same(both(run))
+            """,
+        )
+
     def test_tile_store_bounds_on_arguments(self):
         # A partial trailing tile must not write past the array's rows.
         _run(
