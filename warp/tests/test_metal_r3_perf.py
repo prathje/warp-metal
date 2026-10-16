@@ -540,6 +540,9 @@ for it in range(10):
     tt.fill_(-1.0)
     torch.mps.synchronize()
     np.testing.assert_array_equal(out.numpy(), np.full(N, it + 1, np.float32))
+
+from warp._src.metal_dispatch import get_dispatcher
+assert get_dispatcher()._torch_mode == "gpu", get_dispatcher()._torch_mode
 """
 
 
@@ -547,9 +550,11 @@ for it in range(10):
 @unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
 @unittest.skipUnless(_has_torch_mps(), "Torch with MPS is not installed")
 class TestMetalSharedBufferOrdering(unittest.TestCase):
-    # Batched launches stay uncommitted while the GPU is busy; Metal orders
-    # work across command queues (Warp's vs Torch's) only once committed, so
-    # launches binding a buffer shared with Torch must commit immediately.
+    # Batched launches stay uncommitted while the GPU is busy, so launches
+    # binding a buffer shared with Torch commit immediately. Committing alone
+    # is not enough: Metal does not order command buffers across queues, so
+    # Warp also encodes on Torch's queue (``metal_torch_sync``; this failed
+    # 1-2 of 5 runs with "stale torch read" before).
     def test_torch_interop_without_sync(self):
         _run_with_metal_enabled(self, _TORCH_ORDER_SNIPPET, timeout=300)
 
