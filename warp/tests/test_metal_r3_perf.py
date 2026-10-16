@@ -301,9 +301,9 @@ class TestMetalAsyncFill(unittest.TestCase):
             disp = get_dispatcher()
             calls = [0]
             orig = type(disp).sync
-            def counting(self):
+            def counting(self, *args, **kwargs):
                 calls[0] += 1
-                return orig(self)
+                return orig(self, *args, **kwargs)
             type(disp).sync = counting
 
             n = 1 << 16
