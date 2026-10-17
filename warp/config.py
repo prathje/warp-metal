@@ -555,6 +555,25 @@ does not apply. Kernels outside the supported pattern keep the serial
 (one-thread-per-tile) model.
 """
 
+metal_outline_funcs: str = _os.environ.get("WARP_METAL_OUTLINE_FUNCS", "").strip().lower() or "auto"
+"""Emit large ``@wp.func`` bodies as separate MSL functions on Metal.
+
+The Metal codegen inlines every user function into the kernel body. For very
+large kernels (Newton's mesh/convex narrow phase) this produces megabytes of
+MSL that Apple's shader compiler needs tens of minutes to compile. With
+outlining, each inlined body is extracted after translation into a
+``noinline`` MSL function, and identical bodies (the same overload reached from
+several call sites) are emitted once.
+
+* ``"auto"`` (default): outline only in large kernels, and only bodies that
+  are big or repeated.
+* ``"all"``: outline every eligible body (testing).
+* ``"off"``: inline everything (previous behavior).
+
+Initialized from the ``WARP_METAL_OUTLINE_FUNCS`` environment variable. Does
+not affect CPU or CUDA kernels.
+"""
+
 disable_metal_solver_icb_capture: bool = False
 """Disable the mujoco_warp solver's MTLIndirectCommandBuffer fast path.
 

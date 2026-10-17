@@ -140,6 +140,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from warp._src import codegen_metal_texture as _mtex
+from warp._src import codegen_metal_outline as _moutline
 from warp._src import codegen_metal_tiles as _mtiles
 from warp._src.codegen_metal_ast import _STRUCT_DUAL_RESET_MARKER
 from warp._src.codegen_metal_ast import Assign as _AstAssign
@@ -18208,6 +18209,9 @@ def _generate_msl_kernel_uncached(
     )
 
     for raw in forward_lines:
+        if raw.startswith(_moutline.MARKER_PREFIX):
+            body_lines.append(raw)
+            continue
         line = _strip_comments_and_directives(raw)
         if line is None:
             continue
@@ -20251,7 +20255,14 @@ def _codegen_source_hash() -> str:
         import warp._src.codegen_metal_locals as _locals_mod  # noqa: PLC0415
 
         h = hashlib.sha256()
-        for mod_file in (__file__, _ast_mod.__file__, _mtiles.__file__, _mtex.__file__, _locals_mod.__file__):
+        for mod_file in (
+            __file__,
+            _ast_mod.__file__,
+            _mtiles.__file__,
+            _mtex.__file__,
+            _locals_mod.__file__,
+            _moutline.__file__,
+        ):
             with open(mod_file, "rb") as f:
                 h.update(f.read())
         _codegen_source_hash_cached = h.hexdigest()
@@ -20457,6 +20468,8 @@ def _artifact_cache_key(kernel, adj) -> str | None:
         f"coopblock={getattr(adj, '_metal_coop_block_n', 0)}",
         # ``metal_print = "error"`` must reach the generator to raise.
         f"print={getattr(warp.config, 'metal_print', 'warn')}",
+        # Outline-region markers are only emitted when outlining is on.
+        f"outline={_moutline.mode() != 'off'}",
     ):
         h.update(part.encode("utf-8"))
         h.update(b"\x00")
@@ -22198,11 +22211,14 @@ def _wrap_msl_for_native_dispatch(
     if ("wp_f64" in signature or "wp_f64" in prologue) and "struct wp_f64 {" not in header:
         header = _f64_emulate_helpers() + "\n" + header
     header = _force_inline_helpers(header)
+    # ``@wp.func`` bodies as separate MSL functions (``metal_outline_funcs``).
+    body, outlined = _moutline.outline_kernel(artifact.name, params, prologue, body, header)
     return (
         "#include <metal_stdlib>\n"
         "#include <metal_atomic>\n"
         "using namespace metal;\n"
         f"{header}\n"
+        f"{outlined}"
         f"{signature} {{\n"
         f"{prologue}{body}\n"
         "}\n"

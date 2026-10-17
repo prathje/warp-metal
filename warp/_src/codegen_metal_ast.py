@@ -1995,9 +1995,20 @@ def _inline_one_call(
             ret_flag = f"var_{inline_id}__ret_flag"
             decls.append(_RawLine(raw=f"    bool {ret_flag} = false;"))
         body_with_breaks = _rewrite_returns_to_breaks(fn_folded, return_value_dst, ret_flag)
-        return [*decls, _DoWhileZero(raw="", body=tuple(body_with_breaks))]
+        return _outline_mark(fn_overload, inline_id, [*decls, _DoWhileZero(raw="", body=tuple(body_with_breaks))])
 
-    return [*decls, *fn_folded]
+    return _outline_mark(fn_overload, inline_id, [*decls, *fn_folded])
+
+
+def _outline_mark(fn_overload, inline_id: int, nodes: list[Node]) -> list[Node]:
+    """Bracket an inlined body with outline-region markers (see
+    :mod:`warp._src.codegen_metal_outline`); a no-op when outlining is off."""
+    from warp._src.codegen_metal_outline import region_markers  # noqa: PLC0415
+
+    markers = region_markers(fn_overload, inline_id)
+    if markers is None:
+        return nodes
+    return [Comment(raw=markers[0]), *nodes, Comment(raw=markers[1])]
 
 
 # ---------------------------------------------------------------------------
