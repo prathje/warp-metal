@@ -3163,6 +3163,10 @@ class ModuleHasher:
 
         # configuration parameters
         for opt in sorted(options.keys()):
+            # Metal-only options (``metal_*``) never reach CPU/CUDA codegen;
+            # the Metal backend keys its own caches on them.
+            if opt.startswith("metal_"):
+                continue
             s = f"{opt}:{options[opt]}"
             ch.update(bytes(s, "utf-8"))
 

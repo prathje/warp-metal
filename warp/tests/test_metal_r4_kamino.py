@@ -272,6 +272,26 @@ class TestMetalR4Kamino(unittest.TestCase):
             """,
         )
 
+    def test_metal_module_options_do_not_change_module_hash(self):
+        # ``metal_*`` module options are Metal-only: CPU/CUDA module hashes
+        # (and so their kernel caches) must not change when one is set.
+        _run(
+            self,
+            """
+            @wp.kernel
+            def k(a: wp.array[float]):
+                a[wp.tid()] = 1.0
+
+            a = wp.zeros(2, dtype=float, device="cpu")
+            wp.launch(k, dim=2, inputs=[a], device="cpu")
+            mod = wp.get_module(k.module.name)
+            h0 = mod.get_module_hash()
+            wp.set_module_options({"metal_fp64": "emulate"})
+            mod.hashers = {}
+            assert mod.get_module_hash() == h0
+            """,
+        )
+
     def test_transposed_matmul_operands(self):
         # ``tile_matmul(transpose(a), transpose(b), c)`` with rectangular tiles,
         # and a transpose read by ``tile_store`` after a double transpose.
