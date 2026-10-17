@@ -246,6 +246,32 @@ class TestMetalR4Kamino(unittest.TestCase):
             """,
         )
 
+    def test_module_fp64_option_after_first_launch(self):
+        # Setting ``metal_fp64`` after the kernel already ran on Metal must
+        # rebuild it instead of reusing the artifact of the old mode.
+        _run(
+            self,
+            """
+            @wp.kernel
+            def k(a: wp.array[float], out: wp.array[float]):
+                i = wp.tid()
+                x = wp.float64(a[i]) * wp.float64(1.0e8) + wp.float64(1.0)
+                out[i] = wp.float32(x - wp.float64(a[i]) * wp.float64(1.0e8))
+
+            def run(dev):
+                a = wp.array([1.0, 3.0], dtype=float, device=dev)
+                o = wp.zeros(2, dtype=float, device=dev)
+                wp.launch(k, dim=2, inputs=[a, o], device=dev)
+                return o.numpy()
+
+            demoted = run("metal:0")
+            wp.set_module_options({"metal_fp64": "emulate"})
+            np.testing.assert_array_equal(run("metal:0"), 1.0)
+            np.testing.assert_array_equal(run("cpu"), 1.0)
+            assert not np.array_equal(demoted, 1.0)
+            """,
+        )
+
     def test_transposed_matmul_operands(self):
         # ``tile_matmul(transpose(a), transpose(b), c)`` with rectangular tiles,
         # and a transpose read by ``tile_store`` after a double transpose.

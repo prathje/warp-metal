@@ -21914,6 +21914,21 @@ def _coop_upgrade_pending(kernel, artifact, block_dim: int | None) -> bool:
     )
 
 
+def _drop_stale_fp64_artifacts(kernel) -> None:
+    """Forget a kernel's cached Metal artifacts when its float64 mode changed.
+
+    The mode (``warp.config.metal_fp64`` or the module's ``metal_fp64``
+    option, see ``_kernel_fp64_mode``) changes the generated MSL, but the
+    per-kernel artifact / PSO caches are keyed on the kernel object only.
+    """
+    mode = _fp64_mode()
+    if getattr(kernel, "_metal_fp64_mode", mode) != mode:
+        for attr in ("_metal_artifact", "_metal_native_pso", "_metal_mlx_kernel", "_metal_adj_cache", "_metal_alias_psos"):
+            if hasattr(kernel, attr):
+                setattr(kernel, attr, None)
+    kernel._metal_fp64_mode = mode
+
+
 def _get_or_build_metal_kernel_native(
     kernel, block_dim: int | None = None, adjoint: bool = False, grad_args: tuple[str, ...] = ()
 ):
@@ -21928,6 +21943,7 @@ def _get_or_build_metal_kernel_native(
     """
     from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
 
+    _drop_stale_fp64_artifacts(kernel)
     if adjoint:
         cache = getattr(kernel, "_metal_adj_cache", None)
         if cache is None:
@@ -21991,6 +22007,7 @@ def _get_or_build_metal_kernel(kernel, block_dim: int | None = None):
     """
     import mlx.core as mx  # noqa: PLC0415
 
+    _drop_stale_fp64_artifacts(kernel)
     artifact = getattr(kernel, "_metal_artifact", None)
     mlx_kernel = getattr(kernel, "_metal_mlx_kernel", None)
     if _coop_upgrade_pending(kernel, artifact, block_dim):
