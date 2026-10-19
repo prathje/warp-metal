@@ -22312,6 +22312,7 @@ def _get_or_build_metal_kernel_native(
         artifact = generate_msl_kernel(kernel, block_dim=block_dim, adjoint=True, grad_args=grad_args)
         wrapped = _wrap_msl_for_native_dispatch(artifact)
         pso = get_dispatcher().compile(wrapped, f"custom_kernel_{artifact.name}")
+        _note_native_pso(pso, wrapped)
         cache[grad_args] = (artifact, pso)
         return artifact, pso
 
@@ -22330,9 +22331,9 @@ def _get_or_build_metal_kernel_native(
             return artifact, None
         wrapped = _wrap_msl_for_native_dispatch(artifact)
         kernel._metal_native_wrapped_source = wrapped
-        kernel._metal_grid_only = None
         try:
             pso = get_dispatcher().compile(wrapped, f"custom_kernel_{artifact.name}")
+            _note_native_pso(pso, wrapped)
         except Exception:
             if os.environ.get("WARP_METAL_DUMP_ON_FAIL"):
                 import tempfile
@@ -22457,38 +22458,106 @@ def _normalize_none_array_args(kernel, fwd_args: list, device) -> None:
         fwd_args[i] = placeholder
 
 
-_TG_DEPENDENT_PAT = re.compile(
-    r"\bthreadgroup_barrier\b|\bthreadgroup\s+\w|\bsimd_\w+\s*\(|\bsimdgroup_\w+\s*\(|"
+_TG_SHAPE_TOKENS = (
+    r"\bthreadgroup_barrier\b|\bthreadgroup\s+\w|\bsimd_\w+\s*\(|\bsimdgroup_\w+\s*\(|\bquad_\w+\s*\(|"
     r"\bthread_index_in_simdgroup\b|\bthreadgroup_position_in_grid\b|\bthreads_per_threadgroup\b|"
-    r"\bthread_position_in_threadgroup\b|\b_coop_lane\b|\bWP_NATIVE_BLOCK_SYNC\(\)\s*;|"
+    r"\bthread_position_in_threadgroup\b|\bthread_index_in_threadgroup\b|\bsimdgroup_index_in_threadgroup\b|"
+    r"\bthreads_per_simdgroup\b|\bthread_execution_width\b|\bthreadgroups_per_grid\b|"
+    r"\bdispatch_threads_per_threadgroup\b|\bquadgroup_\w+\b|\bthread_index_in_quadgroup\b|"
+    r"\b_coop_lane\b|\bWP_NATIVE_BLOCK_SYNC\(\)\s*;"
+)
+# Tokens that make a kernel body depend on its threadgroup shape.
+_TG_DEPENDENT_PAT = re.compile(
+    _TG_SHAPE_TOKENS + r"|"
     # Lock loops: threads that share a SIMD group can livelock on one lock,
     # so keep the launch shape these kernels were validated with.
     r"\batomic_compare_exchange_\w+|\bwp_a64_\w+|spin"
 )
+# The same for the helper functions a kernel calls. Their CAS loops are
+# lock-free or serialise SIMD groups by design (``_F64_ATOMIC_HELPERS``).
+_TG_HELPER_DEPENDENT_PAT = re.compile(_TG_SHAPE_TOKENS)
+_MSL_FUNC_HEAD_PAT = re.compile(
+    r"^[ \t]*(?:template\s*<[^<>]*(?:<[^<>]*>[^<>]*)*>\s*)?[A-Za-z_][\w:<>,\s\*&]*?\b([A-Za-z_]\w*)\s*\([^;{}()]*(?:\([^;{}()]*\)[^;{}()]*)*\)\s*(?:const\s*)?\{",
+    re.MULTILINE,
+)
+_MSL_CALL_NAME_PAT = re.compile(r"\b([A-Za-z_]\w*)\s*\(")
+_MSL_BRACE_PAT = re.compile(r"[{}]")
+# PSO id -> whether the launcher may pick any threadgroup shape for it
+# (see ``_grid_only_source``); PSO id -> ``maxTotalThreadsPerThreadgroup``.
+_PSO_GRID_ONLY: dict[int, bool] = {}
+_PSO_MAX_THREADS: dict[int, int] = {}
 
 
-def _grid_only_kernel(kernel) -> bool:
-    """Whether the kernel's native MSL is independent of its threadgroup shape.
+def _msl_function_bodies(header: str) -> dict[str, list[str]]:
+    """``name -> [body text]`` of the functions defined in an MSL prelude
+    (macro-generated functions are not seen)."""
+    out: dict[str, list[str]] = {}
+    pos = 0
+    while True:
+        m = _MSL_FUNC_HEAD_PAT.search(header, pos)
+        if m is None:
+            return out
+        depth, end = 0, len(header)
+        for b in _MSL_BRACE_PAT.finditer(header, m.end() - 1):
+            depth += 1 if b.group(0) == "{" else -1
+            if depth == 0:
+                end = b.end()
+                break
+        out.setdefault(m.group(1), []).append(header[m.end() : end])
+        pos = end
 
-    True when the body never touches threadgroup memory, barriers, SIMD-group
-    functions, threadgroup-relative indices or lock loops, so any threadgroup
-    shape gives the same result. Cached on the kernel.
+
+def _grid_only_source(src: str) -> bool:
+    """Whether a native-dispatch MSL kernel is independent of its threadgroup shape.
+
+    True when neither the kernel body nor a helper it calls (transitively)
+    touches threadgroup memory, barriers, SIMD-group or quad-group
+    functions or threadgroup-relative indices, and the body has no lock
+    loops, so any threadgroup shape gives the same result.
     """
-    cached = getattr(kernel, "_metal_grid_only", None)
-    if cached is not None:
-        return cached
-    src = getattr(kernel, "_metal_native_wrapped_source", None)
-    if not src:
-        return False
     start = src.find("[[kernel]]")
     if start < 0:
         return False
+    open_at = src.find(") {", start)
+    if open_at < 0:
+        return False
     # The body after the parameter list (which declares every attribute).
-    body = src[src.find(") {", start) :]
-    body = body.replace("uint _coop_lane = thread_position_in_threadgroup.x;", "")
-    ok = _TG_DEPENDENT_PAT.search(body) is None
-    kernel._metal_grid_only = ok
-    return ok
+    body = src[open_at:].replace("uint _coop_lane = thread_position_in_threadgroup.x;", "")
+    if _TG_DEPENDENT_PAT.search(body) is not None:
+        return False
+    helpers = None
+    seen: set[str] = set()
+    todo = [body]
+    while todo:
+        names = set(_MSL_CALL_NAME_PAT.findall(todo.pop())) - seen
+        if not names:
+            continue
+        if helpers is None:
+            helpers = _msl_function_bodies(src[:start])
+        for name in names:
+            seen.add(name)
+            for text in helpers.get(name, ()):
+                if _TG_HELPER_DEPENDENT_PAT.search(text) is not None:
+                    return False
+                todo.append(text)
+    return True
+
+
+def _note_native_pso(pso, wrapped: str) -> None:
+    """Record launch-shape facts about a freshly compiled native PSO."""
+    if pso is not None and id(pso) not in _PSO_GRID_ONLY:
+        _PSO_GRID_ONLY[id(pso)] = _grid_only_source(wrapped)
+
+
+def _pso_max_threads(pso) -> int:
+    n = _PSO_MAX_THREADS.get(id(pso))
+    if n is None:
+        try:
+            n = int(pso.maxTotalThreadsPerThreadgroup())
+        except Exception:
+            n = 1024
+        _PSO_MAX_THREADS[id(pso)] = n
+    return n
 
 
 def _native_lane_launch_error(kernel, block_dim: int) -> str:
@@ -22673,6 +22742,7 @@ def _alias_variant_pso(kernel, artifact, topology: tuple[tuple[str, str, int], .
     use_buffer = getattr(artifact, "native_alias_offs_slot", None) is not None
     try:
         pso = get_dispatcher().compile(wrapped, f"custom_kernel_{artifact.name}")
+        _note_native_pso(pso, wrapped)
     except Exception as exc:
         raise MetalCodegenError(
             f"Kernel '{kernel.key}': argument(s) {', '.join(a[0] for a in topology)} share memory with another "
@@ -23376,13 +23446,19 @@ def launch_metal_kernel_native(
             tg = (min(256, grid_x), 1, 1)
         else:
             tg = (min(64, grid_x), 1, 1)
-        if len(dims) >= 2 and tg[0] < 64 and _grid_only_kernel(kernel):
+        # The PSO's own limit (lower for kernels with many registers).
+        max_threads = _pso_max_threads(pso)
+        grid_only = _PSO_GRID_ONLY.get(id(pso), False)
+        if grid_only and tg[0] > max_threads:
+            tg = (max_threads, 1, 1)
+        if len(dims) >= 2 and tg[0] < 64 and grid_only:
             # A short leading launch dim (``dim=(num_worlds, n)`` with few
             # worlds) would give threadgroups of one or a few threads: up to
             # 15x slower, more so from a captured graph. Kernels that index
             # only by ``thread_position_in_grid`` may span the other axes.
-            ty = max(1, min(grid_y, 256 // tg[0]))
-            tz = max(1, min(grid_z, 256 // (tg[0] * ty)))
+            cap = min(256, max_threads)
+            ty = max(1, min(grid_y, cap // tg[0]))
+            tz = max(1, min(grid_z, cap // (tg[0] * ty)))
             tg = (tg[0], ty, tz)
         if artifact.coop_chol_n > 0:
             grid_x = grid_x * 32
@@ -23392,6 +23468,14 @@ def launch_metal_kernel_native(
             if grid_y * grid_z <= 1024:
                 tg = (1, grid_y, grid_z)
             # else: keep default tg and accept potential race (matches MLX path's behaviour).
+    if tg[0] * tg[1] * tg[2] > _pso_max_threads(pso):
+        # Metal leaves an oversized threadgroup undefined; this shape is
+        # part of the kernel's semantics (barriers, SIMD groups, lanes).
+        raise RuntimeError(
+            f"Kernel '{kernel.key}' needs a Metal threadgroup of {tg[0] * tg[1] * tg[2]} threads {tg}, but its "
+            f"compiled pipeline allows at most {_pso_max_threads(pso)} (too many registers or too much "
+            "private memory per thread)."
+        )
 
     # ---- Spilled array params (see ``_wrap_msl_for_native_dispatch``) ----
     spill_slots = getattr(artifact, "native_spill_slots", ())

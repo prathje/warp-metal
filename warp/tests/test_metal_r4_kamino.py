@@ -352,6 +352,82 @@ class TestMetalR4Kamino(unittest.TestCase):
             """,
         )
 
+    def test_grid_only_classification(self):
+        # Threadgroups span the y/z axes only for kernels whose MSL does not
+        # depend on the threadgroup shape, including helpers they call, and
+        # the decision belongs to the pipeline actually launched (forward and
+        # backward kernels differ).
+        _run(
+            self,
+            """
+            from warp._src import codegen_metal as cm
+
+            head = (
+                "inline float h_lane(float v) { return metal::simd_sum(v); }\\n"
+                "inline float h_mid(float v) { return h_lane(v) + 1.0f; }\\n"
+                "inline float h_ok(float v) { return v * 2.0f; }\\n"
+                "inline float h_unused(float v) { return metal::simd_max(v); }\\n"
+            )
+            sig = "[[kernel]] void custom_kernel_k(device float* a [[buffer(0)]], uint3 thread_position_in_grid [[thread_position_in_grid]]) {"
+
+            def src(body):
+                return head + sig + "\\n" + body + "\\n}\\n"
+
+            assert cm._grid_only_source(src("a[0] = h_ok(a[1]);"))
+            assert not cm._grid_only_source(src("a[0] = h_mid(a[1]);"))
+            assert not cm._grid_only_source(src("a[0] = metal::quad_sum(a[1]);"))
+            assert not cm._grid_only_source(src("threadgroup float s[4]; a[0] = s[0];"))
+
+            @wp.kernel
+            def k(x: wp.array2d[float], y: wp.array2d[float], s: wp.array[float]):
+                i, j = wp.tid()
+                y[i, j] = x[i, j] * x[i, j]
+                wp.atomic_add(s, i, x[i, j])
+
+            def run(dev):
+                x = wp.array(np.linspace(0.0, 1.0, 2 * 777, dtype=np.float32).reshape(2, 777), device=dev, requires_grad=True)
+                y = wp.zeros((2, 777), dtype=float, device=dev, requires_grad=True)
+                s = wp.zeros(2, dtype=float, device=dev, requires_grad=True)
+                tape = wp.Tape()
+                with tape:
+                    wp.launch(k, dim=(2, 777), inputs=[x, y, s], device=dev)
+                y.grad.fill_(1.0)
+                s.grad.fill_(2.0)
+                tape.backward()
+                return y.numpy(), s.numpy(), x.grad.numpy()
+
+            assert_same(both(run))
+            fwd = k._metal_native_pso
+            adj = [p for _a, p in k._metal_adj_cache.values()]
+            assert id(fwd) in cm._PSO_GRID_ONLY and all(id(p) in cm._PSO_GRID_ONLY for p in adj)
+            """,
+        )
+
+    def test_short_leading_dim_launch_fp64_atomics(self):
+        # Spanned threadgroups with the lock-based float64 atomics (emulated
+        # mode) and a 3-D launch.
+        _run(
+            self,
+            """
+            wp.set_module_options({"metal_fp64": "emulate"})
+
+            @wp.kernel
+            def k(a: wp.array3d[wp.float64], s: wp.array[wp.float64]):
+                i, j, l = wp.tid()
+                wp.atomic_add(s, i, a[i, j, l])
+
+            v = np.random.default_rng(0).random((2, 9, 301))
+
+            def run(dev):
+                a = wp.array(v, dtype=wp.float64, device=dev)
+                s = wp.zeros(2, dtype=wp.float64, device=dev)
+                wp.launch(k, dim=(2, 9, 301), inputs=[a, s], device=dev)
+                return s.numpy()
+
+            assert_same(both(run), rtol=1e-12, atol=1e-9)
+            """,
+        )
+
     def test_module_fp64_option_after_first_launch(self):
         # Setting ``metal_fp64`` after the kernel already ran on Metal must
         # rebuild it instead of reusing the artifact of the old mode.
