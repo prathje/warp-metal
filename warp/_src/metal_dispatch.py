@@ -152,6 +152,13 @@ _OP_CTRL = 6
 # Build-time only: loop-execution begin / end markers, stripped by
 # ``_build_program`` into ``MetalGraph._loop_spans``.
 _OP_MARK = 7
+# ``(_OP_DIRECT, spec)``: a direct (non-ICB) dispatch of a kernel whose
+# private memory is too large for an indirect command buffer (see
+# ``_large_private_memory``). ``spec`` is ``(pso, [(buffer, offset, slot)...],
+# grid, threadgroup, name, MTLSize grid, MTLSize threadgroup)``. Inside a
+# gated region the PSO is a variant that returns early when the
+# ``WpExecRange`` its gate op wrote has length 0.
+_OP_DIRECT = 8
 # Replay keeps at most this many committed-but-unfinished command buffers
 # of a program while inside an unrolled loop, so it can see a loop latch
 # false and stop encoding iterations that would all be skipped.
@@ -198,30 +205,102 @@ def _u32(value: int) -> tuple[bytes, int]:
     return ((value & 0xFFFFFFFF).to_bytes(4, "little"), 4)
 
 
-# Per-thread private tile storage above which a kernel's PSO is kept out of
-# indirect command buffers for eager dispatch (see ``MetalDispatcher.compile``).
-# Measured on Apple M1: a 16 KiB private tile replays from an ICB after it has
-# run, 24 KiB fails.
+# Per-thread private storage above which a kernel's PSO is kept out of
+# indirect command buffers (see ``MetalDispatcher.compile``). Measured on
+# Apple M1: a 16 KiB private tile replays from an ICB after it has run, 24 KiB
+# fails. Metal exposes no query for a pipeline's private memory size, so the
+# estimate comes from the MSL source.
 _LARGE_PRIVATE_BYTES = 16 * 1024
 _TILE_DECL_PAT = re.compile(r"^\s*wp_tile_(\d+)x(\d+)_(?:vec(\d+)_)?(\w+?)\s+var_\w+\s*;", re.MULTILINE)
-_SCALAR_BYTES = {"float": 4, "int": 4, "uint": 4, "half": 2, "short": 2, "ushort": 2, "char": 1, "uchar": 1}
+# ``T name[N][M] = {};`` thread-local arrays (``wp.zeros`` in a kernel, see
+# ``codegen_metal_locals``) and ``wp_vecN_T`` / ``wp_matRxC_T`` locals.
+# Address-space-qualified declarations (threadgroup / constant / device)
+# are not private memory and are skipped.
+_ARRAY_DECL_PAT = re.compile(
+    r"^\s*(?!(?:threadgroup|constant|device|static|return)\b)(?:thread\s+)?(?P<type>[A-Za-z_]\w*)\s+\w+\s*(?P<dims>(?:\[\s*\d+\s*\]\s*)+)(?:=[^;]*)?;",
+    re.MULTILINE,
+)
+_VECMAT_DECL_PAT = re.compile(
+    r"^\s*(?:thread\s+)?wp_(?:vec(?P<n>\d+)|mat(?P<r>\d+)x(?P<c>\d+))_(?P<scalar>\w+?)\s+\w+\s*(?:=[^;]*)?;",
+    re.MULTILINE,
+)
+_SCALAR_BYTES = {
+    "float": 4,
+    "int": 4,
+    "uint": 4,
+    "int32_t": 4,
+    "uint32_t": 4,
+    "bool": 1,
+    "half": 2,
+    "short": 2,
+    "ushort": 2,
+    "char": 1,
+    "uchar": 1,
+    "int8_t": 1,
+    "uint8_t": 1,
+    "int16_t": 2,
+    "uint16_t": 2,
+    "double": 8,
+    "long": 8,
+    "ulong": 8,
+    "int64_t": 8,
+    "uint64_t": 8,
+}
+_VECMAT_TYPE_PAT = re.compile(r"wp_(?:vec(\d+)|mat(\d+)x(\d+))_(\w+)$")
 
 
-def _large_private_memory(source: str) -> bool:
-    """Whether the kernel's private tile locals exceed ``_LARGE_PRIVATE_BYTES``.
+def _type_bytes(name: str) -> int:
+    """Size of an MSL scalar / ``wp_vecN_T`` / ``wp_matRxC_T`` type (8 for unknown types)."""
+    b = _SCALAR_BYTES.get(name)
+    if b is not None:
+        return b
+    m = _VECMAT_TYPE_PAT.match(name)
+    if m:
+        n = int(m.group(1)) if m.group(1) else int(m.group(2)) * int(m.group(3))
+        return n * _SCALAR_BYTES.get(m.group(4), 8)
+    vm = re.match(r"(float|int|uint|half|short|ushort|char|uchar|bool)(\d)(?:x(\d))?$", name)
+    if vm:
+        return _SCALAR_BYTES[vm.group(1)] * int(vm.group(2)) * int(vm.group(3) or 1)
+    return 8
 
-    Sums the ``wp_tile_RxC_<scalar>`` locals the Metal codegen declares; other
-    stack use is not counted, so this is a lower bound.
+
+def _private_memory_bytes(source: str) -> int:
+    """Estimate of the per-thread private memory a kernel's locals need.
+
+    Sums the ``wp_tile_RxC_<scalar>`` tile locals the Metal codegen declares,
+    fixed-size thread-local arrays and ``wp_vec`` / ``wp_mat`` locals,
+    anywhere in the source (helpers are inlined into the kernel, so counting
+    their locals errs on the large side). Scalars, native vectors and
+    compiler temporaries are not counted.
     """
-    if "wp_tile_" not in source:
-        return False
     total = 0
     for m in _TILE_DECL_PAT.finditer(source):
         rows, cols, vec, scalar = int(m.group(1)), int(m.group(2)), int(m.group(3) or 1), m.group(4)
         total += rows * cols * vec * _SCALAR_BYTES.get(scalar, 8)
-        if total > _LARGE_PRIVATE_BYTES:
-            return True
-    return False
+    # Arrays and vec/mat locals: only the kernel itself and ``noinline``
+    # helpers (own stack frames). The always-inline library helpers declare
+    # one result local per overload, mostly unused by any given kernel.
+    k = source.find("[[kernel]]")
+    parts = [source[k:]] if k >= 0 else [source]
+    for m in re.finditer(r"__attribute__\(\(noinline\)\)", source[: max(k, 0)]):
+        end = source.find("\n}", m.end())
+        parts.append(source[m.end() : end if end >= 0 else len(source)])
+    scan = "\n".join(parts)
+    for m in _ARRAY_DECL_PAT.finditer(scan):
+        count = 1
+        for d in re.findall(r"\d+", m.group("dims")):
+            count *= int(d)
+        total += count * _type_bytes(m.group("type"))
+    for m in _VECMAT_DECL_PAT.finditer(scan):
+        n = int(m.group("n")) if m.group("n") else int(m.group("r")) * int(m.group("c"))
+        total += n * _SCALAR_BYTES.get(m.group("scalar"), 8)
+    return total
+
+
+def _large_private_memory(source: str) -> bool:
+    """Whether the kernel's estimated private memory (see
+    :func:`_private_memory_bytes`) exceeds ``_LARGE_PRIVATE_BYTES``."""
+    return _private_memory_bytes(source) > _LARGE_PRIVATE_BYTES
 
 
 class MetalGraph:
@@ -642,8 +721,10 @@ class MetalDispatcher:
         # environment; ``enable_dispatch_profile()`` toggles at runtime.
         self._profile_dispatch = bool(int(os.environ.get("WARP_METAL_PROFILE_DISPATCH", "0") or "0"))
         self._pso_name: dict[int, str] = {}
-        # Direct-dispatch PSO id -> (source, entry point) of its ICB-capable twin.
-        self._icb_twin_src: dict[int, tuple[str, str]] = {}
+        # Direct-only PSO id -> (estimated private bytes, source, entry point).
+        # These are never encoded into an ICB; graph capture records them as
+        # direct dispatches in the replay program (see ``_record_direct``).
+        self._direct_only: dict[int, tuple[int, str, str]] = {}
         # entry_point -> [count, total_ns, total_grid]
         self._dispatch_stats: dict[str, list] = {}
         # Allocation guard / canary settings — read once here rather than
@@ -668,11 +749,12 @@ class MetalDispatcher:
         ``icb`` selects whether the PSO may be encoded into an indirect
         command buffer (graph capture). ``None`` decides from the source:
         kernels with large per-thread private tiles (see
-        :func:`_large_private_memory`) get a direct-dispatch PSO, and
-        :meth:`_record_dispatch` swaps in an ICB-capable twin, compiled on
-        first capture. Once an ICB-capable PSO with that much private memory
-        has run, the Apple GPU driver fails every later indirect-command-
-        buffer execution in the process with "Insufficient Memory".
+        :func:`_large_private_memory`) get a direct-dispatch PSO only, and
+        graph capture records them as direct dispatches in the replay
+        program (see :meth:`_record_direct`). An ICB holding such a kernel
+        fails with "Insufficient Memory", and once an ICB-capable PSO with
+        that much private memory has run the Apple GPU driver fails every
+        later indirect-command-buffer execution in the process.
 
         Caches the compiled library and pipeline state — subsequent
         compiles with the same source are O(dict lookup).
@@ -686,7 +768,7 @@ class MetalDispatcher:
             icb = not _large_private_memory(source)
             if not icb:
                 pso = self.compile(source, entry_point, icb=False)
-                self._icb_twin_src[id(pso)] = (source, entry_point)
+                self._direct_only[id(pso)] = (_private_memory_bytes(source), source, entry_point)
                 return pso
         key = (self._hash(source), entry_point) if icb else (self._hash(source), entry_point, "direct")
         cached = self._pipeline_cache.get(key)
@@ -2101,6 +2183,14 @@ class MetalDispatcher:
                     ranges_buf, full_buf = table
                     program.append((_OP_GATE, tuple(conds), conds_params(conds), ranges_buf, full_buf))
                     program.append((_OP_EXEC_IND, ranges_buf, 0))
+                elif kind == "direct":
+                    spec, gate = node[1], node[2]
+                    if conds:
+                        # Recorded inside a region, so ``spec`` is the gated
+                        # variant reading ``gate_buf`` (see ``_record_direct``).
+                        gate_buf, full_buf = gate
+                        program.append((_OP_GATE, tuple(conds), conds_params(conds), gate_buf, full_buf))
+                    program.append((_OP_DIRECT, spec))
                 elif kind == "gate":
                     _k, flag_buf, flag_off, negate, snapshot, body = node
                     if not body:
@@ -2176,7 +2266,7 @@ class MetalDispatcher:
         descriptors in one graph-owned buffer. Every buffer a descriptor
         points at is added to ``resident`` (``id -> buffer``): replay must
         declare it with ``useResource`` since no argument slot binds it."""
-        ctrl = [op for op in program if op[0] not in (_OP_EXEC, _OP_EXEC_IND)]
+        ctrl = [op for op in program if op[0] not in (_OP_EXEC, _OP_EXEC_IND, _OP_DIRECT)]
         if not ctrl:
             return program
         stride = (_CTRL_OP_SIZE + 15) & ~15
@@ -2195,7 +2285,7 @@ class MetalDispatcher:
         k = 0
         for op in program:
             code = op[0]
-            if code in (_OP_EXEC, _OP_EXEC_IND):
+            if code in (_OP_EXEC, _OP_EXEC_IND, _OP_DIRECT):
                 out.append(op)
                 continue
             flags = [0] * 8
@@ -2433,6 +2523,13 @@ class MetalDispatcher:
                 elif code == _OP_EXEC_IND:
                     exec_indirect(icb, op[1], op[2])
                     bound = None
+                elif code == _OP_DIRECT:
+                    spec = op[1]
+                    set_pso(spec[0])
+                    for buf, off, slot in spec[1]:
+                        set_buffer(buf, off, slot)
+                    dispatch(spec[5], spec[6])
+                    bound = None
                 else:
                     exec_range(icb, nsrange(op[1], op[2]))
                     bound = None
@@ -2491,7 +2588,8 @@ class MetalDispatcher:
         above it are real GPU work.
 
         Caveats: gated regions are ignored (every command executes,
-        ungated), and timing runs synchronously (``waitUntilCompleted``
+        ungated), direct-dispatched kernels (too much private memory for
+        an ICB, see :meth:`compile`) are skipped, and timing runs synchronously (``waitUntilCompleted``
         per batch of ≤2048 commands). Apple GPUs only support
         stage-boundary counter sampling; raises
         :class:`MetalDispatchError` where even that is unavailable.
@@ -2591,12 +2689,11 @@ class MetalDispatcher:
         conflicts on any shared buffer with the still-open chunk, the
         chunk is closed and a new one starts here.
         """
-        twin = self._icb_twin_src.get(id(pso))
-        if twin is not None:
-            pso = self.compile(twin[0], twin[1], icb=True)
-
         st = self._record_state
         assert st is not None  # caller checked
+        if id(pso) in self._direct_only:
+            self._record_direct(st, pso, bindings, grid, threadgroup, reads_resident, extra_resources)
+            return
         if st["count"] >= st["max"]:
             self._grow_icb(st)
         # Compute this command's read/write sets over shared buffers.
@@ -2724,6 +2821,117 @@ class MetalDispatcher:
         st["names"].append(self._pso_name.get(id(pso), "<unknown>"))
         st["specs"].append((pso, spec_bindings, (gx, gy, gz), (tx, ty, tz)))
         st["count"] += 1
+
+    def _gated_variant(self, pso, slot: int):
+        """Direct-only PSO of ``pso``'s kernel with an extra
+        ``device const uint* [[buffer(slot)]]`` gate argument: every thread
+        returns at once when word 1 (a ``WpExecRange`` length) is zero."""
+        nbytes, source, entry = self._direct_only[id(pso)]
+        name = self._pso_name.get(id(pso), entry)
+        if slot > 30:
+            raise MetalDispatchError(
+                f"Kernel {name!r} (about {nbytes} bytes of private memory, too much for a Metal indirect "
+                f"command buffer) is captured inside wp.capture_if / wp.capture_while and binds {slot} "
+                "buffers; the gated direct dispatch needs one more slot than Metal's 31."
+            )
+        m = re.search(r"\[\[kernel\]\]\s*void\s+" + re.escape(entry) + r"\s*\(", source)
+        if m is None:
+            raise MetalDispatchError(f"Cannot find the [[kernel]] signature of {entry!r} to gate it")
+        depth, i = 1, m.end()
+        while depth:
+            c = source[i]
+            depth += (c == "(") - (c == ")")
+            i += 1
+        close = i - 1
+        brace = source.index("{", close)
+        gated = (
+            source[:close]
+            + f",\n    device const uint* __wp_gate [[buffer({slot})]]"
+            + source[close : brace + 1]
+            + "\n    if (__wp_gate[1] == 0u) { return; }"
+            + source[brace + 1 :]
+        )
+        gpso = self.compile(gated, entry, icb=False)
+        self._direct_only[id(gpso)] = (nbytes, gated, entry)
+        return gpso
+
+    def _record_direct(self, st, pso, bindings, grid, threadgroup, reads_resident, extra_resources) -> None:
+        """Record a direct-only kernel (see :meth:`compile`) into the
+        recording's conditional tree instead of an ICB slot.
+
+        Replay encodes it with ``dispatchThreads`` on the replay encoder, in
+        order with the ICB command runs around it. Inside a gated region or
+        loop it runs a variant of the kernel that reads its gate from an
+        extra buffer and returns at once when a condition fails (see
+        :meth:`_gated_variant`): an indirect dispatch
+        (``dispatchThreadgroupsWithIndirectBuffer``) of such a kernel fails
+        on the GPU with "Insufficient Memory", like an ICB.
+        """
+        name = self._pso_name.get(id(pso), "<unknown>")
+        gx, gy, gz = (int(v) for v in grid)
+        tx, ty, tz = (int(v) for v in threadgroup)
+        gate = None
+        if st["stack"]:
+            slot = len(bindings)
+            pso = self._gated_variant(pso, slot)
+            if tx * ty * tz > int(pso.maxTotalThreadsPerThreadgroup()):
+                raise MetalDispatchError(
+                    f"Kernel {name!r}: the gated variant for wp.capture_if / wp.capture_while allows at most "
+                    f"{int(pso.maxTotalThreadsPerThreadgroup())} threads per threadgroup, the launch uses "
+                    f"{(tx, ty, tz)}."
+                )
+            # ``WpExecRange`` the gate op writes: ``full`` = (0, 1), length
+            # zeroed when a condition fails; the kernel reads the length.
+            full_buf, full_addr = self.alloc(8)
+            gate_buf, gate_addr = self.alloc(8)
+            ctypes.memset(gate_addr, 0, 8)
+            packed = (ctypes.c_uint32 * 2).from_address(full_addr)
+            packed[0], packed[1] = 0, 1
+            st["owned_buffers"].extend((full_buf, gate_buf))
+            gate = (gate_buf, full_buf)
+            bindings = [*bindings, gate_buf]
+        # Order against the ICB commands around it: close the open chunk
+        # (replay puts a barrier between program ops).
+        self._close_open_chunk(st)
+        res_set = st["resources_set"]
+        resources = st["resources"]
+        owned = st["owned_buffers"]
+
+        def add_resource(buf):
+            if id(buf) not in res_set:
+                res_set.add(id(buf))
+                resources.append(buf)
+
+        if reads_resident:
+            for r in self._resident_resources:
+                add_resource(r)
+        for buf, _mode in extra_resources or ():
+            add_resource(buf)
+        spec_bindings: list = []
+        for idx, entry in enumerate(bindings):
+            if isinstance(entry, tuple) and len(entry) == 2:
+                data, length = entry
+                buf, addr = self.alloc(length)
+                ctypes.memmove(addr, data, length)
+                owned.append(buf)
+                spec_bindings.append((buf, 0, idx))
+            elif isinstance(entry, BufferSlice):
+                spec_bindings.append((entry.buffer, entry.offset, idx))
+            else:
+                spec_bindings.append((entry, 0, idx))
+            add_resource(spec_bindings[-1][0])
+        Metal = self._Metal
+        spec = (
+            pso,
+            spec_bindings,
+            (gx, gy, gz),
+            (tx, ty, tz),
+            name,
+            Metal.MTLSizeMake(gx, gy, gz),
+            Metal.MTLSizeMake(tx, ty, tz),
+        )
+        self._current_block(st).append(["direct", spec, gate])
+        st["conditional"] = True
 
     def _grow_icb(self, st) -> None:
         """Double the recording's ICB capacity, re-encoding the commands

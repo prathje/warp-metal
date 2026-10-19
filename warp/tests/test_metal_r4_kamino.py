@@ -217,6 +217,112 @@ class TestMetalR4Kamino(unittest.TestCase):
             """,
         )
 
+    def test_graph_capture_of_large_private_kernel(self):
+        # A kernel with more private memory than an ICB supports used to be
+        # encoded into the graph's ICB; replay failed with "Insufficient
+        # Memory" and every later graph in the process failed too. Graph
+        # capture now dispatches it directly, in order with the ICB commands
+        # around it, also inside capture_if / capture_while. The replayed
+        # results must match an eager run of the same launches on the CPU.
+        _run(
+            self,
+            """
+            from warp._src import metal_dispatch as md
+
+            R, C = 96, 64
+
+            @wp.kernel
+            def big(a: wp.array2d[float], out: wp.array2d[float]):
+                _b, _l = wp.tid()
+                t = wp.tile_load(a, shape=(R, C))
+                o = wp.tile_load(out, shape=(R, C))
+                u = wp.tile_map(wp.add, o, wp.tile_map(wp.mul, t, t))
+                wp.tile_store(out, u)
+
+            @wp.kernel
+            def inc(a: wp.array2d[float], v: float):
+                i, j = wp.tid()
+                a[i, j] = a[i, j] + v
+
+            @wp.kernel
+            def count_down(flag: wp.array[int], cnt: wp.array[int]):
+                cnt[0] = cnt[0] - 1
+                if cnt[0] <= 0:
+                    flag[0] = 0
+
+            @wp.kernel
+            def locals_big(a: wp.array[float], out: wp.array[float]):
+                i = wp.tid()
+                s = wp.zeros(shape=(6144,), dtype=float)
+                for j in range(6144):
+                    s[j] = a[j % a.shape[0]] + float(j % 97)
+                acc = float(0.0)
+                for j in range(6144):
+                    acc += s[(j * 7 + i) % 6144]
+                out[i] = out[i] + acc
+
+            rng = np.random.default_rng(3)
+            A = (0.1 * rng.standard_normal((R, C))).astype(np.float32)
+
+            def make(dev):
+                return dict(
+                    a=wp.array(A, device=dev),
+                    out=wp.zeros((R, C), dtype=float, device=dev),
+                    flag=wp.zeros(1, dtype=int, device=dev),
+                    cnt=wp.zeros(1, dtype=int, device=dev),
+                    off=wp.zeros(1, dtype=int, device=dev),
+                    small=wp.zeros(16, dtype=float, device=dev),
+                    sa=wp.array(np.arange(16, dtype=np.float32), device=dev),
+                )
+
+            def step(v, dev, capture):
+                wp.launch(inc, dim=(R, C), inputs=[v["a"], 1.0], device=dev)
+                wp.launch_tiled(big, dim=1, inputs=[v["a"], v["out"]], block_dim=64, device=dev)
+                wp.launch(inc, dim=(R, C), inputs=[v["out"], 0.5], device=dev)
+
+                def body():
+                    wp.launch_tiled(big, dim=1, inputs=[v["a"], v["out"]], block_dim=64, device=dev)
+                    wp.launch(count_down, dim=1, inputs=[v["flag"], v["cnt"]], device=dev)
+
+                def skipped():
+                    wp.launch_tiled(big, dim=1, inputs=[v["a"], v["out"]], block_dim=64, device=dev)
+
+                if capture:
+                    with wp.ScopedMetalCaptureWhileBudget(8):
+                        wp.capture_while(v["flag"], while_body=body)
+                    wp.capture_if(v["off"], on_true=skipped)
+                else:
+                    while v["flag"].numpy()[0]:
+                        body()
+                wp.launch(locals_big, dim=16, inputs=[v["sa"], v["small"]], device=dev)
+
+            cpu = make("cpu")
+            met = make("metal:0")
+            with wp.ScopedCapture(device="metal:0") as cap:
+                step(met, "metal:0", capture=True)
+            for loops in (3, 2):
+                for v in (cpu, met):
+                    v["flag"].fill_(1)
+                    v["cnt"].fill_(loops)
+                step(cpu, "cpu", capture=False)
+                wp.capture_launch(cap.graph)
+                for name in ("out", "a", "small", "cnt"):
+                    np.testing.assert_allclose(met[name].numpy(), cpu[name].numpy(), rtol=1e-5, atol=1e-4, err_msg=name)
+
+            disp = md.get_dispatcher()
+            names = {str(disp._pso_name.get(k)) for k in disp._direct_only}
+            assert any("locals_big" in n for n in names), names
+            assert any("big" in n and "locals" not in n for n in names), names
+
+            # Later graphs in the process still replay.
+            with wp.ScopedCapture(device="metal:0") as cap2:
+                wp.launch(inc, dim=(R, C), inputs=[met["a"], 1.0], device="metal:0")
+            before = met["a"].numpy()
+            wp.capture_launch(cap2.graph)
+            np.testing.assert_allclose(met["a"].numpy(), before + 1.0, rtol=1e-6)
+            """,
+        )
+
     def test_short_leading_dim_launch(self):
         # ``dim=(num_worlds, n)`` with few worlds: threadgroups now span the
         # second axis for kernels that only index by the grid position.
