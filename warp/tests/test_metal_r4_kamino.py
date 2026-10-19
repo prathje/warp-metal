@@ -454,6 +454,43 @@ class TestMetalR4Kamino(unittest.TestCase):
             """,
         )
 
+    def test_module_fp64_option_after_first_launch_with_f64_args(self):
+        # The rebuild must also drop the launch metadata (arg maps, wrapped
+        # source, constant buffers) built from the old artifact: float64
+        # array and struct arguments are packed per mode.
+        _run(
+            self,
+            """
+            @wp.struct
+            class S:
+                scale: wp.float64
+                n: int
+
+            @wp.kernel
+            def k(a: wp.array[wp.float64], s: S, out: wp.array[float]):
+                i = wp.tid()
+                x = a[i] * s.scale + wp.float64(1.0)
+                out[i] = wp.float32(x - a[i] * s.scale) + wp.float32(s.n)
+
+            def run(dev):
+                a = wp.array([1.0, 3.0], dtype=wp.float64, device=dev)
+                s = S()
+                s.scale = wp.float64(1.0e8)
+                s.n = 2
+                o = wp.zeros(2, dtype=float, device=dev)
+                wp.launch(k, dim=2, inputs=[a, s, o], device=dev)
+                return o.numpy()
+
+            try:
+                run("metal:0")
+            except Exception:
+                pass  # the default mode may reject float64 arguments
+            wp.set_module_options({"metal_fp64": "emulate"})
+            np.testing.assert_array_equal(run("cpu"), 3.0)
+            np.testing.assert_array_equal(run("metal:0"), 3.0)
+            """,
+        )
+
     def test_metal_module_options_do_not_change_module_hash(self):
         # ``metal_*`` module options are Metal-only: CPU/CUDA module hashes
         # (and so their kernel caches) must not change when one is set.

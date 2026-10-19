@@ -22280,7 +22280,18 @@ def _drop_stale_fp64_artifacts(kernel) -> None:
     """
     mode = _fp64_mode()
     if getattr(kernel, "_metal_fp64_mode", mode) != mode:
-        for attr in ("_metal_artifact", "_metal_native_pso", "_metal_mlx_kernel", "_metal_adj_cache", "_metal_alias_psos"):
+        for attr in (
+            "_metal_artifact",
+            "_metal_native_pso",
+            "_metal_mlx_kernel",
+            "_metal_adj_cache",
+            "_metal_alias_psos",
+            # launch metadata derived from the old artifact; resetting
+            # ``_metal_native_arg_by_name`` rebuilds the other arg maps
+            "_metal_native_arg_by_name",
+            "_metal_native_wrapped_source",
+            "_metal_native_const_buf_cache",
+        ):
             if hasattr(kernel, attr):
                 setattr(kernel, attr, None)
     kernel._metal_fp64_mode = mode
