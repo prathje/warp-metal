@@ -725,6 +725,10 @@ class MetalDispatcher:
         # These are never encoded into an ICB; graph capture records them as
         # direct dispatches in the replay program (see ``_record_direct``).
         self._direct_only: dict[int, tuple[int, str, str]] = {}
+        # Source hash -> whether ``compile(icb=None)`` may use an ICB PSO.
+        # Memoizes the private-memory scan, which costs ~50x the hash and
+        # would otherwise run on every device op (fill / zero / copy).
+        self._icb_ok: dict[str, bool] = {}
         # entry_point -> [count, total_ns, total_grid]
         self._dispatch_stats: dict[str, list] = {}
         # Allocation guard / canary settings — read once here rather than
@@ -765,10 +769,14 @@ class MetalDispatcher:
         compile each time.
         """
         if icb is None:
-            icb = not _large_private_memory(source)
+            h = self._hash(source)
+            icb = self._icb_ok.get(h)
+            if icb is None:
+                icb = self._icb_ok[h] = not _large_private_memory(source)
             if not icb:
                 pso = self.compile(source, entry_point, icb=False)
-                self._direct_only[id(pso)] = (_private_memory_bytes(source), source, entry_point)
+                if id(pso) not in self._direct_only:
+                    self._direct_only[id(pso)] = (_private_memory_bytes(source), source, entry_point)
                 return pso
         key = (self._hash(source), entry_point) if icb else (self._hash(source), entry_point, "direct")
         cached = self._pipeline_cache.get(key)
