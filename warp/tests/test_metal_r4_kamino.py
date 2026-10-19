@@ -435,6 +435,183 @@ class TestMetalR4Kamino(unittest.TestCase):
             """,
         )
 
+    def test_tile_transpose_is_a_view(self):
+        # ``wp.tile_transpose`` is a view of its source on CPU/CUDA: writes to
+        # the source after the transpose show through it, and writes through
+        # it change the source. Metal used to keep a stale copy whenever the
+        # transpose could not be folded into its uses.
+        _run(
+            self,
+            """
+            M, N, K = 3, 4, 2
+
+            @wp.func
+            def f_read(t: wp.tile(dtype=float, shape=(N, M))):
+                return wp.tile_sum(t)
+
+            @wp.func
+            def f_write(t: wp.tile(dtype=float, shape=(N, M)), x: wp.tile(dtype=float, shape=(N, K)),
+                        y: wp.tile(dtype=float, shape=(K, M))):
+                wp.tile_matmul(x, y, t)
+
+            @wp.func
+            def f_tmm(l: wp.tile(dtype=float, shape=(M, N)), x: wp.tile(dtype=float, shape=(M, K)),
+                      acc: wp.tile(dtype=float, shape=(N, K))):
+                lt = wp.tile_transpose(l)
+                wp.tile_matmul(lt, x, acc)
+
+            @wp.kernel(enable_backward=False)
+            def k(a: wp.array2d[float], x: wp.array2d[float], y: wp.array2d[float], xt: wp.array2d[float],
+                  yt: wp.array2d[float], out: wp.array3d[float], sums: wp.array[float], ext: wp.array[float],
+                  n: int, out7: wp.array2d[float]):
+                _i, _l = wp.tid()
+                tx = wp.tile_load(x, shape=(M, K))
+                ty = wp.tile_load(y, shape=(K, N))
+                txt = wp.tile_load(xt, shape=(N, K), storage="shared")
+                tyt = wp.tile_load(yt, shape=(K, M), storage="shared")
+                # 0: source written (matmul) after the transpose
+                s0 = wp.tile_load(a, shape=(M, N))
+                t0 = wp.tile_transpose(s0)
+                wp.tile_matmul(tx, ty, s0)
+                wp.tile_store(out[0], t0)
+                # 1: transpose written (matmul C), source read
+                s1 = wp.tile_load(a, shape=(M, N))
+                t1 = wp.tile_transpose(s1)
+                wp.tile_matmul(txt, tyt, t1)
+                wp.tile_store(out[1], wp.tile_transpose(s1))
+                # 2: transpose written by a wp.func, element writes through it
+                s2 = wp.tile_load(a, shape=(M, N))
+                t2 = wp.tile_transpose(s2)
+                f_write(t2, txt, tyt)
+                t2[1, 2] = 42.0
+                t2 += wp.tile_load(xt, shape=(N, M))
+                wp.tile_store(out[2], wp.tile_transpose(s2))
+                # 3: source element write and in-place add, transpose read by a
+                # wp.func, an element read and tile_map
+                s3 = wp.tile_load(a, shape=(M, N))
+                t3 = wp.tile_transpose(s3)
+                s3[2, 1] = 7.0
+                s3 += wp.tile_load(a, shape=(M, N))
+                wp.tile_store(sums, f_read(t3))
+                ext[0] = t3[3, 1]
+                wp.tile_store(out[3], wp.tile_map(wp.mul, t3, t3))
+                # 4: transpose taken before a loop that updates the source
+                s4 = wp.tile_load(a, shape=(M, N))
+                t4 = wp.tile_transpose(s4)
+                acc = wp.tile_zeros(shape=(K, M), dtype=float)
+                for _it in range(n):
+                    wp.tile_matmul(ty, t4, acc)
+                    wp.tile_matmul(tx, ty, s4)
+                wp.tile_store(out[4], wp.tile_transpose(acc))
+                # 5: transpose re-taken in a loop, source updated after it
+                s5 = wp.tile_load(a, shape=(M, N))
+                acc5 = wp.tile_zeros(shape=(N, M), dtype=float)
+                for _it in range(n):
+                    t5 = wp.tile_transpose(s5)
+                    s5 += wp.tile_load(a, shape=(M, N))
+                    acc5 += wp.tile_map(wp.mul, t5, t5)
+                wp.tile_store(out[5], acc5)
+                # 6: assignment copies (``u = t`` is ``wp::copy``): writes to the
+                # copy do not reach the source
+                s6 = wp.tile_load(a, shape=(M, N))
+                t6 = wp.tile_transpose(s6)
+                u6 = t6
+                u6[0, 0] = -1.0
+                wp.tile_store(out[6], wp.tile_transpose(s6))
+                # 7: transpose of a loop-local tile inside a wp.func (inlined
+                # locals are declared up front)
+                txs = wp.tile_load(x, shape=(M, K), storage="shared")
+                acc7 = wp.tile_zeros(shape=(N, K), dtype=float, storage="shared")
+                for _it in range(n):
+                    l7 = wp.tile_load(a, shape=(M, N), storage="shared")
+                    f_tmm(l7, txs, acc7)
+                wp.tile_store(out7, acc7)
+
+            rng = np.random.default_rng(1)
+            a_np = rng.standard_normal((M, N)).astype(np.float32)
+            arrs = [rng.standard_normal(sh).astype(np.float32) for sh in ((M, K), (K, N), (N, K), (K, M))]
+
+            def run(dev):
+                ins = [wp.array(a_np, device=dev)] + [wp.array(v, device=dev) for v in arrs]
+                out = wp.zeros((7, N, M), dtype=float, device=dev)
+                sums = wp.zeros(1, dtype=float, device=dev)
+                ext = wp.zeros(1, dtype=float, device=dev)
+                out7 = wp.zeros((N, K), dtype=float, device=dev)
+                wp.launch_tiled(k, dim=1, inputs=[*ins, out, sums, ext, 3, out7], block_dim=1, device=dev)
+                return out.numpy(), sums.numpy(), ext.numpy(), out7.numpy()
+
+            res = both(run)
+            assert_same(res, rtol=1e-5, atol=1e-4)
+            # The CPU reference really is a view (case 0 sees the update).
+            o = res["cpu"][0]
+            np.testing.assert_allclose(o[0], (a_np + arrs[0] @ arrs[1]).T, rtol=1e-5, atol=1e-5)
+            """,
+        )
+
+    def test_tile_transpose_views_metal_cannot_lower_raise(self):
+        # Where the view semantics cannot be reproduced, Metal must refuse
+        # instead of computing something else.
+        _run(
+            self,
+            """
+            from warp._src.codegen_metal import MetalCodegenError
+
+            M, N = 3, 4
+
+            @wp.kernel(enable_backward=False, module="unique")
+            def k_alias(a: wp.array2d[float], out: wp.array2d[float]):
+                _i, _l = wp.tid()
+                s = wp.tile_load(a, shape=(N, N))
+                t = wp.tile_transpose(s)
+                wp.tile_matmul(t, wp.tile_load(a, shape=(N, N)), s)
+                wp.tile_store(out, s)
+
+            @wp.kernel(enable_backward=False, module="unique")
+            def k_view(a: wp.array2d[float], out: wp.array2d[float]):
+                _i, _l = wp.tid()
+                s = wp.tile_load(a, shape=(M, N))
+                t = wp.tile_transpose(s)
+                v = wp.tile_view(t, offset=(1, 0), shape=(2, M))
+                wp.tile_assign(v, wp.tile_ones(shape=(1, M), dtype=float), offset=(0, 0))
+                wp.tile_store(out, t)
+
+            @wp.kernel(enable_backward=False, module="unique")
+            def k_row(a: wp.array2d[float], out: wp.array2d[float]):
+                _i, _l = wp.tid()
+                s = wp.tile_load(a, shape=(1, N))
+                t = wp.tile_transpose(s)
+                s += wp.tile_load(a, shape=(1, N))
+                wp.tile_store(out, t)
+
+            @wp.kernel(enable_backward=False, module="unique")
+            def k_row_ok(a: wp.array2d[float], out: wp.array2d[float]):
+                _i, _l = wp.tid()
+                s = wp.tile_load(a, shape=(1, N))
+                t = wp.tile_transpose(s)
+                wp.tile_store(out, t)
+                s += wp.tile_load(a, shape=(1, N))
+
+            a = wp.ones((N, N), dtype=float, device="metal:0")
+            out = wp.zeros((N, N), dtype=float, device="metal:0")
+            for kern in (k_alias, k_view, k_row):
+                try:
+                    wp.launch_tiled(kern, dim=1, inputs=[a, out], block_dim=1, device="metal:0")
+                    wp.synchronize_device("metal:0")
+                except MetalCodegenError as e:
+                    assert "tile_transpose" in str(e), e
+                else:
+                    raise AssertionError(f"{kern.key} did not raise")
+
+            def run(dev):
+                a = wp.array(np.arange(N, dtype=np.float32).reshape(1, N), device=dev)
+                out = wp.zeros((N, 1), dtype=float, device=dev)
+                wp.launch_tiled(k_row_ok, dim=1, inputs=[a, out], block_dim=1, device=dev)
+                return out.numpy()
+
+            assert_same(both(run))
+            """,
+        )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

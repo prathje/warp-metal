@@ -9039,6 +9039,7 @@ def _plan_smem_tiles(
     tile_var_dims: dict[str, tuple[int, int, str]],
     tile_var_vec_n: dict[str, int],
     reserved_floats: int = 0,
+    exclude: set[str] | frozenset = frozenset(),
 ) -> tuple[dict[str, tuple[int, int, int, str]], int]:
     """Decide which tile locals can live in threadgroup memory.
 
@@ -9060,11 +9061,17 @@ def _plan_smem_tiles(
     alias the same storage (the factorization is in place), which is what
     keeps the arena down to one N*N slot for the common
     load -> factorize -> solve -> store shape.
+
+    Labels in ``exclude`` (sources of folded ``tile_transpose`` views, which
+    the translators read as private structs) are never promoted.
     """
     candidates = {
         label
         for label, (rows, cols, _scalar) in tile_var_dims.items()
-        if rows == cols and _COOP_CHOL_MIN_N <= rows <= _COOP_CHOL_MAX_N and not tile_var_vec_n.get(label)
+        if rows == cols
+        and _COOP_CHOL_MIN_N <= rows <= _COOP_CHOL_MAX_N
+        and not tile_var_vec_n.get(label)
+        and label not in exclude
     }
     if not candidates:
         return {}, 0
@@ -11375,6 +11382,8 @@ _TILE_ASSIGN_PAT = re.compile(r"\bwp::tile_assign\s*\(([^)]*)\)")
 # ``repl_transpose_notpl`` using ``tile_var_dims``.
 _TILE_TRANSPOSE_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_transpose\s*<[^()]*>\s*\(\s*var_(\w+)\s*\)")
 _TILE_TRANSPOSE_NOTPL_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_transpose\s*\(\s*var_(\w+)\s*\)")
+# ``wp::metal_tile_transpose_copy(var_D, var_S);`` (see ``_fold_tile_transpose_views``).
+_TILE_TRANSPOSE_COPY_PAT = re.compile(r"\bwp::metal_tile_transpose_copy\s*\(\s*var_(\w+)\s*,\s*var_(\w+)\s*\)\s*;")
 # ``wp::adj_tile_transpose(var_T, adj_T, adj_RET)`` — transpose is its own
 # adjoint, accumulated: ``adj_T += transpose(adj_RET)`` (see tile.h).
 _ADJ_TILE_TRANSPOSE_PAT = re.compile(r"\bwp::adj_tile_transpose\s*\(\s*var_(\w+)\s*,\s*adj_(\w+)\s*,\s*adj_(\w+)\s*\)")
@@ -11418,34 +11427,43 @@ def _fold_tile_transpose_views(
     lines: list[str],
     tile_var_dims: dict[str, tuple[int, int, str]],
     tile_var_vec_n: dict[str, int],
-) -> tuple[list[str], dict[str, str]]:
-    """Read ``tile_transpose`` results through their source tile.
+) -> tuple[list[str], dict[str, str], dict[str, float]]:
+    """Lower ``tile_transpose`` results as views of their source tile.
 
-    On CUDA and CPU ``wp.tile_transpose(S)`` is a layout view of ``S``. The
-    serial Metal model holds tiles in private structs, so a transpose is a
-    full copy, and kernels that transpose large tiles (Kamino's blocked LLT
-    at ``block_size=64``: nine 16 KB tiles) exceed the per-thread stack the
-    Apple GPU compiler allows ("Compute function exceeds available stack
-    space", or an XPC crash of the compiler service).
+    On CUDA and CPU ``wp.tile_transpose(S)`` is a layout view of ``S``:
+    element ``(i, j)`` of ``T = transpose(S)`` *is* element ``(j, i)`` of
+    ``S``, so writes to ``S`` after the transpose are visible through ``T``
+    and writes to ``T`` change ``S``. The serial Metal model holds tiles in
+    private structs. A copy taken at the transpose would go stale (silently
+    wrong results), and kernels that transpose large tiles (Kamino's
+    blocked LLT at ``block_size=64``: nine 16 KB tiles) exceed the
+    per-thread stack the Apple GPU compiler allows.
 
-    A transpose ``T = transpose(S)`` is dropped when ``T`` has this one
-    definition and every use of ``T`` is one of:
+    For ``T = transpose(S)`` with one definition (scalar 2-D tiles, ``S``
+    not itself a view that a later assignment could rebind), ``T`` is
+    removed and every statement that names it reads or writes ``S``
+    at that point of the program, independent of control flow:
 
-    - the ``A`` or ``B`` operand of ``tile_matmul`` (not ``C``, and ``C`` is
-      not ``S``): the translator reads ``S`` with swapped indices;
-    - the ``B`` operand of ``tile_lower/upper_solve_inplace``: the existing
-      transposed solve helper updates ``S`` in place, as the CUDA view does;
-    - the source of ``U = transpose(T)``, where ``U`` has one definition and
-      is only read (matmul ``A``/``B``, ``tile_store`` source, ``tile_extract``,
-      solve ``L``, another transpose): ``U`` is ``S`` itself, so its uses are
-      renamed to ``S``.
+    - ``U = transpose(T)`` (one definition): ``U`` is ``S``, so it is
+      renamed to ``S``;
+    - folded positions, which the translators read through ``S`` with
+      swapped indices: the ``A`` / ``B`` operand of ``tile_matmul``, the
+      factor ``L`` of ``tile_lower/upper_solve_inplace``, a ``tile_store``
+      source and ``tile_extract`` (rewritten with swapped indices here);
+      the right-hand side ``B`` of a solve, which the transposed solve
+      helper updates in ``S``;
+    - any other statement: ``T`` is refreshed from ``S`` just before it
+      and, unless the statement is a known pure read, ``S`` is updated
+      from ``T`` just after it (``wp::metal_tile_transpose_copy``).
 
-    - the triangular factor (``L``) of a solve, or a ``tile_store`` source:
-      the translators read ``S`` with swapped indices.
-
-    Between a dropped transpose and its last use, ``S`` may only be read
-    (or updated through the ``T`` solve), so the folded reads see the values
-    the copy would have held. Scalar 2-D tiles only.
+    A statement that writes ``S`` or one of its transposes and also names
+    another of them (``tile_matmul(T, B, S)``, ``tile_add_inplace(S, T)``)
+    has an element order the view does not define, and a statement that
+    makes a further view or copy of ``T`` (``tile_view``, ``var_X = var_T``)
+    would escape the analysis: both raise :class:`MetalCodegenError`.
+    Transposes this pass cannot lower (vector or 1-wide tiles, ``T`` with
+    several definitions) stay copies and go through
+    :func:`_check_tile_transpose_copies`.
 
     A ``tile_zeros`` / ``tile_ones`` tile whose only uses are ``tile_store``
     sources is dropped too; the stores write the constant.
@@ -11453,132 +11471,136 @@ def _fold_tile_transpose_views(
     Returns the rewritten lines, ``{T: S}`` and ``{C: value}`` for the
     translators.
     """
-    defs: dict[str, int] = {}
-    for line in lines:
-        for m in re.finditer(r"\bvar_(\w+)\s*=(?!=)", line):
-            defs[m.group(1)] = defs.get(m.group(1), 0) + 1
-    tdefs: dict[str, tuple[int, str]] = {}
+    lines = list(lines)
+    tdefs = _tile_transpose_defs(lines)
     cdefs: dict[str, tuple[int, float]] = {}
     for i, line in enumerate(lines):
-        m = _TILE_TRANSPOSE_STMT_PAT.match(line)
-        if m is not None:
-            tdefs[m.group(1)] = (i, m.group(2))
         m = _TILE_CONST_STMT_PAT.match(line)
         if m is not None:
             cdefs[m.group(1)] = (i, 0.0 if m.group(2) == "zeros" else 1.0)
     if not tdefs and not cdefs:
         return lines, {}, {}
 
-    def _ref(label: str) -> re.Pattern:
-        return re.compile(rf"\bvar_{re.escape(label)}\b")
-
-    def _uses(label: str, start: int) -> list[int] | None:
-        pat = _ref(label)
-        idx = [i for i, ln in enumerate(lines) if pat.search(ln) and i != start]
-        if any(i < start for i in idx):
-            return None
-        return idx
-
     def _scalar2d(label: str) -> bool:
         d = tile_var_dims.get(label)
         return d is not None and d[0] > 1 and d[1] > 1 and not tile_var_vec_n.get(label)
 
-    def _reads_only(line: str, label: str) -> bool:
-        # Every mention of ``var_label`` on ``line`` is a read position.
-        tok = f"var_{label}"
-        n = len(_ref(label).findall(line))
-        seen = 0
-        for args in _ir_call_args(line, _TILE_MATMUL_ACC_PAT) + _ir_call_args(line, _TILE_MATMUL_ASSIGN_PAT):
-            if len(args) == 8 and args[5] != tok:
-                seen += args[3:5].count(tok)
-        for args in _ir_call_args(line, _TILE_LOWER_SOLVE_INPLACE_PAT) + _ir_call_args(
-            line, _TILE_UPPER_SOLVE_INPLACE_PAT
-        ):
-            if len(args) == 3 and args[1] == tok and args[2] != tok:
-                seen += 1
-        for args in _ir_call_args(line, _TILE_STORE_SRC_PAT):
-            if args and args[-1] == tok:
-                seen += 1
-        seen += sum(1 for m in _TILE_EXTRACT_SRC_PAT.finditer(line) if m.group(1) == label)
-        m = _TILE_TRANSPOSE_STMT_PAT.match(line)
-        if m is not None and m.group(2) == label:
-            seen += 1
-        return seen == n and not re.search(rf"\b{tok}\s*(?:\.|\[|=(?!=))", line)
-
-    def _range_ok(src: str, lo: int, hi: int, allowed: set[int]) -> bool:
-        pat = _ref(src)
-        return all(i in allowed or not pat.search(lines[i]) or _reads_only(lines[i], src) for i in range(lo, hi + 1))
-
-    views: dict[str, str] = {}
-    renames: dict[str, str] = {}
-    drop: set[int] = set()
-    for t_label, (t_line, s_label) in tdefs.items():
-        if defs.get(t_label) != 1 or s_label == t_label or s_label in views or s_label in renames:
-            continue
-        if not (_scalar2d(t_label) and _scalar2d(s_label)):
-            continue
+    def _transposed_dims(t_label: str, s_label: str) -> bool:
         st, tt = tile_var_dims[s_label], tile_var_dims[t_label]
-        if (st[0], st[1], st[2]) != (tt[1], tt[0], tt[2]):
-            continue
-        uses = _uses(t_label, t_line)
-        if not uses:
-            continue
-        tok = f"var_{t_label}"
-        ok = True
-        solve_lines: set[int] = set()
-        inner: list[tuple[int, str, list[int]]] = []
-        for i in uses:
-            line = lines[i]
-            n = len(_ref(t_label).findall(line))
-            mm = [
-                a
-                for a in _ir_call_args(line, _TILE_MATMUL_ACC_PAT) + _ir_call_args(line, _TILE_MATMUL_ASSIGN_PAT)
-                if len(a) == 8
+        return (st[0], st[1], st[2]) == (tt[1], tt[0], tt[2])
+
+    def _lowerable(t_label: str, s_label: str, defs: dict[str, list[int]]) -> bool:
+        return (
+            len(defs.get(t_label, ())) == 1
+            and s_label != t_label
+            and _scalar2d(t_label)
+            and _scalar2d(s_label)
+            and _transposed_dims(t_label, s_label)
+            and not _tile_may_rebind(lines, s_label, defs)
+            and _first_mention(lines, t_label) >= tdefs_now[t_label][0]
+        )
+
+    # 1. ``U = transpose(transpose(S))`` is ``S``: rename, to a fixpoint.
+    renamed = True
+    while renamed:
+        renamed = False
+        tdefs_now = _tile_transpose_defs(lines)
+        defs = _ir_def_lines(lines)
+        for u_label, (u_line, t_label) in tdefs_now.items():
+            if t_label not in tdefs_now:
+                continue
+            s_label = tdefs_now[t_label][1]
+            if s_label == u_label or not _lowerable(t_label, s_label, defs):
+                continue
+            if len(defs.get(u_label, ())) != 1 or _first_mention(lines, u_label) < u_line:
+                continue
+            if tile_var_dims.get(u_label) != tile_var_dims.get(s_label) or not _scalar2d(u_label):
+                continue
+            ref = _ir_ref(u_label)
+            lines = [
+                f"    // tile_transpose of a transpose is its source: {line.strip()}"
+                if i == u_line
+                else ref.sub(f"var_{s_label}", line)
+                for i, line in enumerate(lines)
             ]
-            if mm and all(a[5] not in (tok, f"var_{s_label}") for a in mm):
-                if sum(a[3:5].count(tok) for a in mm) == n and not re.search(rf"\b{tok}\s*=(?!=)", line):
-                    continue
-            sv = _ir_call_args(line, _TILE_LOWER_SOLVE_INPLACE_PAT) + _ir_call_args(line, _TILE_UPPER_SOLVE_INPLACE_PAT)
-            if n == 1 and len(sv) == 1 and len(sv[0]) == 3 and sv[0][2] == tok and sv[0][1] != f"var_{s_label}":
-                solve_lines.add(i)
-                continue
-            if n == 1 and len(sv) == 1 and len(sv[0]) == 3 and sv[0][1] == tok and sv[0][2] != f"var_{s_label}":
-                # The triangular factor of a solve: read only.
-                continue
-            st_args = _ir_call_args(line, _TILE_STORE_SRC_PAT)
-            if n == 1 and len(st_args) == 1 and st_args[0][-1] == tok:
-                continue
-            m = _TILE_TRANSPOSE_STMT_PAT.match(line)
-            if m is not None and m.group(2) == t_label and defs.get(m.group(1)) == 1:
-                u_label = m.group(1)
-                u_uses = _uses(u_label, i)
-                ud = tile_var_dims.get(u_label)
-                if u_uses is not None and ud is not None and ud == st and not tile_var_vec_n.get(u_label):
-                    if all(_reads_only(lines[j], u_label) for j in u_uses):
-                        inner.append((i, u_label, u_uses))
-                        continue
-            ok = False
+            renamed = True
             break
-        if not ok:
+
+    # 2. Lower the remaining transposes of scalar 2-D tiles.
+    tdefs_now = _tile_transpose_defs(lines)
+    defs = _ir_def_lines(lines)
+    views: dict[str, str] = {}
+    for t_label, (_t_line, s_label) in sorted(tdefs_now.items(), key=lambda kv: kv[1][0]):
+        # A source that is itself a lowered transpose has no storage of its
+        # own; that chain stays a copy (and is checked as one).
+        if s_label not in views and _lowerable(t_label, s_label, defs):
+            views[t_label] = s_label
+    # Alias groups: a source and every lowered transpose of it.
+    group_of: dict[str, str] = {}
+    for t_label, s_label in views.items():
+        group_of[t_label] = s_label
+        group_of.setdefault(s_label, s_label)
+    pre: dict[int, list[str]] = {}
+    post: dict[int, list[str]] = {}
+    drop: set[int] = {tdefs_now[t][0] for t in views}
+    for i, line in enumerate(lines):
+        if i in drop or _ir_skip(line):
             continue
-        last = max([*uses, *(j for _i, _u, uu in inner for j in uu)])
-        if not _range_ok(s_label, t_line + 1, last, solve_lines):
+        mentioned = [lbl for lbl in group_of if _ir_ref(lbl).search(line)]
+        if not mentioned:
             continue
-        views[t_label] = s_label
-        drop.add(t_line)
-        for i, u_label, _uu in inner:
-            renames[u_label] = s_label
-            drop.add(i)
+        roles: list[tuple[str, str]] = []  # (label, role), see ``_tile_mention_roles``
+        for lbl in mentioned:
+            roles.extend((lbl, r) for r in _tile_mention_roles(line, lbl))
+        lowered = [(lbl, r) for lbl, r in roles if lbl in views]
+        if not lowered:
+            continue
+        by_group: dict[str, list[tuple[str, str]]] = {}
+        for lbl, r in roles:
+            by_group.setdefault(group_of[lbl], []).append((lbl, r))
+        for members in by_group.values():
+            if len(members) > 1 and any(r not in ("r", "fold-r", "extract") for _l, r in members):
+                raise MetalCodegenError(
+                    "MSL codegen: a statement writes a tile and also reads or writes a "
+                    "wp.tile_transpose() view of the same tile; the element order of that update is not "
+                    "defined by the view, so Metal cannot reproduce it. Copy the transpose into a new tile "
+                    f"first (statement: {line.strip()!r})"
+                )
+        for t_label, role in lowered:
+            s_label = views[t_label]
+            if role in ("fold-r", "fold-w"):
+                continue
+            if role == "extract":
+                lines[i] = _swap_tile_extract(lines[i], t_label, s_label)
+                continue
+            if role in ("view", "tsrc"):
+                raise MetalCodegenError(
+                    "MSL codegen: a view or copy of a wp.tile_transpose() result (tile_view, tile_reshape, "
+                    "assignment, ...) is not supported on Metal; transpose the source tile directly "
+                    f"(statement: {line.strip()!r})"
+                )
+            if not _ir_simple_statement(line):
+                raise MetalCodegenError(
+                    f"MSL codegen: cannot lower a wp.tile_transpose() view used in {line.strip()!r} on Metal"
+                )
+            refresh = f"wp::metal_tile_transpose_copy(var_{t_label}, var_{s_label});"
+            if refresh not in pre.setdefault(i, []):
+                pre[i].append(refresh)
+            if role != "r":
+                post.setdefault(i, []).append(f"wp::metal_tile_transpose_copy(var_{s_label}, var_{t_label});")
     # ``C = tile_zeros/ones(...)`` that is only ever a ``tile_store`` source:
     # the store writes the constant, and no tile is materialised.
     fills: dict[str, float] = {}
     for c_label, (c_line, value) in cdefs.items():
-        if defs.get(c_label) != 1 or not _scalar2d(c_label):
+        if len(defs.get(c_label, ())) != 1 or not _scalar2d(c_label):
             continue
-        uses = _uses(c_label, c_line)
+        ref = _ir_ref(c_label)
+        uses = [i for i, ln in enumerate(lines) if i != c_line and ref.search(ln)]
+        if any(i < c_line for i in uses):
+            continue
         tok = f"var_{c_label}"
         if uses and all(
-            len(_ref(c_label).findall(lines[i])) == 1
+            len(ref.findall(lines[i])) == 1
             and len(_ir_call_args(lines[i], _TILE_STORE_SRC_PAT)) == 1
             and _ir_call_args(lines[i], _TILE_STORE_SRC_PAT)[0][-1] == tok
             for i in uses
@@ -11590,13 +11612,326 @@ def _fold_tile_transpose_views(
     out: list[str] = []
     for i, line in enumerate(lines):
         if i in drop:
-            out.append(f"    // tile_transpose folded into its uses: {line.strip()}")
+            # Keep the statement text: later scans that look for every mention
+            # of a tile (e.g. ``_plan_smem_tiles``) still see the source.
+            out.append(f"    // tile_transpose / constant tile folded into its uses: {line.strip()}")
             continue
-        new_line = line
-        for u_label, s_label in renames.items():
-            new_line = _ref(u_label).sub(f"var_{s_label}", new_line)
-        out.append(new_line)
+        indent = line[: len(line) - len(line.lstrip())]
+        out.extend(indent + s for s in pre.get(i, ()))
+        out.append(line)
+        out.extend(indent + s for s in post.get(i, ()))
     return out, views, fills
+
+
+# A local declaration without initializer (``wp_tile_32x32_float var_5;``,
+# emitted for inlined ``wp.func`` locals): neither a read nor a write.
+_IR_DECL_ONLY_PAT = re.compile(
+    r"^\s*(?:const\s+)?(?!return\b|goto\b)[A-Za-z_][\w:]*(?:\s*<[^;=()]*>)?[\s\*&]+var_\w+\s*;\s*$"
+)
+
+
+def _ir_skip(line: str) -> bool:
+    """Lines the transpose analyses ignore: comments and bare declarations."""
+    s = line.lstrip()
+    return s.startswith("//") or _IR_DECL_ONLY_PAT.match(line) is not None
+
+
+def _ir_ref(label: str) -> re.Pattern:
+    return re.compile(rf"\bvar_{re.escape(label)}\b")
+
+
+def _ir_def_lines(lines: list[str]) -> dict[str, list[int]]:
+    """``label -> [line index]`` of every ``var_label = ...`` assignment."""
+    defs: dict[str, list[int]] = {}
+    for i, line in enumerate(lines):
+        if _ir_skip(line):
+            continue
+        for m in re.finditer(r"\bvar_(\w+)\s*=(?!=)", line):
+            defs.setdefault(m.group(1), []).append(i)
+    return defs
+
+
+def _tile_transpose_defs(lines: list[str]) -> dict[str, tuple[int, str]]:
+    """``T -> (line, S)`` for ``var_T = wp::tile_transpose(var_S);`` statements
+    (the last one wins for a label defined more than once)."""
+    out: dict[str, tuple[int, str]] = {}
+    for i, line in enumerate(lines):
+        m = _TILE_TRANSPOSE_STMT_PAT.match(line)
+        if m is not None:
+            out[m.group(1)] = (i, m.group(2))
+    return out
+
+
+def _first_mention(lines: list[str], label: str) -> int:
+    ref = _ir_ref(label)
+    for i, line in enumerate(lines):
+        if not _ir_skip(line) and ref.search(line):
+            return i
+    return len(lines)
+
+
+# Tile ops whose result is a view of (or may alias) their tile argument.
+_TILE_VIEW_OP_PAT = re.compile(r"\bwp::(tile_view|tile_reshape|tile_squeeze|tile_broadcast|tile_transpose)\b")
+# Value-returning tile ops that only read their tile arguments.
+_TILE_PURE_READ_OPS = frozenset(
+    {
+        "tile_map",
+        "tile_unary_map",
+        "tile_binary_map",
+        "tile_reduce",
+        "tile_sum",
+        "tile_max",
+        "tile_min",
+        "tile_argmax",
+        "tile_argmin",
+        "tile_astype",
+        "tile_scan_inclusive",
+        "tile_scan_exclusive",
+        "tile_scan_max_inclusive",
+        "tile_scan_min_inclusive",
+        "add",
+        "sub",
+        "mul",
+        "div",
+        "neg",
+    }
+)
+_IR_CALL_STMT_PAT = re.compile(r"^\s*(?:var_(\w+)\s*=\s*)?wp::(\w+)\s*(?:<[^()]*>)?\s*\((.*)\)\s*;\s*$")
+
+
+def _tile_may_rebind(lines: list[str], label: str, defs: dict[str, list[int]]) -> bool:
+    """Whether ``label`` may be a non-owning view that a later assignment
+    rebinds (on CPU/CUDA a view assignment re-points it instead of copying),
+    so a transpose taken earlier would keep the old storage."""
+    idx = defs.get(label, ())
+    if len(idx) <= 1:
+        return False
+    return any(_TILE_VIEW_OP_PAT.search(lines[i]) for i in idx)
+
+
+def _ir_simple_statement(line: str) -> bool:
+    s = line.strip()
+    return (
+        s.endswith(";")
+        and "{" not in s
+        and "}" not in s
+        and not re.match(r"(?:return|break|continue|goto|if|for|while|do|case|default)\b", s)
+    )
+
+
+def _swap_tile_extract(line: str, t_label: str, s_label: str) -> str:
+    def repl(m: re.Match[str]) -> str:
+        args = [a.strip() for a in m.group(1).split(",")]
+        if len(args) != 3 or args[0] != f"var_{t_label}":
+            raise MetalCodegenError(f"MSL codegen: unexpected tile_extract of a transpose: {line.strip()!r}")
+        return f"wp::tile_extract(var_{s_label}, {args[2]}, {args[1]})"
+
+    return re.sub(r"\bwp::tile_extract\s*\(([^()]*)\)", repl, line)
+
+
+def _tile_mention_roles(line: str, label: str) -> list[str]:
+    """Role of each mention of tile ``label`` on IR statement ``line``.
+
+    ``"fold-r"`` / ``"fold-w"``: a position the transpose translators read
+    (``tile_matmul`` A/B, solve factor, ``tile_store`` source) or update
+    (solve right-hand side) through the source tile; ``"extract"``:
+    ``tile_extract`` source; ``"r"``: read by a pure value-returning op;
+    ``"tsrc"``: the source of another ``tile_transpose``; ``"view"``: the
+    source of another view or copy (``tile_view``, ``var_X = var_label;``);
+    ``"w"``: anything else (may write the tile).
+    """
+    tok = f"var_{label}"
+    ref = _ir_ref(label)
+    n = len(ref.findall(line))
+    if n == 0:
+        return []
+    roles: list[str] = []
+    if re.search(rf"(?:[.\[&*]\s*{tok}\b|\b{tok}\s*(?:\.|\[|->|=(?!=)))", line):
+        return ["w"] * n
+    if re.match(r"^\s*wp::adj_\w+\s*(?:<[^()]*>)?\s*\(", line):
+        # Reverse-mode statement: reads primal values, writes ``adj_*`` duals.
+        return ["r"] * n
+    for args in _ir_call_args(line, _TILE_MATMUL_ACC_PAT) + _ir_call_args(line, _TILE_MATMUL_ASSIGN_PAT):
+        if len(args) == 8:
+            roles += ["fold-r"] * args[3:5].count(tok)
+            roles += ["w"] * (args[5] == tok)
+    for args in _ir_call_args(line, _TILE_LOWER_SOLVE_INPLACE_PAT) + _ir_call_args(line, _TILE_UPPER_SOLVE_INPLACE_PAT):
+        if len(args) == 3:
+            roles += ["fold-r"] * (args[1] == tok)
+            roles += ["fold-w"] * (args[2] == tok)
+    for args in _ir_call_args(line, _TILE_STORE_SRC_PAT):
+        if args and args[-1] == tok:
+            roles.append("fold-r")
+    for m in _TILE_EXTRACT_SRC_PAT.finditer(line):
+        if m.group(1) == label:
+            roles.append("extract")
+    m = _TILE_TRANSPOSE_STMT_PAT.match(line)
+    if m is not None and m.group(2) == label:
+        roles.append("tsrc")
+    if len(roles) == n:
+        return roles
+    # Remaining mentions: classify the statement as a whole.
+    if re.match(rf"^\s*var_\w+\s*=\s*{tok}\s*;\s*$", line) or _TILE_VIEW_OP_PAT.search(line):
+        return ["view"] * n
+    m = _IR_CALL_STMT_PAT.match(line)
+    if m is not None and m.group(2) in _TILE_PURE_READ_OPS and m.group(1) != label:
+        inner = re.findall(r"\b(\w+)\s*(?:<[^()]*>)?\s*\(", m.group(3))
+        if all(name in _TILE_PURE_READ_OPS for name in inner):
+            return ["r"] * n
+    return ["w"] * n
+
+
+class _IRBlocks:
+    """Brace structure of IR statements, for the conservative reachability
+    test of :func:`_check_tile_transpose_copies`."""
+
+    def __init__(self, lines: list[str]):
+        self.ok = True
+        # Block: [start line, end line, is_loop, parent index]; 0 is the root.
+        self.blocks: list[list] = [[-1, len(lines), False, -1]]
+        self.inner: list[int] = [0] * len(lines)
+        stack = [0]
+        for i, line in enumerate(lines):
+            s = line.strip()
+            if s.startswith("//"):
+                self.inner[i] = stack[-1]
+                continue
+            if re.search(r"\bgoto\b", s):
+                self.ok = False
+            closes = s.count("}")
+            opens = s.count("{")
+            for _ in range(closes):
+                if len(stack) == 1:
+                    self.ok = False
+                    break
+                b = self.blocks[stack.pop()]
+                b[1] = i
+                if b[2] is None:
+                    # ``do { ... } while (0);`` is an inlined function body, not a loop.
+                    b[2] = not re.match(r"^\}\s*while\s*\(\s*(?:0|false)\s*\)", s)
+            self.inner[i] = stack[-1]
+            for _ in range(opens):
+                is_loop = (
+                    True if re.match(r"(?:for|while)\b", s) else (None if re.match(r"(?:\}\s*)?do\b", s) else False)
+                )
+                self.blocks.append([i, len(lines), is_loop, stack[-1]])
+                stack.append(len(self.blocks) - 1)
+        if len(stack) != 1:
+            self.ok = False
+
+    def contains(self, b: int, i: int) -> bool:
+        start, end = self.blocks[b][0], self.blocks[b][1]
+        return b == 0 or start < i <= end
+
+    def _chain(self, i: int) -> list[int]:
+        out, b = [], self.inner[i]
+        while b >= 0:
+            out.append(b)
+            b = self.blocks[b][3]
+        return out
+
+    def _loop_with(self, x: int, y: int, inside: int = 0) -> bool:
+        """A loop strictly inside block ``inside`` that contains ``x`` and ``y``."""
+        for b in self._chain(x):
+            if b == inside:
+                return False
+            if self.blocks[b][2] and self.contains(b, y):
+                return True
+        return False
+
+    def reach(self, x: int, y: int, d: int) -> bool:
+        """Whether line ``y`` may run after line ``x`` without line ``d``
+        running in between (conservative: ``True`` when unsure)."""
+        if not self.ok:
+            return True
+        if y <= x and not self._loop_with(x, y):
+            return False
+        bd = self.inner[d]
+        if not (self.contains(bd, y) and d < y):
+            return True
+        if not self.contains(bd, x) or x < d:
+            return False
+        if y <= x and not self._loop_with(x, y, inside=bd):
+            return False
+        return True
+
+
+def _check_tile_transpose_copies(lines: list[str], lowered: set[str] | frozenset = frozenset()) -> None:
+    """Fail loudly where a ``tile_transpose`` the Metal codegen keeps as a
+    copy would diverge from the CPU/CUDA view semantics.
+
+    The copy is exact unless, after the transpose, the source tile is
+    written while the copy is still read, or the copy is written while the
+    source tile (or the tile its source was transposed from) is still read.
+    ``tile_lower/upper_solve_inplace`` on the copy writes through to the
+    source (see ``_repl_solve_inplace``). Transposes in ``lowered`` were
+    handled by :func:`_fold_tile_transpose_views`.
+    """
+    tdefs = [
+        (i, m.group(1), m.group(2))
+        for i, line in enumerate(lines)
+        for m in [_TILE_TRANSPOSE_STMT_PAT.match(line)]
+        if m is not None and m.group(1) not in lowered
+    ]
+    if not tdefs:
+        return
+    src_of = {t: s for _i, t, s in tdefs}
+    blocks = _IRBlocks(lines)
+    mention_cache: dict[str, list[tuple[int, list[str]]]] = {}
+
+    def mentions(label: str) -> list[tuple[int, list[str]]]:
+        got = mention_cache.get(label)
+        if got is None:
+            ref = _ir_ref(label)
+            got = [
+                (i, _tile_mention_roles(line, label))
+                for i, line in enumerate(lines)
+                if not _ir_skip(line) and ref.search(line)
+            ]
+            mention_cache[label] = got
+        return got
+
+    def writes(label: str, d: int, through_solve: bool) -> list[int]:
+        out = []
+        for i, roles in mentions(label):
+            if i == d:
+                continue
+            if any(r in ("w", "view") or (r == "fold-w" and not through_solve) for r in roles):
+                out.append(i)
+        return out
+
+    def hazard(d: int, ws: list[int], rs: list[int]) -> tuple[int, int] | None:
+        for w in ws:
+            if not blocks.reach(d, w, d):
+                continue
+            for r in rs:
+                if r != d and blocks.reach(w, r, d):
+                    return w, r
+        return None
+
+    for d, t_label, s_label in tdefs:
+        t_reads = [i for i, _roles in mentions(t_label) if i != d]
+        if not t_reads:
+            continue
+        # The source written while the copy is still read.
+        hit = hazard(d, writes(s_label, d, through_solve=True), t_reads)
+        if hit is None:
+            # The copy written (other than by the write-through solve) while
+            # its source chain is still read.
+            chain, s = [], s_label
+            while s is not None and s not in chain:
+                chain.append(s)
+                s = src_of.get(s)
+            src_reads = sorted({i for c in chain for i, _roles in mentions(c) if i != d})
+            hit = hazard(d, writes(t_label, d, through_solve=True), src_reads)
+        if hit is not None:
+            w, r = hit
+            raise MetalCodegenError(
+                "MSL codegen: wp.tile_transpose() is a view of its source tile, but this kernel needs a copy on "
+                "Metal and the copy would go stale: a tile is written after the transpose "
+                f"({lines[w].strip()!r}) while the other side is still read ({lines[r].strip()!r}). Transpose the "
+                "tile again after the update, or copy it into a new tile."
+            )
 
 
 # ``tile_lower_solve_inplace(0, L_tile, B_tile)`` — solve ``L X = B``
@@ -13191,6 +13526,25 @@ def _translate_tile_intrinsics(
         return f"var_{lhs} = {helper}(var_{in_label})"
 
     line = _TILE_TRANSPOSE_NOTPL_PAT.sub(repl_transpose_notpl, line)
+
+    def repl_transpose_copy(m: re.Match[str]) -> str:
+        # ``wp::metal_tile_transpose_copy(var_D, var_S);``: ``D = transpose(S)``
+        # element by element, emitted by ``_fold_tile_transpose_views`` to
+        # refresh a transpose view before a statement that names it, or to
+        # write it back to its source after one. An explicit loop, not a
+        # struct-returning helper: ``var_S = helper(var_D)`` after an
+        # in-place update miscompiles (see ``_repl_solve_inplace``).
+        dst, src = m.group(1), m.group(2)
+        d_dims, s_dims = tile_var_dims.get(dst), tile_var_dims.get(src)
+        if d_dims is None or s_dims is None or (d_dims[0], d_dims[1]) != (s_dims[1], s_dims[0]):
+            raise MetalCodegenError(f"MSL codegen: bad transpose view copy {m.group(0)!r}")
+        rows, cols = d_dims[0], d_dims[1]
+        return (
+            f"for (int _tvc_i = 0; _tvc_i < {rows}; ++_tvc_i) for (int _tvc_j = 0; _tvc_j < {cols}; ++_tvc_j) "
+            f"var_{dst}.c[_tvc_i * {cols} + _tvc_j] = var_{src}.c[_tvc_j * {rows} + _tvc_i];"
+        )
+
+    line = _TILE_TRANSPOSE_COPY_PAT.sub(repl_transpose_copy, line)
 
     def repl_adj_transpose(m: re.Match[str]) -> str:
         # ``adj_T += transpose(adj_RET)``. ``adj_RET`` has the transposed
@@ -17422,6 +17776,8 @@ def _generate_msl_kernel_uncached(
         forward_lines, transpose_views, fill_tiles = _fold_tile_transpose_views(
             forward_lines, tile_var_dims, tile_var_vec_n
         )
+    # Transposes that stay copies must not diverge from the view semantics.
+    _check_tile_transpose_copies(forward_lines, set(transpose_views))
     # Pre-scan: a kernel goes "cooperative" when any of its
     # ``tile_cholesky`` / ``tile_cholesky_inplace`` calls applies to a
     # square tile in the cooperative range. Determining this *before*
@@ -17503,6 +17859,7 @@ def _generate_msl_kernel_uncached(
             tile_var_dims,
             tile_var_vec_n,
             reserved_floats=pre_coop_chol_n * pre_coop_chol_n,
+            exclude=set(transpose_views.values()),
         )
 
     # ---- Quaternion-typed locals --------------------------------------
