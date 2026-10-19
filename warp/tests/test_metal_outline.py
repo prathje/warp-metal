@@ -238,6 +238,51 @@ class TestMetalOutline(unittest.TestCase):
             """,
         )
 
+    def test_stores_through_kernel_arrays_are_outlined(self):
+        # Bodies that store or atomically update a kernel array argument
+        # (Newton's write_contact_to_reducer) take the buffer pointer by
+        # value and are outlined too.
+        _run(
+            self,
+            """
+            @wp.func
+            def emit(counts: wp.array[int], vals: wp.array[wp.vec3], flags: wp.array[int], i: int, v: wp.vec3):
+                slot = wp.atomic_add(counts, i % 4, 1)
+                vals[i] = v * float(i % 4 + 1)
+                if wp.length(v) > 1.0:
+                    flags[i] = slot * 0 + 1
+                    wp.atomic_max(counts, 4, i)
+                else:
+                    flags[i] = -1
+                for j in range(3):
+                    wp.atomic_add(vals, (i + j + 1) % vals.shape[0], v * 0.0)
+                return slot * 0 + i % 4
+
+            @wp.kernel
+            def k(inp: wp.array[wp.vec3], counts: wp.array[int], vals: wp.array[wp.vec3], flags: wp.array[int],
+                  bins: wp.array[int]):
+                i = wp.tid()
+                bins[i] = emit(counts, vals, flags, i, inp[i])
+
+            def launch(dev):
+                rng = np.random.default_rng(3)
+                inp = wp.array(rng.standard_normal((200, 3)).astype(np.float32), dtype=wp.vec3, device=dev)
+                counts = wp.zeros(5, dtype=int, device=dev)
+                vals = wp.zeros(200, dtype=wp.vec3, device=dev)
+                flags = wp.zeros(200, dtype=int, device=dev)
+                bins = wp.zeros(200, dtype=int, device=dev)
+                wp.launch(k, 200, inputs=[inp], outputs=[counts, vals, flags, bins], device=dev)
+                return [counts.numpy(), vals.numpy(), flags.numpy(), bins.numpy()]
+
+            cpu, metal = both(launch)
+            assert_same(cpu, metal)
+            assert_outlined(k)
+            src = k._metal_native_wrapped_source
+            kernel_body = src[src.index("[[kernel]]"):]
+            assert "atomic_fetch_add" not in kernel_body, "store/atomic region stayed inline"
+            """,
+        )
+
     def test_off_mode_emits_no_functions(self):
         _run(
             self,

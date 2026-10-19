@@ -298,12 +298,26 @@ class _Bail(Exception):
 
 
 def _analyze_tokens(text_lines: list[str], ref_funcs: set[str], helper_ref_pos: dict[str, tuple[bool, ...]]):
-    """Return ``(ordered identifiers, written names, region decl names)``.
+    """Return ``(ordered identifiers, written names, region decl names,
+    directly written names)``.
+
+    ``written`` holds every name the region may modify, including stores
+    through a subscript or ``->`` (``p[i] = v``, ``&p[i]``); ``direct`` only the
+    names whose own value may change (``x = v``, ``x.f = v``, ``&x``, ``x++``,
+    a by-reference argument). A pointer kernel parameter that is only stored
+    through can be passed to the outlined function by value.
 
     Raises :class:`_Bail` for constructs that cannot leave the kernel.
     """
     order: dict[str, None] = {}
     written: set[str] = set()
+    direct: set[str] = set()
+
+    def mark(name: str, through: bool) -> None:
+        written.add(name)
+        if not through:
+            direct.add(name)
+
     decls: set[str] = set()
     depth = 0
     # Stack of open braces: True for a loop/switch body.
@@ -353,12 +367,14 @@ def _analyze_tokens(text_lines: list[str], ref_funcs: set[str], helper_ref_pos: 
                 order.setdefault(text, None)
                 # Written?
                 pprev = toks[k - 1] if k > 0 else None
+                # ``p[...]`` / ``p->f``: an access through ``p``, not of ``p``.
+                through = k + 1 < n and toks[k + 1][1] in ("[", "->")
                 if pprev is not None and pprev[1] in ("++", "--"):
-                    written.add(text)
+                    mark(text, through)
                 elif pprev is not None and pprev[1] == "&":
                     pp2 = toks[k - 2] if k > 1 else None
                     if pp2 is None or (pp2[0] == "op" and pp2[1] not in (")", "]")):
-                        written.add(text)
+                        mark(text, through)
                 j = k + 1
                 member_call = False
                 while j < n:
@@ -383,16 +399,18 @@ def _analyze_tokens(text_lines: list[str], ref_funcs: set[str], helper_ref_pos: 
                     break
                 nxt = toks[j][1] if j < n else None
                 if member_call or nxt in _ASSIGN_OPS or nxt in ("++", "--"):
-                    written.add(text)
+                    mark(text, through and not member_call)
                 elif calls and pprev is not None and pprev[1] in ("(", ",") and nxt in (",", ")"):
+                    # A whole-name argument (``j == k + 1``) to a by-reference
+                    # parameter may change the name itself.
                     callee, argi = calls[-1]
                     if callee is not None:
                         pos = helper_ref_pos.get(callee)
                         if pos is not None:
                             if argi < len(pos) and pos[argi]:
-                                written.add(text)
+                                mark(text, through)
                         elif callee in ref_funcs:
-                            written.add(text)
+                            mark(text, through)
                 continue
             if text == "(":
                 callee = toks[k - 1][1] if k > 0 and toks[k - 1][0] == "id" else None
@@ -430,7 +448,7 @@ def _analyze_tokens(text_lines: list[str], ref_funcs: set[str], helper_ref_pos: 
                 pending_loop = False
     if depth != 0:
         raise _Bail("unbalanced")
-    return list(order), written, decls
+    return list(order), written, decls, direct
 
 
 _ARRAY_DIM_RE = re.compile(r"\[[^\]]*\]")
@@ -542,6 +560,11 @@ def outline_kernel(kernel_name: str, params: list[str], prologue: str, body: str
     helper_ref_pos: dict[str, tuple[bool, ...]] = {}
     noinline = _noinline_attr()
     stats = {"regions": 0, "outlined": 0, "bailed": 0}
+    bail_reasons: list[str] = []
+
+    def bail(r: _Region, why: str) -> None:
+        stats["bailed"] += 1
+        bail_reasons.append(f"{r.key[:50]} ({r.end - r.begin} lines): {why}")
 
     def process(r: _Region) -> None:
         for c in r.children:
@@ -554,9 +577,9 @@ def outline_kernel(kernel_name: str, params: list[str], prologue: str, body: str
         if n_text < min_lines:
             return
         try:
-            ids, written, rdecls = _analyze_tokens(text, ref_funcs, helper_ref_pos)
-        except _Bail:
-            stats["bailed"] += 1
+            ids, written, rdecls, direct = _analyze_tokens(text, ref_funcs, helper_ref_pos)
+        except _Bail as e:
+            bail(r, str(e))
             return
         free: list[_Decl] = []
         moved: list[_Decl] = []
@@ -567,7 +590,7 @@ def outline_kernel(kernel_name: str, params: list[str], prologue: str, body: str
                     scan.total(name) != scan.count_in(name, r.begin, r.end)
                     and _resolve(r.scopes, name, r.begin) is None
                 ):
-                    stats["bailed"] += 1
+                    bail(r, f"local {name} used after region")
                     return
                 continue
             d = _resolve(r.scopes, name, r.begin)
@@ -585,8 +608,10 @@ def outline_kernel(kernel_name: str, params: list[str], prologue: str, body: str
             ):
                 moved.append(d)
                 continue
-            if d.param and name in written:
-                stats["bailed"] += 1
+            if d.param and (name in direct or (name in written and "*" not in d.type)):
+                # Pointer parameters are passed by value: storing through
+                # one is fine, changing the pointer itself is not.
+                bail(r, f"writes kernel param {name}")
                 return
             free.append(d)
         ren: dict[str, str] = {}
@@ -639,4 +664,7 @@ def outline_kernel(kernel_name: str, params: list[str], prologue: str, body: str
             f"({stats['bailed']} kept inline), {len(functions)} functions",
             flush=True,
         )
+        if os.environ.get("WARP_METAL_OUTLINE_VERBOSE") == "2":
+            for b in bail_reasons:
+                print(f"[warp-metal-outline]   kept inline: {b}", flush=True)
     return "\n".join(new_lines), "\n".join(functions.values())
