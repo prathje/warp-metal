@@ -2997,11 +2997,6 @@ def fold_struct_array_array_fields(
     pt_shape: dict[str, tuple[str, str, Any]] = {}
     pt_elem: dict[str, tuple[str, str, Any, list[str]]] = {}
     pt_decls: list[Node] = []
-    # Default-constructed struct locals (``var_X = S();``), and element
-    # copies whose captured index may be -1 because a ``wp::where`` picked
-    # such a default value: their array fields are empty (null, shape 0).
-    default_struct: dict[str, str] = {}  # label -> struct ctype name
-    maybe_empty: set[str] = set()  # captured index locals that may be -1
     used: set[str] = set()
     consts = dict(const_ints or {})
     for v in adj.variables:
@@ -3019,56 +3014,67 @@ def fold_struct_array_array_fields(
             return consts[p[4:]]
         return None
 
+    # Struct values whose element index can be tracked at run time: each
+    # gets its own index local (``var_X__ptidx``, -1 for a default-constructed
+    # struct, whose array members are empty) that every definition of ``X``
+    # updates. A value qualifies only when *every* definition is an element
+    # address with a runtime index, a default construction, or a load / copy /
+    # ``wp::where`` / ``wp::assign`` of qualifying values of one struct-array
+    # argument, and no array member is written through it. Anything else stays
+    # untracked, so reading its array members fails loudly.
+    track_arg, maybe_empty = (
+        _sa_trackable(emit(nodes), struct_args, struct_ctypes, ctypes_of, _const_index)
+        if synthetic_out is not None
+        else ({}, set())
+    )
+    maybe_empty = {f"{label}__ptidx" for label in maybe_empty}  # as index-local names
+
     def _sub_syn(text: str) -> str:
         if not syn_val:
             return text
         return re.sub(r"\bvar_(\w+)\b", lambda mm: f"var_{syn_val.get(mm.group(1), mm.group(1))}", text)
 
+    def cap_of(label: str) -> str:
+        if label not in elem_dyn:
+            raise MetalCodegenError(
+                f"Kernel {adj.fun_name!r}: internal error tracking struct-array element 'var_{label}'"
+            )
+        return f"var_{elem_dyn[label]}"
+
+    def bind(label: str, arg: str | None, index_expr: str, indent: str) -> list[Node]:
+        """``label`` now holds element ``index_expr`` of ``arg`` (-1: default)."""
+        cap = f"{label}__ptidx"
+        if label not in elem_dyn:
+            pt_decls.append(_RawLine(raw=f"    int var_{cap} = -1;"))
+            if arg is not None:
+                elem[label] = arg
+            elem_dyn[label] = cap
+        return [_RawLine(raw=f"{indent}var_{cap} = {index_expr};")]
+
     def rewrite_leaf(n: Node) -> list[Node]:
         raw = getattr(n, "raw", "") or ""
         if "var_" not in raw:
             return [n]
+        ind = _leading_indent(raw)
         m = _SA_DEFAULT_STRUCT_PAT.match(raw)
-        if m and ctypes_of.get(m.group("lhs")) == m.group("ctor") and m.group("ctor") in struct_ctypes.values():
-            default_struct[m.group("lhs")] = m.group("ctor")
-            return [n]
+        if m and m.group("lhs") in track_arg:
+            return [n, *bind(m.group("lhs"), track_arg[m.group("lhs")], "-1", ind)]
         m = _SA_WHERE_PAT.match(raw)
-        if m and synthetic_out is not None and (m.group("a") in elem_dyn or m.group("b") in elem_dyn):
-            # ``x = c ? element copy : (element copy | S())`` -- the select a
-            # conditionally assigned struct local becomes. Track which element
-            # (if any) the result is a copy of.
-            lhs, sides = m.group("lhs"), (m.group("a"), m.group("b"))
-            args = {elem[x] for x in sides if x in elem_dyn}
-            arg = next(iter(args))
-            idx = []
-            for x in sides:
-                if x in elem_dyn:
-                    idx.append(f"var_{elem_dyn[x]}")
-                elif default_struct.get(x) == struct_ctypes.get(arg) and struct_ctypes.get(arg) is not None:
-                    idx.append("-1")
-                else:
-                    idx = []
-                    break
-            if len(args) == 1 and len(idx) == 2:
-                cap = f"{lhs}__ptidx"
-                pt_decls.append(_RawLine(raw=f"    int var_{cap} = 0;"))
-                elem[lhs] = arg
-                elem_dyn[lhs] = cap
-                if "-1" in idx or any(i[4:] in maybe_empty for i in idx if i.startswith("var_")):
-                    maybe_empty.add(cap)
-                sel = f"((var_{m.group('c')}) ? ({idx[0]}) : ({idx[1]}))"
-                return [n, _RawLine(raw=f"{_leading_indent(raw)}var_{cap} = {sel};")]
+        if m and m.group("lhs") in track_arg:
+            lhs, a, b = m.group("lhs"), m.group("a"), m.group("b")
+            sel = f"((var_{m.group('c')}) ? ({cap_of(a)}) : ({cap_of(b)}))"
+            return [n, *bind(lhs, track_arg[lhs], sel, ind)]
+        m = _SA_ASSIGN_PAT.match(raw)
+        if m and m.group("dst") in track_arg:
+            return [n, *bind(m.group("dst"), track_arg[m.group("dst")], cap_of(m.group("src")), ind)]
         m = _SA_ADDR_PAT.match(raw)
         if m and m.group("arr") in struct_args:
             elem[m.group("lhs")] = m.group("arr")
             k = _const_index(m.group("rest"))
             if k is not None and synthetic_out is not None:
                 elem_idx[m.group("lhs")] = k
-            elif synthetic_out is not None and len(_split_top_level_args(m.group("rest"))) == 1:
-                cap = f"{m.group('lhs')}__ptidx"
-                pt_decls.append(_RawLine(raw=f"    int var_{cap} = 0;"))
-                elem_dyn[m.group("lhs")] = cap
-                return [n, _RawLine(raw=f"{_leading_indent(raw)}var_{cap} = {m.group('rest').strip()};")]
+            elif m.group("lhs") in track_arg:
+                return [n, *bind(m.group("lhs"), m.group("arr"), m.group("rest").strip(), ind)]
             return [n]
         m = _MESH_LOAD_PAT.match(raw)
         if m:
@@ -3084,12 +3090,12 @@ def fold_struct_array_array_fields(
                 return []
             if src in pt_elem:
                 return [_RawLine(raw=f"{m.group('indent')}var_{lhs} = {_pt_read(*pt_elem[src])};")]
-            if src in elem:
+            if lhs in track_arg:
+                return [n, *bind(lhs, track_arg[lhs], cap_of(src), m.group("indent"))]
+            if src in elem and src not in elem_dyn:
                 elem[lhs] = elem[src]
                 if src in elem_idx:
                     elem_idx[lhs] = elem_idx[src]
-                if src in elem_dyn:
-                    elem_dyn[lhs] = elem_dyn[src]
                 return [n]
             if src in fptr:
                 fptr[lhs] = fptr[src]
@@ -3105,12 +3111,12 @@ def fold_struct_array_array_fields(
                     ) from e
                 return [_RawLine(raw=f"{m.group('indent')}var_{lhs} = {zero};")]
         m = _MESH_COPY_PAT.match(raw)
-        if m and m.group("src") in elem:
+        if m and m.group("lhs") in track_arg:
+            return [n, *bind(m.group("lhs"), track_arg[m.group("lhs")], cap_of(m.group("src")), m.group("indent"))]
+        if m and m.group("src") in elem and m.group("src") not in elem_dyn:
             elem[m.group("lhs")] = elem[m.group("src")]
             if m.group("src") in elem_idx:
                 elem_idx[m.group("lhs")] = elem_idx[m.group("src")]
-            if m.group("src") in elem_dyn:
-                elem_dyn[m.group("lhs")] = elem_dyn[m.group("src")]
             return [n]
         if m and m.group("src") in pt_val:
             pt_val[m.group("lhs")] = pt_val[m.group("src")]
@@ -3299,6 +3305,104 @@ def fold_struct_array_array_fields(
 # addresses of packed storage. A ``wp::Mesh`` local therefore lowers to a
 # ``wp_mesh_desc_t`` value and the IR's field-pointer / array-load / address
 # chains collapse into direct reads of that storage.
+
+_SA_ASSIGN_PAT = re.compile(r"^\s*wp::assign\s*\(\s*var_(?P<dst>\w+)\s*,\s*var_(?P<src>\w+)\s*\)\s*;\s*$")
+_SA_DEF_PAT = re.compile(r"^\s*(?:var_(?P<lhs>\w+)\s*=(?!=)|wp::(?:assign|store)\w*\s*\(\s*var_(?P<dst>\w+)\s*,)")
+
+
+def _sa_trackable(lines, struct_args, struct_ctypes, ctypes_of, const_index):
+    """Struct values whose struct-array element index can be tracked (see
+    ``fold_struct_array_array_fields``): ``({label: arg or None}, labels that
+    may hold a default-constructed value)``. ``None`` means only default
+    values reach the label (its index is always -1)."""
+    names = {v: k for k, v in struct_ctypes.items() if v}
+    cand: dict[str, str] = {}  # label -> struct native name
+    for label, ct in ctypes_of.items():
+        base = ct.replace("*", "").replace("&", "").replace("const", "").strip()
+        if base in names:
+            cand[label] = base
+    defs: dict[str, list[tuple[str, tuple[str, ...], str | None]]] = {}
+    bad: set[str] = set()
+    field_ptr_of: dict[str, str] = {}  # array-member pointer label -> struct label
+    for raw in lines:
+        m = _SA_DEF_PAT.match(raw)
+        if m is None:
+            continue
+        lhs = m.group("lhs") or m.group("dst")
+        if lhs in field_ptr_of and m.group("dst"):
+            # A store through an array-member pointer rebinds the member.
+            bad.add(field_ptr_of[lhs])
+            continue
+        mf = _MESH_FIELD_PTR_PAT.match(raw)
+        if mf and mf.group("root") in cand:
+            arg = names[cand[mf.group("root")]]
+            if mf.group("field") in struct_args.get(arg, ()):
+                field_ptr_of[mf.group("lhs")] = mf.group("root")
+            continue
+        if lhs not in cand and lhs not in ctypes_of and m.group("lhs"):
+            # Synthetic locals (``var_mtp1``) have no recorded ctype: an
+            # element address, or a load / copy of a candidate, is one.
+            ma = _SA_ADDR_PAT.match(raw)
+            ml = _MESH_LOAD_PAT.match(raw) or _MESH_COPY_PAT.match(raw)
+            if ma and ma.group("arr") in struct_args:
+                cand[lhs] = struct_ctypes[ma.group("arr")]
+            elif ml and ml.group("src") in cand:
+                cand[lhs] = cand[ml.group("src")]
+        if lhs not in cand:
+            continue
+        ma = _SA_ADDR_PAT.match(raw)
+        if ma and ma.group("arr") in struct_args:
+            if const_index(ma.group("rest")) is not None or len(_split_top_level_args(ma.group("rest"))) != 1:
+                bad.add(lhs)
+            else:
+                defs.setdefault(lhs, []).append(("addr", (), ma.group("arr")))
+            continue
+        md = _SA_DEFAULT_STRUCT_PAT.match(raw)
+        if md and md.group("ctor") == cand[lhs]:
+            defs.setdefault(lhs, []).append(("default", (), None))
+            continue
+        mw = _SA_WHERE_PAT.match(raw)
+        if mw:
+            defs.setdefault(lhs, []).append(("where", (mw.group("a"), mw.group("b")), None))
+            continue
+        ms = _SA_ASSIGN_PAT.match(raw)
+        if ms and m.group("dst"):
+            defs.setdefault(lhs, []).append(("copy", (ms.group("src"),), None))
+            continue
+        ml = _MESH_LOAD_PAT.match(raw) or _MESH_COPY_PAT.match(raw)
+        if ml and m.group("lhs"):
+            defs.setdefault(lhs, []).append(("copy", (ml.group("src"),), None))
+            continue
+        bad.add(lhs)
+    ok = {label for label in defs if label not in bad}
+    args: dict[str, set[str]] = {label: set() for label in ok}
+    empty: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        for label in list(ok):
+            a = args[label]
+            n_before, e_before = len(a), label in empty
+            fail = False
+            for kind, srcs, arg in defs[label]:
+                if kind == "addr":
+                    a.add(arg)
+                elif kind == "default":
+                    empty.add(label)
+                for src in srcs:
+                    if src not in ok:
+                        fail = True
+                        break
+                    a |= args[src]
+                    if src in empty:
+                        empty.add(label)
+            if fail or len(a) > 1:
+                ok.discard(label)
+                changed = True
+            elif len(a) != n_before or (label in empty) != e_before:
+                changed = True
+    return {label: next(iter(args[label]), None) for label in ok}, empty & ok
+
 
 _SA_DEFAULT_STRUCT_PAT = re.compile(r"^\s*var_(?P<lhs>\w+)\s*=\s*(?P<ctor>[A-Za-z_]\w*)\s*\(\s*\)\s*;\s*$")
 _SA_WHERE_PAT = re.compile(

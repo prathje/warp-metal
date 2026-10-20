@@ -832,6 +832,75 @@ class TestMetalR3Locals(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet, timeout=120)
 
+    def test_struct_array_loop_carried_element_copy(self):
+        # ``s = S(); for j: if c: s = table[j]`` -- the struct is carried
+        # across iterations (``wp::assign`` at the end of each), so its
+        # element index must be too; a struct also fed from a source that
+        # cannot be tracked (a struct argument) must fail loudly, not read
+        # the wrong arrays.
+        snippet = _snippet(
+            """
+            @wp.struct
+            class Sdf:
+                slots: wp.array[wp.int32]
+                s: float
+
+            @wp.kernel
+            def k(table: wp.array[Sdf], n: int, out: wp.array[int], out2: wp.array[int]):
+                tid = wp.tid()
+                s = Sdf()
+                acc = int(0)
+                acc2 = int(0)
+                for j in range(n):
+                    if j == tid % 3:
+                        s = table[j]
+                    acc += s.slots.shape[0]
+                    if s.slots.shape[0] > 0:
+                        acc2 += s.slots[0]
+                out[tid] = acc
+                out2[tid] = acc2
+
+            @wp.kernel
+            def k_mixed(table: wp.array[Sdf], extra: Sdf, out: wp.array[int]):
+                tid = wp.tid()
+                s = extra
+                if tid % 2 == 0:
+                    s = table[tid % 3]
+                out[tid] = s.slots.shape[0] * 100 + s.slots[0]
+
+            def make(dev):
+                items = []
+                for g in range(3):
+                    sd = Sdf()
+                    sd.slots = wp.array(np.arange(10 * g + 1, 10 * g + 3 + g, dtype=np.int32), device=dev)
+                    sd.s = float(g)
+                    items.append(sd)
+                # The element records do not keep their arrays alive.
+                return wp.array(items, dtype=Sdf, device=dev), items
+
+            def run(dev):
+                table, _items = make(dev)
+                o = wp.zeros(6, dtype=int, device=dev)
+                o2 = wp.zeros(6, dtype=int, device=dev)
+                wp.launch(k, 6, [table, 3, o, o2], device=dev)
+                return o.numpy(), o2.numpy()
+
+            res = compare(run)
+            np.testing.assert_array_equal(res["metal:0"][0], [6, 6, 4, 6, 6, 4])
+
+            ex = Sdf()
+            ex.slots = wp.array(np.array([7, 8], dtype=np.int32), device="metal:0")
+            try:
+                table, _items = make("metal:0")
+                wp.launch(k_mixed, 6, [table, ex, wp.zeros(6, dtype=int, device="metal:0")], device="metal:0")
+            except Exception as e:
+                assert "MetalCodegenError" in type(e).__name__, e
+            else:
+                raise AssertionError("an untrackable struct-array element copy was not rejected")
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
     def test_fixed_array_ptr_of_view_and_misaligned_offset(self):
         # ``.ptr`` of a row view is the row's byte address (the element size,
         # not the element count, scales the offset); a constant ``ptr``
