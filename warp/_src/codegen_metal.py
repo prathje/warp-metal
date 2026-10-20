@@ -23368,7 +23368,12 @@ def _get_or_build_metal_kernel_native(
         artifact = None
         pso = None
         kernel._metal_native_pso = None
+    content_key = None
     if artifact is None:
+        content_key = _content_artifact_key(kernel, block_dim)
+        hit = _CONTENT_ARTIFACTS.get(content_key) if content_key is not None else None
+        if hit is not None:
+            return _adopt_content_artifact(kernel, hit)
         artifact = generate_msl_kernel(kernel, block_dim=block_dim)
         kernel._metal_artifact = artifact
     if pso is None:
@@ -23397,7 +23402,81 @@ def _get_or_build_metal_kernel_native(
                 print(f"[warp-metal] kernel '{kernel.key}' failed to compile; dumped to {dump_dir}", flush=True)
             raise
         kernel._metal_native_pso = pso
+        if content_key is not None:
+            _store_content_artifact(content_key, kernel, artifact, pso)
     elif pso is _METAL_NOOP_PSO:
+        return artifact, None
+    return artifact, pso
+
+
+# In-process cache of forward native artifacts by kernel *content*: factories
+# that create a new kernel object with identical content for every model
+# (Newton's narrow phase builds two per CollisionPipeline) otherwise pay the
+# Python IR build, MSL generation, outlining and PSO compile again each time;
+# CPU/CUDA reuse the loaded module by its hash. Keyed on Warp's deep content
+# hash (``_kernel_content_hash``), the module's resolved options, the launch
+# block_dim and the codegen knobs of ``_artifact_cache_key``.
+_CONTENT_ARTIFACTS: dict[str, tuple] = {}
+_CONTENT_ARTIFACTS_MAX = 4096
+
+
+def _content_artifact_key(kernel, block_dim: int | None) -> str | None:
+    import hashlib  # noqa: PLC0415
+
+    import warp  # noqa: PLC0415
+
+    try:
+        content_hash = _kernel_content_hash(kernel)
+        module = kernel.module
+        options = module.resolve_options(warp.config) if hasattr(module, "resolve_options") else module.options
+        options_sig = repr(sorted((str(k), str(v)) for k, v in dict(options).items()))
+    except Exception:
+        return None
+    h = hashlib.sha256()
+    for part in (
+        content_hash,
+        kernel.key,
+        str(block_dim),
+        options_sig,
+        f"native={bool(warp.config.metal_native_dispatch)}",
+        f"tgtiles={_threadgroup_tiles_enabled()}",
+        f"fp64={_fp64_mode()}",
+        f"spin={_spin_lock_serialization_enabled()}",
+        f"coop={_coop_tiles_enabled()}",
+        f"print={getattr(warp.config, 'metal_print', 'warn')}",
+        f"outline={_moutline.mode() != 'off'}",
+    ):
+        h.update(part.encode("utf-8"))
+        h.update(b"\x00")
+    return h.hexdigest()
+
+
+_CONTENT_ADJ_FLAGS = ("_metal_coop_block_checked", "_metal_wide_block_checked")
+
+
+def _store_content_artifact(key: str, kernel, artifact, pso) -> None:
+    if len(_CONTENT_ARTIFACTS) >= _CONTENT_ARTIFACTS_MAX:
+        _CONTENT_ARTIFACTS.clear()
+    flags = {f: getattr(kernel.adj, f, False) for f in _CONTENT_ADJ_FLAGS}
+    _CONTENT_ARTIFACTS[key] = (artifact, pso, getattr(kernel, "_metal_native_wrapped_source", None), flags)
+
+
+def _adopt_content_artifact(kernel, hit):
+    """Use another kernel object's artifact and PSO for ``kernel`` (same content)."""
+    artifact, pso, wrapped, flags = hit
+    kernel._metal_artifact = artifact
+    kernel._metal_native_pso = pso
+    kernel._metal_native_wrapped_source = wrapped
+    if getattr(artifact, "coop_block_n", 0) == 0:
+        # The source kernel already decided against the coop / wide-block
+        # models at this width; without its flags the next launch would
+        # rebuild to re-check. A coop / wide artifact needs none: its
+        # ``coop_block_n`` already rules out an upgrade, and a later
+        # regeneration (fp64 mode change) decides afresh from a new build.
+        for f, v in flags.items():
+            if v:
+                setattr(kernel.adj, f, True)
+    if pso is _METAL_NOOP_PSO:
         return artifact, None
     return artifact, pso
 

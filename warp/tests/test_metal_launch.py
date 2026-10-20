@@ -9014,6 +9014,74 @@ class TestMetalHostOpOrdering(unittest.TestCase):
 
 @unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
 @unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
+class TestMetalContentArtifactCache(unittest.TestCase):
+    """A new kernel object with the same content (a factory called again with
+    the same arguments under a named module) reuses the first object's
+    artifact and PSO instead of regenerating them; different content never
+    shares."""
+
+    def test_factory_kernels_share_artifacts_by_content(self):
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+            from warp._src import codegen_metal as cm
+
+            generated = []
+            _orig = cm.generate_msl_kernel
+
+            def _gen(kernel, *a, **k):
+                generated.append(kernel.key)
+                return _orig(kernel, *a, **k)
+
+            cm.generate_msl_kernel = _gen
+
+            def make(scale, flip):
+                @wp.kernel(enable_backward=False, module="content_cache_factory")
+                def scaled(a: wp.array[wp.float32], out: wp.array[wp.float32]):
+                    tid = wp.tid()
+                    v = a[tid] * scale
+                    if wp.static(flip):
+                        v = -v
+                    out[tid] = v
+                return scaled
+
+            dev = 'metal:0'
+            a = wp.array(np.arange(64, dtype=np.float32), device=dev)
+            out = wp.zeros(64, dtype=wp.float32, device=dev)
+
+            def run(k):
+                out.zero_()
+                wp.launch(k, dim=64, inputs=[a, out], device=dev)
+                return out.numpy().copy()
+
+            k1 = make(2.0, False)
+            r1 = run(k1)
+            n1 = len(generated)
+            k2 = make(2.0, False)
+            assert k2 is not k1
+            r2 = run(k2)
+            assert len(generated) == n1, generated  # same content: reused
+            assert k2._metal_native_pso is k1._metal_native_pso
+            np.testing.assert_array_equal(r1, np.arange(64) * 2.0)
+            np.testing.assert_array_equal(r2, r1)
+            # Different closure constant / wp.static value: own artifact, own result.
+            r3 = run(make(3.0, False))
+            assert len(generated) == n1 + 1, generated
+            np.testing.assert_array_equal(r3, np.arange(64) * 3.0)
+            r4 = run(make(2.0, True))
+            assert len(generated) == n1 + 2, generated
+            np.testing.assert_array_equal(r4, -np.arange(64) * 2.0)
+            # Another launch width is another entry.
+            out.zero_()
+            k5 = make(2.0, False)
+            wp.launch(k5, dim=64, inputs=[a, out], device=dev, block_dim=64)
+            np.testing.assert_array_equal(out.numpy(), r1)
+            assert len(generated) == n1 + 3, generated
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=180)
+
+
 class TestMetalArtifactCache(unittest.TestCase):
     """The on-disk MSL artifact cache must round-trip artifacts exactly and
     degrade to regeneration on any corruption."""
