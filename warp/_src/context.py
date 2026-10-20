@@ -5460,7 +5460,23 @@ class CudaManagedAllocator:
 # reference here, otherwise the buffer is freed once the local goes out of scope and
 # the pointer becomes dangling.
 _metal_buffer_registry: dict[int, Any] = {}
-_metal_buffer_lock = threading.Lock()
+# Guards the registry, the base/extent index and the foreign/private tables.
+#
+# A garbage collection can run at almost any bytecode boundary, including
+# inside these critical sections, and the finalizers it runs free Metal
+# arrays (``wp.array.__del__`` -> ``MetalDefaultAllocator.deallocate``). So
+# releases never block on this lock: they queue in
+# ``_metal_pending_releases`` and are applied by whoever holds the lock next
+# (:func:`_metal_drain_pending_releases`, run after every critical section).
+# The lock is re-entrant only so a finalizer can tell (``_is_owned``) that it
+# runs inside a critical section on its own thread; nested lookups are
+# allowed (they do not mutate), nested registrations raise.
+_metal_buffer_lock = threading.RLock()
+# ``(foreign, ptr)`` releases waiting for the lock. Deferring a release only
+# keeps the buffer alive (the registry still references it) a little longer,
+# so its address cannot be reused while it is queued; GPU work that binds
+# the buffer holds its own reference (``MetalDispatcher._inflight_refs``).
+_metal_pending_releases: collections.deque = collections.deque()
 
 
 # Sorted allocation bases + byte lengths, kept in step with the registry so
@@ -5477,26 +5493,90 @@ def _metal_buffer_length(buf) -> int | None:
 
 
 def _metal_index_buffer(ptr: int, buf) -> None:
-    """Record ``buf``'s extent for :func:`_metal_find_buffer` (lock held by caller)."""
+    """Record ``buf``'s extent for :func:`_metal_find_buffer` (lock held by caller).
+
+    Ordered so a lookup nested in a finalizer at any point sees a consistent
+    index: every base in ``_metal_buffer_bases`` has an extent and a
+    registry entry (the registry entry is set by the caller first).
+    """
     nbytes = _metal_buffer_length(buf)
     if nbytes is None:
         return
-    if ptr not in _metal_buffer_nbytes:
-        bisect.insort(_metal_buffer_bases, ptr)
+    new = ptr not in _metal_buffer_nbytes
     _metal_buffer_nbytes[ptr] = int(nbytes)
+    if new:
+        bisect.insort(_metal_buffer_bases, ptr)
 
 
 def _metal_unindex_buffer(ptr: int) -> None:
-    if _metal_buffer_nbytes.pop(ptr, None) is not None:
+    """Drop ``ptr`` from the index (lock held); the base goes before its extent."""
+    if ptr in _metal_buffer_nbytes:
         i = bisect.bisect_left(_metal_buffer_bases, ptr)
         if i < len(_metal_buffer_bases) and _metal_buffer_bases[i] == ptr:
             del _metal_buffer_bases[i]
+        del _metal_buffer_nbytes[ptr]
+
+
+def _metal_refuse_nested(what: str) -> None:
+    """Raise for a registration while this thread holds ``_metal_buffer_lock``
+    (callers check ``_metal_buffer_lock._is_owned()``).
+
+    Only a finalizer run by a GC inside a registry critical section gets
+    here; a registration would move the index under the interrupted section
+    (and a plain lock would deadlock), so fail loudly instead."""
+    raise RuntimeError(
+        f"Metal: {what} from a finalizer that interrupted a Metal buffer-registry critical section "
+        "(allocating or wrapping Metal memory inside __del__ / weakref.finalize is not supported)"
+    )
+
+
+def _metal_drain_pending_releases() -> None:
+    """Apply queued releases if the registry lock is free; never blocks.
+
+    If the lock is held by an outer critical section on this thread, or by
+    another thread, the holder applies the queue when it leaves the section
+    (every section ends with this call after releasing the lock, and a
+    release is queued before its own attempt to take the lock, so no queued
+    release is stranded)."""
+    lock = _metal_buffer_lock
+    while _metal_pending_releases:
+        if lock._is_owned() or not lock.acquire(blocking=False):
+            return
+        released: list = []
+        try:
+            _metal_apply_pending_releases_locked(released)
+        finally:
+            lock.release()
+        # Outside the lock: dispatcher bookkeeping, and the last references
+        # to the buffers die here.
+        for buf in released:
+            _metal_unmark_shared_buffer(buf)
+        del released
+
+
+def _metal_apply_pending_releases_locked(released: list) -> None:
+    pending = _metal_pending_releases
+    while pending:
+        foreign, ptr = pending.popleft()
+        if foreign:
+            _metal_release_foreign_locked(ptr, released)
+        else:
+            _metal_unindex_buffer(ptr)
+            buf = _metal_buffer_registry.pop(ptr, None)
+            if buf is not None:
+                released.append(buf)
 
 
 def _metal_register_buffer(ptr: int, mx_array) -> None:
-    with _metal_buffer_lock:
-        _metal_buffer_registry[ptr] = mx_array
-        _metal_index_buffer(ptr, mx_array)
+    if _metal_buffer_lock._is_owned():
+        _metal_refuse_nested("allocating a Metal buffer")
+    try:
+        with _metal_buffer_lock:
+            _metal_buffer_registry[ptr] = mx_array
+            _metal_index_buffer(ptr, mx_array)
+    finally:
+        if _metal_pending_releases:
+            _metal_drain_pending_releases()
 
 
 def _metal_get_buffer(ptr: int):
@@ -5507,14 +5587,31 @@ def _metal_get_buffer(ptr: int):
     to launch — added now alongside the allocator so the registry has a single
     documented access pattern.
     """
-    with _metal_buffer_lock:
-        return _metal_buffer_registry.get(ptr)
+    try:
+        with _metal_buffer_lock:
+            return _metal_buffer_registry.get(ptr)
+    finally:
+        if _metal_pending_releases:
+            _metal_drain_pending_releases()
 
 
 def _metal_release_buffer(ptr: int) -> None:
-    with _metal_buffer_lock:
-        released = _metal_buffer_registry.pop(ptr, None)
+    # Called from ``wp.array.__del__``, i.e. possibly from a GC that
+    # interrupted a registry critical section on this thread: never block.
+    lock = _metal_buffer_lock
+    if lock._is_owned() or not lock.acquire(blocking=False):
+        # Queue first, then retry the lock: a holder that releases after our
+        # failed attempt sees the entry in its exit drain.
+        _metal_pending_releases.append((False, ptr))
+        _metal_drain_pending_releases()
+        return
+    try:
         _metal_unindex_buffer(ptr)
+        released = _metal_buffer_registry.pop(ptr, None)
+    finally:
+        lock.release()
+    if _metal_pending_releases:
+        _metal_drain_pending_releases()
     _metal_unmark_shared_buffer(released)
 
 
@@ -5549,42 +5646,54 @@ def _metal_unmark_shared_buffer(mtl_buf) -> None:
 
 
 def _metal_register_foreign_buffer(ptr: int, owner) -> None:
-    with _metal_buffer_lock:
-        if ptr in _metal_buffer_registry and ptr not in _metal_foreign_refcounts:
-            # Already a Warp-owned allocation at this address (e.g. a Warp
-            # array round-tripped through an external framework and wrapped
-            # back). The allocator entry outlives any foreign wrapper —
-            # leave it alone so releasing the wrapper can't unregister it.
-            shared = _metal_buffer_registry[ptr]
-        else:
-            n = _metal_foreign_refcounts.get(ptr, 0)
-            _metal_foreign_refcounts[ptr] = n + 1
-            if n == 0:
-                _metal_buffer_registry[ptr] = owner
-                _metal_index_buffer(ptr, owner)
-            shared = _metal_buffer_registry[ptr]
+    if _metal_buffer_lock._is_owned():
+        _metal_refuse_nested("wrapping a foreign Metal buffer")
+    try:
+        with _metal_buffer_lock:
+            if ptr in _metal_buffer_registry and ptr not in _metal_foreign_refcounts:
+                # Already a Warp-owned allocation at this address (e.g. a Warp
+                # array round-tripped through an external framework and wrapped
+                # back). The allocator entry outlives any foreign wrapper —
+                # leave it alone so releasing the wrapper can't unregister it.
+                shared = _metal_buffer_registry[ptr]
+            else:
+                n = _metal_foreign_refcounts.get(ptr, 0)
+                _metal_foreign_refcounts[ptr] = n + 1
+                if n == 0:
+                    _metal_buffer_registry[ptr] = owner
+                    _metal_index_buffer(ptr, owner)
+                shared = _metal_buffer_registry[ptr]
+    finally:
+        if _metal_pending_releases:
+            _metal_drain_pending_releases()
     _metal_mark_shared_buffer(shared)
     if shared is not owner:
         _metal_mark_shared_buffer(owner)
 
 
 def _metal_release_foreign_buffer(ptr: int) -> None:
-    with _metal_buffer_lock:
-        n = _metal_foreign_refcounts.get(ptr)
-        if n is None:
-            # Not a foreign registration (Warp-owned, or already released).
-            return
-        if n > 1:
-            _metal_foreign_refcounts[ptr] = n - 1
-            return
-        _metal_foreign_refcounts.pop(ptr, None)
-        released = _metal_buffer_registry.pop(ptr, None)
-        _metal_unindex_buffer(ptr)
-        _metal_unmark_shared_buffer(released)
-        objc_id = _metal_private_owners.pop(ptr, None)
-        if objc_id is not None:
-            _metal_private_keys.pop(objc_id, None)
-            _metal_private_free.append((ptr, _metal_private_spans.pop(ptr)))
+    # A ``weakref.finalize`` callback: deferred like :func:`_metal_release_buffer`.
+    _metal_pending_releases.append((True, ptr))
+    _metal_drain_pending_releases()
+
+
+def _metal_release_foreign_locked(ptr: int, released: list) -> None:
+    n = _metal_foreign_refcounts.get(ptr)
+    if n is None:
+        # Not a foreign registration (Warp-owned, or already released).
+        return
+    if n > 1:
+        _metal_foreign_refcounts[ptr] = n - 1
+        return
+    _metal_foreign_refcounts.pop(ptr, None)
+    _metal_unindex_buffer(ptr)
+    buf = _metal_buffer_registry.pop(ptr, None)
+    if buf is not None:
+        released.append(buf)
+    objc_id = _metal_private_owners.pop(ptr, None)
+    if objc_id is not None:
+        _metal_private_keys.pop(objc_id, None)
+        _metal_private_free.append((ptr, _metal_private_spans.pop(ptr)))
 
 
 # Private-storage foreign buffers (what Torch's MPS allocator hands out) have
@@ -5619,32 +5728,39 @@ def _metal_register_private_buffer(objc_id: int, mtl_buf) -> int:
     yields the same key so refcounts and views stay consistent.
     """
     global _metal_private_next_ptr
-    with _metal_buffer_lock:
-        ptr = _metal_private_keys.get(objc_id)
-        if ptr is None:
-            nbytes = int(_metal_buffer_length(mtl_buf) or 0)
-            # Page-round and leave a guard page so neighbouring keys never
-            # bisect into each other's extent.
-            span = ((nbytes + 4095) & ~4095) + 4096
-            for i, (free_ptr, free_span) in enumerate(_metal_private_free):
-                if free_span >= span:
-                    ptr, span = free_ptr, free_span
-                    del _metal_private_free[i]
-                    break
+    if _metal_buffer_lock._is_owned():
+        _metal_refuse_nested("wrapping a private-storage Metal buffer")
+    try:
+        with _metal_buffer_lock:
+            ptr = _metal_private_keys.get(objc_id)
             if ptr is None:
-                ptr = _metal_private_next_ptr
-                if ptr + span >= _METAL_PRIVATE_PTR_LIMIT:
-                    raise RuntimeError("Exhausted the synthetic key space for private-storage Metal buffers")
-                _metal_private_next_ptr = ptr + span
-            _metal_private_keys[objc_id] = ptr
-            _metal_private_owners[ptr] = objc_id
-            _metal_private_spans[ptr] = span
-        n = _metal_foreign_refcounts.get(ptr, 0)
-        _metal_foreign_refcounts[ptr] = n + 1
-        if n == 0:
-            _metal_buffer_registry[ptr] = mtl_buf
-            _metal_index_buffer(ptr, mtl_buf)
-    _metal_mark_shared_buffer(_metal_buffer_registry.get(ptr, mtl_buf))
+                nbytes = int(_metal_buffer_length(mtl_buf) or 0)
+                # Page-round and leave a guard page so neighbouring keys never
+                # bisect into each other's extent.
+                span = ((nbytes + 4095) & ~4095) + 4096
+                for i, (free_ptr, free_span) in enumerate(_metal_private_free):
+                    if free_span >= span:
+                        ptr, span = free_ptr, free_span
+                        del _metal_private_free[i]
+                        break
+                if ptr is None:
+                    ptr = _metal_private_next_ptr
+                    if ptr + span >= _METAL_PRIVATE_PTR_LIMIT:
+                        raise RuntimeError("Exhausted the synthetic key space for private-storage Metal buffers")
+                    _metal_private_next_ptr = ptr + span
+                _metal_private_keys[objc_id] = ptr
+                _metal_private_owners[ptr] = objc_id
+                _metal_private_spans[ptr] = span
+            n = _metal_foreign_refcounts.get(ptr, 0)
+            _metal_foreign_refcounts[ptr] = n + 1
+            if n == 0:
+                _metal_buffer_registry[ptr] = mtl_buf
+                _metal_index_buffer(ptr, mtl_buf)
+            shared = _metal_buffer_registry.get(ptr, mtl_buf)
+    finally:
+        if _metal_pending_releases:
+            _metal_drain_pending_releases()
+    _metal_mark_shared_buffer(shared)
     return ptr
 
 
@@ -5701,16 +5817,20 @@ def _metal_find_buffer(ptr: int):
     registers ``MTLBuffer`` (byte length via ``length()``), MLX mode a flat
     ``uint8`` ``mx.array`` (``nbytes``).
     """
-    with _metal_buffer_lock:
-        buf = _metal_buffer_registry.get(ptr)
-        if buf is not None:
-            return buf, 0
-        i = bisect.bisect_right(_metal_buffer_bases, ptr) - 1
-        if i >= 0:
-            base = _metal_buffer_bases[i]
-            if base < ptr < base + _metal_buffer_nbytes[base]:
-                return _metal_buffer_registry[base], ptr - base
-    return None, 0
+    try:
+        with _metal_buffer_lock:
+            buf = _metal_buffer_registry.get(ptr)
+            if buf is not None:
+                return buf, 0
+            i = bisect.bisect_right(_metal_buffer_bases, ptr) - 1
+            if i >= 0:
+                base = _metal_buffer_bases[i]
+                if base < ptr < base + _metal_buffer_nbytes[base]:
+                    return _metal_buffer_registry[base], ptr - base
+        return None, 0
+    finally:
+        if _metal_pending_releases:
+            _metal_drain_pending_releases()
 
 
 def _metal_host_memset(ptr, value, nbytes):
