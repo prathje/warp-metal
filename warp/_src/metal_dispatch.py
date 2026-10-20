@@ -340,8 +340,11 @@ class MetalGraph:
         "_names",
         "_owned_buffers",
         "_program",
+        "_refresh",
+        "_refresh_keep",
         "_resources",
         "_signature",
+        "__weakref__",
     )
 
     def __init__(
@@ -358,6 +361,12 @@ class MetalGraph:
     ):
         self._icb = icb
         self._count = count
+        # Host hooks run (after a sync) before every replay, e.g. to rewrite
+        # the pointer tables of struct-array array fields from the element
+        # records as they are then; ``_refresh_keep`` holds what they need
+        # (see ``MetalDispatcher.add_record_refresh``).
+        self._refresh: list = []
+        self._refresh_keep: list = []
         # ``(start, end, snap_addr)`` per unrolled ``capture_while``
         # execution in ``program`` (see ``_build_program``); set by
         # ``end_record``.
@@ -1920,7 +1929,28 @@ class MetalDispatcher:
             # so the commands can be re-encoded into a larger ICB when the
             # recording outgrows ``max`` (see ``_grow_icb``).
             "specs": [],
+            # Every buffer a recorded command may write (``id``), and the
+            # replay refresh hooks with the buffers they read on the host
+            # (``add_record_refresh``).
+            "all_writes": set(),
+            "refresh": [],
         }
+
+    def add_record_refresh(self, fn, keep: Any = None, source: Any = None) -> None:
+        """Run ``fn()`` on the host before every replay of the graph being recorded.
+
+        The replay syncs first, so ``fn`` sees all queued work finished and
+        no earlier replay still reading what it rewrites. ``keep`` stays
+        alive with the graph; a ``(obj, release)`` pair has ``release()``
+        called when the graph is collected. ``source`` is the buffer ``fn``
+        reads: a graph whose own commands write it is rejected at
+        :meth:`end_record`, since a host refresh before the replay could not
+        see those writes.
+        """
+        st = self._record_state
+        if st is None:
+            raise MetalDispatchError("add_record_refresh() outside a recording")
+        st["refresh"].append((fn, keep, source))
 
     def end_record(self) -> MetalGraph:
         """Exit recording mode and return the captured :class:`MetalGraph`."""
@@ -1976,6 +2006,13 @@ class MetalDispatcher:
             for start, _length in chunks:
                 if start > 0:
                     icb.indirectComputeCommandAtIndex_(start).setBarrier()
+        for _fn, _keep, source in st["refresh"]:
+            if source is not None and (not st["has_modes"] or id(source) in st["all_writes"]):
+                raise MetalDispatchError(
+                    "A captured kernel reads array members of a struct array that a command in the same graph "
+                    "writes (or whose writes are unknown); the per-replay refresh of its pointer table could "
+                    "not see those writes. Launch the reading kernel outside the capture."
+                )
         graph = MetalGraph(
             icb=st["icb"],
             count=st["count"],
@@ -1989,6 +2026,14 @@ class MetalDispatcher:
         )
         if program is not None and loop_spans:
             graph._loop_spans = loop_spans
+        if st["refresh"]:
+            import weakref  # noqa: PLC0415
+
+            graph._refresh = [fn for fn, _keep, _src in st["refresh"]]
+            graph._refresh_keep = [keep for _fn, keep, _src in st["refresh"]]
+            for keep in graph._refresh_keep:
+                if isinstance(keep, tuple) and len(keep) == 2 and callable(keep[1]):
+                    weakref.finalize(graph, keep[1])
         return graph
 
     def pause_record(self) -> None:
@@ -2357,6 +2402,10 @@ class MetalDispatcher:
         """
         if self._record_state is not None:
             raise MetalDispatchError("Cannot replay while a recording is open")
+        if graph._refresh:
+            self.sync()
+            for fn in graph._refresh:
+                fn()
         if graph._loop_checks:
             # Overflow from an earlier replay of this graph that has
             # already completed (non-blocking); the next sync point
@@ -2700,6 +2749,16 @@ class MetalDispatcher:
         st = self._record_state
         assert st is not None  # caller checked
         if id(pso) in self._direct_only:
+            # Writes of a direct-only command, for ``end_record``'s refresh check.
+            if binding_modes is None:
+                st["all_writes"].update(id(b) for b in map(_binding_buffer, bindings) if b is not None)
+            else:
+                st["all_writes"].update(
+                    id(b)
+                    for b, mode in zip(map(_binding_buffer, bindings), binding_modes)
+                    if b is not None and mode in ("w", "rw")
+                )
+            st["all_writes"].update(id(buf) for buf, mode in (extra_resources or ()) if mode in ("w", "rw"))
             self._record_direct(st, pso, bindings, grid, threadgroup, reads_resident, extra_resources)
             return
         if st["count"] >= st["max"]:
@@ -2751,6 +2810,7 @@ class MetalDispatcher:
                     cmd_reads.add(ptr)
                 if mode in ("w", "rw"):
                     cmd_writes.add(ptr)
+            st["all_writes"].update(cmd_writes)
             # Conflict check vs the still-open chunk.
             chunk_reads = st["chunk_reads"]
             chunk_writes = st["chunk_writes"]

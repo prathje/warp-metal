@@ -21564,13 +21564,15 @@ def _struct_field_launch_value(fwd_args, arg_by_name, root_label: str, fpath: tu
     """
     idx, arg = arg_by_name[root_label]
     value = fwd_args[idx]
-    if fpath and fpath[0].startswith("["):
+    if fpath and fpath[0].startswith("[") and fpath[0] != "[*]":
         from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
 
         if get_dispatcher()._record_state is not None:
             # The element records are resolved to buffers on the host at
             # launch; a replay would keep reading the arrays bound at
             # capture time even after ``data.assign(...)`` rebinds them.
+            # (Pointer tables, ``"[*]"``, are refreshed before every replay
+            # instead; see ``_struct_array_ptr_table``.)
             raise RuntimeError(
                 f"Metal: kernel reads array fields of the elements of {root_label!r} (a wp.array of a struct "
                 "with array members), which cannot be captured into a Metal graph; launch it outside "
@@ -21611,11 +21613,93 @@ def _struct_array_ptr_table(arr, struct_type, fpath: tuple[str, ...]):
     host-visible storage at every launch (so a record rebound to a new
     array, even one reusing a freed array's address, is seen). The field
     buffers are declared GPU-resident until the next launch rebuilds the
-    table or ``arr`` is collected. Graph capture is rejected by the caller:
-    a replay could not re-resolve the records.
+    table or ``arr`` is collected. A launch recorded into a graph gets a
+    table that is refreshed before every replay
+    (:func:`_struct_array_ptr_table_recorded`).
+    """
+    import weakref  # noqa: PLC0415
+
+    import warp as wp  # noqa: PLC0415
+    from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
+
+    if arr is None or getattr(arr, "ptr", None) is None or arr.size == 0:
+        return None
+    table, bufs = _struct_array_ptr_rows(arr, struct_type, fpath)
+    dispatcher = get_dispatcher()
+    if dispatcher._record_state is not None:
+        return _struct_array_ptr_table_recorded(dispatcher, arr, struct_type, fpath, table, bufs)
+    cache = arr.__dict__.setdefault("_metal_ptab_cache", {})
+    hit = cache.get(fpath)
+    key = table.tobytes()
+    if hit is not None and hit[0] == key:
+        return hit[1]
+    _ptab_retain(dispatcher, bufs)
+    tab = wp.array(table, dtype=wp.uint64, device=arr.device)
+    if hit is not None:
+        hit[2]()  # release the previous table's residency now
+    fin = weakref.finalize(arr, _ptab_release, dispatcher, bufs)
+    cache[fpath] = (key, tab, fin)
+    return tab
+
+
+def _ptab_retain(dispatcher, bufs) -> None:
+    for buf in bufs:
+        if _PTAB_RESIDENT_REFS.get(id(buf), 0) == 0:
+            dispatcher.add_resident_resource(buf)
+        _PTAB_RESIDENT_REFS[id(buf)] = _PTAB_RESIDENT_REFS.get(id(buf), 0) + 1
+
+
+def _struct_array_ptr_table_recorded(dispatcher, arr, struct_type, fpath, table, bufs):
+    """Pointer table for a launch recorded into a Metal graph.
+
+    The graph gets its own table buffer, rewritten before every replay from
+    the element records as they are then (``MetalDispatcher.replay`` runs
+    the refresh hooks after a sync). A graph whose own commands write the
+    struct array is rejected at ``end_record``: the host-side refresh would
+    see the records from before those writes.
     """
     import ctypes  # noqa: PLC0415
     import weakref  # noqa: PLC0415
+
+    import warp as wp  # noqa: PLC0415
+    from warp._src.context import _metal_find_buffer  # noqa: PLC0415
+
+    # Host write into the shared-storage buffer: a ``wp.array(numpy)`` copy
+    # is refused inside a capture (it would not be replayed), and the
+    # refresh hook rewrites the same bytes on the host before every replay.
+    tab = wp.empty(table.shape, dtype=wp.uint64, device=arr.device)
+    ctypes.memmove(int(tab.ptr), table.ctypes.data, table.nbytes)
+    held = {"bufs": list(bufs)}
+    _ptab_retain(dispatcher, held["bufs"])
+    arr_ref = weakref.ref(arr)
+    nbytes = table.nbytes
+
+    def refresh() -> None:
+        a = arr_ref()
+        if a is None:
+            return
+        new, new_bufs = _struct_array_ptr_rows(a, struct_type, fpath)
+        if new.nbytes != nbytes:
+            raise RuntimeError("Metal: a captured struct array with array members changed size")
+        cur = (ctypes.c_char * nbytes).from_address(int(tab.ptr))
+        if bytes(cur) != new.tobytes():
+            ctypes.memmove(int(tab.ptr), new.ctypes.data, nbytes)
+        _ptab_retain(dispatcher, new_bufs)
+        _ptab_release(dispatcher, held["bufs"])
+        held["bufs"] = list(new_bufs)
+
+    def release() -> None:
+        _ptab_release(dispatcher, held["bufs"])
+        held["bufs"] = []
+
+    src_buf, _ = _metal_find_buffer(int(arr.ptr))
+    dispatcher.add_record_refresh(refresh, keep=(tab, release), source=src_buf)
+    return tab
+
+
+def _struct_array_ptr_rows(arr, struct_type, fpath: tuple[str, ...]):
+    """``(table, field buffers)`` of :func:`_struct_array_ptr_table`, read from the records now."""
+    import ctypes  # noqa: PLC0415
 
     import numpy as np  # noqa: PLC0415
 
@@ -21623,8 +21707,6 @@ def _struct_array_ptr_table(arr, struct_type, fpath: tuple[str, ...]):
     from warp._src.context import _metal_find_buffer  # noqa: PLC0415
     from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
 
-    if arr is None or getattr(arr, "ptr", None) is None or arr.size == 0:
-        return None
     if not arr.is_contiguous:
         raise RuntimeError("Metal: struct arrays with array members must be contiguous")
     np_dtype = np.dtype(struct_type.numpy_dtype())
@@ -21670,22 +21752,7 @@ def _struct_array_ptr_table(arr, struct_type, fpath: tuple[str, ...]):
             table[e * _PTAB_ROW + 1 + d] = shape[d]
         if all(b is not buf for b in bufs):
             bufs.append(buf)
-    cache = arr.__dict__.setdefault("_metal_ptab_cache", {})
-    hit = cache.get(fpath)
-    key = table.tobytes()
-    if hit is not None and hit[0] == key:
-        return hit[1]
-    dispatcher = get_dispatcher()
-    for buf in bufs:
-        if _PTAB_RESIDENT_REFS.get(id(buf), 0) == 0:
-            dispatcher.add_resident_resource(buf)
-        _PTAB_RESIDENT_REFS[id(buf)] = _PTAB_RESIDENT_REFS.get(id(buf), 0) + 1
-    tab = wp.array(table, dtype=wp.uint64, device=arr.device)
-    if hit is not None:
-        hit[2]()  # release the previous table's residency now
-    fin = weakref.finalize(arr, _ptab_release, dispatcher, bufs)
-    cache[fpath] = (key, tab, fin)
-    return tab
+    return table, bufs
 
 
 def _struct_array_elem_field_value(arr, struct_type, k: int, fpath: tuple[str, ...]):
@@ -23575,7 +23642,9 @@ def launch_metal_kernel_native(
             grid,
             tg,
             binding_modes=binding_modes,
-            reads_resident=artifact.uses_bvh,
+            # Pointer-table reads (array members of struct-array elements)
+            # reach their buffers through addresses, like BVH queries.
+            reads_resident=artifact.uses_bvh or any(fp[:1] == ("[*]",) for _r, fp in struct_field_args.values()),
             extra_resources=extra_resources,
         )
     except Exception:

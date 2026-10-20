@@ -912,15 +912,18 @@ class TestMetalR3Locals(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet, timeout=120)
 
-    def test_struct_array_element_arrays_reject_capture(self):
-        # The element records are resolved to buffers on the host at launch;
-        # a graph replay would keep reading the arrays bound at capture time,
-        # so capturing such a kernel raises instead of going stale.
+    def test_struct_array_element_arrays_capture(self):
+        # Constant-element reads bind the element's array at launch and
+        # cannot be captured. Runtime-element reads go through a pointer table
+        # that a graph refreshes from the records before every replay, so a
+        # record rebound after the capture is seen; a graph that itself writes
+        # the struct array is rejected (the refresh could not see the writes).
         snippet = _snippet(
             """
             @wp.struct
             class G:
                 vals: wp.array[float]
+                s: float
 
             @wp.kernel
             def kc(data: wp.array[G], out: wp.array[float]):
@@ -928,7 +931,11 @@ class TestMetalR3Locals(unittest.TestCase):
 
             @wp.kernel
             def kd(ids: wp.array[int], data: wp.array[G], out: wp.array[float]):
-                out[wp.tid()] = data[ids[0]].vals[wp.tid()]
+                out[wp.tid()] = data[ids[0]].vals[wp.tid()] + float(data[ids[0]].vals.shape[0])
+
+            @wp.kernel
+            def kw(data: wp.array[G]):
+                data[0].s = 2.0
 
             dev = "metal:0"
             g = G()
@@ -937,21 +944,35 @@ class TestMetalR3Locals(unittest.TestCase):
             out = wp.zeros(2, dtype=float, device=dev)
             ids = wp.zeros(1, dtype=int, device=dev)
             wp.launch(kc, 2, [data, out], device=dev)
-            wp.launch(kd, 2, [ids, data, out], device=dev)
             np.testing.assert_allclose(out.numpy(), [1.0, 2.0])
-            for kern, args in ((kc, [data, out]), (kd, [ids, data, out])):
-                try:
-                    with wp.ScopedCapture(device=dev):
-                        wp.launch(kern, 2, args, device=dev)
-                except RuntimeError as e:
-                    assert "cannot be captured" in str(e), e
-                else:
-                    raise AssertionError("capturing a struct-array array-field read was not rejected")
-            # Rebinding a record to a new array is seen by the next launch.
-            g.vals = wp.array([5.0, 6.0], dtype=float, device=dev)
+            try:
+                with wp.ScopedCapture(device=dev):
+                    wp.launch(kc, 2, [data, out], device=dev)
+            except RuntimeError as e:
+                assert "cannot be captured" in str(e), e
+            else:
+                raise AssertionError("capturing a constant-element array-field read was not rejected")
+
+            with wp.ScopedCapture(device=dev) as cap:
+                wp.launch(kd, 2, [ids, data, out], device=dev)
+            wp.capture_launch(cap.graph)
+            np.testing.assert_allclose(out.numpy(), [3.0, 4.0])
+            # Rebind the record to a new (longer) array after the capture.
+            g.vals = wp.array([5.0, 6.0, 7.0], dtype=float, device=dev)
             data.assign(wp.array([g], dtype=G, device=dev))
+            wp.capture_launch(cap.graph)
+            np.testing.assert_allclose(out.numpy(), [8.0, 9.0])
             wp.launch(kd, 2, [ids, data, out], device=dev)
-            np.testing.assert_allclose(out.numpy(), [5.0, 6.0])
+            np.testing.assert_allclose(out.numpy(), [8.0, 9.0])
+
+            try:
+                with wp.ScopedCapture(device=dev):
+                    wp.launch(kw, 1, [data], device=dev)
+                    wp.launch(kd, 2, [ids, data, out], device=dev)
+            except Exception as e:
+                assert "same graph" in str(e), e
+            else:
+                raise AssertionError("a graph writing the struct array it refreshes from was not rejected")
             """
         )
         _run_with_metal_enabled(self, snippet, timeout=120)
