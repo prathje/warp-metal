@@ -167,7 +167,12 @@ _DECL_RE = re.compile(
     + r")\s*(?<=[\s*&])(?P<name>[A-Za-z_]\w*)\s*(?P<dims>(?:\[[^\]]*\]\s*)*)(?P<rest>=|;)"
 )
 _FOR_DECL_RE = re.compile(r"\bfor\s*\(\s*(?P<type>" + _QUALS + _TYPE + r")\s*(?<=[\s*&])(?P<name>[A-Za-z_]\w*)\s*=")
-_SIMPLE_INIT_RE = re.compile(r"^\s*=\s*(?:[\w:]+\s*\(\s*[-+\w.]*\s*\)|[-+\w.]+)\s*;\s*$|^\s*;\s*$")
+# A declaration that may move into an outlined function: no initialiser, a
+# literal, or ``T(literal)`` / ``T()`` -- nothing that names another variable.
+_LITERAL = r"(?:[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?[fFuUlLhH]*|true|false)"
+_SIMPLE_INIT_RE = re.compile(
+    r"^\s*=\s*(?:[\w:]+\s*\(\s*(?:" + _LITERAL + r")?\s*\)|" + _LITERAL + r")\s*;\s*$|^\s*;\s*$"
+)
 
 
 class _Decl:
@@ -652,7 +657,6 @@ def outline_kernel(kernel_name: str, params: list[str], prologue: str, body: str
             decl, is_ref = _param_decl(d, pname, d.name in written, d.name in scan.addr_taken)
             sig.append(decl)
             ref_pos.append(is_ref)
-        local_names = [nm for nm in ids if nm in rdecls] + [d.name for d in moved]
         seen = set(ren)
         k = 0
         for nm in ids:
@@ -662,7 +666,6 @@ def outline_kernel(kernel_name: str, params: list[str], prologue: str, body: str
                 ren[nm] = f"l{k}"
                 k += 1
                 seen.add(nm)
-        del local_names
         body_out = [_rename(cur[d.line], ren) for d in moved]
         body_out += [_rename(ln, ren) for ln in text if not ln.startswith(MARKER_PREFIX)]
         canon = "\n".join(body_out)
@@ -684,9 +687,9 @@ def outline_kernel(kernel_name: str, params: list[str], prologue: str, body: str
         process(r)
     if not functions:
         return strip_markers(body), ""
+    # Only the body is rewritten: the caller keeps the prologue verbatim, so a
+    # declaration moved out of the prologue stays there as an unused local.
     new_lines = [ln for ln in cur[n_pro:] if ln is not None and not ln.startswith(MARKER_PREFIX)]
-    # A moved declaration may have come from the prologue; keep the prologue
-    # verbatim otherwise.
     if os.environ.get("WARP_METAL_OUTLINE_VERBOSE"):
         print(
             f"[warp-metal-outline] {kernel_name}: {stats['outlined']}/{stats['regions']} regions outlined "
