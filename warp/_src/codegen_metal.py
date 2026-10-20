@@ -8825,6 +8825,185 @@ class _CoopPlan:
     singleton: frozenset = frozenset()
 
 
+_COOP_VAR_PAT = re.compile(r"\bvar_(\w+)")
+_COOP_ASSIGN_PAT = re.compile(r"^\s*var_(\w+)\s*=\s*(.*?);?\s*$")
+_COOP_INPLACE_PAT = re.compile(r"^\s*wp::\w*(?:assign_inplace|_inplace)\s*\(\s*var_(\w+)\s*,(.*)\)\s*;\s*$")
+_COOP_LOOP_START_PAT = re.compile(r"^\s*(start_\w+):;\s*$")
+_COOP_LOOP_HEADER_PAT = re.compile(r"^\s*if\s*\((.*)\)\s*goto\s+(end_\w+)\s*;\s*$")
+_COOP_IF_PAT = re.compile(r"^\s*if\s*\((.*)\)\s*\{\s*$")
+_COOP_COLLECTIVE_PAT = re.compile(
+    r"\bwp::tile_(reduce|sum|min|max|scan_inclusive|scan_exclusive|from_thread|extract|scatter_masked)\b"
+    r"\s*(?:<[^()]*>)?\s*\(\s*([^,)]*)"
+)
+
+
+def _coop_collectives_uniform(
+    lines: list[str],
+    lane_labels: set[str],
+    distributed: set[str],
+    singleton: set[str],
+    reduce_labels: set[str],
+) -> bool:
+    """Whether every cross-lane tile collective runs with all lanes active.
+
+    ``simd_sum`` / ``simd_ballot`` / ``simd_shuffle`` only see the lanes that
+    reach them, so a collective under a lane-dependent ``if`` or loop (or
+    after a lane-dependent early ``return`` / ``goto``) would silently
+    reduce over a subset of the block. CUDA puts a block-wide sync there,
+    which is undefined in divergent code; Metal must not guess.
+
+    ``tile_extract`` of a distributed tile (one ``simd_shuffle``) is not
+    checked: under a lane-dependent condition it is right whenever the
+    source lane is active, e.g. ``if j == last: tile_extract(scan, last)``
+    (stream compaction), which this check cannot tell from an inactive
+    source lane.
+
+    Flow-sensitive taint pass over the forward IR: the lane index of
+    ``wp.tid()`` (and anything computed from it, from an atomic's return
+    value, or assigned under a lane-dependent condition) is lane-dependent;
+    reduction results, singleton reads and shuffles with a uniform index
+    are uniform. Loops are iterated to a fixpoint.
+    """
+    taint: set[str] = set(lane_labels)
+    state = {"sticky": False, "bad": False}
+    # Enclosing loops (innermost last) and the loops a lane-dependent
+    # ``break`` / ``continue`` (``goto end_X`` / ``goto start_X``) has made
+    # divergent: the rest of such a loop runs with a subset of the lanes, and
+    # they reconverge after the loop.
+    loop_stack: list[str] = []
+    loop_div: set[str] = set()
+    n = len(lines)
+    ends: dict[str, int] = {}
+    for idx, ln in enumerate(lines):
+        m = re.match(r"^\s*(end_\w+):;\s*$", ln)
+        if m:
+            ends[m.group(1)] = idx
+
+    def tainted(text: str) -> bool:
+        return any(v in taint for v in _COOP_VAR_PAT.findall(text))
+
+    def collective_uniform_result(rhs: str) -> bool | None:
+        m = _COOP_COLLECTIVE_PAT.search(rhs)
+        if m is None:
+            return None
+        op, first = m.group(1), m.group(2).strip()
+        src = first[len("var_") :] if first.startswith("var_") else first
+        if op in ("reduce", "sum", "min", "max", "from_thread"):
+            return True
+        if op == "extract":
+            if src in singleton or src in reduce_labels:
+                return True
+            if src in distributed:
+                idx_args = rhs[m.end() :]
+                return not tainted(idx_args)
+        return None
+
+    def is_collective(line: str) -> bool:
+        for m in _COOP_COLLECTIVE_PAT.finditer(line):
+            op, first = m.group(1), m.group(2).strip()
+            src = first[len("var_") :] if first.startswith("var_") else first
+            if op == "reduce":
+                # ``tile_reduce(op, var_t)``: the tile is the second argument.
+                return True
+            if op in ("sum", "min", "max", "scan_inclusive", "scan_exclusive", "from_thread"):
+                if src in distributed:
+                    return True
+            elif op == "scatter_masked" and src in singleton:
+                return True
+        return False
+
+    def set_taint(label: str, value: bool, nested: bool) -> None:
+        if value:
+            taint.add(label)
+        elif not nested:
+            taint.discard(label)
+
+    def find_close(i0: int) -> int:
+        depth = 0
+        for j in range(i0, n):
+            t = lines[j].strip()
+            if t.endswith("{") and "}" not in t:
+                depth += 1
+            elif t == "}":
+                depth -= 1
+                if depth == 0:
+                    return j
+        return n - 1
+
+    def run(i0: int, i1: int, ctx: bool, nested: bool) -> None:
+        i = i0
+        while i < i1 and not state["bad"]:
+            ln = lines[i]
+            t = ln.strip()
+            m_if = _COOP_IF_PAT.match(ln)
+            if m_if:
+                j = find_close(i)
+                run(i + 1, j, ctx or tainted(m_if.group(1)), True)
+                i = j + 1
+                continue
+            m_loop = _COOP_LOOP_START_PAT.match(ln)
+            if m_loop:
+                end_label = "end_" + m_loop.group(1)[len("start_") :]
+                j = ends.get(end_label, i1)
+                hdr = i + 1
+                cond_text = ""
+                if hdr < j:
+                    mh = _COOP_LOOP_HEADER_PAT.match(lines[hdr])
+                    if mh and mh.group(2) == end_label:
+                        cond_text = mh.group(1)
+                        hdr += 1
+                body_end = j
+                # The loop's own back edge (``goto start_X;``) is not a divergent jump.
+                if body_end - 1 >= hdr and lines[body_end - 1].strip() == f"goto {m_loop.group(1)};":
+                    body_end -= 1
+                loop_id = m_loop.group(1)[len("start_") :]
+                loop_stack.append(loop_id)
+                for _ in range(32):
+                    before = (frozenset(taint), state["sticky"], loop_id in loop_div)
+                    run(hdr, body_end, ctx or tainted(cond_text), True)
+                    if (frozenset(taint), state["sticky"], loop_id in loop_div) == before or state["bad"]:
+                        break
+                loop_stack.pop()
+                loop_div.discard(loop_id)
+                i = j + 1
+                continue
+            divergent = ctx or state["sticky"] or any(lp in loop_div for lp in loop_stack)
+            if is_collective(ln) and divergent:
+                state["bad"] = True
+                return
+            if t.startswith("return") or ("goto " in t and not _COOP_LOOP_HEADER_PAT.match(ln)):
+                if divergent:
+                    m_goto = re.match(r"^goto\s+(?:start|end)_(\w+)\s*;$", t)
+                    if m_goto and m_goto.group(1) in loop_stack:
+                        # break / continue: diverges the targeted loop (and the
+                        # loops inside it) until that loop ends.
+                        loop_div.add(m_goto.group(1))
+                    else:
+                        state["sticky"] = True
+            elif "builtin_tid2d(" in t:
+                args = _COOP_VAR_PAT.findall(t)
+                if len(args) >= 2:
+                    taint.add(args[1])
+            else:
+                m_as = _COOP_ASSIGN_PAT.match(ln)
+                if m_as and not t.startswith("if"):
+                    lhs, rhs = m_as.group(1), m_as.group(2)
+                    uni = collective_uniform_result(rhs)
+                    if uni is True:
+                        value = divergent
+                    else:
+                        value = divergent or tainted(rhs) or "wp::atomic_" in rhs or "builtin_tid1d(" in rhs
+                    set_taint(lhs, value, nested)
+                else:
+                    m_ip = _COOP_INPLACE_PAT.match(ln)
+                    if m_ip and (divergent or tainted(m_ip.group(2))):
+                        taint.add(m_ip.group(1))
+            i += 1
+
+    run(0, n, False, False)
+    return not state["bad"]
+
+
 def _coop_block_classify(adj, honest: bool = False) -> _CoopPlan | None:
     """Classify a kernel's tile locals for the distributed-lane lowering.
 
@@ -9034,6 +9213,11 @@ def _coop_block_classify(adj, honest: bool = False) -> _CoopPlan | None:
                     return None
             else:
                 return None
+    # Cross-lane collectives must run with every lane active (see
+    # ``_coop_collectives_uniform``); otherwise keep the serial model.
+    _lane_labels = {lane_label} if lane_label is not None else set()
+    if not _coop_collectives_uniform(lines, _lane_labels, distributed, singleton, reduce_labels):
+        return None
     # Tile-typed locals produced any other way (e.g. returned from a
     # ``@wp.func``) have no distributed lowering.
     for label in tile_vars:

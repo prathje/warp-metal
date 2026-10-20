@@ -7432,6 +7432,210 @@ class TestMetalCoopTiles(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet, timeout=120)
 
+    def test_collectives_under_lane_divergence_keep_serial_model(self):
+        # simd_sum / simd_ballot / simd_shuffle only see the active lanes, so a
+        # tile collective under a lane-dependent if/loop/early return must not
+        # take the distributed-lane path. Uniform conditions (kernel args,
+        # unrolled constants vs block_dim) keep it.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            opts = {"enable_backward": False}
+
+            @wp.kernel(module="unique", module_options=opts)
+            def div_scatter_sum(out: wp.array2d[wp.float32]):
+                wid, tid = wp.tid()
+                t = wp.tile_zeros(shape=32, dtype=wp.float32, storage="shared")
+                wp.tile_scatter_masked(t, tid, 1.0, True)
+                if tid < 16:
+                    out[wid, tid] = wp.tile_sum(t)[0]
+
+            @wp.kernel(module="unique", module_options=opts)
+            def div_singleton(out: wp.array2d[wp.int32]):
+                wid, tid = wp.tid()
+                t = wp.tile_zeros(shape=32, dtype=wp.float32, storage="shared")
+                wp.tile_scatter_masked(t, tid, 1.0, True)
+                s = wp.tile_sum(t)[0]
+                cs = wp.tile_zeros(shape=1, dtype=wp.int32, storage="shared")
+                if tid == 3:
+                    wp.tile_scatter_masked(cs, 0, 42, True)
+                out[wid, tid] = cs[0] + wp.int32(s) * 0
+
+            @wp.kernel(module="unique", module_options=opts)
+            def div_reduce(a: wp.array2d[wp.float32], out: wp.array2d[wp.float32]):
+                wid, tid = wp.tid()
+                v = a[wid, tid]
+                if tid < 16:
+                    out[wid, tid] = wp.tile_extract(wp.tile_reduce(wp.add, wp.tile(v)), 0)
+
+            @wp.kernel(module="unique", module_options=opts)
+            def div_loop(a: wp.array2d[wp.float32], out: wp.array2d[wp.float32]):
+                wid, tid = wp.tid()
+                acc = wp.float32(0.0)
+                for i in range(tid, 8):
+                    v = a[wid, i]
+                    acc += wp.tile_extract(wp.tile_reduce(wp.add, wp.tile(v)), 0)
+                out[wid, tid] = acc
+
+            @wp.kernel(module="unique", module_options=opts)
+            def div_return(a: wp.array2d[wp.float32], out: wp.array2d[wp.float32]):
+                wid, tid = wp.tid()
+                v = a[wid, tid]
+                if v > 0.5:
+                    return
+                out[wid, tid] = wp.tile_extract(wp.tile_reduce(wp.max, wp.tile(v)), 0)
+
+            @wp.kernel(module="unique", module_options=opts)
+            def div_continue(a: wp.array2d[wp.float32], out: wp.array2d[wp.float32]):
+                wid, tid = wp.tid()
+                acc = wp.float32(0.0)
+                for k in range(4):
+                    if tid == k:
+                        continue
+                    v = a[wid, tid] + float(k)
+                    acc += wp.tile_extract(wp.tile_reduce(wp.add, wp.tile(v)), 0)
+                out[wid, tid] = acc
+
+            @wp.kernel(module="unique", module_options=opts)
+            def inner_continue(a: wp.array2d[wp.float32], n: int, out: wp.array2d[wp.float32]):
+                # Newton's export_reduced_contacts shape: a lane-0 branch with a
+                # `continue` in its own inner loop, collectives in the outer loop.
+                wid, tid = wp.tid()
+                acc = wp.float32(0.0)
+                for k in range(n):
+                    v = a[wid, tid] * float(k + 1)
+                    acc += wp.tile_extract(wp.tile_reduce(wp.add, wp.tile(v)), 0)
+                    if tid == 0:
+                        for q in range(n):
+                            if q == 1:
+                                continue
+                            acc += 1.0
+                out[wid, tid] = acc
+
+            @wp.kernel(module="unique", module_options=opts)
+            def uniform(a: wp.array2d[wp.float32], n: int, out: wp.array2d[wp.float32]):
+                wid, tid = wp.tid()
+                nl = wp.block_dim()
+                v = a[wid, tid]
+                s = wp.float32(0.0)
+                if n > 4:
+                    s = wp.tile_extract(wp.tile_reduce(wp.add, wp.tile(v)), 0)
+                for k in range(n):
+                    s += wp.tile_extract(wp.tile_reduce(wp.max, wp.tile(v + float(k))), 0)
+                b = wp.float32(0.0)
+                for jj in range(40):
+                    if jj < nl:
+                        x = wp.tile_extract(wp.tile(v), jj)
+                        if tid > jj:
+                            b += x
+                if tid == 7:
+                    out[wid, 32] = s
+                out[wid, tid] = b
+
+            rng = np.random.default_rng(2)
+            an = rng.random((2, 32)).astype(np.float32)
+
+            # Lane-indexed scatters keep needing real lanes: loud error, not a wrong result.
+            for k, dt in ((div_scatter_sum, wp.float32), (div_singleton, wp.int32)):
+                o = wp.zeros((2, 32), dtype=dt, device='metal:0')
+                try:
+                    wp.launch_tiled(k, dim=2, inputs=[o], block_dim=32, device='metal:0')
+                    o.numpy()
+                except RuntimeError as e:
+                    assert 'lane of wp.tid()' in str(e), e
+                else:
+                    raise AssertionError(f'{k.key} must not run divergent collectives with real lanes')
+
+            # Without lane-indexed tile writes they fall back to the serial (CPU) model.
+            for k in (div_reduce, div_loop, div_return, div_continue):
+                res = {}
+                for dev in ('cpu', 'metal:0'):
+                    o = wp.zeros((2, 32), dtype=wp.float32, device=dev)
+                    wp.launch_tiled(k, dim=2, inputs=[wp.array(an, device=dev), o], block_dim=32, device=dev)
+                    res[dev] = o.numpy()
+                assert k._metal_artifact.coop_block_n == 0, k.key
+                np.testing.assert_allclose(res['metal:0'], res['cpu'], rtol=1e-6, atol=0)
+
+            o = wp.zeros((2, 32), dtype=wp.float32, device='metal:0')
+            wp.launch_tiled(inner_continue, dim=2, inputs=[wp.array(an, device='metal:0'), 3, o], block_dim=32,
+                            device='metal:0')
+            assert inner_continue._metal_artifact.coop_block_n == 32
+            expect = np.repeat((an.sum(axis=1) * 6.0)[:, None], 32, axis=1)
+            expect[:, 0] += 6.0
+            np.testing.assert_allclose(o.numpy(), expect, rtol=1e-5)
+
+            o = wp.zeros((2, 33), dtype=wp.float32, device='metal:0')
+            wp.launch_tiled(uniform, dim=2, inputs=[wp.array(an, device='metal:0'), 6, o], block_dim=32, device='metal:0')
+            assert uniform._metal_artifact.coop_block_n == 32
+            o = o.numpy()
+            expect_s = an.sum(axis=1) + sum(an.max(axis=1) + k for k in range(6))
+            np.testing.assert_allclose(o[:, 32], expect_s, rtol=1e-5)
+            expect_b = np.concatenate([np.zeros((2, 1)), np.cumsum(an, axis=1)[:, :-1]], axis=1)
+            np.testing.assert_allclose(o[:, :32], expect_b, rtol=1e-5, atol=1e-6)
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=180)
+
+    def test_integer_and_nan_reductions(self):
+        # int32 tile_sum/min/max are exact; float min/max follow Warp's
+        # fmin/fmax semantics (a NaN operand is ignored unless all are NaN),
+        # tile_sum propagates NaN.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            @wp.kernel(module="unique", module_options={"enable_backward": False})
+            def red(a: wp.array2d[wp.float32], ai: wp.array2d[wp.int32],
+                    out: wp.array2d[wp.float32], outi: wp.array2d[wp.int32]):
+                wid, tid = wp.tid()
+                t = wp.tile_zeros(shape=32, dtype=wp.float32, storage="shared")
+                ti = wp.tile_zeros(shape=32, dtype=wp.int32, storage="shared")
+                wp.tile_scatter_masked(t, tid, a[wid, tid], True)
+                wp.tile_scatter_masked(ti, tid, ai[wid, tid], True)
+                mx = wp.tile_max(t)[0]
+                mn = wp.tile_min(t)[0]
+                sm = wp.tile_sum(t)[0]
+                v = a[wid, tid]
+                r = wp.tile_extract(wp.tile_reduce(wp.max, wp.tile(v)), 0)
+                imx = wp.tile_max(ti)[0]
+                imn = wp.tile_min(ti)[0]
+                ism = wp.tile_sum(ti)[0]
+                vi = ai[wid, tid]
+                ior = wp.tile_extract(wp.tile_reduce(wp.bit_or, wp.tile(vi)), 0)
+                if tid == 0:
+                    out[wid, 0] = mx
+                    out[wid, 1] = mn
+                    out[wid, 2] = sm
+                    out[wid, 3] = r
+                    outi[wid, 0] = imx
+                    outi[wid, 1] = imn
+                    outi[wid, 2] = ism
+                    outi[wid, 3] = ior
+
+            an = (np.arange(96, dtype=np.float32).reshape(3, 32) - 20.0)
+            an[1, 5] = np.nan
+            an[2, :] = np.nan
+            ain = (np.arange(96, dtype=np.int64).reshape(3, 32) * 7919 - 100000).astype(np.int32)
+            ain[2, 3] = np.iinfo(np.int32).min
+            o = wp.zeros((3, 4), dtype=wp.float32, device='metal:0')
+            oi = wp.zeros((3, 4), dtype=wp.int32, device='metal:0')
+            wp.launch_tiled(red, dim=3, inputs=[wp.array(an, device='metal:0'), wp.array(ain, device='metal:0'), o, oi],
+                            block_dim=32, device='metal:0')
+            assert red._metal_artifact.coop_block_n == 32
+            o, oi = o.numpy(), oi.numpy()
+            np.testing.assert_array_equal(o[:, 0], np.array([np.nanmax(an[0]), np.nanmax(an[1]), np.nan], np.float32))
+            np.testing.assert_array_equal(o[:, 1], np.array([np.nanmin(an[0]), np.nanmin(an[1]), np.nan], np.float32))
+            np.testing.assert_array_equal(o[:, 3], o[:, 0])
+            assert o[0, 2] == an[0].sum() and np.isnan(o[1, 2]) and np.isnan(o[2, 2])
+            np.testing.assert_array_equal(oi[:, 0], ain.max(axis=1))
+            np.testing.assert_array_equal(oi[:, 1], ain.min(axis=1))
+            np.testing.assert_array_equal(oi[:, 2], ain.astype(np.int64).sum(axis=1).astype(np.int32))
+            np.testing.assert_array_equal(oi[:, 3], np.bitwise_or.reduce(ain, axis=1))
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
     def test_strided_atomic_runs_real_lanes(self):
         snippet = textwrap.dedent(
             """
