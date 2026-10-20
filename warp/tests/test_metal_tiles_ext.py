@@ -223,6 +223,7 @@ class TestMetalTilesExt(unittest.TestCase):
                 idx: int
                 val: float
                 inner: Inner
+                m: wp.mat22
 
             @wp.func
             def make_item(i: int, v: float):
@@ -231,6 +232,7 @@ class TestMetalTilesExt(unittest.TestCase):
                 it.val = v * 2.0
                 it.inner.w = wp.vec3(v, float(i), -v)
                 it.inner.k = wp.uint32(i * 7 + 1)
+                it.m = wp.mat22(v, 1.0, float(i), -v)
                 return it
 
             @wp.func
@@ -238,7 +240,7 @@ class TestMetalTilesExt(unittest.TestCase):
                 p, slot = wp.tile_stack_pop(st)
                 if slot >= 0:
                     out_i[b, slot] = p.idx + int(p.inner.k) * 100
-                    out_v[b, slot] = p.val + p.inner.w[0] - p.inner.w[2] + p.inner.w[1]
+                    out_v[b, slot] = p.val + p.inner.w[0] - p.inner.w[2] + p.inner.w[1] + p.m[1, 0] * p.m[0, 0]
                 return slot
 
             @wp.kernel
@@ -264,6 +266,34 @@ class TestMetalTilesExt(unittest.TestCase):
             compare(k, [4], lambda d: [wp.array(xs, device=d), wp.full((4, 6), -1, dtype=int, device=d),
                                        wp.zeros((4, 6), dtype=float, device=d), wp.zeros(4, dtype=int, device=d)],
                     [1, 2, 3], block_dim=1, atol=0)
+
+            # Array (and texture) members cannot ride in the packed element:
+            # a pop would return them empty, so the kernel is rejected.
+            @wp.struct
+            class WithArray:
+                idx: int
+                arr: wp.array[float]
+
+            @wp.kernel
+            def k_arr(x: wp.array[float], out: wp.array[float]):
+                b, t = wp.tid()
+                st = wp.tile_stack(capacity=4, dtype=WithArray)
+                it = WithArray()
+                it.idx = 3
+                it.arr = x
+                wp.tile_stack_push(st, it, True)
+                p, slot = wp.tile_stack_pop(st)
+                out[b] = float(p.idx) + p.arr[1] + float(p.arr.shape[0])
+
+            from warp._src.codegen_metal import MetalCodegenError
+            x = wp.array([1.0, 10.0], dtype=float, device="metal:0")
+            o = wp.zeros(2, dtype=float, device="metal:0")
+            try:
+                wp.launch_tiled(k_arr, dim=[2], inputs=[x, o], block_dim=1, device="metal:0")
+            except MetalCodegenError as e:
+                assert "array or texture" in str(e), e
+            else:
+                raise AssertionError("tile_stack of a struct with an array member was not rejected")
             """,
         )
 

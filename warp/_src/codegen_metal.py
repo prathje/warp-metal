@@ -17131,6 +17131,14 @@ def _generate_msl_kernel_uncached(
             raise MetalCodegenError(
                 f"Kernel {adj.fun_name!r}: tile_stack element type {_se[0]!r} is not a known struct"
             )
+        _bad_field = _struct_handle_field(_lay)
+        if _bad_field is not None:
+            # The packed element holds scalar leaves only; an array or texture
+            # member would come back from tile_stack_pop empty.
+            raise MetalCodegenError(
+                f"Kernel {adj.fun_name!r}: tile_stack of struct {_lay.name!r} is not supported on Metal: member "
+                f"{_bad_field!r} is an array or texture"
+            )
         _mtiles.register_struct_stack_elem(
             _se[0], [(_path, _fi.msl_type) for _path, _off, _fi in _iter_scalar_leaves(_lay)]
         )
@@ -21315,6 +21323,19 @@ def _struct_layout_for(struct_cls) -> _StructLayout:
         raise MetalCodegenError(f"MSL codegen: struct {layout.name!r} has size {total}, not a multiple of 4")
     layout.scalars_per_elem = total // 4
     return layout
+
+
+def _struct_handle_field(layout: _StructLayout, prefix: str = "") -> str | None:
+    """Path of the first array or texture member of ``layout`` (nested structs included), else None."""
+    for fname, finfo in layout.fields.items():
+        path = f"{prefix}{fname}"
+        if finfo.kind in (_STRUCT_FIELD_KIND_ARRAY_UNUSED, _STRUCT_FIELD_KIND_TEXTURE):
+            return path
+        if finfo.kind == _STRUCT_FIELD_KIND_STRUCT:
+            sub = _struct_handle_field(finfo.sub, prefix=f"{path}.")
+            if sub is not None:
+                return sub
+    return None
 
 
 def _iter_scalar_leaves(layout: _StructLayout, prefix: str = "", base: int = 0):
