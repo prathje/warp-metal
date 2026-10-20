@@ -7671,7 +7671,8 @@ class TestMetalCoopTiles(unittest.TestCase):
         # native ``__syncthreads()``, cross-thread exchange through device
         # memory. At block_dim 64..1024 it runs one real threadgroup per block
         # (several SIMD groups); without a barrier, or with tile ops, the
-        # kernel keeps its old model.
+        # kernel keeps its old model. One kernel object can be launched at
+        # several widths.
         snippet = textwrap.dedent(
             """
             import numpy as np
@@ -7694,7 +7695,7 @@ class TestMetalCoopTiles(unittest.TestCase):
                     lane = tid % bd
                     wid = tid / bd
                     v = a[tid]
-                    if bd != width:
+                    if width != 0 and bd != width:
                         return
                     for _r in range(rounds):
                         out[tid] = v
@@ -7758,14 +7759,54 @@ class TestMetalCoopTiles(unittest.TestCase):
                           block_dim=bd, device=dev)
                 assert rotate_2d._metal_artifact.coop_block_n == bd
                 np.testing.assert_allclose(out2.numpy(), exp, rtol=1e-6)
-                # The block model is fixed at the first launch: another width raises.
-                try:
-                    wp.launch(rotate_1d, dim=nw * 128, inputs=[rounds, wp.array(a_np.ravel()[: nw * 128], device=dev),
-                              out], block_dim=128, device=dev)
-                except RuntimeError as e:
-                    assert 'block_dim=' in str(e), e
+
+            # One kernel object at several widths: each block model keeps its own
+            # artifact (another width used to raise), and switching back reuses it.
+            from warp._src import codegen_metal as cm
+            generated = []
+            _orig_gen = cm.generate_msl_kernel
+
+            def _gen(kernel, *a, **k):
+                generated.append(k.get('block_dim'))
+                return _orig_gen(kernel, *a, **k)
+
+            cm.generate_msl_kernel = _gen
+            rot, _ = make_rotate(0)  # width guard off: any block_dim
+            nw = 2
+            for width in (256, 128, 1, 256, 128, 1):
+                a_np = rng.random((nw, width)).astype(np.float32)
+                out = wp.zeros(nw * width, dtype=wp.float32, device=dev)
+                wp.launch(rot, dim=nw * width, inputs=[rounds, wp.array(a_np.ravel(), device=dev), out],
+                          block_dim=width, device=dev)
+                got = out.numpy().reshape(nw, width)
+                if width == 1:
+                    exp = a_np + rounds * np.arange(nw)[:, None]
                 else:
-                    raise AssertionError('relaunch at another width must raise')
+                    exp = expect(a_np, rounds)
+                np.testing.assert_allclose(got, exp, rtol=1e-6)
+            assert generated == [256, 128, 1], generated
+
+            # The same for the 32-lane coop model of a tile kernel and its serial model.
+            @wp.kernel(module="unique", module_options=opts)
+            def row_sum(a: wp.array2d[wp.float32], out: wp.array2d[wp.float32]):
+                wid, lane = wp.tid()
+                v = a[wid, lane]
+                out[wid, lane] = wp.tile_sum(wp.tile(v))[0]
+
+            generated.clear()
+            a_np = rng.random((2, 32)).astype(np.float32)
+            a32 = wp.array(a_np, device=dev)
+            for width in (32, 1, 32, 1):
+                o = wp.zeros((2, 32), dtype=wp.float32, device=dev)
+                if width == 32:
+                    wp.launch(row_sum, dim=(2, 32), inputs=[a32, o], block_dim=32, device=dev)
+                    np.testing.assert_allclose(o.numpy(), np.repeat(a_np.sum(axis=1)[:, None], 32, axis=1), rtol=1e-5)
+                else:
+                    # One lane per block: each thread sums its own one-element tile.
+                    wp.launch(row_sum, dim=(2, 32), inputs=[a32, o], block_dim=1, device=dev)
+                    np.testing.assert_allclose(o.numpy(), a_np, rtol=1e-6)
+            assert generated == [32, 1], generated
+            cm.generate_msl_kernel = _orig_gen
 
             # dim not a multiple of block_dim: loud.
             rotate_1d, _ = make_rotate(128)

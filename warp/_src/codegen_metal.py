@@ -23326,9 +23326,13 @@ def _drop_stale_fp64_artifacts(kernel) -> None:
             "_metal_native_arg_by_name",
             "_metal_native_wrapped_source",
             "_metal_native_const_buf_cache",
+            "_metal_model_variants",
+            "_metal_model_key",
         ):
             if hasattr(kernel, attr):
                 setattr(kernel, attr, None)
+        if getattr(kernel.adj, "_metal_coop_block_n", 0):
+            _reset_adj_block_model(kernel.adj)
     kernel._metal_fp64_mode = mode
 
 
@@ -23362,6 +23366,7 @@ def _get_or_build_metal_kernel_native(
         cache[grad_args] = (artifact, pso)
         return artifact, pso
 
+    _switch_block_model(kernel, block_dim)
     artifact = getattr(kernel, "_metal_artifact", None)
     pso = getattr(kernel, "_metal_native_pso", None)
     if _coop_upgrade_pending(kernel, artifact, block_dim):
@@ -23373,7 +23378,7 @@ def _get_or_build_metal_kernel_native(
         content_key = _content_artifact_key(kernel, block_dim)
         hit = _CONTENT_ARTIFACTS.get(content_key) if content_key is not None else None
         if hit is not None:
-            return _adopt_content_artifact(kernel, hit)
+            return _adopt_content_artifact(kernel, hit, block_dim)
         artifact = generate_msl_kernel(kernel, block_dim=block_dim)
         kernel._metal_artifact = artifact
     if pso is None:
@@ -23407,6 +23412,81 @@ def _get_or_build_metal_kernel_native(
     elif pso is _METAL_NOOP_PSO:
         return artifact, None
     return artifact, pso
+
+
+def _block_model_key(block_dim: int | None) -> str:
+    """The block model a launch width asks for: coop (32 lanes), wide (64..1024) or serial."""
+    if block_dim == _COOP_BLOCK_DIM:
+        return "coop"
+    if _wide_block_dim(block_dim):
+        return f"wide{block_dim}"
+    return "serial"
+
+
+# Kernel attributes derived from the current artifact (rebuilt lazily).
+_ARTIFACT_DERIVED_ATTRS = ("_metal_native_arg_by_name", "_metal_native_const_buf_cache", "_metal_alias_psos")
+# Adjoint attributes recording the block-model decision.
+_ADJ_MODEL_ATTRS = ("_metal_coop_block_n", "_metal_coop_plan", "_metal_coop_block_checked", "_metal_wide_block_checked")
+
+
+def _reset_adj_block_model(adj) -> None:
+    """Forget the block-model decision so the next build decides afresh."""
+    adj._metal_coop_block_n = 0
+    adj._metal_coop_plan = None
+    adj._metal_coop_block_checked = False
+    adj._metal_wide_block_checked = False
+    adj._metal_ir_ok = False
+
+
+def _switch_block_model(kernel, block_dim: int | None) -> None:
+    """Keep one forward native artifact per block model on a kernel object.
+
+    The coop / wide-block decision rebuilds the kernel's IR at the launch
+    width, so it used to be fixed at the first such launch and a later
+    launch at another width raised (a test running a kernel with one lane,
+    a solver picking 64 instead of 128 threads for more worlds). Now the
+    current artifact, PSO and decision are stashed under their model key and
+    a launch at another width restores its own variant or builds it from a
+    freshly reset adjoint.
+    """
+    key = _block_model_key(block_dim)
+    current = getattr(kernel, "_metal_model_key", None)
+    artifact = getattr(kernel, "_metal_artifact", None)
+    if current is None:
+        if artifact is not None:
+            n = getattr(artifact, "coop_block_n", 0)
+            current = "coop" if n == _COOP_BLOCK_DIM else (f"wide{n}" if n > _COOP_BLOCK_DIM else key)
+        else:
+            current = key
+        kernel._metal_model_key = current
+    if current == key:
+        return
+    variants = getattr(kernel, "_metal_model_variants", None)
+    if variants is None:
+        variants = {}
+        kernel._metal_model_variants = variants
+    adj = kernel.adj
+    if artifact is not None:
+        variants[current] = (
+            artifact,
+            getattr(kernel, "_metal_native_pso", None),
+            getattr(kernel, "_metal_native_wrapped_source", None),
+            {a: getattr(adj, a, None) for a in _ADJ_MODEL_ATTRS},
+        )
+    for attr in _ARTIFACT_DERIVED_ATTRS:
+        if hasattr(kernel, attr):
+            setattr(kernel, attr, None)
+    stored = variants.get(key)
+    if stored is not None:
+        kernel._metal_artifact, kernel._metal_native_pso, kernel._metal_native_wrapped_source, flags = stored
+        for a, v in flags.items():
+            setattr(adj, a, v)
+    else:
+        kernel._metal_artifact = None
+        kernel._metal_native_pso = None
+        kernel._metal_native_wrapped_source = None
+        _reset_adj_block_model(adj)
+    kernel._metal_model_key = key
 
 
 # In-process cache of forward native artifacts by kernel *content*: factories
@@ -23461,10 +23541,11 @@ def _store_content_artifact(key: str, kernel, artifact, pso) -> None:
     _CONTENT_ARTIFACTS[key] = (artifact, pso, getattr(kernel, "_metal_native_wrapped_source", None), flags)
 
 
-def _adopt_content_artifact(kernel, hit):
+def _adopt_content_artifact(kernel, hit, block_dim: int | None):
     """Use another kernel object's artifact and PSO for ``kernel`` (same content)."""
     artifact, pso, wrapped, flags = hit
     kernel._metal_artifact = artifact
+    kernel._metal_model_key = _block_model_key(block_dim)
     kernel._metal_native_pso = pso
     kernel._metal_native_wrapped_source = wrapped
     if getattr(artifact, "coop_block_n", 0) == 0:
