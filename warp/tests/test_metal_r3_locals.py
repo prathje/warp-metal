@@ -782,6 +782,56 @@ class TestMetalR3Locals(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet, timeout=120)
 
+    def test_struct_array_conditional_element_copy_array_fields(self):
+        # ``s = S(); if c: s = table[i]`` (Newton's texture-SDF lookup): the
+        # struct local is a select between an element copy and a default
+        # struct, and a @wp.func reads its 3-D array field and shapes.
+        snippet = _snippet(
+            """
+            @wp.struct
+            class Sdf:
+                slots: wp.array3d[wp.uint32]
+                lower: wp.vec3
+                baked: bool
+
+            @wp.func
+            def lookup(s: Sdf, x: int, y: int, z: int):
+                if s.slots.shape[0] == 0:
+                    return -1
+                return int(s.slots[x, y, z]) + int(s.lower[1]) + wp.where(s.baked, 1000, 0)
+
+            @wp.kernel
+            def k(table: wp.array[Sdf], ids: wp.array[int], out: wp.array[int], shp: wp.array[int]):
+                tid = wp.tid()
+                i = ids[tid]
+                use = i >= 0 and i < table.shape[0]
+                s = Sdf()
+                if use:
+                    s = table[i]
+                out[tid] = lookup(s, tid % 2, 1, tid % 3)
+                shp[tid] = s.slots.shape[0] * 100 + s.slots.shape[2]
+
+            def run(dev):
+                rng = np.random.default_rng(1)
+                items = []
+                for g in range(3):
+                    sd = Sdf()
+                    sd.slots = wp.array(rng.integers(0, 50, (2 + g, 3, 4)).astype(np.uint32), dtype=wp.uint32, device=dev)
+                    sd.lower = wp.vec3(0.0, float(g), 0.0)
+                    sd.baked = g == 1
+                    items.append(sd)
+                table = wp.array(items, dtype=Sdf, device=dev)
+                ids = wp.array([2, -1, 0, 1, 7, 1], dtype=int, device=dev)
+                o = wp.zeros(6, dtype=int, device=dev)
+                s = wp.zeros(6, dtype=int, device=dev)
+                wp.launch(k, 6, [table, ids, o, s], device=dev)
+                return o.numpy(), s.numpy()
+
+            compare(run)
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
     def test_fixed_array_ptr_of_view_and_misaligned_offset(self):
         # ``.ptr`` of a row view is the row's byte address (the element size,
         # not the element count, scales the offset); a constant ``ptr``
@@ -1056,7 +1106,6 @@ class TestMetalR3Locals(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet, timeout=120)
 
-
     def test_struct_field_arrays_chosen_by_const_branches(self):
         # mujoco_warp's ``multicontact``: ``if t1 == MESH: vert = g1.vert
         # elif t2 == MESH: vert = g2.vert`` with closure-constant geom types,
@@ -1119,6 +1168,7 @@ class TestMetalR3Locals(unittest.TestCase):
             """
         )
         _run_with_metal_enabled(self, snippet, timeout=120)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -2977,6 +2977,7 @@ def fold_struct_array_array_fields(
                 struct_args[a.label] = fields
     if not struct_args:
         return nodes, set(), set()
+    struct_ctypes = {a.label: getattr(a.type.dtype, "native_name", None) for a in adj.args if a.label in struct_args}
 
     ctypes_of: dict[str, str] = {v.label: v.ctype() for v in adj.variables}
     ctypes_of.update(extra_var_ctypes or {})
@@ -2996,6 +2997,11 @@ def fold_struct_array_array_fields(
     pt_shape: dict[str, tuple[str, str, Any]] = {}
     pt_elem: dict[str, tuple[str, str, Any, list[str]]] = {}
     pt_decls: list[Node] = []
+    # Default-constructed struct locals (``var_X = S();``), and element
+    # copies whose captured index may be -1 because a ``wp::where`` picked
+    # such a default value: their array fields are empty (null, shape 0).
+    default_struct: dict[str, str] = {}  # label -> struct ctype name
+    maybe_empty: set[str] = set()  # captured index locals that may be -1
     used: set[str] = set()
     consts = dict(const_ints or {})
     for v in adj.variables:
@@ -3022,6 +3028,36 @@ def fold_struct_array_array_fields(
         raw = getattr(n, "raw", "") or ""
         if "var_" not in raw:
             return [n]
+        m = _SA_DEFAULT_STRUCT_PAT.match(raw)
+        if m and ctypes_of.get(m.group("lhs")) == m.group("ctor") and m.group("ctor") in struct_ctypes.values():
+            default_struct[m.group("lhs")] = m.group("ctor")
+            return [n]
+        m = _SA_WHERE_PAT.match(raw)
+        if m and synthetic_out is not None and (m.group("a") in elem_dyn or m.group("b") in elem_dyn):
+            # ``x = c ? element copy : (element copy | S())`` -- the select a
+            # conditionally assigned struct local becomes. Track which element
+            # (if any) the result is a copy of.
+            lhs, sides = m.group("lhs"), (m.group("a"), m.group("b"))
+            args = {elem[x] for x in sides if x in elem_dyn}
+            arg = next(iter(args))
+            idx = []
+            for x in sides:
+                if x in elem_dyn:
+                    idx.append(f"var_{elem_dyn[x]}")
+                elif default_struct.get(x) == struct_ctypes.get(arg) and struct_ctypes.get(arg) is not None:
+                    idx.append("-1")
+                else:
+                    idx = []
+                    break
+            if len(args) == 1 and len(idx) == 2:
+                cap = f"{lhs}__ptidx"
+                pt_decls.append(_RawLine(raw=f"    int var_{cap} = 0;"))
+                elem[lhs] = arg
+                elem_dyn[lhs] = cap
+                if "-1" in idx or any(i[4:] in maybe_empty for i in idx if i.startswith("var_")):
+                    maybe_empty.add(cap)
+                sel = f"((var_{m.group('c')}) ? ({idx[0]}) : ({idx[1]}))"
+                return [n, _RawLine(raw=f"{_leading_indent(raw)}var_{cap} = {sel};")]
         m = _SA_ADDR_PAT.match(raw)
         if m and m.group("arr") in struct_args:
             elem[m.group("lhs")] = m.group("arr")
@@ -3127,11 +3163,11 @@ def fold_struct_array_array_fields(
                 if info is None:
                     return mm.group(0)
                 k = mm.group(0)[mm.group(0).index(",") + 1 : -1].strip()
-                return f"int(var_{info[0]}[(var_{info[1]}) * 5 + 1 + ({k})])"
+                return _guard(info[1], f"int(var_{info[0]}[(var_{info[1]}) * 5 + 1 + ({k})])")
 
             def _sub_len(mm: re.Match[str]) -> str:
                 info = pt_val.get(mm.group(1))
-                return mm.group(0) if info is None else f"int(var_{info[0]}[(var_{info[1]}) * 5 + 1])"
+                return mm.group(0) if info is None else _guard(info[1], f"int(var_{info[0]}[(var_{info[1]}) * 5 + 1])")
 
             new_pt = _MESH_LEN_PAT.sub(_sub_len, _MESH_SHAPE_EXTRACT_PAT.sub(_sub_pt, raw))
             if new_pt != raw:
@@ -3189,6 +3225,11 @@ def fold_struct_array_array_fields(
                 out.extend(rewrite_leaf(n))
         return out
 
+    def _guard(cap: str, expr: str) -> str:
+        """``expr`` reads pointer-table row ``cap``; an empty array (index -1,
+        a default-constructed struct) has shape 0 and no row."""
+        return f"((var_{cap}) < 0 ? 0 : {expr})" if cap in maybe_empty else expr
+
     def _pt_read(syn: str, cap: str, ftype, idx: list[str]) -> str:
         """Element ``idx`` of the array field whose pointer-table row is ``cap``."""
         from warp._src.codegen import Var  # noqa: PLC0415
@@ -3207,7 +3248,10 @@ def fold_struct_array_array_fields(
                 f"Kernel {adj.fun_name!r}: array field of {Var.dtype_to_ctype(dtype)!r} elements read through a "
                 "wp.array[Struct] element is not supported on Metal"
             )
-        row = f"(var_{cap}) * 5"  # ``_PTAB_ROW`` in codegen_metal
+        # ``_PTAB_ROW`` in codegen_metal. Reading an element of an empty
+        # array (index -1) is out of bounds on every device; clamp the row so
+        # it at least stays inside the table.
+        row = f"(metal::max(var_{cap}, 0)) * 5" if cap in maybe_empty else f"(var_{cap}) * 5"
         dims = [f"int(var_{syn}[{row} + {1 + d}])" for d in range(len(idx))]
         flat = ""
         for d, i in enumerate(idx):
@@ -3256,6 +3300,10 @@ def fold_struct_array_array_fields(
 # ``wp_mesh_desc_t`` value and the IR's field-pointer / array-load / address
 # chains collapse into direct reads of that storage.
 
+_SA_DEFAULT_STRUCT_PAT = re.compile(r"^\s*var_(?P<lhs>\w+)\s*=\s*(?P<ctor>[A-Za-z_]\w*)\s*\(\s*\)\s*;\s*$")
+_SA_WHERE_PAT = re.compile(
+    r"^\s*var_(?P<lhs>\w+)\s*=\s*wp::where\s*\(\s*var_(?P<c>\w+)\s*,\s*var_(?P<a>\w+)\s*,\s*var_(?P<b>\w+)\s*\)\s*;\s*$"
+)
 _MESH_GET_PAT = re.compile(r"^(?P<indent>\s*)var_(?P<lhs>\w+)\s*=\s*wp::mesh_get\s*\((?P<arg>.*)\)\s*;\s*$")
 _MESH_FIELD_PTR_PAT = re.compile(
     r"^\s*var_(?P<lhs>\w+)\s*=\s*&\s*\(\s*\(?\s*var_(?P<root>\w+)\s*\)?\s*(?:\.|->)\s*(?P<field>\w+)\s*\)\s*;\s*$"
