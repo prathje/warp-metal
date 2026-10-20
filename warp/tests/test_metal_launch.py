@@ -7666,6 +7666,139 @@ class TestMetalCoopTiles(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet, timeout=180)
 
+    def test_wide_block_barrier_kernels(self):
+        # The CUDA block idiom without tile ops: ``wp.block_dim()`` lanes, a
+        # native ``__syncthreads()``, cross-thread exchange through device
+        # memory. At block_dim 64..1024 it runs one real threadgroup per block
+        # (several SIMD groups); without a barrier, or with tile ops, the
+        # kernel keeps its old model.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            opts = {"enable_backward": False}
+
+            @wp.func_native(\"\"\"
+            #if defined(__CUDA_ARCH__)
+            __syncthreads();
+            #endif
+            \"\"\")
+            def block_sync(): ...
+
+            def make_rotate(width):
+                # One kernel object per width (the block model is fixed at the first launch).
+                @wp.kernel(module="unique", module_options=opts)
+                def rotate_1d(rounds: int, a: wp.array[wp.float32], out: wp.array[wp.float32]):
+                    tid = wp.tid()
+                    bd = wp.int32(wp.block_dim())
+                    lane = tid % bd
+                    wid = tid / bd
+                    v = a[tid]
+                    if bd != width:
+                        return
+                    for _r in range(rounds):
+                        out[tid] = v
+                        block_sync()
+                        # Reads lanes of other SIMD groups (offset 33).
+                        v = out[wid * bd + (lane + 33) % bd] + float(wid)
+                        block_sync()
+                    out[tid] = v
+
+                @wp.kernel(module="unique", module_options=opts)
+                def rotate_2d(rounds: int, a: wp.array2d[wp.float32], out: wp.array2d[wp.float32]):
+                    wid, lane = wp.tid()
+                    bd = wp.block_dim()
+                    v = a[wid, lane]
+                    if bd != width:
+                        return
+                    for _r in range(rounds):
+                        out[wid, lane] = v
+                        block_sync()
+                        v = out[wid, (lane + 33) % bd] + float(wid)
+                        block_sync()
+                    out[wid, lane] = v
+
+                return rotate_1d, rotate_2d
+
+
+            @wp.kernel(module="unique", module_options=opts)
+            def no_barrier(a: wp.array[wp.float32], out: wp.array[wp.float32]):
+                tid = wp.tid()
+                out[tid] = a[tid] + float(wp.block_dim())
+
+            @wp.kernel(module="unique", module_options=opts)
+            def barrier_and_tile(a: wp.array2d[wp.float32], out: wp.array2d[wp.float32]):
+                wid, lane = wp.tid()
+                v = a[wid, lane]
+                block_sync()
+                out[wid, lane] = wp.tile_sum(wp.tile(v))[0] + float(wp.block_dim()) * 0.0
+
+            def expect(a_np, rounds):
+                nw, bd = a_np.shape
+                v = a_np.astype(np.float64).copy()
+                for _ in range(rounds):
+                    v = np.roll(v, -33, axis=1) + np.arange(nw)[:, None]
+                return v
+
+            dev = 'metal:0'
+            rng = np.random.default_rng(3)
+            rounds = 5
+            for bd in (64, 256, 1024):
+                rotate_1d, rotate_2d = make_rotate(bd)
+                nw = 3
+                a_np = rng.random((nw, bd)).astype(np.float32)
+                exp = expect(a_np, rounds)
+                out = wp.zeros(nw * bd, dtype=wp.float32, device=dev)
+                wp.launch(rotate_1d, dim=nw * bd, inputs=[rounds, wp.array(a_np.ravel(), device=dev), out],
+                          block_dim=bd, device=dev)
+                assert rotate_1d._metal_artifact.coop_block_n == bd, rotate_1d._metal_artifact.coop_block_n
+                np.testing.assert_allclose(out.numpy().reshape(nw, bd), exp, rtol=1e-6)
+                out2 = wp.zeros((nw, bd), dtype=wp.float32, device=dev)
+                wp.launch(rotate_2d, dim=(nw, bd), inputs=[rounds, wp.array(a_np, device=dev), out2],
+                          block_dim=bd, device=dev)
+                assert rotate_2d._metal_artifact.coop_block_n == bd
+                np.testing.assert_allclose(out2.numpy(), exp, rtol=1e-6)
+                # The block model is fixed at the first launch: another width raises.
+                try:
+                    wp.launch(rotate_1d, dim=nw * 128, inputs=[rounds, wp.array(a_np.ravel()[: nw * 128], device=dev),
+                              out], block_dim=128, device=dev)
+                except RuntimeError as e:
+                    assert 'block_dim=' in str(e), e
+                else:
+                    raise AssertionError('relaunch at another width must raise')
+
+            # dim not a multiple of block_dim: loud.
+            rotate_1d, _ = make_rotate(128)
+            out = wp.zeros(200, dtype=wp.float32, device=dev)
+            try:
+                wp.launch(rotate_1d, dim=200, inputs=[1, wp.zeros(200, dtype=wp.float32, device=dev), out],
+                          block_dim=128, device=dev)
+            except RuntimeError as e:
+                assert 'multiple of 128' in str(e), e
+            else:
+                raise AssertionError('a partial wide block must raise')
+
+            # No barrier: unchanged (serial model, block_dim() == 1).
+            a = wp.array(np.arange(512, dtype=np.float32), device=dev)
+            o = wp.zeros(512, dtype=wp.float32, device=dev)
+            wp.launch(no_barrier, dim=512, inputs=[a, o], block_dim=256, device=dev)
+            assert no_barrier._metal_artifact.coop_block_n == 0
+            np.testing.assert_array_equal(o.numpy(), np.arange(512, dtype=np.float32) + 1.0)
+
+            # Barrier plus a tile op: not a wide block.
+            o = wp.zeros((2, 64), dtype=wp.float32, device=dev)
+            try:
+                wp.launch(barrier_and_tile, dim=(2, 64), inputs=[wp.ones((2, 64), dtype=wp.float32, device=dev), o],
+                          block_dim=64, device=dev)
+                o.numpy()
+            except Exception:
+                pass
+            art = getattr(barrier_and_tile, '_metal_artifact', None)
+            assert art is None or art.coop_block_n == 0
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=240)
+
     def test_integer_and_nan_reductions(self):
         # int32 tile_sum/min/max are exact; float min/max follow Warp's
         # fmin/fmax semantics (a NaN operand is ignored unless all are NaN),

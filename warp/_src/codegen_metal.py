@@ -8640,6 +8640,70 @@ def _coop_tiles_enabled() -> bool:
     return bool(getattr(_wp_cfg, "metal_coop_tiles", True))
 
 
+# Wide blocks: ``block_dim`` lanes in one threadgroup (several SIMD groups).
+_WIDE_BLOCK_MAX = 1024
+_NATIVE_BLOCK_SYNC_PAT = re.compile(r"__syncthreads\s*\(\s*\)")
+
+
+def _wide_block_dim(block_dim: int | None) -> bool:
+    """A block width the wide-block model can run (a multiple of the SIMD width above it)."""
+    return (
+        block_dim is not None
+        and _COOP_BLOCK_DIM < block_dim <= _WIDE_BLOCK_MAX
+        and block_dim % _COOP_BLOCK_DIM == 0
+    )
+
+
+def _wide_block_eligible(adj) -> bool:
+    """Whether a kernel is written in the CUDA block idiom with no SIMD collectives.
+
+    The wide-block model runs one ``block_dim``-thread threadgroup per block:
+    ``wp.block_dim()`` is the real width and a native ``__syncthreads()`` is
+    a threadgroup barrier. That is all such a kernel needs, so it requires
+    (on the kernel and every user function it calls) no tile ops at all,
+    ``wp.block_dim()`` in the kernel, a call to a native snippet holding
+    ``__syncthreads()``, and a 1-D ``wp.tid()`` or the 2-D lane form. Kernels
+    without a barrier keep the serial model (``block_dim()`` lowers to 1), so
+    plain launches at the default ``block_dim=256`` are unaffected.
+    """
+    try:
+        text = "\n".join(adj.blocks[0].body_forward)
+    except Exception:
+        return False
+    if "builtin_block_dim(" not in text:
+        return False
+    tid1d = "builtin_tid1d(" in text
+    if tid1d == ("builtin_tid2d(" in text) or re.search(r"builtin_tid[34]d\s*\(", text):
+        return False
+    barrier = False
+    seen: set[int] = set()
+    stack = [adj]
+    while stack:
+        a = stack.pop()
+        try:
+            body = "\n".join(a.blocks[0].body_forward)
+        except Exception:
+            body = ""
+        if re.search(r"\bwp::(?:adj_)?(?:un)?tile\w*\b|\bWP_TILE_", body):
+            return False
+        for f in getattr(a, "called_user_functions", {}) or {}:
+            if id(f) in seen:
+                continue
+            seen.add(id(f))
+            snippet = getattr(f, "native_snippet", None)
+            if snippet:
+                if _NATIVE_BLOCK_SYNC_PAT.search(snippet):
+                    barrier = True
+                if "WP_TILE_" in snippet:
+                    return False
+            elif getattr(f, "adj", None) is not None:
+                stack.append(f.adj)
+    for v in adj.variables:
+        if _parse_tile_ctype(v.ctype()) is not None:
+            return False
+    return barrier
+
+
 # The one block width the distributed-tile path supports: one full Apple
 # SIMD group, so cross-lane reductions are single ``simd_*`` intrinsics
 # and ``threadgroup == simdgroup`` (no extra smem staging needed).
@@ -16443,6 +16507,31 @@ def _ensure_adj_built(kernel, block_dim: int | None = None, enable_backward: boo
                         f"Kernel {adj.fun_name!r}: its reverse pass uses a tile adjoint the distributed-lane "
                         "lowering does not support on Metal"
                     )
+    # Wide-block upgrade: a barrier-synchronised block kernel without tile
+    # ops, launched at a multiple of the SIMD width above it, runs one real
+    # ``block_dim``-thread threadgroup per block (see ``_wide_block_eligible``).
+    # One-time per kernel object, like the distributed-tile decision.
+    if (
+        _wide_block_dim(block_dim)
+        and _coop_tiles_enabled()
+        and getattr(adj, "_metal_coop_block_n", 0) == 0
+        and not getattr(adj, "_metal_wide_block_checked", False)
+    ):
+        adj._metal_wide_block_checked = True
+        if _wide_block_eligible(adj):
+            _build(block_dim, _has_reverse())
+            if _wide_block_eligible(adj):
+                adj._metal_coop_block_n = block_dim
+                adj._metal_coop_plan = _CoopPlan(
+                    coldist={}, full=set(), tid1d="builtin_tid1d(" in "\n".join(adj.blocks[0].body_forward),
+                    reverse_ok=False, singleton=frozenset(),
+                )
+            else:
+                _build(1, _has_reverse())
+        if enable_backward and getattr(adj, "_metal_coop_block_n", 0) == block_dim:
+            raise MetalCodegenError(
+                f"Kernel {adj.fun_name!r}: reverse mode of a wide-block (barrier) kernel is not supported on Metal"
+            )
     # When the kernel is part of a registered module (``module="unique"``),
     # ``adj.build`` sets ``adj.builder_options`` to the module's options
     # dict, which our default options dict can't reach. Backfill the keys
@@ -23210,13 +23299,11 @@ def _coop_upgrade_pending(kernel, artifact, block_dim: int | None) -> bool:
     this is the first launch at the cooperative block width (the coop
     eligibility check is one-time per kernel and keyed off the launch's
     ``block_dim``, which earlier launches may not have hit)."""
-    return (
-        block_dim == _COOP_BLOCK_DIM
-        and artifact is not None
-        and getattr(artifact, "coop_block_n", 0) == 0
-        and not getattr(kernel.adj, "_metal_coop_block_checked", False)
-        and _coop_tiles_enabled()
-    )
+    if artifact is None or getattr(artifact, "coop_block_n", 0) != 0 or not _coop_tiles_enabled():
+        return False
+    if block_dim == _COOP_BLOCK_DIM:
+        return not getattr(kernel.adj, "_metal_coop_block_checked", False)
+    return _wide_block_dim(block_dim) and not getattr(kernel.adj, "_metal_wide_block_checked", False)
 
 
 def _drop_stale_fp64_artifacts(kernel) -> None:
