@@ -7353,6 +7353,85 @@ class TestMetalCoopTiles(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet, timeout=120)
 
+    def test_tile_sum_max_and_singleton_broadcast_match_cpu(self):
+        # Kamino's PADMM projection shape: per-lane partials scattered into
+        # block_dim-wide shared tiles, reduced with tile_max/tile_sum, and a
+        # 1-element shared tile that one lane writes and every lane reads.
+        # Also: a value written to device memory by one lane is read by
+        # another after the reduction (CUDA orders that with the tile sync).
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            @wp.kernel(module="unique", module_options={"enable_backward": False})
+            def red(a: wp.array[wp.float32], n: int, writer: int, scratch: wp.array[wp.float32],
+                    out: wp.array[wp.float32], lanes: wp.array2d[wp.int32], peek: wp.array2d[wp.float32]):
+                wid, tid = wp.tid()
+                nt = wp.block_dim()
+                m = wp.float32(0.0)
+                lo = wp.float32(1.0e30)
+                s = wp.float32(0.0)
+                for i in range(tid, n, nt):
+                    v = a[wid * n + i]
+                    m = wp.max(m, wp.abs(v))
+                    lo = wp.min(lo, v)
+                    s += v * v
+                scratch[wid * 32 + tid] = s
+                mt = wp.tile_zeros(shape=32, dtype=wp.float32, storage="shared")
+                lt = wp.tile_zeros(shape=32, dtype=wp.float32, storage="shared")
+                st = wp.tile_zeros(shape=32, dtype=wp.float32, storage="shared")
+                wp.tile_scatter_masked(mt, tid, m, tid < nt)
+                wp.tile_scatter_masked(lt, tid, lo, tid < nt)
+                wp.tile_scatter_masked(st, tid, s, tid < nt)
+                mx = wp.tile_max(mt)[0]
+                mn = wp.tile_min(lt)[0]
+                sm = wp.tile_sum(st)[0]
+                # read another lane's device-memory write after the reductions
+                peek[wid, tid] = scratch[wid * 32 + (tid + 1) % nt]
+                code = wp.int32(0)
+                if tid == writer:
+                    code = wp.where(mx > 2.0, 10, 20) + tid
+                cs = wp.tile_zeros(shape=1, dtype=wp.int32, storage="shared")
+                wp.tile_scatter_masked(cs, 0, code, tid == writer)
+                nobody = wp.tile_full(shape=1, value=7, dtype=wp.int32, storage="shared")
+                wp.tile_scatter_masked(nobody, 0, 99, tid > 1000)
+                lanes[wid, tid] = cs[0] * 100 + nobody[0]
+                if tid == 0:
+                    out[wid * 3 + 0] = mx
+                    out[wid * 3 + 1] = mn
+                    out[wid * 3 + 2] = sm
+
+            def run(dev, writer):
+                rng = np.random.default_rng(5)
+                W, n = 4, 77
+                an = rng.standard_normal(W * n).astype(np.float32)
+                a = wp.array(an, device=dev)
+                scratch = wp.zeros(W * 32, dtype=wp.float32, device=dev)
+                out = wp.zeros(W * 3, dtype=wp.float32, device=dev)
+                lanes = wp.zeros((W, 32), dtype=wp.int32, device=dev)
+                peek = wp.zeros((W, 32), dtype=wp.float32, device=dev)
+                wp.launch_tiled(red, dim=W, inputs=[a, n, writer, scratch, out, lanes, peek],
+                                block_dim=32, device=dev)
+                return an.reshape(W, n), out.numpy().reshape(W, 3), lanes.numpy(), peek.numpy(), scratch.numpy()
+
+            A, o_c, l_c, _, _ = run('cpu', 0)
+            for writer in (0, 7):
+                A, o_m, l_m, p_m, sc_m = run('metal:0', writer)
+                np.testing.assert_allclose(o_m, o_c, rtol=1e-5, atol=1e-6)
+                np.testing.assert_allclose(o_m[:, 0], np.abs(A).max(axis=1), rtol=0, atol=0)
+                np.testing.assert_allclose(o_m[:, 1], A.min(axis=1), rtol=0, atol=0)
+                expect = (np.where(o_m[:, 0] > 2.0, 10, 20) + writer) * 100 + 7
+                assert (l_m == expect[:, None]).all(), (l_m, expect)
+                np.testing.assert_array_equal(p_m, np.roll(sc_m.reshape(4, 32), -1, axis=1))
+            assert (l_c[:, 0] == (np.where(o_c[:, 0] > 2.0, 10, 20)) * 100 + 7).all()
+            art = red._metal_artifact
+            assert art.coop_block_n == 32, art.coop_block_n
+            for token in ('simd_max', 'simd_min', 'simd_sum', 'simd_ballot', 'simdgroup_barrier'):
+                assert token in art.source, token
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
     def test_strided_atomic_runs_real_lanes(self):
         snippet = textwrap.dedent(
             """

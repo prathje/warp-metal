@@ -8718,6 +8718,19 @@ def _coop_reduce_expr(val: str, elem_msl: str, simd_fn: str) -> str:
     raise MetalCodegenError(f"distributed tile_reduce: unsupported element type {elem_msl!r}")
 
 
+# Block-wide tile collectives synchronize the block on CUDA (``WP_TILE_SYNC``),
+# which also orders the threads' global-memory accesses: kernels write device
+# memory from one lane and read it from another after a ``tile_reduce`` /
+# ``tile_sum`` / shared-tile scatter. A coop-block kernel is one SIMD group, so
+# the SIMD-group barrier gives the same guarantee before each collective.
+_COOP_SYNC = "metal::simdgroup_barrier(metal::mem_flags::mem_device | metal::mem_flags::mem_threadgroup)"
+
+
+def _coop_synced_reduce(val: str, elem_msl: str, simd_fn: str) -> str:
+    """:func:`_coop_reduce_expr` preceded by the block barrier CUDA's tile reductions imply."""
+    return f"({{ {_COOP_SYNC}; {_coop_reduce_expr(val, elem_msl, simd_fn)}; }})"
+
+
 # One MSL lane index for the distributed-tile lowerings. The launcher runs a
 # coop-block kernel as one ``(1, 32, 1)`` threadgroup per launch-tiled block,
 # i.e. exactly one SIMD group, so the SIMD lane is the block-local thread
@@ -8747,9 +8760,13 @@ def _coop_block_eligible(adj) -> bool:
     ``tile_from_thread(shape=32, ...)``), and whatever a supported op
     derives from those. Supported on distributed tiles:
 
-    - ``tile_reduce`` with add/min/max (→ ``simd_sum`` / ``simd_min`` /
-      ``simd_max``), ``tile_scan_inclusive`` / ``_exclusive`` (→
-      ``simd_prefix_*_sum``);
+    - ``tile_reduce`` with add/min/max and ``tile_sum`` / ``tile_min`` /
+      ``tile_max`` (→ ``simd_sum`` / ``simd_min`` / ``simd_max``, after a
+      SIMD-group barrier that orders device memory like CUDA's tile sync),
+      ``tile_scan_inclusive`` / ``_exclusive`` (→ ``simd_prefix_*_sum``);
+    - *singleton* tiles: a shape-(1,) scalar ``tile_zeros`` / ``tile_ones``
+      / ``tile_full`` written only by ``tile_scatter_masked`` (broadcast
+      from the first lane whose mask is set) and read by ``tile_extract``;
     - ``tile_extract(t, i)`` on a distributed tile (→ ``simd_shuffle``) or
       on a reduce result (a broadcast value);
     - ``tile_from_thread`` (→ ``simd_shuffle`` of the named lane's value);
@@ -8799,6 +8816,13 @@ class _CoopPlan:
     # enforced: a forward-only kernel may keep the lane model even when its
     # (never generated) backward pass would not be expressible.
     reverse_ok: bool = True
+    # Labels of *singleton* tiles: shape-(1,) scalar tiles created by
+    # ``tile_zeros``/``tile_ones``/``tile_full`` that are only written by
+    # ``tile_scatter_masked`` and read by ``tile_extract`` — the "one lane
+    # publishes a value to the block" idiom (a shared 1-element tile on
+    # CUDA). Each lane keeps a copy; a scatter broadcasts the writing
+    # lane's value into every copy.
+    singleton: frozenset = frozenset()
 
 
 def _coop_block_classify(adj, honest: bool = False) -> _CoopPlan | None:
@@ -8875,6 +8899,7 @@ def _coop_block_classify(adj, honest: bool = False) -> _CoopPlan | None:
     _lane_m = re.search(r"builtin_tid2d\s*\(\s*var_\w+\s*,\s*var_(\w+)\s*\)", text)
     lane_label = _lane_m.group(1) if _lane_m else None
     reduce_labels: set[str] = set()
+    singleton: set[str] = set()
     for raw in lines:
         lhs_m = re.match(r"\s*var_(\w+)\s*=", raw)
         lhs = lhs_m.group(1) if lhs_m else None
@@ -8894,8 +8919,14 @@ def _coop_block_classify(adj, honest: bool = False) -> _CoopPlan | None:
                 if len(args) != 2:
                     return None
                 src = _label(args[0])
-                if src not in distributed and src not in reduce_labels:
+                if src not in distributed and src not in reduce_labels and src not in singleton:
                     return None
+            elif op in ("sum", "min", "max"):
+                # ``tile_sum`` / ``tile_min`` / ``tile_max`` of a distributed
+                # tile: the same cross-lane SIMD reduction as ``tile_reduce``.
+                if lhs is None or len(args) != 1 or _label(args[0]) not in distributed:
+                    return None
+                reduce_labels.add(lhs)
             elif op == "from_thread":
                 if len(args) != 2 or lhs not in distributed:
                     return None
@@ -8977,8 +9008,23 @@ def _coop_block_classify(adj, honest: bool = False) -> _CoopPlan | None:
                     return None
                 distributed.add(lhs)
             elif op in ("zeros", "ones", "full", "arange"):
-                if lhs not in distributed:
+                if lhs in distributed:
+                    pass
+                elif (
+                    op != "arange"
+                    and lhs in tile_vars
+                    and tile_vars[lhs][2] == 1
+                    and tile_vars[lhs][3] == 1
+                    and tile_vars[lhs][1] in _SCALAR_CTYPE_TO_MSL
+                    and lhs not in reduce_labels
+                ):
+                    singleton.add(lhs)
+                else:
                     return None
+            elif op == "scatter_masked" and len(args) == 4 and _label(args[0]) in singleton:
+                # ``tile_scatter_masked(t, 0, value, mask)`` into a singleton
+                # tile: broadcast from the (first) lane whose mask is set.
+                pass
             elif op == "scatter_masked":
                 # ``tile_scatter_masked(t, lane, value, mask)``: each lane
                 # writes its own element of a distributed tile.
@@ -8991,7 +9037,13 @@ def _coop_block_classify(adj, honest: bool = False) -> _CoopPlan | None:
     # Tile-typed locals produced any other way (e.g. returned from a
     # ``@wp.func``) have no distributed lowering.
     for label in tile_vars:
-        if label not in distributed and label not in reduce_labels and label not in coldist and label not in full:
+        if (
+            label not in distributed
+            and label not in reduce_labels
+            and label not in coldist
+            and label not in full
+            and label not in singleton
+        ):
             return None
     # Reverse-mode IR: does every tile adjoint have a per-lane or cross-lane
     # lowering? Recorded in the plan (see ``_CoopPlan.reverse_ok``).
@@ -9024,7 +9076,7 @@ def _coop_block_classify(adj, honest: bool = False) -> _CoopPlan | None:
                 ok = False
             if not ok:
                 reverse_ok = False
-    return _CoopPlan(coldist=coldist, full=full, tid1d=tid1d, reverse_ok=reverse_ok)
+    return _CoopPlan(coldist=coldist, full=full, tid1d=tid1d, reverse_ok=reverse_ok, singleton=frozenset(singleton))
 
 
 _SMEM_LOAD_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_load\s*<")
@@ -12775,7 +12827,7 @@ def _translate_tile_intrinsics(
                 raise MetalCodegenError(
                     f"distributed tile_reduce supports wp.add/mul/min/max/bit_and/bit_or/bit_xor; got {op_fn!r}"
                 )
-            return f"var_{lhs} = {_coop_reduce_expr(f'var_{in_label}', distributed_tiles[in_label], simd_fn)}"
+            return f"var_{lhs} = {_coop_synced_reduce(f'var_{in_label}', distributed_tiles[in_label], simd_fn)}"
         dims = tile_var_dims.get(in_label)
         if dims is None:
             return f"var_{lhs} = var_{in_label}"
@@ -12838,6 +12890,9 @@ def _translate_tile_intrinsics(
         lhs = m.group(1)
         op = m.group(2)
         in_label = m.group(3)
+        if in_label in distributed_tiles:
+            # One element per lane: cross-lane SIMD reduction (see tile_reduce).
+            return f"var_{lhs} = {_coop_synced_reduce(f'var_{in_label}', distributed_tiles[in_label], 'simd_' + op)}"
         dims = tile_var_dims.get(in_label)
         n = dims[0] * dims[1] if dims is not None else 1
         if n == 1:
@@ -12854,6 +12909,9 @@ def _translate_tile_intrinsics(
     def repl_tile_sum(m: re.Match[str]) -> str:
         lhs = m.group(1)
         in_label = m.group(2)
+        if in_label in distributed_tiles:
+            # One element per lane: cross-lane SIMD reduction (see tile_reduce).
+            return f"var_{lhs} = {_coop_synced_reduce(f'var_{in_label}', distributed_tiles[in_label], 'simd_sum')}"
         dims = tile_var_dims.get(in_label)
         n = dims[0] * dims[1] if dims is not None else 1
         if n == 1:
@@ -17464,13 +17522,35 @@ def _generate_msl_kernel_uncached(
             # ``_coop_block_eligible`` for the ops that keep them per-lane.
             if (label in _ctor_labels and kind == "register") or dtype_ctype in _SCALAR_CTYPE_TO_MSL:
                 distributed_tiles[label] = _msl_scalar_type(dtype_ctype)
-    if distributed_tiles:
-        # Lane-indexed masked scatter into a distributed tile (only form the
-        # classifier admits): the lane updates its own element.
+    # Singleton tiles (see ``_CoopPlan.singleton``): label -> element MSL type.
+    singleton_tiles: dict[str, str] = {}
+    if _coop_plan is not None and _coop_plan.singleton:
+        _all_ctypes_sg: dict[str, str] = {str(v.label): v.ctype() for v in adj.variables}
+        _all_ctypes_sg.update(_inlined_var_ctypes)
+        for label in _coop_plan.singleton:
+            parsed = _parse_tile_ctype(_all_ctypes_sg.get(label, ""))
+            if parsed is None or parsed[1] not in _SCALAR_CTYPE_TO_MSL:
+                raise MetalCodegenError(f"MSL codegen: singleton tile 'var_{label}' has no scalar element type")
+            singleton_tiles[label] = _SCALAR_CTYPE_TO_MSL[parsed[1]]
+    if distributed_tiles or singleton_tiles:
+        # Lane-indexed masked scatter into a distributed tile: the lane
+        # updates its own element. Scatter into a singleton tile: every
+        # lane's copy takes the value of the first lane that writes element
+        # 0 (CUDA leaves concurrent writers unordered; one lane wins).
         def _repl_coop_scatter(m: re.Match[str]) -> str:
             args = [a.strip() for a in _split_top_level_args(m.group(1))]
             t = args[0][len("var_") :] if args[0].startswith("var_") else args[0]
-            if t not in distributed_tiles or len(args) != 4:
+            if len(args) != 4:
+                return m.group(0)
+            if t in singleton_tiles:
+                ty = singleton_tiles[t]
+                return (
+                    f"{{ const bool _sg_w = ({args[3]}) && (({args[1]}) == 0); {_COOP_SYNC}; "
+                    f"const uint _sg_v = uint(ulong(simd_vote::vote_t(metal::simd_ballot(_sg_w)))); "
+                    f"const {ty} _sg_x = metal::simd_shuffle(({ty})({args[2]}), (ushort)metal::ctz(_sg_v | (_sg_v == 0u ? 1u : 0u))); "
+                    f"if (_sg_v != 0u) {{ var_{t} = _sg_x; }} }}"
+                )
+            if t not in distributed_tiles:
                 return m.group(0)
             return f"if ({args[3]}) {{ var_{t} = ({distributed_tiles[t]})({args[2]}); }}"
 
