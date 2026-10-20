@@ -748,6 +748,107 @@ _ADJ_MAP_PAT = re.compile(r"\bwp::adj_tile_(binary_map|unary_map|map)\s*(?:<[^()
 _STACK_CTYPE_PAT = re.compile(r"^wp::tile_stack_t<\s*(.+)\s*,\s*(\d+)\s*>$")
 
 
+# ``wp.tile_stack(dtype=<@wp.struct>)`` element types. The Metal codegen
+# splits struct values into per-field locals and never gives a Warp struct
+# an MSL type, so a struct-element stack stores a packed MSL struct of the
+# struct's scalar leaves instead: ``wp_stk_<native name>``. Push packs the
+# pushed value's per-field locals into it, pop unpacks into the target's
+# (:func:`lower_struct_stack_ops`). The definitions are keyed by the
+# struct's native name (which includes its hash), so they are the same for
+# every kernel and safe to keep for the process lifetime.
+_STRUCT_STACK_ELEMS: dict[str, tuple[str, tuple[tuple[str, str], ...]]] = {}
+
+
+def struct_stack_elem(native_name: str) -> tuple[str, tuple[tuple[str, str], ...]] | None:
+    """``(MSL element type, ((leaf path, MSL type), ...))`` of a registered struct-element stack."""
+    return _STRUCT_STACK_ELEMS.get(native_name)
+
+
+def register_struct_stack_elem(native_name: str, leaves: list[tuple[str, str]]) -> str:
+    """Register the packed element type for stacks of struct ``native_name``.
+
+    ``leaves`` are the struct's scalar leaves as ``(path, msl_type)``, with
+    paths in the per-field-local form (``inner__w``).
+    """
+    name = f"wp_stk_{native_name}"
+    _STRUCT_STACK_ELEMS[native_name] = (name, tuple(leaves))
+    return name
+
+
+def stack_elem_ctype(ctype: str) -> tuple[str, str] | None:
+    """``(element ctype, capacity)`` of a ``wp::tile_stack_t`` ctype, else None."""
+    m = _STACK_CTYPE_PAT.match(ctype.strip())
+    return (m.group(1).strip(), m.group(2)) if m is not None else None
+
+
+_STACK_PUSH_PAT = re.compile(r"\bwp::tile_stack_push\s*\(\s*var_(\w+)\s*,\s*([^,()]+?)\s*,")
+_STACK_POP_PAT = re.compile(r"\bwp::tile_stack_pop\s*\(\s*var_(\w+)\s*,\s*([^,()]+?)\s*,\s*([^,()]+?)\s*\)\s*;")
+
+
+def lower_struct_stack_ops(
+    lines: list[str], stack_elems: dict[str, str], struct_locals: dict[str, list[str]]
+) -> list[str]:
+    """Pack / unpack struct values at ``tile_stack_push`` / ``pop`` of struct-element stacks.
+
+    ``stack_elems`` maps a stack local's label to its struct's native name;
+    ``struct_locals`` maps a struct value local's label to its leaf paths.
+    Any other value form raises, so nothing is silently dropped.
+    """
+    from warp._src.codegen_metal import MetalCodegenError  # noqa: PLC0415
+
+    if not stack_elems:
+        return lines
+
+    def leaves_of(label: str, native: str, what: str) -> tuple[str, list[str]]:
+        elem_name, leaves = _STRUCT_STACK_ELEMS[native]
+        paths = struct_locals.get(label)
+        if paths is None or list(paths) != [p for p, _ in leaves]:
+            raise MetalCodegenError(
+                f"MSL codegen: tile_stack_{what} of a struct-element stack needs a struct local of the "
+                f"stack's dtype (got {label!r})"
+            )
+        return elem_name, [f"var_{label}__{p}" for p in paths]
+
+    out = []
+    n_pop = 0
+    for line in lines:
+        if "tile_stack_p" not in line:
+            out.append(line)
+            continue
+
+        def repl_push(m: re.Match[str]) -> str:
+            native = stack_elems.get(m.group(1))
+            if native is None:
+                return m.group(0)
+            val = m.group(2).strip()
+            if not val.startswith("var_"):
+                raise MetalCodegenError(f"MSL codegen: tile_stack_push of struct value {val!r} not supported")
+            elem_name, fields = leaves_of(val[4:], native, "push")
+            return f"wp::tile_stack_push(var_{m.group(1)}, {elem_name}{{{', '.join(fields)}}},"
+
+        def repl_pop(m: re.Match[str]) -> str:
+            nonlocal n_pop
+            native = stack_elems.get(m.group(1))
+            if native is None:
+                return m.group(0)
+            dst = m.group(2).strip()
+            if not dst.startswith("var_"):
+                raise MetalCodegenError(f"MSL codegen: tile_stack_pop into {dst!r} not supported")
+            elem_name, fields = leaves_of(dst[4:], native, "pop")
+            tmp = f"_stk_pop{n_pop}"
+            n_pop += 1
+            paths = struct_locals[dst[4:]]
+            unpack = " ".join(f"{f} = {tmp}.{p};" for f, p in zip(fields, paths))
+            return (
+                f"{{ {elem_name} {tmp}; wp::tile_stack_pop(var_{m.group(1)}, {tmp}, {m.group(3).strip()}); {unpack} }}"
+            )
+
+        line = _STACK_PUSH_PAT.sub(repl_push, line)
+        line = _STACK_POP_PAT.sub(repl_pop, line)
+        out.append(line)
+    return out
+
+
 def msl_var_type(ctype: str) -> str | None:
     """MSL type for the tile-side value types this module owns, else None."""
     ct = ctype.strip()
@@ -755,6 +856,9 @@ def msl_var_type(ctype: str) -> str | None:
     if m is not None:
         from warp._src.codegen_metal import _msl_var_type  # noqa: PLC0415
 
+        elem = _STRUCT_STACK_ELEMS.get(m.group(1).strip())
+        if elem is not None:
+            return f"wp_tile_stack<{elem[0]}, {m.group(2)}>"
         return f"wp_tile_stack<{_msl_var_type(m.group(1).strip())}, {m.group(2)}>"
     if ct in ("wp::mesh_query_aabb_thread_block_t", "wp::bvh_query_thread_block_t"):
         return "wp_bvh_tile_query_t"
@@ -811,6 +915,10 @@ def emit_helpers(source: str) -> str:
     parts = []
     if "wp_tile_stack" in source:
         parts.append(_STACK_HELPERS)
+        for elem_name, leaves in sorted(_STRUCT_STACK_ELEMS.values()):
+            if re.search(r"\b" + elem_name + r"\b", source):
+                fields = " ".join(f"{t} {p};" for p, t in leaves)
+                parts.append(f"struct {elem_name} {{ {fields} }};")
     if "wp_bvh_tile_" in source:
         parts.append(_QUERY_HELPERS)
     return "\n".join(parts)

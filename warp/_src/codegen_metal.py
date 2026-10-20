@@ -17112,6 +17112,39 @@ def _generate_msl_kernel_uncached(
         if isinstance(arg.type, _Struct):
             struct_arg_layouts[arg.label] = _struct_layout_for(arg.type)
 
+    # ``wp.tile_stack(dtype=<@wp.struct>)``: register a packed element type
+    # per struct dtype and pack / unpack the per-field locals at push / pop
+    # (see ``codegen_metal_tiles.lower_struct_stack_ops``).
+    _struct_stack_elems: dict[str, str] = {}
+    _stack_ctypes = {str(v.label): v.ctype() for v in adj.variables}
+    for _lbl_s, _ct_s in _inlined_var_ctypes.items():
+        _stack_ctypes.setdefault(str(_lbl_s), _ct_s)
+    _layout_by_native = {
+        _lay.native_name: _lay for _lay in (*struct_local_layouts.values(), *struct_arg_layouts.values())
+    }
+    for _lbl_s, _ct_s in _stack_ctypes.items():
+        _se = _mtiles.stack_elem_ctype(_ct_s) if "tile_stack_t" in _ct_s else None
+        if _se is None or _se[0] in _SCALAR_CTYPE_TO_MSL or _se[0].startswith("wp::"):
+            continue
+        _lay = _layout_by_native.get(_se[0])
+        if _lay is None:
+            raise MetalCodegenError(
+                f"Kernel {adj.fun_name!r}: tile_stack element type {_se[0]!r} is not a known struct"
+            )
+        _mtiles.register_struct_stack_elem(
+            _se[0], [(_path, _fi.msl_type) for _path, _off, _fi in _iter_scalar_leaves(_lay)]
+        )
+        _struct_stack_elems[_lbl_s] = _se[0]
+    if _struct_stack_elems:
+        forward_lines = _mtiles.lower_struct_stack_ops(
+            forward_lines,
+            _struct_stack_elems,
+            {
+                _lbl_s: [_path for _path, _off, _fi in _iter_scalar_leaves(_lay)]
+                for _lbl_s, _lay in struct_local_layouts.items()
+            },
+        )
+
     # Builtin value-struct locals (query results like ``wp.mesh_query_point``).
     # Unlike ``@wp.struct`` locals they ARE materialised as real MSL structs
     # (their ctype is in ``_SCALAR_CTYPE_TO_MSL``), so field addresses alias

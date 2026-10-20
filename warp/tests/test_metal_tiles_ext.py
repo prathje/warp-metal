@@ -204,6 +204,69 @@ class TestMetalTilesExt(unittest.TestCase):
             """,
         )
 
+    def test_tile_stack_of_structs(self):
+        # Newton's mesh-SDF midphase keeps a ``wp.tile_stack(dtype=EdgeCullResult)``;
+        # struct elements (incl. nested structs and vector fields), pushed and
+        # popped both in the kernel and inside a ``@wp.func``.
+        _run(
+            self,
+            """
+            from typing import Any
+
+            @wp.struct
+            class Inner:
+                w: wp.vec3
+                k: wp.uint32
+
+            @wp.struct
+            class Item:
+                idx: int
+                val: float
+                inner: Inner
+
+            @wp.func
+            def make_item(i: int, v: float):
+                it = Item()
+                it.idx = i
+                it.val = v * 2.0
+                it.inner.w = wp.vec3(v, float(i), -v)
+                it.inner.k = wp.uint32(i * 7 + 1)
+                return it
+
+            @wp.func
+            def drain_one(st: Any, out_i: wp.array2d[int], out_v: wp.array2d[float], b: int):
+                p, slot = wp.tile_stack_pop(st)
+                if slot >= 0:
+                    out_i[b, slot] = p.idx + int(p.inner.k) * 100
+                    out_v[b, slot] = p.val + p.inner.w[0] - p.inner.w[2] + p.inner.w[1]
+                return slot
+
+            @wp.kernel
+            def k(x: wp.array2d[float], out_i: wp.array2d[int], out_v: wp.array2d[float], cnt: wp.array[int]):
+                b, t = wp.tid()
+                st = wp.tile_stack(capacity=6, dtype=Item)
+                for i in range(t, 8, wp.block_dim()):
+                    wp.tile_stack_push(st, make_item(i, x[b, i]), x[b, i] > -0.5)
+                n = wp.tile_stack_count(st)
+                last = drain_one(st, out_i, out_v, b)
+                while wp.tile_stack_count(st) > 0:
+                    p, slot = wp.tile_stack_pop(st)
+                    if slot >= 0:
+                        out_i[b, slot] = p.idx
+                        out_v[b, slot] = p.val + float(p.inner.k)
+                p, slot = wp.tile_stack_pop(st)
+                wp.tile_stack_clear(st)
+                if t == 0:
+                    cnt[b] = n * 1000 + last * 10 + slot + p.idx + int(p.inner.k)
+
+            rng = np.random.default_rng(5)
+            xs = rng.standard_normal((4, 8)).astype(np.float32)
+            compare(k, [4], lambda d: [wp.array(xs, device=d), wp.full((4, 6), -1, dtype=int, device=d),
+                                       wp.zeros((4, 6), dtype=float, device=d), wp.zeros(4, dtype=int, device=d)],
+                    [1, 2, 3], block_dim=1, atol=0)
+            """,
+        )
+
     def test_tile_mesh_query_aabb(self):
         _run(
             self,
@@ -676,6 +739,8 @@ class TestMetalStructFieldWrite(unittest.TestCase):
         _run(
             self,
             """
+            from typing import Any
+
             @wp.struct
             class Inner:
                 w: wp.vec2
