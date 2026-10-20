@@ -1151,7 +1151,16 @@ class MetalDispatcher:
         if id(mtl_buf) not in self._resident_ids:
             return
         self._resident_ids.discard(id(mtl_buf))
-        self._resident_resources = [r for r in self._resident_resources if r is not mtl_buf]
+        # Copy-on-write, so loops over the old list are unaffected. This runs
+        # from finalizers, which a GC can start inside the comprehension of
+        # another removal: rebuild if the list was replaced meanwhile, so
+        # the nested removal is not undone.
+        while True:
+            old = self._resident_resources
+            new = [r for r in old if r is not mtl_buf]
+            if self._resident_resources is old:
+                self._resident_resources = new
+                break
         # Force a full re-apply on the next dispatch — the applied-count
         # bookkeeping is positional and just went stale.
         self._resident_encoder = None
@@ -1159,17 +1168,22 @@ class MetalDispatcher:
 
     def _apply_resident_resources(self, encoder) -> None:
         """Declare any not-yet-declared resident resources to ``encoder``."""
-        n = len(self._resident_resources)
+        resources = self._resident_resources
+        n = len(resources)
         if n == 0:
             return
         if self._resident_encoder is encoder and self._resident_applied >= n:
             return
         start = self._resident_applied if self._resident_encoder is encoder else 0
         usage = self._usage_read_write
-        for r in self._resident_resources[start:]:
+        for r in resources[start:n]:
             encoder.useResource_usage_(r, usage)
-        self._resident_encoder = encoder
-        self._resident_applied = n
+        # A finalizer (``remove_resident_resource``) may have replaced the
+        # list during the loop; then the positional count is stale and the
+        # next call must re-declare from the start (it already reset it).
+        if self._resident_resources is resources:
+            self._resident_encoder = encoder
+            self._resident_applied = n
 
     def fill_zero(self, mtl_buf, nbytes: int) -> None:
         """Zero a region of an ``MTLBuffer`` via a blit encoder.

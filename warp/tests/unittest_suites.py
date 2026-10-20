@@ -224,7 +224,10 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
     from warp.tests.test_lvalue import TestLValue
     from warp.tests.test_math import TestMath
     from warp.tests.test_metal_ast import TestMetalASTFold, TestMetalASTParseShapes, TestMetalASTRoundTrip
-    from warp.tests.test_metal_buffer_registry import TestMetalBufferRegistryReentrancy
+    from warp.tests.test_metal_buffer_registry import (
+        TestMetalBufferRegistryReentrancy,
+        TestMetalResidentSetReentrancy,
+    )
     from warp.tests.test_metal_codegen import TestMetalCodegenCompiles, TestMetalCodegenStructure
     from warp.tests.test_metal_codegen_gaps import TestMetalCodegenGaps
     from warp.tests.test_metal_device import TestMetalAllocator, TestMetalDevice, TestMetalDisabled
@@ -478,6 +481,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
         TestMetalR3Tiles,
         TestMetalR4Kamino,
         TestMetalR5StructCopy,
+        TestMetalResidentSetReentrancy,
         TestMetalTilesExt,
         TestMetalTorchSync,
         TestMetalTorchSyncHost,

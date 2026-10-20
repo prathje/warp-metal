@@ -132,10 +132,12 @@ pointer to the offending statement):
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import contextvars
 import os
 import re
+import threading
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -22346,16 +22348,45 @@ def _check_struct_record_aliasing(kernel, artifact, fwd_args, writes, reads) -> 
 # have at most four dims).
 _PTAB_ROW = 5
 _PTAB_RESIDENT_REFS: dict[int, int] = {}
+# Refcount updates go through a queue applied under ``_PTAB_LOCK``.
+# ``_ptab_release`` runs from ``weakref.finalize`` (a GC can start it between
+# the read and the write of another update to the same count, losing one of
+# them), so it never blocks on the lock: it queues, and whoever holds the
+# lock applies the queue before letting go of it.
+_PTAB_LOCK = threading.Lock()
+_PTAB_PENDING: collections.deque = collections.deque()
+
+
+def _ptab_apply_pending() -> None:
+    """Apply queued refcount updates (``_PTAB_LOCK`` held)."""
+    while _PTAB_PENDING:
+        dispatcher, bufs, delta = _PTAB_PENDING.popleft()
+        for buf in bufs:
+            n = _PTAB_RESIDENT_REFS.get(id(buf), 0)
+            if delta > 0:
+                if n == 0:
+                    dispatcher.add_resident_resource(buf)
+                _PTAB_RESIDENT_REFS[id(buf)] = n + 1
+            elif n <= 1:
+                _PTAB_RESIDENT_REFS.pop(id(buf), None)
+                dispatcher.remove_resident_resource(buf)
+            else:
+                _PTAB_RESIDENT_REFS[id(buf)] = n - 1
+
+
+def _ptab_drain() -> None:
+    while _PTAB_PENDING:
+        if not _PTAB_LOCK.acquire(blocking=False):
+            return  # the holder applies the queue before releasing
+        try:
+            _ptab_apply_pending()
+        finally:
+            _PTAB_LOCK.release()
 
 
 def _ptab_release(dispatcher, bufs) -> None:
-    for buf in bufs:
-        n = _PTAB_RESIDENT_REFS.get(id(buf), 0) - 1
-        if n <= 0:
-            _PTAB_RESIDENT_REFS.pop(id(buf), None)
-            dispatcher.remove_resident_resource(buf)
-        else:
-            _PTAB_RESIDENT_REFS[id(buf)] = n
+    _PTAB_PENDING.append((dispatcher, list(bufs), -1))
+    _ptab_drain()
 
 
 def _struct_array_ptr_table(arr, struct_type, fpath: tuple[str, ...]):
@@ -22396,10 +22427,12 @@ def _struct_array_ptr_table(arr, struct_type, fpath: tuple[str, ...]):
 
 
 def _ptab_retain(dispatcher, bufs) -> None:
-    for buf in bufs:
-        if _PTAB_RESIDENT_REFS.get(id(buf), 0) == 0:
-            dispatcher.add_resident_resource(buf)
-        _PTAB_RESIDENT_REFS[id(buf)] = _PTAB_RESIDENT_REFS.get(id(buf), 0) + 1
+    # Never called from a finalizer, so it may block; it must, since the
+    # buffers have to be resident before the launch that follows.
+    _PTAB_PENDING.append((dispatcher, list(bufs), 1))
+    with _PTAB_LOCK:
+        _ptab_apply_pending()
+    _ptab_drain()  # releases queued by finalizers while the lock was held
 
 
 def _struct_array_ptr_table_recorded(dispatcher, arr, struct_type, fpath, table, bufs):

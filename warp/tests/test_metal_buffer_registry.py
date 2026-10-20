@@ -385,5 +385,107 @@ class TestMetalBufferRegistryReentrancy(unittest.TestCase):
         )
 
 
+@unittest.skipUnless(_metal_available(), "Metal backend requires Apple Silicon and MLX")
+class TestMetalResidentSetReentrancy(unittest.TestCase):
+    def test_remove_during_apply_keeps_later_adds(self):
+        # ``remove_resident_resource`` runs from finalizers (Bvh/Mesh/HashGrid
+        # ``__del__``). A removal while ``_apply_resident_resources`` declares
+        # the set to an encoder must not leave a stale applied-count that
+        # makes the next encoder skip a newly added resource.
+        _run(
+            self,
+            """
+            from warp._src.metal_dispatch import MetalDispatcher
+            d = types.SimpleNamespace(
+                _resident_resources=[], _resident_ids=set(), _resident_applied=0,
+                _resident_encoder=None, _usage_read_write=3,
+            )
+            add = lambda r: MetalDispatcher.add_resident_resource(d, r)
+            rem = lambda r: MetalDispatcher.remove_resident_resource(d, r)
+            res = [object() for _ in range(4)]
+            for r in res:
+                add(r)
+            class Enc:
+                def __init__(self, hook=None):
+                    self.used, self.hook = [], hook
+                def useResource_usage_(self, r, usage):
+                    self.used.append(r)
+                    if self.hook is not None:
+                        h, self.hook = self.hook, None
+                        h()
+            enc = Enc(hook=lambda: rem(res[0]))  # a finalizer fires mid-apply
+            MetalDispatcher._apply_resident_resources(d, enc)
+            new = object()
+            add(new)
+            MetalDispatcher._apply_resident_resources(d, enc)
+            assert new in enc.used, "resource added after a mid-apply removal was never declared"
+            """,
+        )
+
+    def test_nested_removal_is_not_undone(self):
+        # A finalizer removal that interrupts another removal's list rebuild
+        # must survive it (else the removed buffer stays resident forever).
+        _run(
+            self,
+            """
+            from warp._src.metal_dispatch import MetalDispatcher
+            d = types.SimpleNamespace(
+                _resident_resources=[], _resident_ids=set(), _resident_applied=0,
+                _resident_encoder=None, _usage_read_write=3,
+            )
+            res = [object() for _ in range(4)]
+            for r in res:
+                MetalDispatcher.add_resident_resource(d, r)
+            class Hooked(list):
+                fired = False
+                def __iter__(self):
+                    if not Hooked.fired:
+                        Hooked.fired = True
+                        MetalDispatcher.remove_resident_resource(d, res[2])  # "finalizer"
+                    return super().__iter__()
+            d._resident_resources = Hooked(d._resident_resources)
+            MetalDispatcher.remove_resident_resource(d, res[0])
+            assert Hooked.fired
+            assert res[2] not in d._resident_resources, "nested removal was undone"
+            assert res[0] not in d._resident_resources
+            assert list(d._resident_resources) == [res[1], res[3]], d._resident_resources
+            """,
+        )
+
+    def test_ptab_release_from_finalizer_during_update(self):
+        # ``_ptab_release`` (a weakref.finalize callback) interrupting a
+        # pointer-table residency update is queued and applied, never lost.
+        _run(
+            self,
+            """
+            from warp._src import codegen_metal as cm
+            buf, other = object(), object()
+            log = []
+            class FakeDispatcher:
+                hook = None
+                def add_resident_resource(self, b):
+                    log.append(("add", b))
+                    if self.hook is not None:
+                        h, self.hook = self.hook, None
+                        h()
+                def remove_resident_resource(self, b):
+                    log.append(("remove", b))
+            d = FakeDispatcher()
+            cm._ptab_retain(d, [buf])           # buf: 1
+            cm._ptab_retain(d, [buf])           # buf: 2
+            # While retaining ``other``, two finalizers release ``buf``.
+            d.hook = lambda: (cm._ptab_release(d, [buf]), cm._ptab_release(d, [buf]))
+            cm._ptab_retain(d, [other])
+            assert not cm._PTAB_PENDING
+            assert id(buf) not in cm._PTAB_RESIDENT_REFS, cm._PTAB_RESIDENT_REFS
+            assert cm._PTAB_RESIDENT_REFS[id(other)] == 1
+            assert ("remove", buf) in log
+            cm._ptab_release(d, [other])
+            assert id(other) not in cm._PTAB_RESIDENT_REFS
+            assert not cm._PTAB_LOCK.locked()
+            """,
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
