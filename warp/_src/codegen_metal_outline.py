@@ -63,6 +63,32 @@ def region_markers(fn_overload, inline_id: int) -> tuple[str, str] | None:
     return (f"{_BEGIN}{inline_id} {key}", f"{_END}{inline_id}")
 
 
+_OUTLINED_DEF_RE = re.compile(r"^(?:__attribute__\(\(noinline\)\) )?void (wp_outl_\w+)\(", re.MULTILINE)
+
+
+def outlined_function_bodies(src: str) -> list[str]:
+    """Bodies of the outlined functions defined in an MSL source.
+
+    They are the kernel's own code, so kernel-level scans (for example the
+    threadgroup-shape checks in ``codegen_metal._grid_only_source``) must
+    treat them like the kernel body, not like library helpers.
+    """
+    out = []
+    for m in _OUTLINED_DEF_RE.finditer(src):
+        start = src.find("{", m.end())
+        depth = 0
+        for i in range(start, len(src)):
+            c = src[i]
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    out.append(src[start : i + 1])
+                    break
+    return out
+
+
 def strip_markers(body: str) -> str:
     if MARKER_PREFIX not in body:
         return body

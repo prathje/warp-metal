@@ -283,6 +283,55 @@ class TestMetalOutline(unittest.TestCase):
             """,
         )
 
+    def test_outlined_bodies_count_as_kernel_code_for_launch_shape(self):
+        # A lock loop in a @wp.func keeps the kernel off grid-only
+        # threadgroup spanning whether the body is inlined or outlined;
+        # library helpers keep their exemption.
+        _run(
+            self,
+            """
+            from warp._src import codegen_metal as cm
+
+            head = "inline int h_cas(device atomic_int* p) { int e = 0; atomic_compare_exchange_weak_explicit(p, &e, 1, memory_order_relaxed, memory_order_relaxed); return e; }\\n"
+            outl = (
+                "__attribute__((noinline)) void wp_outl_0123456789abcdef(device atomic_int* p0, thread int& p1) {\\n"
+                "    int l0 = 0; atomic_compare_exchange_weak_explicit(p0, &l0, 1, memory_order_relaxed, memory_order_relaxed); p1 = l0;\\n"
+                "}\\n"
+            )
+            sig = "[[kernel]] void custom_kernel_k(device atomic_int* a [[buffer(0)]], device int* b [[buffer(1)]]) {"
+            assert cm._grid_only_source(head + sig + "\\nb[0] = h_cas(a);\\n}\\n")
+            assert not cm._grid_only_source(head + outl + sig + "\\nint r = 0; wp_outl_0123456789abcdef(a, r); b[0] = r;\\n}\\n")
+
+            # 64-bit atomics lower to a lock loop (``wp_a64_*``) in the code
+            # that uses them, here the outlined body.
+            @wp.func
+            def bump(acc: wp.array[wp.int64], i: int, v: float):
+                s = float(0.0)
+                for j in range(4):
+                    s += v * float(j)
+                wp.atomic_add(acc, i % 3, wp.int64(i))
+                return s
+
+            @wp.kernel
+            def k(acc: wp.array[wp.int64], out: wp.array[float]):
+                i = wp.tid()
+                out[i] = bump(acc, i, float(i))
+
+            def launch(dev):
+                acc = wp.zeros(3, dtype=wp.int64, device=dev)
+                out = wp.zeros(64, dtype=float, device=dev)
+                wp.launch(k, 64, inputs=[acc], outputs=[out], device=dev)
+                return [acc.numpy(), out.numpy()]
+
+            cpu, metal = both(launch)
+            assert_same(cpu, metal)
+            assert_outlined(k)
+            src = k._metal_native_wrapped_source
+            assert "wp_a64_" not in src[src.index("[[kernel]]"):]
+            assert not cm._grid_only_source(src)
+            """,
+        )
+
     def test_off_mode_emits_no_functions(self):
         _run(
             self,

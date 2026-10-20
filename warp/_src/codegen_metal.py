@@ -22533,8 +22533,9 @@ _TG_DEPENDENT_PAT = re.compile(
     # so keep the launch shape these kernels were validated with.
     r"\batomic_compare_exchange_\w+|\bwp_a64_\w+|spin"
 )
-# The same for the helper functions a kernel calls. Their CAS loops are
-# lock-free or serialise SIMD groups by design (``_F64_ATOMIC_HELPERS``).
+# The same for the library helper functions a kernel calls. Their CAS loops
+# are lock-free or serialise SIMD groups by design (``_F64_ATOMIC_HELPERS``).
+# Outlined ``@wp.func`` bodies are not helpers: they use ``_TG_DEPENDENT_PAT``.
 _TG_HELPER_DEPENDENT_PAT = re.compile(_TG_SHAPE_TOKENS)
 _MSL_FUNC_HEAD_PAT = re.compile(
     r"^[ \t]*(?:template\s*<[^<>]*(?:<[^<>]*>[^<>]*)*>\s*)?[A-Za-z_][\w:<>,\s\*&]*?\b([A-Za-z_]\w*)\s*\([^;{}()]*(?:\([^;{}()]*\)[^;{}()]*)*\)\s*(?:const\s*)?\{",
@@ -22585,9 +22586,16 @@ def _grid_only_source(src: str) -> bool:
     body = src[open_at:].replace("uint _coop_lane = thread_position_in_threadgroup.x;", "")
     if _TG_DEPENDENT_PAT.search(body) is not None:
         return False
+    todo = [body]
+    # Outlined ``@wp.func`` bodies are kernel code moved into functions;
+    # they get the kernel-body check (lock loops included), not the
+    # library-helper exemption.
+    for text in _moutline.outlined_function_bodies(src[:start]):
+        if _TG_DEPENDENT_PAT.search(text) is not None:
+            return False
+        todo.append(text)
     helpers = None
     seen: set[str] = set()
-    todo = [body]
     while todo:
         names = set(_MSL_CALL_NAME_PAT.findall(todo.pop())) - seen
         if not names:
