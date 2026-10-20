@@ -16541,6 +16541,16 @@ def _generate_msl_kernel_uncached(
         _wrap_msl_types,
         _wrap_consts,
     )
+    # The view fold drops array-member stores into struct locals
+    # (``s.a = x``); ``_struct_record_reach`` must still see them.
+    _rec_pre_view_lines: list[str] = []
+    if any(
+        _is_array_arg(_a)
+        and isinstance(getattr(_a.type, "dtype", None), _StructEarly)
+        and _layout_has_array_fields(_struct_layout_for(_a.type.dtype))
+        for _a in adj.args
+    ):
+        _rec_pre_view_lines = _ast_emit(_ast_nodes)
     _ast_nodes, _view_skip = _ast_fold_views(
         _ast_nodes,
         adj,
@@ -17112,6 +17122,61 @@ def _generate_msl_kernel_uncached(
         if isinstance(arg.type, _Struct):
             struct_arg_layouts[arg.label] = _struct_layout_for(arg.type)
 
+    # Whole-struct stores into a ``wp.array[Struct]`` whose struct has array
+    # members (``data[i] = src[j]``) must copy the members' ``array_t``
+    # records: every struct layout of this kernel then carries them as
+    # hidden leaves (see ``_add_array_records``). ``_rec_reach`` holds the
+    # struct locals whose value can reach such a store.
+    _rec_store_arrs: set[str] = set()
+    _rec_store_vals: set[str] = set()
+    for raw in forward_lines:
+        m = _ARRAY_STORE_MULTI_PAT.match(raw)
+        if not m or m.group("arr") not in struct_arr_info:
+            continue
+        if not _layout_has_array_fields(struct_arr_info[m.group("arr")]):
+            continue
+        _rec_store_arrs.add(m.group("arr"))
+        _val = _split_array_store_args(m.group("rest"))[-1]
+        if _val.startswith("var_") and _val[len("var_") :] in struct_arg_layouts:
+            continue  # copied word for word from the arg buffer
+        if not _val.startswith("var_") or _val[len("var_") :] not in struct_local_layouts:
+            raise MetalCodegenError(
+                f"Kernel {adj.fun_name!r}: storing {_val!r} into wp.array[Struct] {m.group('arr')!r} (a struct with "
+                "array members) is not supported on Metal; store a struct local"
+            )
+        _rec_store_vals.add(_val[len("var_") :])
+    _rec_reach: set[str] = set()
+    if _rec_store_arrs:
+        _struct_cls_of: dict[str, Any] = {}
+        for var in adj.variables:
+            if isinstance(var.type, _Struct):
+                _struct_cls_of[var.label] = var.type
+        _struct_cls_of.update({k: v for k, v in _inlined_struct_locals.items() if isinstance(v, _Struct)})
+        for _lbl in list(struct_local_layouts):
+            if _lbl in _struct_cls_of and _layout_has_array_fields(struct_local_layouts[_lbl]):
+                struct_local_layouts[_lbl] = _add_array_records(
+                    _struct_layout_for(_struct_cls_of[_lbl]), _struct_cls_of[_lbl]
+                )
+        for arg in adj.args:
+            if arg.label in struct_arg_layouts and _layout_has_array_fields(struct_arg_layouts[arg.label]):
+                struct_arg_layouts[arg.label] = _add_array_records(_struct_layout_for(arg.type), arg.type)
+        # Struct arrays: kernel args and arrays held by struct args.
+        for arg in (*adj.args, *struct_field_array_vars, *grad_array_vars):
+            if arg.label in struct_arr_info and _layout_has_array_fields(struct_arr_info[arg.label]):
+                struct_arr_info[arg.label] = _add_array_records(_struct_layout_for(arg.type.dtype), arg.type.dtype)
+        # Reads of array members resolve through pointer tables / bindings
+        # built from the records when the launch starts, so they cannot see
+        # this kernel's own stores (unless those store the records back
+        # unchanged: ``s = d[i]; s.k += 1; d[i] = s``).
+        _rec_changing = _struct_record_changing_stores(forward_lines, struct_local_layouts, _rec_store_arrs)
+        for _syn_arg, _syn_path in _sa_synthetic.values():
+            if _syn_arg in _rec_changing:
+                raise MetalCodegenError(
+                    f"Kernel {adj.fun_name!r}: reads array members of the elements of {_syn_arg!r} and also stores "
+                    f"whole elements into it; on Metal those reads see the arrays from before the launch. Split "
+                    "the store and the reads into separate kernels"
+                )
+
     # ``wp.tile_stack(dtype=<@wp.struct>)``: register a packed element type
     # per struct dtype and pack / unpack the per-field locals at push / pop
     # (see ``codegen_metal_tiles.lower_struct_stack_ops``).
@@ -17309,6 +17374,15 @@ def _generate_msl_kernel_uncached(
         if field_info.kind == _STRUCT_FIELD_KIND_TEXTURE:
             struct_ptr_bases[field_local] = (buf, f"{base_expr} + {field_info.offset}", field_info.sub)
         _bind_buffer_field(field_local, buf, f"{base_expr} + {field_info.offset}", field_info)
+
+    if _rec_store_arrs:
+        _rec_reach = _struct_record_reach(
+            adj,
+            [*_rec_pre_view_lines, *forward_lines],
+            _rec_store_vals,
+            struct_local_layouts,
+            set(struct_ptr_bases) | set(struct_arg_layouts),
+        )
 
     # ---- ``wp::indexref`` on vec lvalues -------------------------------
     # ``v[i] = x`` (or a component reference used as an lvalue) with a
@@ -19012,6 +19086,24 @@ def _generate_msl_kernel_uncached(
                 read = _struct_field_read_expr(buf, f"{base_expr} + {off}", finfo)
                 body_lines.append(_finalize(f"{indent}{dst_local} = {read};"))
             continue
+        # ``s = p`` where ``p`` is a struct kernel arg: one per-leaf read from
+        # the arg's flat buffer (array-member records included when the
+        # layout carries them).
+        if (
+            m_struct_copy
+            and m_struct_copy.group(2) in struct_local_layouts
+            and m_struct_copy.group(3) in struct_arg_layouts
+        ):
+            indent = m_struct_copy.group("indent")
+            dst = m_struct_copy.group(2)
+            src_arg = m_struct_copy.group(3)
+            dst_leaves = {path for path, _off, _fi in _iter_scalar_leaves(struct_local_layouts[dst])}
+            for fpath, off, finfo in _iter_scalar_leaves(struct_arg_layouts[src_arg]):
+                if fpath not in dst_leaves:
+                    continue
+                read = _struct_field_read_expr(src_arg, str(off), finfo)
+                body_lines.append(_finalize(f"{indent}{_per_field_local(dst, fpath)} = {read};"))
+            continue
         # ``t = l.inner`` where ``l`` is a struct *local*: the source is a
         # pointer alias into the local's per-field expansion.
         if (
@@ -19409,6 +19501,17 @@ def _generate_msl_kernel_uncached(
                     # Strip leading "var_" if present so we can reuse the
                     # per-field-local naming convention.
                     val_struct_label = value[len("var_") :] if value.startswith("var_") else value
+                    if val_struct_label in struct_arg_layouts and value.startswith("var_"):
+                        # ``arr[i] = struct_arg``: the arg buffer holds the
+                        # struct's bytes (array members' records included),
+                        # so copy it word for word, like the native by-value
+                        # copy.
+                        base = f"{elem_idx} * {layout.scalars_per_elem}"
+                        for _w in range(layout.scalars_per_elem):
+                            body_lines.append(
+                                _finalize(_emit_scalar_write(f"{base} + {_w}", f"{val_struct_label}[{_w}]"))
+                            )
+                        continue
                     if val_struct_label not in struct_local_layouts:
                         raise MetalCodegenError(
                             f"Kernel {adj.fun_name!r}: ``arr[i] = X`` where X ({value!r}) is not a "
@@ -21093,6 +21196,11 @@ class _StructFieldInfo:
     # is the field width and ``byte_shift`` its byte position in the slot.
     bits: int = 32
     byte_shift: int = 0
+    # ``_STRUCT_FIELD_KIND_ARRAY_UNUSED`` fields of a layout built by
+    # ``_add_array_records``: the field's ``array_t`` record spans
+    # ``rec_words`` 4-byte words from ``offset``, and whole-struct moves
+    # carry them as hidden ``uint`` leaves (see ``_iter_scalar_leaves``).
+    rec_words: int = 0
 
 
 @dataclass
@@ -21351,6 +21459,295 @@ def _iter_scalar_leaves(layout: _StructLayout, prefix: str = "", base: int = 0):
             yield from _iter_scalar_leaves(finfo.sub, prefix=f"{path}__", base=base + finfo.offset)
         elif finfo.kind != _STRUCT_FIELD_KIND_ARRAY_UNUSED:
             yield path, base + finfo.offset, finfo
+        else:
+            for w in range(finfo.rec_words):
+                yield f"{path}__rec{w}", base + finfo.offset + w, _ARRAY_RECORD_WORD
+
+
+# One 4-byte word of an array field's ``array_t`` record (see
+# ``_add_array_records``), moved verbatim as a ``uint``.
+_ARRAY_RECORD_WORD = _StructFieldInfo(
+    name="rec", offset=0, size=1, kind=_STRUCT_FIELD_KIND_SCALAR, msl_type="uint", scalar_msl="uint"
+)
+
+
+def _layout_has_array_fields(layout: _StructLayout) -> bool:
+    """``layout`` (nested structs included) has a ``wp.array`` member."""
+    for finfo in layout.fields.values():
+        if finfo.kind == _STRUCT_FIELD_KIND_ARRAY_UNUSED:
+            return True
+        if finfo.kind == _STRUCT_FIELD_KIND_STRUCT and _layout_has_array_fields(finfo.sub):
+            return True
+    return False
+
+
+def _layout_carries_records(layout: _StructLayout) -> bool:
+    """Every array member of ``layout`` (nested included) has its record
+    exposed by ``_add_array_records``."""
+    for finfo in layout.fields.values():
+        if finfo.kind == _STRUCT_FIELD_KIND_ARRAY_UNUSED and finfo.rec_words == 0:
+            return False
+        if finfo.kind == _STRUCT_FIELD_KIND_STRUCT and not _layout_carries_records(finfo.sub):
+            return False
+    return True
+
+
+_REC_FIELD_PTR_PAT = re.compile(r"^\s*var_(\w+)\s*=\s*&\s*\(\s*var_(\w+)\s*(?:->|\.)\s*(\w+)\s*\)\s*;\s*$")
+_REC_COPY_PAT = re.compile(
+    r"^\s*(?:var_(?P<lhs>\w+)\s*=\s*(?:wp::(?:copy|load)\s*\(\s*)?var_(?P<src>\w+)\s*\)?"
+    r"|wp::assign\s*\(\s*var_(?P<dst>\w+)\s*,\s*var_(?P<src2>\w+)\s*\))\s*;\s*$"
+)
+_REC_WHERE_PAT = re.compile(r"^\s*var_(\w+)\s*=\s*wp::where\s*\((.*)\)\s*;\s*$")
+_REC_CTOR_PAT = re.compile(r"^\s*var_(\w+)\s*=\s*(\w+)\s*\((.*)\)\s*;\s*$")
+_REC_ZERO_PAT = re.compile(r"^\s*var_(\w+)\s*=\s*\{\s*\}\s*;\s*$")
+_REC_DEF_PAT = re.compile(r"^\s*(?:var_(\w+)\s*=(?!=)|wp::\w+\s*\(\s*&?\s*var_(\w+)\s*[,)])")
+_REC_STORE_PAT = re.compile(r"^\s*wp::(?:store|assign_inplace|assign)\s*\(\s*var_(\w+)\s*,\s*(.+?)\s*\)\s*;\s*$")
+
+
+def _struct_record_reach(
+    adj, lines: list[str], roots: set[str], local_layouts: dict[str, _StructLayout], storage_ptrs: set[str]
+) -> set[str]:
+    """Struct locals whose value can reach a whole-struct store in ``roots``.
+
+    Their array-member records are carried as hidden leaves (see
+    ``_add_array_records``), so every way such a local gets its array
+    members must be one that moves those leaves: an element / struct-arg
+    load, a copy, ``wp::where``, a default or zero construction. Storing an
+    array into a member (``s.a = x``: the GPU has no host record for ``x``)
+    or constructing the struct from arrays raises ``MetalCodegenError``, as
+    does any other definition this pass does not recognise.
+    """
+    ptr_root: dict[str, str] = {}  # pointer into a struct local -> that local
+    ptr_layout: dict[str, _StructLayout] = {}  # pointer to a nested struct field -> its layout
+    array_ptrs: set[str] = set()  # pointers to an array member of a struct local
+    edges: list[tuple[str, str]] = []  # (dst, src): src's value flows into dst
+    unknown: dict[str, str] = {}  # label -> first unrecognised defining line
+    bad: dict[str, str] = {}  # label -> line that sets an array member from outside
+    for raw in lines:
+        m = _REC_FIELD_PTR_PAT.match(raw)
+        if m:
+            ptr, root, field = m.groups()
+            if root in local_layouts:
+                lay, owner = local_layouts[root], root
+            elif root in ptr_layout:
+                lay, owner = ptr_layout[root], ptr_root[root]
+            else:
+                continue
+            finfo = lay.fields.get(field)
+            if finfo is None:
+                continue
+            ptr_root[ptr] = owner
+            if finfo.kind == _STRUCT_FIELD_KIND_STRUCT:
+                ptr_layout[ptr] = finfo.sub
+            elif finfo.kind == _STRUCT_FIELD_KIND_ARRAY_UNUSED:
+                array_ptrs.add(ptr)
+            continue
+        m = _REC_STORE_PAT.match(raw)
+        if m and m.group(1) in ptr_root:
+            ptr, val = m.group(1), m.group(2)
+            owner = ptr_root[ptr]
+            if ptr in array_ptrs:
+                bad.setdefault(owner, raw)
+            elif ptr in ptr_layout:
+                mv = re.fullmatch(r"var_(\w+)", val)
+                if mv and mv.group(1) in local_layouts:
+                    edges.append((owner, mv.group(1)))
+                elif mv and mv.group(1) in ptr_root:
+                    edges.append((owner, ptr_root[mv.group(1)]))
+                elif _layout_has_array_fields(ptr_layout[ptr]):
+                    unknown.setdefault(owner, raw)
+            continue
+        m = _REC_COPY_PAT.match(raw)
+        if m:
+            dst = m.group("lhs") or m.group("dst")
+            src = m.group("src") or m.group("src2")
+            if dst in local_layouts:
+                if src in local_layouts:
+                    edges.append((dst, src))
+                elif src in ptr_root:
+                    edges.append((dst, ptr_root[src]))
+                elif src not in storage_ptrs:
+                    # Not a load from struct storage (an array element or a
+                    # struct arg field), which would hold the records.
+                    unknown.setdefault(dst, raw)
+            continue
+        m = _REC_WHERE_PAT.match(raw)
+        if m and m.group(1) in local_layouts:
+            args = [a.strip() for a in _split_top_level_args(m.group(2))]
+            for a in args[1:]:
+                ma = re.fullmatch(r"var_(\w+)", a)
+                if ma and ma.group(1) in local_layouts:
+                    edges.append((m.group(1), ma.group(1)))
+                else:
+                    unknown.setdefault(m.group(1), raw)
+            continue
+        if _REC_ZERO_PAT.match(raw):
+            continue
+        m = _REC_CTOR_PAT.match(raw)
+        if (
+            m
+            and m.group(1) in local_layouts
+            and m.group(2) in (local_layouts[m.group(1)].name, local_layouts[m.group(1)].native_name)
+        ):
+            lay = local_layouts[m.group(1)]
+            args = [a.strip() for a in _split_top_level_args(m.group(3))] if m.group(3).strip() else []
+            for finfo, a in zip(lay.fields.values(), args, strict=False):
+                if finfo.kind == _STRUCT_FIELD_KIND_ARRAY_UNUSED:
+                    bad.setdefault(m.group(1), raw)
+                elif finfo.kind == _STRUCT_FIELD_KIND_STRUCT:
+                    ma = re.fullmatch(r"var_(\w+)", a)
+                    if ma and ma.group(1) in local_layouts:
+                        edges.append((m.group(1), ma.group(1)))
+                    elif _layout_has_array_fields(finfo.sub) and not (ma and ma.group(1) in ptr_root):
+                        unknown.setdefault(m.group(1), raw)
+                    elif ma:
+                        edges.append((m.group(1), ptr_root[ma.group(1)]))
+            continue
+        m = _REC_DEF_PAT.match(raw)
+        if m:
+            lbl = m.group(1) or m.group(2)
+            if lbl in local_layouts and not raw.lstrip().startswith(("wp::array_store", "wp::adj_")):
+                unknown.setdefault(lbl, raw)
+    reach = set(roots)
+    changed = True
+    while changed:
+        changed = False
+        for dst, src in edges:
+            if dst in reach and src not in reach:
+                reach.add(src)
+                changed = True
+    for lbl in sorted(reach):
+        if not _layout_carries_records(local_layouts[lbl]):
+            raise MetalCodegenError(
+                f"Kernel {adj.fun_name!r}: the array members of struct value 'var_{lbl}', which is stored into a "
+                "wp.array[Struct], cannot be tracked on Metal"
+            )
+        if lbl in bad:
+            raise MetalCodegenError(
+                f"Kernel {adj.fun_name!r}: a struct whose array member is set from an array value "
+                f"({bad[lbl].strip()!r}) is stored into a wp.array[Struct]; Metal can only copy array members "
+                "from struct-array elements, struct arguments or default-constructed structs"
+            )
+        if lbl in unknown:
+            raise MetalCodegenError(
+                f"Kernel {adj.fun_name!r}: cannot track the array members of struct value 'var_{lbl}' (defined by "
+                f"{unknown[lbl].strip()!r}), which is stored into a wp.array[Struct] on Metal"
+            )
+    return reach
+
+
+# A definition of a local: ``var_X = ...`` or an in-place update through
+# ``wp::assign`` / ``wp::store`` / ``wp::*_inplace`` (counted as two).
+_REC_INDEX_DEF_PAT = re.compile(
+    r"^\s*(?:var_(\w+)\s*=(?!=)|wp::(?:assign\w*|store|\w+_inplace)\s*\(\s*&?\s*var_(\w+)\s*,)"
+)
+_REC_ADDR_PAT = re.compile(r"^\s*var_(\w+)\s*=\s*wp::address\s*\(\s*var_(\w+)\s*,(.*)\)\s*;\s*$")
+
+
+def _struct_record_changing_stores(
+    lines: list[str], local_layouts: dict[str, _StructLayout], arrays: set[str]
+) -> set[str]:
+    """Struct arrays in ``arrays`` that this kernel may store *different*
+    array-member records into.
+
+    A store ``d[i] = s`` keeps the records when every definition reaching
+    ``s`` is a copy of another such value or a load of ``d[i]`` itself (the
+    same, never reassigned index locals), e.g. ``s = d[i]; s.k += 1;
+    d[i] = s``. Everything else counts as changing.
+    """
+
+    def idx_key(rest: str) -> tuple[str, ...]:
+        # ``wrap_negative_array_indices`` gives each access its own
+        # ``<i>__wrapN`` copy of index ``i``.
+        return tuple(re.sub(r"__wrap\d+$", "", a.strip()) for a in _split_top_level_args(rest))
+
+    addr: dict[str, tuple[str, tuple[str, ...]]] = {}
+    defs: dict[str, list[str]] = {}
+    ndefs: dict[str, int] = {}
+    stores: list[tuple[str, tuple[str, ...], str]] = []
+    for raw in lines:
+        m = _REC_ADDR_PAT.match(raw)
+        if m:
+            addr[m.group(1)] = (m.group(2), idx_key(m.group(3)))
+        m = _ARRAY_STORE_MULTI_PAT.match(raw)
+        if m and m.group("arr") in arrays:
+            args = _split_array_store_args(m.group("rest"))
+            stores.append((m.group("arr"), idx_key(", ".join(args[:-1])), args[-1]))
+            continue
+        m = _REC_INDEX_DEF_PAT.match(raw)
+        if m:
+            lbl = m.group(1) or m.group(2)
+            ndefs[lbl] = ndefs.get(lbl, 0) + (2 if m.group(2) else 1)
+            if lbl in local_layouts:
+                defs.setdefault(lbl, []).append(raw)
+        mp = _REC_FIELD_PTR_PAT.match(raw)
+        if mp and mp.group(2) in local_layouts:
+            # A store into a nested struct member could bring in other
+            # records; treat any field pointer to a struct-typed member as such.
+            finfo = local_layouts[mp.group(2)].fields.get(mp.group(3))
+            if finfo is not None and finfo.kind != _STRUCT_FIELD_KIND_STRUCT:
+                continue
+            defs.setdefault(mp.group(2), []).append("<nested>")
+    changing: set[str] = set()
+    for arr, key, val in stores:
+        if any(k.startswith("var_") and ndefs.get(k[4:], 0) > 1 for k in key) or not all(
+            k.startswith("var_") or k.isdigit() for k in key
+        ):
+            changing.add(arr)
+            continue
+        todo, seen, ok = [val[4:] if val.startswith("var_") else val], set(), True
+        while todo and ok:
+            lbl = todo.pop()
+            if lbl in seen:
+                continue
+            seen.add(lbl)
+            if lbl not in defs:
+                ok = False
+                break
+            for raw in defs[lbl]:
+                mc = _REC_COPY_PAT.match(raw)
+                src = (mc.group("src") or mc.group("src2")) if mc else None
+                if src is not None and src in local_layouts:
+                    todo.append(src)
+                elif src is not None and addr.get(src) == (arr, key):
+                    continue
+                else:
+                    ok = False
+                    break
+        if not ok:
+            changing.add(arr)
+    return changing
+
+
+def _add_array_records(layout: _StructLayout, struct_cls) -> _StructLayout:
+    """``layout`` with the ``array_t`` record of every array member exposed.
+
+    On Metal a struct element stores each array member as the host's
+    ``array_t`` record (data pointer, shape, strides, ...; the data pointer
+    is the CPU address of the Metal allocation), which kernels never
+    dereference: reads of array members resolve through launch-time pointer
+    tables built from these records. A whole-struct store
+    (``data[i] = src[j]``) must therefore copy the records verbatim, like
+    the native backends' by-value struct copy. Marking the fields with
+    ``rec_words`` makes ``_iter_scalar_leaves`` yield the record words as
+    ``uint`` leaves, so every whole-struct move (element load, local copy,
+    ``wp::where``, zero-init, element store) carries them. Mutates and
+    returns ``layout``, which must be a fresh ``_struct_layout_for`` result
+    for ``struct_cls``.
+    """
+    ctype = getattr(struct_cls, "ctype", None)
+    for fname, finfo in layout.fields.items():
+        if finfo.kind == _STRUCT_FIELD_KIND_STRUCT:
+            _add_array_records(finfo.sub, struct_cls.vars[fname].type)
+        elif finfo.kind == _STRUCT_FIELD_KIND_ARRAY_UNUSED:
+            cfield = getattr(ctype, fname, None)
+            if cfield is None or cfield.offset % 4 or cfield.size % 4:
+                raise MetalCodegenError(
+                    f"MSL codegen: array member {fname!r} of struct {layout.name!r} has no 4-byte aligned record"
+                )
+            finfo.offset = cfield.offset // 4
+            finfo.rec_words = cfield.size // 4
+    return layout
 
 
 def _struct_bitcast_read(expr: str, scalar_msl: str) -> str:
