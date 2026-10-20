@@ -99,8 +99,11 @@ def strip_markers(body: str) -> str:
 # Heuristics ("auto")
 # ---------------------------------------------------------------------------
 # Only kernels whose body is large enough for the Apple compile time to
-# matter are outlined; below that, inlining is the best code anyway.
-_AUTO_MIN_KERNEL_LINES = int(os.environ.get("WARP_METAL_OUTLINE_MIN_KERNEL_LINES", "") or 20000)
+# matter are outlined; below that, inlining is the best code anyway. Newton's
+# mesh-SDF contact kernel (~16.5k body lines inlined) already makes Apple's
+# back end abort with an out-of-memory error after minutes; outlined, its
+# pipeline compiles in about a second.
+_AUTO_MIN_KERNEL_LINES = int(os.environ.get("WARP_METAL_OUTLINE_MIN_KERNEL_LINES", "") or 10000)
 # A region is outlined when its (already partly outlined) body has at least
 # this many lines.
 _AUTO_MIN_REGION_LINES = int(os.environ.get("WARP_METAL_OUTLINE_MIN_LINES", "") or 40)
