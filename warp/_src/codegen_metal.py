@@ -21694,6 +21694,11 @@ def _struct_array_ptr_table_recorded(dispatcher, arr, struct_type, fpath, table,
     _ptab_retain(dispatcher, held["bufs"])
     arr_ref = weakref.ref(arr)
     nbytes = table.nbytes
+    # The reading command is recorded with the then-resident buffers as reads,
+    # so the graph orders it after its own writes to those; a buffer bound
+    # later that the graph also writes would not be ordered.
+    resident_at_capture = {id(r) for r in dispatcher._resident_resources} | {id(b) for b in bufs}
+    graph_writes = dispatcher.record_writes()
 
     def refresh() -> None:
         a = arr_ref()
@@ -21702,6 +21707,13 @@ def _struct_array_ptr_table_recorded(dispatcher, arr, struct_type, fpath, table,
         new, new_bufs = _struct_array_ptr_rows(a, struct_type, fpath)
         if new.nbytes != nbytes:
             raise RuntimeError("Metal: a captured struct array with array members changed size")
+        for b in new_bufs:
+            if id(b) not in resident_at_capture and id(b) in graph_writes:
+                raise RuntimeError(
+                    f"Metal: an element of a captured struct array now references (field {'.'.join(fpath)!r}) a "
+                    "buffer that the graph itself writes; the replay could not order that write before the read. "
+                    "Capture the graph again after rebinding."
+                )
         cur = (ctypes.c_char * nbytes).from_address(int(tab.ptr))
         if bytes(cur) != new.tobytes():
             ctypes.memmove(int(tab.ptr), new.ctypes.data, nbytes)

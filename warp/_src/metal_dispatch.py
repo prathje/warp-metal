@@ -1952,6 +1952,15 @@ class MetalDispatcher:
             raise MetalDispatchError("add_record_refresh() outside a recording")
         st["refresh"].append((fn, keep, source))
 
+    def record_writes(self) -> set:
+        """``id``s of the buffers the commands of the graph being recorded may
+        write; the set keeps growing until :meth:`end_record` and stays valid
+        after it."""
+        st = self._record_state
+        if st is None:
+            raise MetalDispatchError("record_writes() outside a recording")
+        return st["all_writes"]
+
     def end_record(self) -> MetalGraph:
         """Exit recording mode and return the captured :class:`MetalGraph`."""
         if self._record_state is None:
@@ -2008,6 +2017,9 @@ class MetalDispatcher:
                     icb.indirectComputeCommandAtIndex_(start).setBarrier()
         for _fn, _keep, source in st["refresh"]:
             if source is not None and (not st["has_modes"] or id(source) in st["all_writes"]):
+                for _f, keep, _s in st["refresh"]:
+                    if isinstance(keep, tuple) and len(keep) == 2 and callable(keep[1]):
+                        keep[1]()
                 raise MetalDispatchError(
                     "A captured kernel reads array members of a struct array that a command in the same graph "
                     "writes (or whose writes are unknown); the per-replay refresh of its pointer table could "
@@ -2402,10 +2414,7 @@ class MetalDispatcher:
         """
         if self._record_state is not None:
             raise MetalDispatchError("Cannot replay while a recording is open")
-        if graph._refresh:
-            self.sync()
-            for fn in graph._refresh:
-                fn()
+        self._run_refresh(graph)
         if graph._loop_checks:
             # Overflow from an earlier replay of this graph that has
             # already completed (non-blocking); the next sync point
@@ -2451,6 +2460,13 @@ class MetalDispatcher:
         if self._cmd_buf is not None and (self._dispatch_count >= self._autoflush_every or self._gpu_idle()):
             self.flush()
             self._dispatch_count = 0
+
+    def _run_refresh(self, graph: MetalGraph) -> None:
+        """Run ``graph``'s host refresh hooks (see :meth:`add_record_refresh`)."""
+        if graph._refresh:
+            self.sync()
+            for fn in graph._refresh:
+                fn()
 
     def _open_replay_encoder(self, graph: MetalGraph):
         """Return the live compute encoder, opening a command buffer /
@@ -2655,6 +2671,7 @@ class MetalDispatcher:
             raise MetalDispatchError("Cannot replay while a recording is open")
         if graph.count == 0:
             return []
+        self._run_refresh(graph)
         Metal = self._Metal
         if not self._device.supportsCounterSampling_(Metal.MTLCounterSamplingPointAtStageBoundary):
             raise MetalDispatchError("Device does not support stage-boundary counter sampling")
@@ -2810,7 +2827,6 @@ class MetalDispatcher:
                     cmd_reads.add(ptr)
                 if mode in ("w", "rw"):
                     cmd_writes.add(ptr)
-            st["all_writes"].update(cmd_writes)
             # Conflict check vs the still-open chunk.
             chunk_reads = st["chunk_reads"]
             chunk_writes = st["chunk_writes"]
@@ -2828,6 +2844,11 @@ class MetalDispatcher:
             else:
                 chunk_reads |= cmd_reads
                 chunk_writes |= cmd_writes
+        # Every buffer this command may write, for ``end_record``'s refresh
+        # check: all of its bindings when the caller gave no modes.
+        if binding_modes is None:
+            st["all_writes"].update(id(b) for b in map(_binding_buffer, bindings) if b is not None)
+        st["all_writes"].update(cmd_writes)
         # Encode the command.
         Metal = self._Metal
         self._record_cmd_index(st)

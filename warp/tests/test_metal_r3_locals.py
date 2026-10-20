@@ -1033,6 +1033,32 @@ class TestMetalR3Locals(unittest.TestCase):
             np.testing.assert_allclose(out.numpy(), [8.0, 9.0])
             wp.launch(kd, 2, [ids, data, out], device=dev)
             np.testing.assert_allclose(out.numpy(), [8.0, 9.0])
+            # ``replay_timed`` refreshes the table too.
+            from warp._src.metal_dispatch import get_dispatcher
+            g.vals = wp.array([1.0, 1.5], dtype=float, device=dev)
+            data.assign(wp.array([g], dtype=G, device=dev))
+            get_dispatcher().replay_timed(cap.graph._metal_graph)
+            np.testing.assert_allclose(out.numpy(), [3.0, 3.5])
+
+            # A record rebound after the capture to a buffer the graph itself
+            # writes cannot be ordered: the replay raises.
+            @wp.kernel
+            def kfill(w: wp.array[float]):
+                w[wp.tid()] = 4.0
+
+            wbuf = wp.zeros(2, dtype=float, device=dev)
+            with wp.ScopedCapture(device=dev) as cap2:
+                wp.launch(kfill, 2, [wbuf], device=dev)
+                wp.launch(kd, 2, [ids, data, out], device=dev)
+            wp.capture_launch(cap2.graph)
+            g.vals = wbuf
+            data.assign(wp.array([g], dtype=G, device=dev))
+            try:
+                wp.capture_launch(cap2.graph)
+            except RuntimeError as e:
+                assert "graph itself writes" in str(e), e
+            else:
+                raise AssertionError("a rebind to a buffer the graph writes was not rejected")
 
             try:
                 with wp.ScopedCapture(device=dev):
