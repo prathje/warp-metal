@@ -459,6 +459,175 @@ class TestMetalR5StructCopy(unittest.TestCase):
             """,
         )
 
+    def test_struct_held_struct_array_store(self):
+        # A struct array held by a struct argument (``h.arr[i] = src[j]``).
+        _run(
+            self,
+            """
+            @wp.struct
+            class Holder:
+                arr: wp.array[Mixed]
+                n: int
+
+            @wp.kernel
+            def cp(h: Holder, src: wp.array[Mixed]):
+                i = wp.tid()
+                h.arr[i] = src[2 - i]
+
+            @wp.kernel
+            def rmw(h: Holder):
+                i = wp.tid()
+                s = h.arr[i]
+                s.k = s.k + h.n
+                h.arr[i] = s
+
+            def run(dev):
+                d, s = mk_mixed(dev, 3, 100.0), mk_mixed(dev, 3, 200.0)
+                h = Holder()
+                h.arr = d
+                h.n = 5
+                wp.launch(cp, 3, [h, s], device=dev)
+                r1 = read(d, dev)
+                wp.launch(rmw, 3, [h], device=dev)
+                return [r1, read(d, dev)]
+
+            compare(run)
+            """,
+        )
+
+    def test_aliased_store_and_member_read_raise_at_launch(self):
+        # ``dst[0] = src[1]`` plus a read of ``src[0].a``: fine for separate
+        # arrays, refused when ``src`` and ``dst`` are the same array (the
+        # read would see the arrays from before the store).
+        _run(
+            self,
+            """
+            @wp.kernel
+            def k(src: wp.array[Mixed], dst: wp.array[Mixed], out: wp.array[float]):
+                i = wp.tid()
+                s = src[1]
+                if i == 0:
+                    dst[0] = s
+                j = i * 0
+                t = src[j]
+                out[i] = float(t.a.shape[0])
+
+            def run(dev):
+                s, d = mk_mixed(dev, 2, 1.0), mk_mixed(dev, 2, 50.0)
+                o = wp.zeros(1, dtype=float, device=dev)
+                wp.launch(k, 1, [s, d, o], device=dev)
+                return [o.numpy(), read(d, dev)]
+
+            compare(run)
+            d = mk_mixed("metal:0", 2, 1.0)
+            o = wp.zeros(1, dtype=float, device="metal:0")
+            try:
+                wp.launch(k, 1, [d, d, o], device="metal:0")
+            except RuntimeError as e:
+                assert "share memory" in str(e), e
+            else:
+                raise AssertionError("aliased store + member read was not refused")
+            """,
+        )
+
+    def _fp64_narrow_fields(self, mode):
+        # float64 (demoted or emulated), float16 and int8 fields next to an
+        # array member, through whole-struct element copies, struct-arg
+        # copies, local field writes and a conditional select.
+        _run(
+            self,
+            f"""
+            wp.config.metal_fp64 = "{mode}"
+            """
+            + """
+            @wp.struct
+            class F:
+                x: float
+                d: wp.float64
+                h: wp.float16
+                b: wp.int8
+                a: wp.array[float]
+
+            @wp.kernel
+            def elem(src: wp.array[F], dst: wp.array[F]):
+                i = wp.tid()
+                dst[i] = src[1 - i]
+
+            @wp.kernel
+            def arg_local(p: F, dst: wp.array[F]):
+                i = wp.tid()
+                s = p
+                s.x = s.x + float(i)
+                if i == 1:
+                    dst[i] = p
+                else:
+                    dst[i] = s
+
+            @wp.kernel
+            def local_rw(src: wp.array[F], dst: wp.array[F], out: wp.array[wp.float64]):
+                i = wp.tid()
+                s = src[i]
+                out[i] = s.d * wp.float64(2.0)
+                s.d = s.d + wp.float64(1.0)
+                t = F()
+                if i == 0:
+                    t = s
+                dst[i] = t
+
+            def mk(dev):
+                items = []
+                for e in range(2):
+                    f = F()
+                    f.x = 1.0 + e
+                    f.d = 0.1 + e
+                    f.h = 0.5 + e
+                    f.b = -3 + e
+                    f.a = wp.array(np.arange(e + 2, dtype=np.float32), device=dev)
+                    items.append(f)
+                KEEP.append(items)
+                return wp.array(items, dtype=F, device=dev)
+
+            def fields(arr):
+                n = arr.numpy()
+                return [n["x"], n["d"], n["h"].astype(np.float32), n["b"], n["a"]["shape"]]
+
+            def run(dev):
+                out = []
+                s, d = mk(dev), wp.zeros(2, dtype=F, device=dev)
+                wp.launch(elem, 2, [s, d], device=dev)
+                out += fields(d)
+                p = F()
+                p.x, p.d, p.h, p.b = 1.0, 0.1, 0.25, 5
+                p.a = wp.zeros(3, dtype=float, device=dev)
+                KEEP.append(p)
+                d = wp.zeros(2, dtype=F, device=dev)
+                wp.launch(arg_local, 2, [p, d], device=dev)
+                out += fields(d)
+                return out
+
+            compare(run)
+
+            # Field arithmetic on a demoted float64 runs in fp32: compare
+            # with a tolerance; the untouched struct fields stay exact.
+            res = {}
+            for dev in ("cpu", "metal:0"):
+                s, d = mk(dev), wp.zeros(2, dtype=F, device=dev)
+                o = wp.zeros(2, dtype=wp.float64, device=dev)
+                wp.launch(local_rw, 2, [s, d, o], device=dev)
+                res[dev] = (fields(d), o.numpy())
+            np.testing.assert_allclose(res["metal:0"][1], res["cpu"][1], rtol=1e-6)
+            np.testing.assert_allclose(res["metal:0"][0][1], res["cpu"][0][1], rtol=1e-6)
+            for k in (0, 2, 3, 4):
+                np.testing.assert_array_equal(res["metal:0"][0][k], res["cpu"][0][k])
+            """,
+        )
+
+    def test_fp64_demote_and_narrow_fields(self):
+        self._fp64_narrow_fields("demote")
+
+    def test_fp64_emulate_and_narrow_fields(self):
+        self._fp64_narrow_fields("emulate")
+
     def test_unsupported_element_stores_raise(self):
         _run(
             self,
@@ -484,6 +653,24 @@ class TestMetalR5StructCopy(unittest.TestCase):
                 t.a = x
                 d[i] = t
 
+            @wp.struct
+            class Holder:
+                arr: wp.array[Mixed]
+
+            @wp.kernel
+            def holder_member_set(h: Holder, x: wp.array[float]):
+                i = wp.tid()
+                s = h.arr[1 - i]
+                s.a = x
+                h.arr[i] = s
+
+            @wp.kernel
+            def holder_default_member_set(h: Holder, x: wp.array[float]):
+                i = wp.tid()
+                s = Mixed()
+                s.a = x
+                h.arr[i] = s
+
             @wp.kernel
             def from_ctor(d: wp.array[Mixed], x: wp.array[float], y: wp.array[wp.vec3]):
                 i = wp.tid()
@@ -494,6 +681,10 @@ class TestMetalR5StructCopy(unittest.TestCase):
             x = wp.zeros(4, dtype=float, device=dev)
             y = wp.zeros(4, dtype=wp.vec3, device=dev)
             expect_raise(lambda: wp.launch(from_ctor, 3, [d, x, y], device=dev), "set from an array")
+            h = Holder()
+            h.arr = mk_mixed(dev, 2, 50.0)
+            expect_raise(lambda: wp.launch(holder_member_set, 1, [h, x], device=dev), "set from an array")
+            expect_raise(lambda: wp.launch(holder_default_member_set, 2, [h, x], device=dev), "set from an array")
             expect_raise(lambda: wp.launch(store_then_read, 3, [d, s, x], device=dev), "before the launch")
             expect_raise(
                 lambda: wp.launch(from_kernel_array, 1, [mk_only(dev, 3, 1.0), x], device=dev), "set from an array"

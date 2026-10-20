@@ -14955,6 +14955,14 @@ class MetalKernelArtifact:
     # ``codegen_metal_ast.fold_struct_array_array_fields``); the launcher
     # refuses a launch where such an arg is non-empty.
     struct_array_field_reads: tuple[str, ...] = ()
+    # Struct arrays (kernel args, or ``<arg>__<path>`` arrays held by struct
+    # args) this kernel may store different array-member records into, and
+    # the struct-array kernel args whose elements' array members it reads
+    # through launch-time pointer tables / bindings. The launcher refuses a
+    # launch where one of the former aliases one of the latter: those reads
+    # would see the records from before the stores.
+    struct_record_writes: tuple[str, ...] = ()
+    struct_member_reads: tuple[str, ...] = ()
     # Native dispatch: binding slots (pre-spill order) moved into the
     # ``__spill_ptrs`` table. Set by ``_wrap_msl_for_native_dispatch``.
     native_spill_slots: tuple[int, ...] = ()
@@ -16542,15 +16550,10 @@ def _generate_msl_kernel_uncached(
         _wrap_consts,
     )
     # The view fold drops array-member stores into struct locals
-    # (``s.a = x``); ``_struct_record_reach`` must still see them.
-    _rec_pre_view_lines: list[str] = []
-    if any(
-        _is_array_arg(_a)
-        and isinstance(getattr(_a.type, "dtype", None), _StructEarly)
-        and _layout_has_array_fields(_struct_layout_for(_a.type.dtype))
-        for _a in adj.args
-    ):
-        _rec_pre_view_lines = _ast_emit(_ast_nodes)
+    # (``s.a = x``); ``_struct_record_reach`` must still see them. Captured
+    # unconditionally: the stored-into struct array may also be held by a
+    # struct argument (``h.arr[i] = s``).
+    _rec_pre_view_lines = _ast_emit(_ast_nodes)
     _ast_nodes, _view_skip = _ast_fold_views(
         _ast_nodes,
         adj,
@@ -17146,6 +17149,7 @@ def _generate_msl_kernel_uncached(
             )
         _rec_store_vals.add(_val[len("var_") :])
     _rec_reach: set[str] = set()
+    _rec_changing: set[str] = set()
     if _rec_store_arrs:
         _struct_cls_of: dict[str, Any] = {}
         for var in adj.variables:
@@ -17205,7 +17209,7 @@ def _generate_msl_kernel_uncached(
                 f"{_bad_field!r} is an array or texture"
             )
         _mtiles.register_struct_stack_elem(
-            _se[0], [(_path, _fi.msl_type) for _path, _off, _fi in _iter_scalar_leaves(_lay)]
+            _se[0], [(_path, _struct_leaf_local_msl(_fi)) for _path, _off, _fi in _iter_scalar_leaves(_lay)]
         )
         _struct_stack_elems[_lbl_s] = _se[0]
     if _struct_stack_elems:
@@ -17312,6 +17316,10 @@ def _generate_msl_kernel_uncached(
                     # A real MSL struct local: members read directly.
                     texture_value_ptrs[field_local] = _per_field_local(struct_local, field_name)
                 subscript_map[field_local] = _per_field_local(struct_local, field_name)
+                if _is_demoted_f64_leaf(field_info):
+                    # The local holds the field's double bits (see
+                    # ``_struct_leaf_local_msl``): convert at value uses / stores.
+                    f64_scalar_alias[field_local] = struct_local
                 if field_info.kind == _STRUCT_FIELD_KIND_VEC:
                     indexref_vec_bases[field_local] = _per_field_local(struct_local, field_name)
                 continue
@@ -17356,6 +17364,8 @@ def _generate_msl_kernel_uncached(
                 struct_ptr_locals[field_local] = (f"{prefix}__{field_name}", field_info.sub)
                 continue
             subscript_map[field_local] = _per_field_local(prefix, field_name)
+            if _is_demoted_f64_leaf(field_info):
+                f64_scalar_alias[field_local] = prefix
             if field_info.kind == _STRUCT_FIELD_KIND_VEC:
                 indexref_vec_bases[field_local] = _per_field_local(prefix, field_name)
             continue
@@ -17517,12 +17527,8 @@ def _generate_msl_kernel_uncached(
                 #   - Custom structs (``wp_mat6x3_float``, ``wp_vec6_float``)
                 #     have no one-int constructor; aggregate value-init
                 #     ``T()`` zeros the trailing ``c[N]`` array.
-                _zero = (
-                    f"{field_info.msl_type}()"
-                    if field_info.msl_type.startswith(("wp_mat", "wp_vec", "wp_texture"))
-                    else f"{field_info.msl_type}(0)"
-                )
-                body_lines.append(f"    {field_info.msl_type} {local_name} = {_zero};")
+                _leaf_t = _struct_leaf_local_msl(field_info)
+                body_lines.append(f"    {_leaf_t} {local_name} = {_struct_leaf_zero(_leaf_t)};")
             continue
         if var.label in vars_to_skip_decl:
             # Iterator-state or induction-variable for a translated for-loop;
@@ -17597,12 +17603,8 @@ def _generate_msl_kernel_uncached(
         layout = struct_local_layouts[mangled_label]
         for field_path, _off, field_info in _iter_scalar_leaves(layout):
             local_name = _per_field_local(mangled_label, field_path)
-            _zero = (
-                f"{field_info.msl_type}()"
-                if field_info.msl_type.startswith(("wp_mat", "wp_vec", "wp_texture"))
-                else f"{field_info.msl_type}(0)"
-            )
-            body_lines.append(f"    {field_info.msl_type} {local_name} = {_zero};")
+            _leaf_t = _struct_leaf_local_msl(field_info)
+            body_lines.append(f"    {_leaf_t} {local_name} = {_struct_leaf_zero(_leaf_t)};")
 
     # --- Per-field struct duals ----------------------------------------
     # A struct value has no MSL type here (forward mode splits it into
@@ -18893,7 +18895,7 @@ def _generate_msl_kernel_uncached(
                         for fpath, off, fi in _iter_scalar_leaves(src_layout):
                             if fpath not in dst_leaves:
                                 continue
-                            read = _struct_field_read_expr(src_label, str(off), fi)
+                            read = _struct_leaf_load_expr(src_label, str(off), fi)
                             body_lines.append(
                                 _finalize(f"{indent}{_per_field_local(dst, f'{fname}__{fpath}')} = {read};")
                             )
@@ -18903,7 +18905,7 @@ def _generate_msl_kernel_uncached(
                         for fpath, off, fi in _iter_scalar_leaves(src_layout):
                             if fpath not in dst_leaves:
                                 continue
-                            read = _struct_field_read_expr(buf, f"{base_expr} + {off}", fi)
+                            read = _struct_leaf_load_expr(buf, f"{base_expr} + {off}", fi)
                             body_lines.append(
                                 _finalize(f"{indent}{_per_field_local(dst, f'{fname}__{fpath}')} = {read};")
                             )
@@ -18912,7 +18914,9 @@ def _generate_msl_kernel_uncached(
                         f"Kernel {adj.fun_name!r}: struct constructor {dst_layout.name!r} field "
                         f"{fname!r} takes a struct arg {arg_expr!r} with no known layout"
                     )
-                body_lines.append(_finalize(f"{indent}{_per_field_local(dst, fname)} = {arg_expr};"))
+                # A demoted float64 leaf holds double bits.
+                leaf_val = f"wp_f32_to_f64({arg_expr})" if _is_demoted_f64_leaf(finfo) else arg_expr
+                body_lines.append(_finalize(f"{indent}{_per_field_local(dst, fname)} = {leaf_val};"))
             continue
         # Whole-struct zero-init ``var_X = {};``. Warp emits this for a
         # struct local that a control-flow join leaves unset — notably the
@@ -18927,11 +18931,7 @@ def _generate_msl_kernel_uncached(
             indent = m_struct_zero.group("indent")
             dst = m_struct_zero.group(2)
             for fpath, _off, finfo in _iter_scalar_leaves(struct_local_layouts[dst]):
-                zero = (
-                    f"{finfo.msl_type}()"
-                    if finfo.msl_type.startswith(("wp_mat", "wp_vec", "wp_texture"))
-                    else f"{finfo.msl_type}(0)"
-                )
+                zero = _struct_leaf_zero(_struct_leaf_local_msl(finfo))
                 body_lines.append(f"{indent}{_per_field_local(dst, fpath)} = {zero};")
             continue
         # Struct-to-struct local copy ``var_X = var_Y;``. Both X and Y
@@ -19083,7 +19083,7 @@ def _generate_msl_kernel_uncached(
                 if fpath not in dst_leaves:
                     continue
                 dst_local = _per_field_local(dst, fpath)
-                read = _struct_field_read_expr(buf, f"{base_expr} + {off}", finfo)
+                read = _struct_leaf_load_expr(buf, f"{base_expr} + {off}", finfo)
                 body_lines.append(_finalize(f"{indent}{dst_local} = {read};"))
             continue
         # ``s = p`` where ``p`` is a struct kernel arg: one per-leaf read from
@@ -19101,7 +19101,7 @@ def _generate_msl_kernel_uncached(
             for fpath, off, finfo in _iter_scalar_leaves(struct_arg_layouts[src_arg]):
                 if fpath not in dst_leaves:
                     continue
-                read = _struct_field_read_expr(src_arg, str(off), finfo)
+                read = _struct_leaf_load_expr(src_arg, str(off), finfo)
                 body_lines.append(_finalize(f"{indent}{_per_field_local(dst, fpath)} = {read};"))
             continue
         # ``t = l.inner`` where ``l`` is a struct *local*: the source is a
@@ -20354,6 +20354,8 @@ def _generate_msl_kernel_uncached(
         struct_array_args=struct_array_args_final,
     )
     _artifact.struct_array_field_reads = tuple(sorted(_sa_field_reads))
+    _artifact.struct_record_writes = tuple(sorted(_rec_changing))
+    _artifact.struct_member_reads = tuple(sorted({_a for _a, _p in _sa_synthetic.values()}))
     return _artifact
 
 
@@ -21764,6 +21766,38 @@ def _struct_bitcast_write(expr: str, scalar_msl: str) -> str:
     return f"as_type<float>({expr})"
 
 
+def _is_demoted_f64_leaf(finfo: _StructFieldInfo) -> bool:
+    """A float64 struct field demoted to fp32 (``metal_fp64="demote"``)."""
+    return finfo.kind == _STRUCT_FIELD_KIND_SCALAR64 and finfo.scalar_msl == "double"
+
+
+def _struct_leaf_local_msl(finfo: _StructFieldInfo) -> str:
+    """MSL type of the per-field local holding struct leaf ``finfo``.
+
+    A demoted float64 field keeps its IEEE-754 double bits (``ulong``) so
+    whole-struct copies and stores round-trip it exactly; value uses and
+    field stores convert through ``wp_f64_to_f32`` / ``wp_f32_to_f64``
+    (``f64_scalar_alias``)."""
+    return "ulong" if _is_demoted_f64_leaf(finfo) else finfo.msl_type
+
+
+def _struct_leaf_zero(msl: str) -> str:
+    """Zero value of per-field local type ``msl`` (custom structs value-init)."""
+    if msl.startswith(("wp_mat", "wp_vec", "wp_texture", _F64_EMU_MSL)):
+        return f"{msl}()"
+    return f"{msl}(0)"
+
+
+def _struct_leaf_load_expr(buf: str, base_expr: str, finfo: _StructFieldInfo) -> str:
+    """Leaf ``finfo`` read from flat struct storage into its per-field local
+    (raw double bits for a demoted float64 field, see ``_struct_leaf_local_msl``)."""
+    if _is_demoted_f64_leaf(finfo):
+        lo = f"as_type<uint>({buf}[{base_expr}])"
+        hi = f"as_type<uint>({buf}[({base_expr}) + 1])"
+        return f"((ulong({hi}) << 32) | ulong({lo}))"
+    return _struct_field_read_expr(buf, base_expr, finfo)
+
+
 def _struct_field_read_expr(buf: str, base_expr: str, finfo: _StructFieldInfo) -> str:
     """Build the MSL rvalue reading leaf field ``finfo`` from flat float32
     storage ``buf`` at scalar offset ``base_expr`` (the field's absolute
@@ -22005,6 +22039,43 @@ def _struct_field_launch_value(fwd_args, arg_by_name, root_label: str, fpath: tu
             return None
         value = getattr(value, comp, None)
     return value
+
+
+def _check_struct_record_aliasing(kernel, artifact, fwd_args, writes, reads) -> None:
+    """Refuse a launch whose array-member reads of one struct array would miss
+    the same kernel's record stores into an aliasing struct array (see
+    ``MetalKernelArtifact.struct_record_writes``)."""
+    arg_by_name = {a.label: (i, a) for i, a in enumerate(kernel.adj.args)}
+    held = {syn: (root, tuple(fpath)) for syn, root, fpath in getattr(artifact, "struct_array_args", ())}
+
+    def value(label):
+        if label in arg_by_name:
+            return fwd_args[arg_by_name[label][0]]
+        if label in held:
+            return _struct_field_launch_value(fwd_args, arg_by_name, *held[label])
+        return None
+
+    def span(a):
+        if a is None or getattr(a, "ptr", None) is None or not getattr(a, "size", 0):
+            return None
+        import warp as wp  # noqa: PLC0415
+
+        return int(a.ptr), int(a.ptr) + a.size * wp.types.type_size_in_bytes(a.dtype)
+
+    for w in writes:
+        ws = span(value(w))
+        if ws is None:
+            continue
+        for r in reads:
+            if r == w:
+                continue  # rejected at codegen time
+            rs = span(value(r))
+            if rs is not None and ws[0] < rs[1] and rs[0] < ws[1]:
+                raise RuntimeError(
+                    f"Metal: kernel '{kernel.key}' stores whole structs with array members into {w!r} and reads "
+                    f"array members of the elements of {r!r}, which share memory in this launch; on Metal those "
+                    "reads see the arrays from before the launch. Pass separate arrays or split the kernel"
+                )
 
 
 # Pointer-table row: field GPU address, then all four extents (Warp arrays
@@ -23455,6 +23526,10 @@ def launch_metal_kernel_native(
                     f"(a wp.array of a struct with array members), which the Metal backend does not "
                     f"support; such reads only work while the array is empty"
                 )
+    _rec_w = getattr(artifact, "struct_record_writes", ())
+    _rec_r = getattr(artifact, "struct_member_reads", ())
+    if _rec_w and _rec_r and not adjoint:
+        _check_struct_record_aliasing(kernel, artifact, fwd_args, _rec_w, _rec_r)
     # Per-kernel metadata dicts are reused across launches — caching
     # them on the kernel object shaves ~10 µs/launch off the hot path.
     arg_by_name = getattr(kernel, "_metal_native_arg_by_name", None)
