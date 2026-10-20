@@ -3029,6 +3029,22 @@ def fold_struct_array_array_fields(
     )
     maybe_empty = {f"{label}__ptidx" for label in maybe_empty}  # as index-local names
 
+    nonneg_cache: list[set[str]] = []
+
+    def _wrapped_index(arr: str, rest: str) -> str:
+        """The element index of ``wp::address(arr, rest)`` wrapped like native
+        Warp (``arr[-1]`` is the last element), as ``wrap_negative_array_indices``
+        does for the address itself."""
+        idx = rest.strip()
+        mi = re.fullmatch(r"var_(\w+)", idx)
+        if mi is None:
+            return idx
+        if not nonneg_cache:
+            nonneg_cache.append(_nonneg_locals(nodes, consts))
+        if mi.group(1) in nonneg_cache[0]:
+            return idx
+        return f"wp_wrap_index({idx}, {arr}_shape[0])"
+
     def _sub_syn(text: str) -> str:
         if not syn_val:
             return text
@@ -3074,7 +3090,7 @@ def fold_struct_array_array_fields(
             if k is not None and synthetic_out is not None:
                 elem_idx[m.group("lhs")] = k
             elif m.group("lhs") in track_arg:
-                return [n, *bind(m.group("lhs"), m.group("arr"), m.group("rest").strip(), ind)]
+                return [n, *bind(m.group("lhs"), m.group("arr"), _wrapped_index(m.group("arr"), m.group("rest")), ind)]
             return [n]
         m = _MESH_LOAD_PAT.match(raw)
         if m:

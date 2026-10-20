@@ -247,6 +247,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
     )
     from warp.tests.test_metal_r3_tiles import TestMetalR3Tiles
     from warp.tests.test_metal_r4_kamino import TestMetalR4Kamino
+    from warp.tests.test_metal_r5_structcopy import TestMetalR5StructCopy
     from warp.tests.test_metal_runtime import TestMetalRuntime, TestMetalRuntimeSubprocess
     from warp.tests.test_metal_tiles_ext import (
         TestMetalMeshWinding,
@@ -474,6 +475,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
         TestMetalTextures,
         TestMetalR3Tiles,
         TestMetalR4Kamino,
+        TestMetalR5StructCopy,
         TestMetalTilesExt,
         TestMetalTorchSync,
         TestMetalTorchSyncHost,
