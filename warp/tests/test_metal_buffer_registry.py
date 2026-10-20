@@ -38,6 +38,10 @@ _PRELUDE = textwrap.dedent(
             self.me = self
 
     def make_garbage(k=4):
+        # Callers disable the automatic GC first, so the cycles survive until
+        # the forced ``gc.collect()`` inside the locked section (and the hook
+        # asserts the releases were queued there, so coverage cannot silently drop).
+        assert not gc.isenabled(), "disable the automatic GC before making test garbage"
         ptrs = []
         for _ in range(k):
             c = Cycle()
@@ -104,12 +108,14 @@ class TestMetalBufferRegistryReentrancy(unittest.TestCase):
             orig = ctx._metal_buffer_length
             fired = []
             gc.collect()
+            gc.disable()
             n0 = len(ctx._metal_buffer_registry)
             garbage = make_garbage()  # cycles become garbage, freed by the collect below
             def length_with_gc(buf):
                 if not fired:
                     fired.append(garbage)
                     gc.collect()
+                    assert ctx._metal_pending_releases, "GC inside the section freed nothing"
                 return orig(buf)
             ctx._metal_buffer_length = length_with_gc
             try:
@@ -138,12 +144,14 @@ class TestMetalBufferRegistryReentrancy(unittest.TestCase):
             live = [wp.empty(32, dtype=wp.float32, device="metal:0") for _ in range(64)]
             target = live[31]
             real_bisect = ctx.bisect
+            gc.disable()
             state = {"armed": True, "freed": make_garbage(8)}
             def bisect_right_with_gc(a, x, *args, **kw):
                 i = real_bisect.bisect_right(a, x, *args, **kw)
                 if state["armed"]:
                     state["armed"] = False
                     gc.collect()
+                    assert ctx._metal_pending_releases, "GC inside the section freed nothing"
                 return i
             shim = types.SimpleNamespace(
                 bisect_right=bisect_right_with_gc,
@@ -177,10 +185,14 @@ class TestMetalBufferRegistryReentrancy(unittest.TestCase):
             view = a[8:]
             real_bisect = ctx.bisect
             calls = []
+            gc.disable()
             freed = make_garbage(4)
             def bisect_right_with_gc(lst, x, *args, **kw):
+                first = not calls
                 calls.append(1)
                 gc.collect()
+                if first:
+                    assert ctx._metal_pending_releases, "GC inside the section freed nothing"
                 return real_bisect.bisect_right(lst, x, *args, **kw)
             ctx.bisect = types.SimpleNamespace(
                 bisect_right=bisect_right_with_gc,
@@ -243,6 +255,7 @@ class TestMetalBufferRegistryReentrancy(unittest.TestCase):
 
             class Holder:
                 pass
+            gc.disable()
             h = Holder(); h.me = h
             weakref.finalize(h, ctx._metal_release_foreign_buffer, fptr)
             h2 = Holder(); h2.me = h2
@@ -252,6 +265,7 @@ class TestMetalBufferRegistryReentrancy(unittest.TestCase):
             orig = ctx._metal_buffer_length
             def length_with_gc(b):
                 gc.collect()
+                assert ctx._metal_pending_releases, "GC inside the section freed nothing"
                 return orig(b)
             ctx._metal_buffer_length = length_with_gc
             try:
@@ -452,38 +466,77 @@ class TestMetalResidentSetReentrancy(unittest.TestCase):
             """,
         )
 
-    def test_ptab_release_from_finalizer_during_update(self):
-        # ``_ptab_release`` (a weakref.finalize callback) interrupting a
-        # pointer-table residency update is queued and applied, never lost.
+    def test_ptab_release_between_read_and_write_of_retain(self):
+        # ``_ptab_release`` (a weakref.finalize callback for an older table)
+        # running between the read and the write of a ``_ptab_retain`` of the
+        # SAME buffer must not lose either update. Forced with a dict whose
+        # ``get`` runs the "finalizer".
+        _run(
+            self,
+            """
+            from warp._src import codegen_metal as cm
+            buf = object()
+            log = []
+            class FakeDispatcher:
+                def add_resident_resource(self, b):
+                    log.append("add")
+                def remove_resident_resource(self, b):
+                    log.append("remove")
+            d = FakeDispatcher()
+            cm._ptab_retain(d, [buf])  # count 1
+            class Hook(dict):
+                armed = False
+                def get(self, k, default=None):
+                    v = dict.get(self, k, default)
+                    if Hook.armed:
+                        Hook.armed = False
+                        cm._ptab_release(d, [buf])
+                    return v
+            cm._PTAB_RESIDENT_REFS = Hook(cm._PTAB_RESIDENT_REFS)
+            Hook.armed = True
+            cm._ptab_retain(d, [buf])  # +1 -1: net count 1, still resident
+            assert not Hook.armed
+            n = cm._PTAB_RESIDENT_REFS.get(id(buf), 0)
+            assert n == 1 and log[-1] != "remove", ("lost update", n, log)
+            assert not cm._PTAB_PENDING
+            """,
+        )
+
+    def test_ptab_retain_from_finalizer_during_apply(self):
+        # A finalizer that launches (-> ``_ptab_retain``), run by a GC while
+        # ``_ptab_apply_pending`` calls into the dispatcher on this thread,
+        # must neither deadlock nor launch without residency.
         _run(
             self,
             """
             from warp._src import codegen_metal as cm
             buf, other = object(), object()
-            log = []
+            resident = set()
             class FakeDispatcher:
                 hook = None
                 def add_resident_resource(self, b):
-                    log.append(("add", b))
+                    resident.add(id(b))
                     if self.hook is not None:
                         h, self.hook = self.hook, None
                         h()
                 def remove_resident_resource(self, b):
-                    log.append(("remove", b))
+                    resident.discard(id(b))
             d = FakeDispatcher()
-            cm._ptab_retain(d, [buf])           # buf: 1
-            cm._ptab_retain(d, [buf])           # buf: 2
-            # While retaining ``other``, two finalizers release ``buf``.
-            d.hook = lambda: (cm._ptab_release(d, [buf]), cm._ptab_release(d, [buf]))
-            cm._ptab_retain(d, [other])
+            seen = []
+            def nested_launch():
+                cm._ptab_retain(d, [other])
+                seen.append(id(other) in resident)  # resident before the nested launch
+            d.hook = nested_launch
+            cm._ptab_retain(d, [buf])
+            assert seen == [True], seen
             assert not cm._PTAB_PENDING
-            assert id(buf) not in cm._PTAB_RESIDENT_REFS, cm._PTAB_RESIDENT_REFS
-            assert cm._PTAB_RESIDENT_REFS[id(other)] == 1
-            assert ("remove", buf) in log
+            assert cm._PTAB_RESIDENT_REFS[id(buf)] == 1 and cm._PTAB_RESIDENT_REFS[id(other)] == 1
+            cm._ptab_release(d, [buf])
             cm._ptab_release(d, [other])
-            assert id(other) not in cm._PTAB_RESIDENT_REFS
-            assert not cm._PTAB_LOCK.locked()
+            assert not cm._PTAB_RESIDENT_REFS and not resident
+            assert not cm._PTAB_LOCK._is_owned()
             """,
+            timeout=60,
         )
 
 

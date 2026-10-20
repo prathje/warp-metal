@@ -5523,7 +5523,12 @@ def _metal_refuse_nested(what: str) -> None:
 
     Only a finalizer run by a GC inside a registry critical section gets
     here; a registration would move the index under the interrupted section
-    (and a plain lock would deadlock), so fail loudly instead."""
+    (and a plain lock would deadlock), so fail loudly instead. This is a
+    deliberate trade-off: the error surfaces as "Exception ignored in
+    __del__" and the finalizer's allocation does not happen, which is strictly
+    better than hanging the process. Warp's own finalizers only release,
+    never allocate; queuing a registration instead is not possible, because
+    the caller needs the pointer registered when ``allocate`` returns."""
     raise RuntimeError(
         f"Metal: {what} from a finalizer that interrupted a Metal buffer-registry critical section "
         "(allocating or wrapping Metal memory inside __del__ / weakref.finalize is not supported)"
