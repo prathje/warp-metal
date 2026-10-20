@@ -7577,6 +7577,95 @@ class TestMetalCoopTiles(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet, timeout=180)
 
+    def test_block_index_of_1d_tid_is_uniform(self):
+        # ``tid = wp.tid(); wid = tid / wp.block_dim()`` is the block index:
+        # per-world loads and early returns keyed on it keep the collectives
+        # on the 32-lane path (Kamino's dense PGS shape). ``tid`` itself,
+        # ``tid % block_dim`` and other divisions stay lane-dependent.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            opts = {"enable_backward": False}
+
+            @wp.kernel(module="unique", module_options=opts)
+            def per_world(counts: wp.array[wp.int32], a: wp.array[wp.float32], out: wp.array[wp.float32]):
+                tid = wp.tid()
+                bd = wp.int32(wp.block_dim())
+                lane = tid % bd
+                wid = tid / bd
+                n = counts[wid]
+                if n == 0:
+                    return
+                acc = wp.float32(0.0)
+                i = lane
+                while i < n:
+                    acc += a[wid * 64 + i]
+                    i += bd
+                s = wp.tile_sum(wp.tile(acc))[0]
+                m = wp.tile_max(wp.tile(acc))[0]
+                if lane == 0:
+                    out[2 * wid] = s
+                    out[2 * wid + 1] = m
+
+            @wp.kernel(module="unique", module_options=opts)
+            def lane_return(a: wp.array[wp.float32], out: wp.array[wp.float32]):
+                tid = wp.tid()
+                bd = wp.int32(wp.block_dim())
+                wid = tid / bd
+                v = a[tid]
+                if tid % bd == 3:
+                    return
+                out[wid] = wp.tile_sum(wp.tile(v))[0]
+
+            @wp.kernel(module="unique", module_options=opts)
+            def half_return(a: wp.array[wp.float32], out: wp.array[wp.float32]):
+                tid = wp.tid()
+                half = tid / 16
+                v = a[tid]
+                if half % 2 == 1:
+                    return
+                out[tid / 32] = wp.tile_sum(wp.tile(v))[0]
+
+            rng = np.random.default_rng(4)
+            nworld = 5
+            counts_np = np.array([64, 0, 1, 33, 40], np.int32)
+            a_np = rng.random(nworld * 64).astype(np.float32)
+            dev = 'metal:0'
+            out = wp.full(2 * nworld, -1.0, dtype=wp.float32, device=dev)
+            wp.launch(per_world, dim=nworld * 32, inputs=[wp.array(counts_np, device=dev), wp.array(a_np, device=dev), out],
+                      block_dim=32, device=dev)
+            assert per_world._metal_artifact.coop_block_n == 32
+            o = out.numpy()
+            for w in range(nworld):
+                n = int(counts_np[w])
+                if n == 0:
+                    assert o[2 * w] == -1.0 and o[2 * w + 1] == -1.0
+                    continue
+                vals = a_np[w * 64 : w * 64 + n]
+                partial = [vals[l::32].sum() for l in range(min(32, n))]
+                np.testing.assert_allclose(o[2 * w], vals.sum(), rtol=1e-5)
+                np.testing.assert_allclose(o[2 * w + 1], max(partial), rtol=1e-6)
+            # CPU runs one lane per world: same sums.
+            out_c = wp.full(2 * nworld, -1.0, dtype=wp.float32, device='cpu')
+            wp.launch(per_world, dim=nworld, inputs=[wp.array(counts_np, device='cpu'), wp.array(a_np, device='cpu'), out_c],
+                      block_dim=1, device='cpu')
+            np.testing.assert_allclose(o[0::2], out_c.numpy()[0::2], rtol=1e-5)
+
+            # A lane-dependent early return before the collective: never the SIMD path.
+            for k in (lane_return, half_return):
+                o = wp.zeros(nworld, dtype=wp.float32, device=dev)
+                try:
+                    wp.launch(k, dim=nworld * 32, inputs=[wp.array(a_np[: nworld * 32], device=dev), o],
+                              block_dim=32, device=dev)
+                    o.numpy()
+                except RuntimeError:
+                    pass
+                assert k._metal_artifact.coop_block_n == 0, k.key
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=180)
+
     def test_integer_and_nan_reductions(self):
         # int32 tile_sum/min/max are exact; float min/max follow Warp's
         # fmin/fmax semantics (a NaN operand is ignored unless all are NaN),

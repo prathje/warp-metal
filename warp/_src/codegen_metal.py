@@ -8833,6 +8833,8 @@ _COOP_INPLACE_PAT = re.compile(r"^\s*wp::\w*(?:assign_inplace|_inplace)\s*\(\s*v
 _COOP_LOOP_START_PAT = re.compile(r"^\s*(start_\w+):;\s*$")
 _COOP_LOOP_HEADER_PAT = re.compile(r"^\s*if\s*\((.*)\)\s*goto\s+(end_\w+)\s*;\s*$")
 _COOP_IF_PAT = re.compile(r"^\s*if\s*\((.*)\)\s*\{\s*$")
+_COOP_BD_CAST_PAT = re.compile(r"^wp::(?:int32|copy)\(\s*var_(\w+)\s*\)$")
+_COOP_BLOCK_INDEX_PAT = re.compile(r"^wp::(?:div|floordiv)\(\s*var_(\w+)\s*,\s*var_(\w+)\s*\)$")
 _COOP_COLLECTIVE_PAT = re.compile(
     r"\bwp::tile_(reduce|sum|min|max|scan_inclusive|scan_exclusive|from_thread|extract|scatter_masked)\b"
     r"\s*(?:<[^()]*>)?\s*\(\s*([^,)]*)"
@@ -8868,6 +8870,27 @@ def _coop_collectives_uniform(
     """
     taint: set[str] = set(lane_labels)
     state = {"sticky": False, "bad": False}
+    # 1-D form: ``tid = wp.tid()``, ``wid = tid / wp.block_dim()`` is the
+    # block index. The coop launch (one SIMD group per block, ``dim`` a
+    # multiple of the block width, ``block_dim`` equal to it) puts every lane
+    # of a block in the same threadgroup, so it is uniform; ``tid % bd`` and
+    # ``tid`` itself stay lane-dependent. Only single-assignment locals count.
+    assigned: dict[str, list[str]] = {}
+    for ln in lines:
+        m_as = _COOP_ASSIGN_PAT.match(ln)
+        if m_as:
+            assigned.setdefault(m_as.group(1), []).append(m_as.group(2).strip())
+    tid1d_labels = {lb for lb, rhs in assigned.items() if rhs == ["builtin_tid1d()"]}
+    bd_labels = {lb for lb, rhs in assigned.items() if rhs == ["builtin_block_dim()"]}
+    for lb, rhs in assigned.items():
+        if len(rhs) == 1:
+            m_cast = _COOP_BD_CAST_PAT.match(rhs[0])
+            if m_cast and m_cast.group(1) in bd_labels:
+                bd_labels.add(lb)
+
+    def block_index(rhs: str) -> bool:
+        m_div = _COOP_BLOCK_INDEX_PAT.match(rhs)
+        return bool(m_div) and m_div.group(1) in tid1d_labels and m_div.group(2) in bd_labels
     # Enclosing loops (innermost last) and the loops a lane-dependent
     # ``break`` / ``continue`` (``goto end_X`` / ``goto start_X``) has made
     # divergent: the rest of such a loop runs with a subset of the lanes, and
@@ -8991,7 +9014,7 @@ def _coop_collectives_uniform(
                 if m_as and not t.startswith("if"):
                     lhs, rhs = m_as.group(1), m_as.group(2)
                     uni = collective_uniform_result(rhs)
-                    if uni is True:
+                    if uni is True or block_index(rhs):
                         value = divergent
                     else:
                         value = divergent or tainted(rhs) or "wp::atomic_" in rhs or "builtin_tid1d(" in rhs
