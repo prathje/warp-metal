@@ -22352,8 +22352,11 @@ _PTAB_RESIDENT_REFS: dict[int, int] = {}
 # ``_ptab_release`` runs from ``weakref.finalize`` (a GC can start it between
 # the read and the write of another update to the same count, losing one of
 # them), so it never blocks on the lock: it queues, and whoever holds the
-# lock applies the queue before letting go of it.
-_PTAB_LOCK = threading.Lock()
+# lock applies the queue before letting go of it. Re-entrant only so a
+# finalizer run by a GC inside ``_ptab_apply_pending`` (which calls into the
+# dispatcher) can detect that with ``_is_owned()``; counts are never applied
+# re-entrantly.
+_PTAB_LOCK = threading.RLock()
 _PTAB_PENDING: collections.deque = collections.deque()
 
 
@@ -22376,8 +22379,8 @@ def _ptab_apply_pending() -> None:
 
 def _ptab_drain() -> None:
     while _PTAB_PENDING:
-        if not _PTAB_LOCK.acquire(blocking=False):
-            return  # the holder applies the queue before releasing
+        if _PTAB_LOCK._is_owned() or not _PTAB_LOCK.acquire(blocking=False):
+            return  # the holder (an outer frame or another thread) applies the queue
         try:
             _ptab_apply_pending()
         finally:
@@ -22427,9 +22430,17 @@ def _struct_array_ptr_table(arr, struct_type, fpath: tuple[str, ...]):
 
 
 def _ptab_retain(dispatcher, bufs) -> None:
-    # Never called from a finalizer, so it may block; it must, since the
-    # buffers have to be resident before the launch that follows.
-    _PTAB_PENDING.append((dispatcher, list(bufs), 1))
+    bufs = list(bufs)
+    if _PTAB_LOCK._is_owned():
+        # A finalizer that launches, run by a GC inside ``_ptab_apply_pending``
+        # on this thread: make the buffers resident now (idempotent) for the
+        # launch that follows, and leave the +1 to the outer holder.
+        for buf in bufs:
+            dispatcher.add_resident_resource(buf)
+        _PTAB_PENDING.append((dispatcher, bufs, 1))
+        return
+    # Otherwise block: the buffers have to be resident before the launch.
+    _PTAB_PENDING.append((dispatcher, bufs, 1))
     with _PTAB_LOCK:
         _ptab_apply_pending()
     _ptab_drain()  # releases queued by finalizers while the lock was held
