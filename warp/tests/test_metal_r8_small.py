@@ -302,7 +302,18 @@ _F64_FP32_WARN_BODY = textwrap.dedent(
         # an fp64 one (``* 0`` keeps the result bit-comparable with CPU).
         b[i] = wp.sqrt(a[i]) * a[i] / wp.float64(3.0) + wp.float64(wp.sin(wp.float32(a[i]))) * wp.float64(0.0)
 
-    for k in (k_trans, k_exact):
+    DEAD = wp.constant(0)
+
+    @wp.kernel(module="unique")
+    def k_dead(a: wp.array[wp.float64], b: wp.array[wp.float64]):
+        i = wp.tid()
+        # Statically dead (constant guard): dropped before MSL, must not warn.
+        if DEAD == 1:
+            b[i] = wp.exp(a[i])
+        else:
+            b[i] = a[i] * wp.float64(2.0)
+
+    for k in (k_trans, k_exact, k_dead):
         wp.set_module_options({"metal_fp64": "emulate"}, module=k.module)
 
     x = np.linspace(0.1, 2.0, 37)
@@ -311,7 +322,7 @@ _F64_FP32_WARN_BODY = textwrap.dedent(
     with contextlib.redirect_stderr(err):
         for dev in ("metal:0", "cpu"):
             a = wp.array(x, dtype=wp.float64, device=dev)
-            for k in (k_trans, k_exact):
+            for k in (k_trans, k_exact, k_dead):
                 b = wp.zeros_like(a)
                 for _ in range(3):
                     wp.launch(k, dim=a.shape[0], inputs=[a, b], device=dev)
@@ -323,6 +334,7 @@ _F64_FP32_WARN_BODY = textwrap.dedent(
     assert "sqrt" not in hits[0].split(" on float64")[0], hits
     # Exact parts stay bit-exact; the fp32 transcendentals carry fp32 error only.
     np.testing.assert_array_equal(outs[("metal:0", k_exact.key)], outs[("cpu", k_exact.key)])
+    np.testing.assert_array_equal(outs[("metal:0", k_dead.key)], outs[("cpu", k_dead.key)])
     np.testing.assert_allclose(outs[("metal:0", k_trans.key)], outs[("cpu", k_trans.key)], rtol=1e-6)
 
     # A new process would load the artifact from the on-disk cache without

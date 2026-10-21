@@ -16932,8 +16932,14 @@ def _generate_msl_kernel_uncached(
     # Component stores into array elements inside inlined ``@wp.func``
     # bodies (``arr[i][j, k] = x`` on an array the function was passed).
     _ast_nodes = _lower_inlined_array_slots(_ast_nodes, adj)
+    # Drop statically-dead branches (geom-type constants baked by kernel
+    # builders) BEFORE the view/field folds — dead mesh-only branches
+    # reference array struct fields that are never assigned for the live
+    # geom types.
+    _ast_nodes = _ast_fold_const_branches(_ast_nodes, adj, _inlined_const_ints)
     # Emulated-fp64 transcendentals that run in fp32 (warned per kernel by
-    # ``_generate_msl_kernel_cached``, also on a warm cache load).
+    # ``_generate_msl_kernel_cached``, also on a warm cache load). Scanned
+    # after the dead-branch fold, so a statically dead call does not warn.
     _fp32_transcendentals = (
         _f64_fp32_transcendental_calls(
             _ast_emit(_ast_nodes),
@@ -16942,11 +16948,6 @@ def _generate_msl_kernel_uncached(
         if _fp64_mode() == "emulate"
         else ()
     )
-    # Drop statically-dead branches (geom-type constants baked by kernel
-    # builders) BEFORE the view/field folds — dead mesh-only branches
-    # reference array struct fields that are never assigned for the live
-    # geom types.
-    _ast_nodes = _ast_fold_const_branches(_ast_nodes, adj, _inlined_const_ints)
     _ast_nodes, _tuple_skip = _ast_fold_tuples(_ast_nodes, adj, _inlined_var_ctypes)
     # Thread-local ``wp.zeros(shape, dtype)`` arrays (``wp::fixedarray_t``)
     # and the array locals derived from them -> MSL thread arrays.
