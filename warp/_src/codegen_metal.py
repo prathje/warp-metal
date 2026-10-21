@@ -6974,6 +6974,11 @@ _MISC_MATH_HELPERS: dict[str, str] = {
     # Warp's step is 1 for x < 0 — the reverse of GLSL/MSL ``step``.
     "wp_step": ("template <typename T>\ninline T wp_step(T x) { return x < T(0) ? T(1) : T(0); }"),
     "wp_nonzero": ("template <typename T>\ninline T wp_nonzero(T x) { return x == T(0) ? T(0) : T(1); }"),
+    # ``wp.bit_count`` (Warp > 1.18, GH-2071): set bits of the fixed-width
+    # two's-complement value, as an int32. ``metal::popcount`` counts the bits
+    # of the operand's own width (char/short/int/long and unsigned), so signed
+    # inputs need no widening.
+    "wp_bit_count": ("template <typename T>\ninline int wp_bit_count(T x) { return int(metal::popcount(x)); }"),
     # ``%`` is integer-only in MSL; float/half dispatch to ``metal::fmod``
     # (truncated remainder, matching Warp's native ``mod``).
     "wp_mod": (
@@ -11546,6 +11551,7 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bwp::sign\b"), "wp_sign"),
     (re.compile(r"\bwp::step\b"), "wp_step"),
     (re.compile(r"\bwp::nonzero\b"), "wp_nonzero"),
+    (re.compile(r"\bwp::bit_count\b"), "wp_bit_count"),
     # ``wp::cbrt`` — MSL has no cbrt; emulate with copysign+pow so
     # negative inputs keep their sign like C's ``cbrtf``.
     (re.compile(r"\bwp::cbrt\b"), "wp_cbrt"),
@@ -16114,7 +16120,7 @@ _ARRAY_CTYPE_ELEM_PAT = re.compile(r"^wp::array_t<\s*(.+?)\s*>$")
 
 def _materialize_for_loop_vars(lines: list[str]) -> list[str]:
     """Give AST-emitted ``for`` loops a private counter when their iteration
-    variable is read after the loop.
+    variable is read after the loop or written inside it.
 
     Warp's IR draws each iteration value from a ``range_t`` iterator, so
     after a loop that ran to completion the variable holds the *last*
@@ -16146,14 +16152,33 @@ def _materialize_for_loop_vars(lines: list[str]) -> list[str]:
                 last_use[name] = j
     rewrite: dict[int, re.Match[str]] = {}
     for i, m in loops:
+        iv_ref = f"var_{m.group('iv')}"
+        write_pat = None
+        written = False
         depth = 0
         close = None
         for j in range(i, len(lines)):
-            depth += lines[j].count("{") - lines[j].count("}")
+            ln = lines[j]
+            depth += ln.count("{") - ln.count("}")
             if depth <= 0:
                 close = j
                 break
-        if close is not None and last_use.get(m.group("iv"), -1) > close:
+            if j > i and not written and iv_ref in ln:
+                if write_pat is None:
+                    write_pat = re.compile(
+                        rf"(?:\b{iv_ref}\s*(?:[-+*/%&|^]|<<|>>)?=(?!=)|\+\+\s*{iv_ref}\b|--\s*{iv_ref}\b"
+                        rf"|\b{iv_ref}\s*(?:\+\+|--)|&\s*\(?\s*{iv_ref}\b"
+                        # statement-level call on it, e.g. ``wp::assign(var_X, var_Y);``
+                        # (adjoint calls only read the primal)
+                        rf"|^\s*(?!(?:if|while|for|switch|return)\b|(?:wp::)?(?:wp_)?adj_)(?:wp::)?\w+\s*\(\s*&?\s*{iv_ref}\b)"
+                    )
+                written = write_pat.search(ln) is not None
+        # The body writes the variable itself: Warp's IR re-binds a
+        # reassigned loop target (``i = i + 3``) by copying the new value
+        # back at the end of the body, which must not move a C loop driven by
+        # that variable (it skipped iterations forward and never terminated
+        # in reverse). Python iteration ignores the write; the counter does too.
+        if close is not None and (written or last_use.get(m.group("iv"), -1) > close):
             rewrite[i] = m
     out: list[str] = []
     n_it = 0

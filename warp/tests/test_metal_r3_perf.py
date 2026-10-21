@@ -94,6 +94,33 @@ class TestMetalForLoopMaterialize(unittest.TestCase):
         self.assertEqual(out[4], "    var_3 = wp_for_it0;")
         self.assertEqual(out[5:], lines[4:])
 
+    def test_rewrites_loops_whose_body_writes_the_variable(self):
+        # ``i = i + 3`` in the body: Warp copies the new value back into the
+        # loop variable, which must not drive the C loop.
+        from warp._src.codegen_metal import _materialize_for_loop_vars  # noqa: PLC0415
+
+        lines = [
+            "for (var_4 = 19; var_4 > -1; var_4 += -1) {",
+            "    var_6 = wp::add(var_4, var_5);",
+            "    wp::assign(var_4, var_6);",
+            "    wp_adj_add(var_4, var_5, adj_4, adj_5, adj_6);",
+            "}",
+            "for (var_7 = 0; var_7 < 20; ++var_7) {",
+            "    var_8 = var_7 + 1;",
+            "    if (var_7 == 3) {",
+            "    wp_adj_cast(var_7, adj_7, adj_8);",
+            "    }",
+            "}",
+            "for (var_9 = 0; var_9 < 20; ++var_9) {",
+            "    var_9 = var_8;",
+            "}",
+        ]
+        out = _materialize_for_loop_vars(lines)
+        self.assertEqual(out[0], "for (int wp_for_it0 = 19; wp_for_it0 > -1; wp_for_it0 += -1) {")
+        self.assertEqual(out[1], "var_4 = wp_for_it0;")
+        self.assertEqual(out[2:7], lines[1:6])  # reads / adjoint calls only: unchanged
+        self.assertEqual(out[12], "for (int wp_for_it1 = 0; wp_for_it1 < 20; ++wp_for_it1) {")
+
     def test_linear_on_many_loops(self):
         # One loop per 3 lines over a 60k-line body: the previous rescan of
         # the remaining kernel per loop took minutes at this size (this test

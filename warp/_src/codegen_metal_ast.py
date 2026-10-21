@@ -619,7 +619,105 @@ def parse(lines: list[str]) -> list[Node]:
     A later pass folds matched if/else and for/while regions into nested
     :class:`If` / :class:`For` / :class:`While` nodes so visitors can recurse.
     """
-    return [parse_line(line) for line in lines]
+    return [parse_line(line) for line in canonicalize_constant_loops(lines)]
+
+
+# ---------------------------------------------------------------------------
+# Rolled constant-range loops (Warp > 1.18, GH-1954)
+# ---------------------------------------------------------------------------
+# A constant ``range()`` longer than ``max_unroll`` with no ``break`` /
+# ``continue`` is lowered with a plain ``int32`` counter instead of a
+# ``wp::range_t``:
+#
+#   forward                                   reverse
+#   var_X = START;                            var_X = LAST;
+#   start_for_K:;                             start_for_K:;
+#       if (var_X >= STOP) goto end_for_K;        if (var_X < START) goto end_for_K;
+#       var_Y = var_X;                            var_Y = var_X;
+#       var_X += STEP;                            var_X -= STEP;
+#
+# (``<=`` / ``>`` for a negative step). The reverse opener carries its own
+# bounds, so no ``wp::iter_reverse`` / replayed ``wp::range`` is involved.
+# Both are rewritten to the ``wp::range`` / ``iter_cmp`` / ``iter_next``
+# opener of older Warp, which the structural fold already turns into a native
+# ``for``. The range object gets a fresh ``var_X__crange`` name: ``var_X``
+# itself is an ordinary declared ``int32`` local that the replay still assigns
+# (``var_X = START;`` standing alone), so its declaration must survive the
+# fold's range-object decl suppression.
+
+_CRANGE_INIT = re.compile(r"^(?P<indent>\s*)var_(?P<it>\w+)\s*=\s*(?P<value>-?\d+)\s*;\s*$")
+_CRANGE_LABEL = re.compile(r"^\s*start_for_(?P<k>\d+)\s*:\s*;\s*$")
+_CRANGE_TEST = re.compile(
+    r"^(?P<indent>\s*)if\s*\(\s*var_(?P<it>\w+)\s*(?P<op>>=|<=|<|>)\s*(?P<bound>-?\d+)\s*\)\s*"
+    r"goto\s+end_for_(?P<k>\d+)\s*;\s*$"
+)
+_CRANGE_VALUE = re.compile(r"^(?P<indent>\s*)var_(?P<val>\w+)\s*=\s*var_(?P<it>\w+)\s*;\s*$")
+_CRANGE_STEP = re.compile(r"^\s*var_(?P<it>\w+)\s*(?P<op>\+=|-=)\s*(?P<step>-?\d+)\s*;\s*$")
+CRANGE_SUFFIX = "__crange"
+
+
+def canonicalize_constant_loops(lines: list[str]) -> list[str]:
+    """Rewrite rolled constant-range loop openers to the ``wp::range`` form.
+
+    Lines that do not form the five-line opener described above pass through
+    unchanged, so IR from Warp <= 1.18 (and any loop that keeps a
+    ``wp::range_t``) is unaffected. An opener whose comparison and step
+    disagree raises :class:`MetalASTParseError` instead of guessing the
+    iteration space.
+    """
+    lines = list(lines)
+    if not any("start_for_" in ln for ln in lines):
+        return lines
+    out: list[str] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        m_init = _CRANGE_INIT.match(lines[i])
+        m_label = _CRANGE_LABEL.match(lines[i + 1]) if m_init and i + 4 < n else None
+        if m_label is None:
+            out.append(lines[i])
+            i += 1
+            continue
+        m_test = _CRANGE_TEST.match(lines[i + 2])
+        m_value = _CRANGE_VALUE.match(lines[i + 3])
+        m_step = _CRANGE_STEP.match(lines[i + 4])
+        it = m_init.group("it")
+        if not (
+            m_test
+            and m_value
+            and m_step
+            and m_test.group("k") == m_label.group("k")
+            and m_test.group("it") == it
+            and m_value.group("it") == it
+            and m_step.group("it") == it
+        ):
+            out.append(lines[i])
+            i += 1
+            continue
+        init = int(m_init.group("value"))
+        bound = int(m_test.group("bound"))
+        step = int(m_step.group("step"))
+        cmp_op, step_op = m_test.group("op"), m_step.group("op")
+        if step == 0:
+            raise MetalASTParseError(f"constant range loop with zero step: {lines[i + 4]!r}")
+        if step_op == "+=" and cmp_op == (">=" if step > 0 else "<="):
+            # Forward: START, STOP, STEP as written.
+            start, stop, rstep = init, bound, step
+        elif step_op == "-=" and cmp_op == ("<" if step > 0 else ">"):
+            # Reverse: LAST down to START (inclusive) in steps of -STEP.
+            start, stop, rstep = init, bound - step, -step
+        else:
+            raise MetalASTParseError(
+                f"constant range loop opener with inconsistent test/step: {lines[i + 2].strip()!r} / {lines[i + 4].strip()!r}"
+            )
+        rng = f"var_{it}{CRANGE_SUFFIX}"
+        k = m_label.group("k")
+        out.append(f"{m_init.group('indent')}{rng} = wp::range({start}, {stop}, {rstep});")
+        out.append(lines[i + 1])
+        out.append(f"{m_test.group('indent')}if (iter_cmp({rng}) == 0) goto end_for_{k};")
+        out.append(f"{m_value.group('indent')}var_{m_value.group('val')} = wp::iter_next({rng});")
+        i += 5
+    return out
 
 
 def emit(nodes: list[Node]) -> list[str]:
