@@ -606,6 +606,41 @@ class TestMetalR4Kamino(unittest.TestCase):
             """,
         )
 
+    def test_block_model_switch_restores_unset_flags(self):
+        # A kernel that never took the coop model at block_dim=32 has no coop
+        # flags set. Switching to the serial model and back restored them as
+        # ``None``, and the backward pass at the new grad set then failed
+        # with ``'>' not supported between 'NoneType' and 'int'``.
+        _run(
+            self,
+            """
+            N = 64
+
+            @wp.kernel(module="unique")
+            def k(a: wp.array[float], b: wp.array[float], out: wp.array[float]):
+                i = wp.tid()
+                t = wp.tile(a[i] + b[i] * a[i])
+                out[i] = wp.untile(wp.tile_map(wp.sin, t)) * 2.0
+
+            rng = np.random.default_rng(0)
+            A, B = rng.random(N).astype(np.float32), rng.random(N).astype(np.float32)
+
+            def run(dev, bd, grad_b):
+                a = wp.array(A, dtype=float, device=dev, requires_grad=True)
+                b = wp.array(B, dtype=float, device=dev, requires_grad=grad_b)
+                o = wp.zeros(N, dtype=float, device=dev, requires_grad=True)
+                tape = wp.Tape()
+                with tape:
+                    wp.launch(k, dim=N, inputs=[a, b, o], device=dev, block_dim=bd)
+                tape.backward(grads={o: wp.ones(N, dtype=float, device=dev)})
+                res = [o.numpy(), a.grad.numpy()] + ([b.grad.numpy()] if grad_b else [])
+                return np.concatenate(res)
+
+            for bd, grad_b in ((32, False), (1, False), (32, True)):
+                np.testing.assert_allclose(run("metal:0", bd, grad_b), run("cpu", 1, grad_b), atol=1e-5)
+            """,
+        )
+
     def test_metal_module_options_do_not_change_module_hash(self):
         # ``metal_*`` module options are Metal-only: CPU/CUDA module hashes
         # (and so their kernel caches) must not change when one is set.

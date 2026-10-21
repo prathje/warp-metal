@@ -16848,7 +16848,7 @@ def _ensure_adj_built(kernel, block_dim: int | None = None, enable_backward: boo
         or not _callee_ir_current(getattr(adj, "_metal_ir_callee_blocks", ()))
     ):
         adj._metal_ir_ok = False
-        stale_coop_n = getattr(adj, "_metal_coop_block_n", 0)
+        stale_coop_n = getattr(adj, "_metal_coop_block_n", 0) or 0
         if stale_coop_n > 0:
             _build(stale_coop_n, bool(getattr(adj, "_metal_built_backward", False)))
             adj._metal_coop_plan = _coop_block_classify(adj, honest=True)
@@ -23941,8 +23941,13 @@ def _block_model_key(block_dim: int | None) -> str:
 
 # Kernel attributes derived from the current artifact (rebuilt lazily).
 _ARTIFACT_DERIVED_ATTRS = ("_metal_native_arg_by_name", "_metal_native_const_buf_cache", "_metal_alias_psos")
-# Adjoint attributes recording the block-model decision.
-_ADJ_MODEL_ATTRS = ("_metal_coop_block_n", "_metal_coop_plan", "_metal_coop_block_checked", "_metal_wide_block_checked")
+# Adjoint attributes recording the block-model decision, with their unset values.
+_ADJ_MODEL_ATTRS = {
+    "_metal_coop_block_n": 0,
+    "_metal_coop_plan": None,
+    "_metal_coop_block_checked": False,
+    "_metal_wide_block_checked": False,
+}
 
 
 def _reset_adj_block_model(adj) -> None:
@@ -23987,7 +23992,7 @@ def _switch_block_model(kernel, block_dim: int | None) -> None:
             artifact,
             getattr(kernel, "_metal_native_pso", None),
             getattr(kernel, "_metal_native_wrapped_source", None),
-            {a: getattr(adj, a, None) for a in _ADJ_MODEL_ATTRS},
+            {a: getattr(adj, a, unset) for a, unset in _ADJ_MODEL_ATTRS.items()},
         )
     for attr in _ARTIFACT_DERIVED_ATTRS:
         if hasattr(kernel, attr):
