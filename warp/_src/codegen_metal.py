@@ -13563,8 +13563,13 @@ def _translate_tile_intrinsics(
         #   adj_C *= beta (accumulating ``tile_matmul(a, b, out)`` form only;
         #   the value-returning form leaves ``adj_C`` alone like
         #   ``adj_tile_matmul`` in ``tile_matmul.h``).
-        # Each block is one thread holding every tile in a private struct, so
-        # the products are plain loops. Anything outside that model raises.
+        # Each block is one thread holding every tile in a private struct.
+        # Both products go through the noinline ``wp_tile_matmul_t{a,b}``
+        # helpers (beta = 1 accumulates): written as two inline loop nests in
+        # one kernel, the Apple GPU compiler dropped the adj_B nest's reads of
+        # adj_C when another tile_matmul adjoint had just accumulated into it
+        # (a chained ``tile_matmul(tile_matmul(a, b), c)`` came back with a
+        # zero gradient for ``b``). Anything outside that model raises.
         if is_coop_kernel or coop_block_n > 0:
             raise MetalCodegenError(
                 f"MSL codegen: reverse of tile_matmul is only supported in the serial tile model or with a "
@@ -13584,30 +13589,28 @@ def _translate_tile_intrinsics(
             raise MetalCodegenError(
                 f"MSL codegen: reverse of tile_matmul on emulated float64 tiles is not supported ({m.group(0)!r})"
             )
+        if len({d[2] for d in dims}) != 1:
+            raise MetalCodegenError(
+                f"MSL codegen: reverse of tile_matmul with mixed operand precisions is not supported ({m.group(0)!r})"
+            )
         # The dual of the product must not be one of the operands' duals: the
-        # loops read ``adj_C`` while they accumulate into ``adj_A`` / ``adj_B``.
+        # helpers read ``adj_C`` while they accumulate into ``adj_A`` / ``adj_B``.
         if adj_c in (adj_a, adj_b):
             raise MetalCodegenError(f"MSL codegen: reverse of tile_matmul with C aliasing A or B ({m.group(0)!r})")
         (r, k, _), (k2, n, _), (r2, n2, scalar) = dims
         if k != k2 or r != r2 or n != n2:
             raise MetalCodegenError(f"MSL codegen: adj_tile_matmul operand shapes disagree in {m.group(0)!r}")
-        a_scalar, b_scalar = dims[0][2], dims[1][2]
 
         def el(var: str, a: int, b: int, idx: str) -> str:
             return var if a == 1 and b == 1 else f"{var}.c[{idx}]"
 
-        al = f"(float)({alpha_arg})"
+        al = f"({scalar})({alpha_arg})"
+        one = f"({scalar})(1.0f)"
+        # adj_A (r x k) += alpha * adj_C (r x n) @ B^T, B held as k x n.
+        # adj_B (k x n) += alpha * A^T @ adj_C (r x n), A held as r x k.
         out = (
-            f"{{ for (int _am_r = 0; _am_r < {r}; ++_am_r) for (int _am_k = 0; _am_k < {k}; ++_am_k) {{ "
-            f"float _am_s = 0.0f; for (int _am_n = 0; _am_n < {n}; ++_am_n) "
-            f"_am_s = metal::fma((float){el(adj_c, r, n, f'_am_r * {n} + _am_n')}, "
-            f"(float){el(b_arg, k, n, f'_am_k * {n} + _am_n')}, _am_s); "
-            f"{el(adj_a, r, k, f'_am_r * {k} + _am_k')} += ({a_scalar})({al} * _am_s); }} "
-            f"for (int _am_k = 0; _am_k < {k}; ++_am_k) for (int _am_n = 0; _am_n < {n}; ++_am_n) {{ "
-            f"float _am_s = 0.0f; for (int _am_r = 0; _am_r < {r}; ++_am_r) "
-            f"_am_s = metal::fma((float){el(a_arg, r, k, f'_am_r * {k} + _am_k')}, "
-            f"(float){el(adj_c, r, n, f'_am_r * {n} + _am_n')}, _am_s); "
-            f"{el(adj_b, k, n, f'_am_k * {n} + _am_n')} += ({b_scalar})({al} * _am_s); }} "
+            f"{{ wp_tile_matmul_tb_{r}x{n}x{k}_{scalar}({adj_c}, {b_arg}, {adj_a}, {al}, {one}); "
+            f"wp_tile_matmul_ta_{k}x{r}x{n}_{scalar}({a_arg}, {adj_c}, {adj_b}, {al}, {one}); "
         )
         if scale_c:
             out += (
