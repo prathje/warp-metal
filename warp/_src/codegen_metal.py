@@ -12386,8 +12386,8 @@ def _tile_grad_slots(
     cols: int,
     vec_n: int,
     two_d: bool | None = None,
-) -> list[tuple[str, str]]:
-    """``[(array_flat_index, tile_element_accessor)]`` for a tile/array pairing.
+) -> list[tuple[str, str, str]]:
+    """``[(array_flat_index, tile_element_accessor, in_bounds)]`` for a tile/array pairing.
 
     Mirrors the index arithmetic of the forward ``tile_store`` /
     ``tile_atomic_add`` lowering so the reverse pass touches exactly the
@@ -12395,33 +12395,45 @@ def _tile_grad_slots(
     tile local to reach one scalar: ``""`` for a tile that collapsed to a
     plain scalar, ``.c[k]`` for a register tile, plus ``[e]`` for the
     component of a vec-element tile.
+
+    ``in_bounds`` is the MSL condition under which the element lies inside
+    the array's tiled dimensions. The forward load zero-fills, and the
+    forward store skips, every element outside them (a partial tile at the
+    array's edge), so the reverse pass must skip those elements too: an
+    unguarded scatter would write past the array and alias other rows.
     """
     if two_d is None:
         two_d = cols > 1
     scalar_inner_dims = (2 if two_d else 1) + (1 if vec_n else 0)
     base_expr = _build_flat_base_expr(arr_name, lead_idx_args, inner_dims=scalar_inner_dims)
+    row_dim = f"(int){arr_name}_shape[{len(lead_idx_args)}]"
     if two_d:
         row_stride = f"{arr_name}_shape[{len(lead_idx_args) + 1}]"
+        col_dim = f"(int){arr_name}_shape[{len(lead_idx_args) + 1}]"
         row_off, col_off = offsets[0], offsets[1]
     else:
         row_stride = "1"
+        col_dim = None
         row_off, col_off = offsets[0], "0"
     n_elem = rows * cols
-    slots: list[tuple[str, str]] = []
+    slots: list[tuple[str, str, str]] = []
     for i in range(rows):
         for j in range(cols):
             flat = f"{base_expr} + (({row_off}) + {i}) * ({row_stride}) + (({col_off}) + {j})"
+            guard = f"(({row_off}) + {i}) >= 0 && (({row_off}) + {i}) < {row_dim}"
+            if col_dim is not None:
+                guard += f" && (({col_off}) + {j}) >= 0 && (({col_off}) + {j}) < {col_dim}"
             k = i * cols + j
             if not vec_n:
                 # A single-element tile collapsed to a plain scalar local.
-                slots.append((f"({flat})", "" if n_elem == 1 else f".c[{k}]"))
+                slots.append((f"({flat})", "" if n_elem == 1 else f".c[{k}]", guard))
                 continue
             # ``wp_tile_RxC_vec<N>_<scalar>`` stores flat, element-major and
             # component-minor (``c[(i*cols + j)*N + e]``); a single-element
             # tile collapsed to a bare vec local, indexed component-wise.
             for e in range(vec_n):
                 cell = f"[{e}]" if n_elem == 1 else f".c[{k * vec_n + e}]"
-                slots.append((f"({flat}) * {vec_n} + {e}", cell))
+                slots.append((f"({flat}) * {vec_n} + {e}", cell, guard))
     return slots
 
 
@@ -19151,15 +19163,21 @@ def _generate_msl_kernel_uncached(
                     # once per block.
                     _lead, _offs = index_args[: ndim - n_off], index_args[ndim - n_off :]
                     _base = _build_flat_base_expr(arr_name, _lead, inner_dims=2 if two_d else 1)
+                    _rdim = f"(int){arr_name}_shape[{len(_lead)}]"
                     if two_d:
                         _rstride = f"{arr_name}_shape[{len(_lead) + 1}]"
                         _roff, _coff = _offs[0], _offs[1]
+                        _cguard = f" && (({_coff}) + _al_j) >= 0 && (({_coff}) + _al_j) < (int){_rstride}"
                     else:
                         _rstride, _roff, _coff = "1", _offs[0], "0"
+                        _cguard = ""
+                    # Skip elements of a partial edge tile that lie outside
+                    # the array, as the forward load did (see _tile_grad_slots).
                     body_lines.append(
                         _finalize(
                             f"{indent}for (int _al_e = {_COOP_LANE}; _al_e < {rows * cols}; _al_e += {coop_block_n}) {{ "
                             f"const int _al_i = _al_e / {cols}; const int _al_j = _al_e - _al_i * {cols}; "
+                            f"if ((({_roff}) + _al_i) >= 0 && (({_roff}) + _al_i) < {_rdim}{_cguard}) "
                             f"wp_adj_accum(&{grad_name}[{_base} + (({_roff}) + _al_i) * ({_rstride}) + (({_coff}) + _al_j)], "
                             f"{adj_tile}.c[_al_e]); }}"
                         )
@@ -19174,18 +19192,24 @@ def _generate_msl_kernel_uncached(
                     tile_var_vec_n.get(tile_label, 0),
                     two_d,
                 )
-                for idx_expr, cell in slots:
+                for idx_expr, cell, in_bounds in slots:
                     tgt = f"{grad_name}[{idx_expr}]"
+                    # Elements outside the array (a partial edge tile) were
+                    # zero-filled / skipped by the forward pass; skip them here.
                     if op == "tile_load":
                         # The tile was READ from the array, so its dual
                         # scatters back into the array's gradient.
-                        body_lines.append(_finalize(f"{indent}wp_adj_accum(&{tgt}, {adj_tile}{cell});"))
+                        body_lines.append(
+                            _finalize(f"{indent}if ({in_bounds}) wp_adj_accum(&{tgt}, {adj_tile}{cell});")
+                        )
+                    elif op == "tile_store":
+                        # ``grad_zero_global``: a plain store consumes
+                        # the gradient, an atomic accumulate does not.
+                        body_lines.append(
+                            _finalize(f"{indent}if ({in_bounds}) {{ {adj_tile}{cell} += {tgt}; {tgt} = 0.0f; }}")
+                        )
                     else:
-                        body_lines.append(_finalize(f"{indent}{adj_tile}{cell} += {tgt};"))
-                        if op == "tile_store":
-                            # ``grad_zero_global``: a plain store consumes
-                            # the gradient, an atomic accumulate does not.
-                            body_lines.append(_finalize(f"{indent}{tgt} = 0.0f;"))
+                        body_lines.append(_finalize(f"{indent}if ({in_bounds}) {adj_tile}{cell} += {tgt};"))
                 continue
         # Address lines have been folded into ``subscript_map`` (or, for
         # struct-element pointers, ``struct_refs``). An address whose base
