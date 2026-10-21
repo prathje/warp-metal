@@ -22561,7 +22561,6 @@ def _struct_array_ptr_table_recorded(dispatcher, arr, struct_type, fpath, table,
     see the records from before those writes.
     """
     import ctypes  # noqa: PLC0415
-    import weakref  # noqa: PLC0415
 
     import warp as wp  # noqa: PLC0415
     from warp._src.context import _metal_find_buffer  # noqa: PLC0415
@@ -22573,7 +22572,6 @@ def _struct_array_ptr_table_recorded(dispatcher, arr, struct_type, fpath, table,
     ctypes.memmove(int(tab.ptr), table.ctypes.data, table.nbytes)
     held = {"bufs": list(bufs)}
     _ptab_retain(dispatcher, held["bufs"])
-    arr_ref = weakref.ref(arr)
     nbytes = table.nbytes
     # The reading command is recorded with the then-resident buffers as reads,
     # so the graph orders it after its own writes to those; a buffer bound
@@ -22582,10 +22580,10 @@ def _struct_array_ptr_table_recorded(dispatcher, arr, struct_type, fpath, table,
     graph_writes = dispatcher.record_writes()
 
     def refresh() -> None:
-        a = arr_ref()
-        if a is None:
-            return
-        new, new_bufs = _struct_array_ptr_rows(a, struct_type, fpath)
+        # ``arr`` is held, not weakly referenced: a temporary view or
+        # ``wp.array(ptr=...)`` wrapper passed to the launch dies after the
+        # capture while the records it shares keep changing.
+        new, new_bufs = _struct_array_ptr_rows(arr, struct_type, fpath)
         if new.nbytes != nbytes:
             raise RuntimeError("Metal: a captured struct array with array members changed size")
         for b in new_bufs:

@@ -290,6 +290,43 @@ class TestMetalR8Capture(unittest.TestCase):
             """,
         )
 
+    def test_dynamic_index_temporary_argument_follows_record(self):
+        # Same for the pointer table of a temporary struct-array argument: it
+        # is still rebuilt before every replay after the argument is collected.
+        _run(
+            self,
+            """
+            import gc
+
+            @wp.kernel
+            def readi(d: wp.array[Info], out: wp.array2d[float]):
+                i = wp.tid()
+                out[i, 0] = d[i].a[0]
+
+            def run(dev):
+                items = [mk_info(dev, 100.0), mk_info(dev, 200.0), mk_info(dev, 300.0)]
+                d = wp.array(items, dtype=Info, device=dev)
+                out = wp.zeros((2, 1), dtype=float, device=dev)
+                if dev == "cpu":
+                    go = lambda: wp.launch(readi, 2, [d[1:], out], device=dev)
+                else:
+                    with wp.ScopedCapture(device=dev) as cap:
+                        wp.launch(readi, 2, [d[1:], out], device=dev)
+                    go = lambda: wp.capture_launch(cap.graph)
+                gc.collect()
+                go()
+                r = [out.numpy().copy()]
+                items[1] = mk_info(dev, 700.0)
+                d.assign(wp.array(items, dtype=Info, device=dev))
+                go()
+                r.append(out.numpy().copy())
+                return r
+
+            res = compare(run)
+            assert res["metal:0"][1][0, 0] == 700.0
+            """,
+        )
+
     def test_graph_writing_the_struct_array_is_rejected(self):
         # The pre-replay check reads the records on the host, so it cannot see
         # writes the graph itself makes to them: rejected at capture end.
