@@ -16840,6 +16840,28 @@ def _check_deterministic_mode_supported(kernel, adj) -> None:
         )
 
 
+def _callee_ir_snapshot(adj) -> tuple:
+    """``(func_adj, func_adj.blocks)`` for every user function ``adj`` calls, transitively."""
+    out = []
+    seen = {id(adj)}
+    stack = [adj]
+    while stack:
+        cur = stack.pop()
+        for func in getattr(cur, "called_user_functions", None) or ():
+            func_adj = getattr(func, "adj", None)
+            if func_adj is None or id(func_adj) in seen:
+                continue
+            seen.add(id(func_adj))
+            out.append((func_adj, getattr(func_adj, "blocks", None)))
+            stack.append(func_adj)
+    return tuple(out)
+
+
+def _callee_ir_current(snapshot) -> bool:
+    """Whether no callee in ``snapshot`` (see ``_callee_ir_snapshot``) was rebuilt since."""
+    return all(getattr(func_adj, "blocks", None) is blocks for func_adj, blocks in snapshot)
+
+
 def _ensure_adj_built(kernel, block_dim: int | None = None, enable_backward: bool = False):
     """Build the kernel's forward IR if it hasn't been already; return the adj.
 
@@ -16889,7 +16911,27 @@ def _ensure_adj_built(kernel, block_dim: int | None = None, enable_backward: boo
         _normalize_adj_ir(adj)
         _check_deterministic_mode_supported(kernel, adj)
         adj._metal_built_backward = backward
+        adj._metal_ir_blocks = adj.blocks
+        adj._metal_ir_callee_blocks = _callee_ir_snapshot(adj)
         adj._metal_ir_ok = True
+
+    # A CPU/CUDA compile of the same kernel rebuilds ``kernel.adj`` with its
+    # own builder options (``Adjoint.build`` makes a new ``blocks`` list), so
+    # the IR no longer is the Metal one even though ``_metal_ir_ok`` is still
+    # set. Translating it emitted e.g. ``&((s).scale)`` on a flattened struct
+    # param. The same holds for every ``@wp.func`` the kernel calls: the
+    # inliner splices ``func.adj.blocks``, which any other kernel's build
+    # (CPU/CUDA, or Metal at another width) replaces. Rebuild at the width
+    # the Metal IR was built with; that also rebuilds the callees.
+    if getattr(adj, "_metal_ir_ok", False) and (
+        getattr(adj, "_metal_ir_blocks", None) is not adj.blocks
+        or not _callee_ir_current(getattr(adj, "_metal_ir_callee_blocks", ()))
+    ):
+        adj._metal_ir_ok = False
+        stale_coop_n = getattr(adj, "_metal_coop_block_n", 0) or 0
+        if stale_coop_n > 0:
+            _build(stale_coop_n, bool(getattr(adj, "_metal_built_backward", False)))
+            adj._metal_coop_plan = _coop_block_classify(adj, honest=True)
 
     def _has_reverse() -> bool:
         # The IR always carries ``body_reverse`` lines; what a backward-
@@ -21296,7 +21338,9 @@ def _generate_msl_kernel_uncached(
 # v11: native packed arrays go bindless (``ptr_table`` / ``__arg_ptrs``).
 # v17: Warp's deep kernel content hash joins the key (callee closures), and
 # user-function native names in the hashed body are canonicalised.
-_ARTIFACT_CACHE_VERSION = 17
+# v18: the IR of called ``@wp.func`` helpers joins the key (a helper rebuilt
+# with other builder options produced a different artifact under one key).
+_ARTIFACT_CACHE_VERSION = 18
 _codegen_source_hash_cached: str | None = None
 
 
@@ -21469,6 +21513,28 @@ def _canonical_user_call_names(body: str, adj) -> str:
     return pat.sub(repl, body)
 
 
+def _callee_ir_digest(adj) -> str:
+    """Hash of the forward IR of every user function ``adj`` calls, transitively.
+
+    Deterministic across processes: callees in call order, each as its
+    canonicalised forward body plus its locals' types and constants.
+    """
+    import hashlib  # noqa: PLC0415
+
+    h = hashlib.sha256()
+    for func_adj, blocks in _callee_ir_snapshot(adj):
+        if not blocks:
+            h.update(b"<unbuilt>\x00")
+            continue
+        h.update(_canonical_user_call_names("\n".join(blocks[0].body_forward), func_adj).encode("utf-8"))
+        h.update(b"\x00")
+        for v in getattr(func_adj, "variables", None) or ():
+            const = getattr(v, "constant", None)
+            h.update(f"{v.label}:{v.ctype()}={const!r};".encode())
+        h.update(b"\x01")
+    return h.hexdigest()
+
+
 def _artifact_cache_key(kernel, adj) -> str | None:
     """Cache key over everything the generated artifact depends on."""
     import hashlib  # noqa: PLC0415
@@ -21489,6 +21555,7 @@ def _artifact_cache_key(kernel, adj) -> str | None:
         const_sig = ";".join(
             f"{v.label}={v.constant!r}" for v in adj.variables if getattr(v, "constant", None) is not None
         )
+        callee_ir = _callee_ir_digest(adj)
     except Exception:
         return None
     import warp  # noqa: PLC0415
@@ -21506,6 +21573,10 @@ def _artifact_cache_key(kernel, adj) -> str | None:
         str(opts.get("output_arch")),
         const_sig,
         body,
+        # The IR of every called ``@wp.func`` as the inliner will splice it.
+        # ``content_hash`` covers their source, but not the builder options
+        # their IR was built with.
+        callee_ir,
         # Native dispatch compiles prologue-free artifacts (outputs bind
         # in place); MLX artifacts carry init shadows. Never mix.
         f"native={bool(warp.config.metal_native_dispatch)}",
@@ -21687,8 +21758,18 @@ def _store_cached_failure(key: str, exc: Exception) -> None:
 def generate_msl_kernel(
     kernel, block_dim: int | None = None, adjoint: bool = False, grad_args: tuple[str, ...] = ()
 ) -> MetalKernelArtifact:
-    """Return the MSL artifact for a Warp ``Kernel`` (see ``_generate_msl_kernel_cached``)."""
-    with _kernel_fp64_mode(kernel):
+    """Return the MSL artifact for a Warp ``Kernel`` (see ``_generate_msl_kernel_cached``).
+
+    Runs under Warp's ``_codegen_lock``, as ``Module._run_codegen`` does for
+    CPU/CUDA: the Metal build and the translation read ``kernel.adj`` and the
+    shared ``@wp.func`` adjoints, which a CPU/CUDA build (or another Metal
+    translation) on another thread would otherwise rebuild in between. The
+    translation is pure Python (no dispatcher, allocation or PSO compile) and
+    the lock is re-entrant, so a nested launch on the same thread is fine.
+    """
+    from warp._src.codegen import _codegen_lock  # noqa: PLC0415
+
+    with _codegen_lock, _kernel_fp64_mode(kernel):
         return _generate_msl_kernel_cached(kernel, block_dim=block_dim, adjoint=adjoint, grad_args=grad_args)
 
 
@@ -24060,8 +24141,13 @@ def _block_model_key(block_dim: int | None) -> str:
 
 # Kernel attributes derived from the current artifact (rebuilt lazily).
 _ARTIFACT_DERIVED_ATTRS = ("_metal_native_arg_by_name", "_metal_native_const_buf_cache", "_metal_alias_psos")
-# Adjoint attributes recording the block-model decision.
-_ADJ_MODEL_ATTRS = ("_metal_coop_block_n", "_metal_coop_plan", "_metal_coop_block_checked", "_metal_wide_block_checked")
+# Adjoint attributes recording the block-model decision, with their unset values.
+_ADJ_MODEL_ATTRS = {
+    "_metal_coop_block_n": 0,
+    "_metal_coop_plan": None,
+    "_metal_coop_block_checked": False,
+    "_metal_wide_block_checked": False,
+}
 
 
 def _reset_adj_block_model(adj) -> None:
@@ -24106,7 +24192,7 @@ def _switch_block_model(kernel, block_dim: int | None) -> None:
             artifact,
             getattr(kernel, "_metal_native_pso", None),
             getattr(kernel, "_metal_native_wrapped_source", None),
-            {a: getattr(adj, a, None) for a in _ADJ_MODEL_ATTRS},
+            {a: getattr(adj, a, unset) for a, unset in _ADJ_MODEL_ATTRS.items()},
         )
     for attr in _ARTIFACT_DERIVED_ATTRS:
         if hasattr(kernel, attr):

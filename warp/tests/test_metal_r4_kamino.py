@@ -491,6 +491,267 @@ class TestMetalR4Kamino(unittest.TestCase):
             """,
         )
 
+    def test_metal_ir_rebuilt_after_cpu_compile_of_same_kernel(self):
+        # A CPU (or CUDA) compile rebuilds ``kernel.adj`` with its own builder
+        # options. A later Metal regeneration (here: a float64 mode change
+        # after the first Metal launch) must rebuild the Metal IR rather than
+        # translate the CPU-built one. ``cache_kernels = False`` forces the CPU
+        # compile; with a warm kernel cache the CPU launch skipped codegen,
+        # which made this flaky (it failed only after the cache was cleared).
+        _run(
+            self,
+            """
+            wp.config.cache_kernels = False
+
+            @wp.struct
+            class S:
+                scale: wp.float64
+                n: int
+
+            @wp.kernel
+            def k(a: wp.array[wp.float64], s: S, out: wp.array[float]):
+                i = wp.tid()
+                x = a[i] * s.scale + wp.float64(1.0)
+                out[i] = wp.float32(x - a[i] * s.scale) + wp.float32(s.n)
+
+            def run(dev):
+                a = wp.array([1.0, 3.0], dtype=wp.float64, device=dev)
+                s = S()
+                s.scale = wp.float64(1.0e8)
+                s.n = 2
+                o = wp.zeros(2, dtype=float, device=dev)
+                wp.launch(k, dim=2, inputs=[a, s, o], device=dev)
+                return o.numpy()
+
+            try:
+                run("metal:0")
+            except Exception:
+                pass  # the default mode may reject float64 arguments
+            wp.set_module_options({"metal_fp64": "emulate"})
+            np.testing.assert_array_equal(run("cpu"), 3.0)
+            np.testing.assert_array_equal(run("metal:0"), 3.0)
+
+            # float32 only: Metal launch, CPU compile, Metal regeneration.
+            @wp.struct
+            class T:
+                scale: float
+                n: int
+
+            @wp.kernel
+            def k2(a: wp.array[float], t: T, out: wp.array[float]):
+                i = wp.tid()
+                out[i] = a[i] * t.scale + float(t.n)
+
+            def run2(dev):
+                a = wp.array([1.0, 3.0], dtype=float, device=dev)
+                t = T()
+                t.scale = 2.0
+                t.n = 1
+                o = wp.zeros(2, dtype=float, device=dev)
+                wp.launch(k2, dim=2, inputs=[a, t, o], device=dev)
+                return o.numpy()
+
+            np.testing.assert_array_equal(run2("metal:0"), [3.0, 7.0])
+            np.testing.assert_array_equal(run2("cpu"), [3.0, 7.0])
+            wp.set_module_options({"metal_fp64": "demote"})
+            np.testing.assert_array_equal(run2("metal:0"), [3.0, 7.0])
+            """,
+        )
+
+    def test_metal_ir_rebuilt_after_other_kernel_rebuilds_shared_func(self):
+        # A ``@wp.func`` adjoint is shared by every kernel calling it, and the
+        # Metal inliner splices ``func.adj.blocks``. A CPU compile of another
+        # kernel (other module) rebuilds the helper with CPU builder options;
+        # a later regeneration of the Metal kernel that keeps its own IR (a
+        # float64 mode change on a serial kernel) must not inline that body.
+        # ``wp.tile_fft`` emits a different form without ``metal_backend``,
+        # which Metal cannot translate.
+        _run(
+            self,
+            """
+            import os
+
+            os.environ["WARP_METAL_DISABLE_ARTIFACT_CACHE"] = "1"
+            wp.config.cache_kernels = False
+            M, N = 1, 16
+
+            @wp.func
+            def fft_row(x: wp.array2d[wp.vec2f], y: wp.array2d[wp.vec2f]):
+                t = wp.tile_load(x, shape=(M, N))
+                wp.tile_fft(t)
+                wp.tile_store(y, t)
+
+            @wp.kernel(module="unique")
+            def k_metal(x: wp.array2d[wp.vec2f], y: wp.array2d[wp.vec2f]):
+                fft_row(x, y)
+
+            @wp.kernel(module="unique")
+            def k_cpu(x: wp.array2d[wp.vec2f], y: wp.array2d[wp.vec2f]):
+                fft_row(x, y)
+
+            xr = np.random.default_rng(1).standard_normal((M, N, 2)).astype(np.float32)
+            expected = np.fft.fft(xr[..., 0] + 1j * xr[..., 1], axis=-1)
+
+            def run(k, dev):
+                x = wp.array(xr, dtype=wp.vec2f, device=dev)
+                y = wp.zeros((M, N), dtype=wp.vec2f, device=dev)
+                wp.launch_tiled(k, dim=[1], inputs=[x, y], device=dev, block_dim=1)
+                r = y.numpy()
+                np.testing.assert_allclose(r[..., 0] + 1j * r[..., 1], expected, atol=1e-3)
+
+            run(k_metal, "metal:0")
+            run(k_cpu, "cpu")
+            wp.config.metal_fp64 = "demote"
+            run(k_metal, "metal:0")
+            """,
+        )
+
+    def test_metal_translation_holds_codegen_lock(self):
+        # A CPU codegen of another kernel on another thread rebuilds the shared
+        # helper's adjoint. Started between the Metal build and the inliner, it
+        # must wait for the translation (``_codegen_lock``) instead of swapping
+        # in the CPU form of ``wp.tile_fft`` under it.
+        _run(
+            self,
+            """
+            import os
+            import threading
+
+            import warp._src.codegen_metal as cm
+
+            os.environ["WARP_METAL_DISABLE_ARTIFACT_CACHE"] = "1"
+            wp.config.cache_kernels = False
+            M, N = 1, 16
+
+            @wp.func
+            def fft_row(x: wp.array2d[wp.vec2f], y: wp.array2d[wp.vec2f]):
+                t = wp.tile_load(x, shape=(M, N))
+                wp.tile_fft(t)
+                wp.tile_store(y, t)
+
+            @wp.kernel(module="unique")
+            def k_metal(x: wp.array2d[wp.vec2f], y: wp.array2d[wp.vec2f]):
+                fft_row(x, y)
+
+            @wp.kernel(module="unique")
+            def k_cpu(x: wp.array2d[wp.vec2f], y: wp.array2d[wp.vec2f]):
+                fft_row(x, y)
+
+            def cpu_codegen():
+                m = k_cpu.module
+                m._run_codegen(m.resolve_options(wp.config, block_dim=1) | {"block_dim": 1, "output_arch": None}, True)
+
+            orig = cm._ast_inline
+            other = []
+
+            def inline_with_concurrent_cpu_build(*args, **kwargs):
+                if not other:
+                    t = threading.Thread(target=cpu_codegen)
+                    other.append(t)
+                    t.start()
+                    t.join(timeout=3.0)  # finishes at once unless the lock holds it off
+                return orig(*args, **kwargs)
+
+            cm._ast_inline = inline_with_concurrent_cpu_build
+            try:
+                art = cm.generate_msl_kernel(k_metal, block_dim=1)
+            finally:
+                cm._ast_inline = orig
+                other[0].join()
+            xr = np.random.default_rng(1).standard_normal((M, N, 2)).astype(np.float32)
+            x = wp.array(xr, dtype=wp.vec2f, device="metal:0")
+            y = wp.zeros((M, N), dtype=wp.vec2f, device="metal:0")
+            wp.launch_tiled(k_metal, dim=[1], inputs=[x, y], device="metal:0", block_dim=1)
+            r = y.numpy()
+            np.testing.assert_allclose(r[..., 0] + 1j * r[..., 1], np.fft.fft(xr[..., 0] + 1j * xr[..., 1]), atol=1e-3)
+            """,
+        )
+
+    def test_artifact_cache_key_covers_callee_ir(self):
+        # The on-disk artifact key must change when a called ``@wp.func``'s
+        # IR does (here: rebuilt by a CPU codegen of another kernel), so an
+        # artifact translated from foreign helper IR can never be stored under
+        # the key of the Metal-built one. It must also be the same in a fresh
+        # process.
+        _run(
+            self,
+            """
+            import os
+            import subprocess
+            import sys
+
+            import warp._src.codegen_metal as cm
+
+            wp.config.cache_kernels = False
+            M, N = 1, 16
+
+            @wp.func
+            def fft_row(x: wp.array2d[wp.vec2f], y: wp.array2d[wp.vec2f]):
+                t = wp.tile_load(x, shape=(M, N))
+                wp.tile_fft(t)
+                wp.tile_store(y, t)
+
+            @wp.kernel(module="unique")
+            def k_metal(x: wp.array2d[wp.vec2f], y: wp.array2d[wp.vec2f]):
+                fft_row(x, y)
+
+            @wp.kernel(module="unique")
+            def k_cpu(x: wp.array2d[wp.vec2f], y: wp.array2d[wp.vec2f]):
+                fft_row(x, y)
+
+            adj = cm._ensure_adj_built(k_metal, block_dim=1)
+            key = cm._artifact_cache_key(k_metal, adj)
+            assert key is not None
+            if os.environ.get("_KEY_ONLY"):
+                print("KEY", key)
+                raise SystemExit(0)
+
+            m = k_cpu.module
+            m._run_codegen(m.resolve_options(wp.config, block_dim=1) | {"block_dim": 1, "output_arch": None}, True)
+            assert k_metal.adj.blocks is adj.blocks  # only the helper was rebuilt
+            assert cm._artifact_cache_key(k_metal, k_metal.adj) != key
+
+            out = subprocess.run([sys.executable, __file__], env=dict(os.environ, _KEY_ONLY="1"),
+                                 capture_output=True, text=True, check=True).stdout
+            assert f"KEY {key}" in out, out
+            """,
+        )
+
+    def test_block_model_switch_restores_unset_flags(self):
+        # A kernel that never took the coop model at block_dim=32 has no coop
+        # flags set. Switching to the serial model and back restored them as
+        # ``None``, and the backward pass at the new grad set then failed
+        # with ``'>' not supported between 'NoneType' and 'int'``.
+        _run(
+            self,
+            """
+            N = 64
+
+            @wp.kernel(module="unique")
+            def k(a: wp.array[float], b: wp.array[float], out: wp.array[float]):
+                i = wp.tid()
+                t = wp.tile(a[i] + b[i] * a[i])
+                out[i] = wp.untile(wp.tile_map(wp.sin, t)) * 2.0
+
+            rng = np.random.default_rng(0)
+            A, B = rng.random(N).astype(np.float32), rng.random(N).astype(np.float32)
+
+            def run(dev, bd, grad_b):
+                a = wp.array(A, dtype=float, device=dev, requires_grad=True)
+                b = wp.array(B, dtype=float, device=dev, requires_grad=grad_b)
+                o = wp.zeros(N, dtype=float, device=dev, requires_grad=True)
+                tape = wp.Tape()
+                with tape:
+                    wp.launch(k, dim=N, inputs=[a, b, o], device=dev, block_dim=bd)
+                tape.backward(grads={o: wp.ones(N, dtype=float, device=dev)})
+                res = [o.numpy(), a.grad.numpy()] + ([b.grad.numpy()] if grad_b else [])
+                return np.concatenate(res)
+
+            for bd, grad_b in ((32, False), (1, False), (32, True)):
+                np.testing.assert_allclose(run("metal:0", bd, grad_b), run("cpu", 1, grad_b), atol=1e-5)
+            """,
+        )
+
     def test_metal_module_options_do_not_change_module_hash(self):
         # ``metal_*`` module options are Metal-only: CPU/CUDA module hashes
         # (and so their kernel caches) must not change when one is set.
