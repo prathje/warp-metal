@@ -178,6 +178,67 @@ class TestMetalTileMatmulAdjoint(unittest.TestCase):
             """,
         )
 
+    def test_tile_view_dual_reaches_parent(self):
+        # The dual of a ``tile_view`` aliases a window of the parent's dual on
+        # CPU/CUDA. On Metal the view is a private copy, and its dual was never
+        # added back: every gradient through a view came back zero. Covers a
+        # view read by tile_map, by the value-returning and the accumulating
+        # tile_matmul, a view of a view, and the parent also used directly.
+        # A view written in place raises.
+        _run(
+            self,
+            """
+            @wp.kernel
+            def k(A: wp.array2d[float], B: wp.array2d[float], O: wp.array2d[float], O2: wp.array2d[float],
+                  O3: wp.array2d[float]):
+                big = wp.tile_map(wp.mul, wp.tile_load(A, shape=(4, 6)), wp.tile_load(A, shape=(4, 6)))
+                b = wp.tile_load(B, shape=(3, 3))
+                v = wp.tile_view(big, offset=(0, 2), shape=(4, 3))
+                wp.tile_store(O, wp.tile_map(wp.add, wp.tile_map(wp.sin, v), wp.tile_matmul(v, b)))
+                acc = wp.tile_zeros(shape=(4, 3), dtype=float)
+                wp.tile_matmul(wp.tile_view(big, offset=(0, 1), shape=(4, 3)), b, acc)
+                wp.tile_store(O2, acc)
+                vv = wp.tile_view(wp.tile_view(big, offset=(1, 1), shape=(3, 4)), offset=(1, 0), shape=(2, 3))
+                wp.tile_store(O3, wp.tile_map(wp.add, wp.tile_map(wp.cos, vv),
+                                              wp.tile_view(big, offset=(0, 0), shape=(2, 3))))
+
+            @wp.kernel
+            def k_bad(A: wp.array2d[float], B: wp.array2d[float], O: wp.array2d[float], O2: wp.array2d[float],
+                      O3: wp.array2d[float]):
+                big = wp.tile_map(wp.mul, wp.tile_load(A, shape=(4, 6)), wp.tile_load(A, shape=(4, 6)))
+                b = wp.tile_load(B, shape=(3, 3))
+                v = wp.tile_view(big, offset=(0, 2), shape=(4, 3))
+                wp.tile_matmul(v, b, v)
+                wp.tile_store(O, wp.tile_view(big, offset=(0, 0), shape=(4, 3)))
+
+            rng = np.random.default_rng(5)
+            A0 = rng.standard_normal((4, 6)).astype(np.float32)
+            B0 = rng.standard_normal((3, 3)).astype(np.float32)
+            Ws = [rng.standard_normal(sh).astype(np.float32) for sh in ((4, 3), (4, 3), (2, 3))]
+
+            def run(dev, kern=k):
+                with wp.ScopedDevice(dev):
+                    a = wp.array(A0, requires_grad=True)
+                    b = wp.array(B0, requires_grad=True)
+                    outs = [wp.zeros(w.shape, dtype=float, requires_grad=True) for w in Ws]
+                    tape = wp.Tape()
+                    with tape:
+                        wp.launch_tiled(kern, dim=1, inputs=[a, b], outputs=outs, block_dim=64)
+                    tape.backward(grads={o: wp.array(w) for o, w in zip(outs, Ws)})
+                    return [o.numpy() for o in outs] + [a.grad.numpy(), b.grad.numpy()]
+
+            res = both(run)
+            assert np.abs(res["cpu"][3]).max() > 0.5 and np.abs(res["cpu"][4]).max() > 0.5
+            assert_same(res, rtol=1e-4, atol=1e-4)
+            try:
+                run("metal:0", k_bad)
+            except Exception as e:
+                assert "written in place" in str(e), e
+            else:
+                raise AssertionError("reverse through a view written in place did not raise")
+            """,
+        )
+
 
 @unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
 @unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
@@ -311,6 +372,8 @@ class TestMetalMeshQueryAdjoint(unittest.TestCase):
                     hit = wp.mesh_query_point(mesh, p, 10.0, inside, face, u, v)
                 elif wp.static(n == 3):
                     hit = wp.mesh_query_point_no_sign(mesh, p, 10.0, face, u, v)
+                elif wp.static(n == 4):
+                    hit = wp.mesh_query_point_sign_winding_number(mesh, p, 10.0, inside, face, u, v)
                 else:
                     hit = wp.mesh_query_furthest_point_no_sign(mesh, p, 0.0, face, u, v)
                 if hit:
@@ -319,7 +382,7 @@ class TestMetalMeshQueryAdjoint(unittest.TestCase):
 
             return k
 
-        for n in range(5):
+        for n in range(6):
             k = make(n)
             oc, gc, fc = run(k, "cpu")
             om, gm, fm = run(k, "metal:0")

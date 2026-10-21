@@ -277,6 +277,7 @@ class TileExt:
                     else:
                         self.views[lhs] = _View(parent, "flat")
             mutated |= _mutated_labels(raw)
+        self.mutated = mutated
         # A parent is "volatile" when it (or another view of it) can change
         # after a view of it was taken; views of volatile parents refresh
         # before every use.
@@ -418,6 +419,51 @@ class TileExt:
             node = v.parent
         return " ".join(out)
 
+    def _adj_flush(self, view: str, line: str) -> str:
+        """Add a view's dual into its parent chain's duals and clear it.
+
+        With the view's dual kept at zero between statements, every parent
+        dual holds what the aliased CPU/CUDA dual holds. A view written in
+        place has its dual *read* by the reverse of that write, which this
+        model cannot reproduce, so that raises.
+        """
+        from warp._src.codegen_metal import MetalCodegenError  # noqa: PLC0415
+
+        out: list[str] = []
+        node = view
+        seen: set[str] = set()
+        while node in self.views and node not in seen:
+            seen.add(node)
+            if node in self.mutated:
+                raise MetalCodegenError(
+                    "MSL codegen: reverse mode through a tile_view / tile_reshape that is written in place is not "
+                    f"supported on Metal (statement: {line.strip()!r})"
+                )
+            v = self.views[node]
+            n = self._n(node)
+            vn = self.vec_n.get(node, 0)
+            comps = list(range(vn)) if vn else [None]
+            if v.kind == "flat":
+
+                def build(k: str) -> str:
+                    return k
+
+            else:
+                wm = self._window_map(node)
+                if wm is None:
+                    raise MetalCodegenError(
+                        f"MSL codegen: reverse mode through this tile view is not supported (statement: {line.strip()!r})"
+                    )
+                build, n = wm
+            body = " ".join(
+                f"{self._elem(f'adj_{v.parent}', v.parent, build('_ta_k'), c)} += "
+                f"{self._elem(f'adj_{node}', node, '_ta_k', c)}; {self._elem(f'adj_{node}', node, '_ta_k', c)} = 0;"
+                for c in comps
+            )
+            out.append(f"for (int _ta_k = 0; _ta_k < {n}; ++_ta_k) {{ {body} }}")
+            node = v.parent
+        return " ".join(out)
+
     def _view_chain_volatile(self, view: str) -> bool:
         node = view
         seen: set[str] = set()
@@ -462,6 +508,15 @@ class TileExt:
                 pre = " ".join(self._refresh_chain(v) for v in views_here if self._view_chain_volatile(v))
                 written = _mutated_labels(line)
                 post = " ".join(self._writeback(v) for v in views_here if v in written)
+            # Reverse statements accumulate into a view's dual. On CPU/CUDA
+            # that dual is a window of the parent's dual; here it is a
+            # private copy, so move it into the parent chain right away.
+            adj_views = sorted(
+                {mm.group(1) for mm in self._label_pat.finditer(line) if mm.group(0).startswith("adj_")}
+                & set(self.views)
+            )
+            if adj_views:
+                post = " ".join(p for p in [post] + [self._adj_flush(v, line) for v in adj_views] if p)
         line = self._lower_ops(line)
         if pre or post:
             indent = line[: len(line) - len(line.lstrip())]
