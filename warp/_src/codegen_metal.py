@@ -6670,6 +6670,11 @@ _MISC_MATH_HELPERS: dict[str, str] = {
     # Warp's step is 1 for x < 0 — the reverse of GLSL/MSL ``step``.
     "wp_step": ("template <typename T>\ninline T wp_step(T x) { return x < T(0) ? T(1) : T(0); }"),
     "wp_nonzero": ("template <typename T>\ninline T wp_nonzero(T x) { return x == T(0) ? T(0) : T(1); }"),
+    # ``wp.bit_count`` (Warp > 1.18, GH-2071): set bits of the fixed-width
+    # two's-complement value, as an int32. ``metal::popcount`` counts the bits
+    # of the operand's own width (char/short/int/long and unsigned), so signed
+    # inputs need no widening.
+    "wp_bit_count": ("template <typename T>\ninline int wp_bit_count(T x) { return int(metal::popcount(x)); }"),
     # ``%`` is integer-only in MSL; float/half dispatch to ``metal::fmod``
     # (truncated remainder, matching Warp's native ``mod``).
     "wp_mod": (
@@ -11242,6 +11247,7 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bwp::sign\b"), "wp_sign"),
     (re.compile(r"\bwp::step\b"), "wp_step"),
     (re.compile(r"\bwp::nonzero\b"), "wp_nonzero"),
+    (re.compile(r"\bwp::bit_count\b"), "wp_bit_count"),
     # ``wp::cbrt`` — MSL has no cbrt; emulate with copysign+pow so
     # negative inputs keep their sign like C's ``cbrtf``.
     (re.compile(r"\bwp::cbrt\b"), "wp_cbrt"),

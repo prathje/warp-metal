@@ -21,6 +21,7 @@ import re
 import textwrap
 import unittest
 
+import warp as wp
 from warp._src.codegen_metal_ast import (
     For,
     ForIterCmp,
@@ -122,8 +123,6 @@ class TestMetalLoopIRFixtures(unittest.TestCase):
         # Whatever shape the running Warp emits: the ``wp::range_t`` form
         # (<= 1.18) passes through untouched, the rolled-counter form is
         # rewritten so that no counter test survives.
-        import warp as wp  # noqa: PLC0415
-
         @wp.kernel
         def long_loops(a: wp.array(dtype=float)):
             s = float(0.0)
@@ -247,6 +246,92 @@ _LOOP_SNIPPET = textwrap.dedent(
 class TestMetalLoopIRDevice(unittest.TestCase):
     def test_long_constant_loops_match_cpu(self):
         _run_with_metal_enabled(self, _LOOP_SNIPPET, timeout=600)
+
+
+_BIT_COUNT_SNIPPET = textwrap.dedent(
+    """
+    import numpy as np
+
+    types = (wp.int8, wp.uint8, wp.int16, wp.uint16, wp.int32, wp.uint32, wp.int64, wp.uint64)
+    kernels = {}
+    for T in types:
+
+        @wp.kernel(module="unique")
+        def count(x: wp.array(dtype=T), out: wp.array(dtype=wp.int32)):
+            i = wp.tid()
+            out[i] = wp.bit_count(x[i]) + wp.bit_count(T(5)) * 100
+
+        kernels[T] = count
+
+    for T in types:
+        np_t = wp._src.types.warp_type_to_np_dtype[T]
+        info = np.iinfo(np_t)
+        vals = np.array([0, 1, 2, 3, 45, info.max, info.min, info.max - 1, info.min + 1], dtype=np_t)
+        if info.min < 0:
+            vals = np.concatenate([vals, np.array([-1, -2, -45], dtype=np_t)])
+        res = {}
+        for dev in ("cpu", "metal:0"):
+            x = wp.array(vals, dtype=T, device=dev)
+            out = wp.zeros(len(vals), dtype=wp.int32, device=dev)
+            wp.launch(kernels[T], dim=len(vals), inputs=[x], outputs=[out], device=dev)
+            res[dev] = out.numpy()
+        bits = np.dtype(np_t).itemsize * 8
+        expect = [bin(int(v) & ((1 << bits) - 1)).count("1") + 200 for v in vals]
+        np.testing.assert_array_equal(res["cpu"], expect, err_msg=str(T))
+        np.testing.assert_array_equal(res["metal:0"], res["cpu"], err_msg=str(T))
+    print("bit_count ok")
+    """
+)
+
+_TEXTURE_ADJ_SNIPPET = textwrap.dedent(
+    """
+    import numpy as np
+    from warp._src.codegen_metal import MetalCodegenError
+
+    @wp.kernel
+    def s2(tex: wp.Texture2D, uv: wp.array[wp.vec2], o: wp.array[float]):
+        i = wp.tid()
+        o[i] = wp.texture_sample(tex, uv[i], dtype=float) * 2.0
+
+    data = np.random.default_rng(0).standard_normal((5, 7)).astype(np.float32)
+    grads = {}
+    for dev in ("cpu", "metal:0"):
+        tex = wp.Texture2D(data, filter_mode=wp.TextureFilterMode.LINEAR, device=dev)
+        uv = wp.array(np.full((4, 2), 0.37, np.float32), dtype=wp.vec2, device=dev, requires_grad=True)
+        o = wp.zeros(4, dtype=float, device=dev, requires_grad=True)
+        tape = wp.Tape()
+        with tape:
+            wp.launch(s2, 4, [tex, uv, o], device=dev)
+        try:
+            tape.backward(grads={o: wp.ones(4, dtype=float, device=dev)})
+            grads[dev] = uv.grad.numpy()
+        except MetalCodegenError as e:
+            assert dev == "metal:0" and "texture_sample" in str(e), e
+            grads[dev] = None
+    if np.any(grads["cpu"] != 0.0):
+        # Differentiable texture_sample (Warp > 1.18, GH-1301): Metal has no
+        # adjoint yet and must say so instead of returning zeros.
+        assert grads["metal:0"] is None, grads
+    else:
+        # Non-differentiable texture_sample (Warp <= 1.18): zero on both.
+        assert grads["metal:0"] is not None, "unexpected raise"
+        np.testing.assert_array_equal(grads["metal:0"], grads["cpu"])
+    print("texture adjoint ok")
+    """
+)
+
+
+@unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
+@unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
+class TestMetalUpstreamBuiltins(unittest.TestCase):
+    """Built-ins whose upstream (> 1.18) form reaches the Metal translator."""
+
+    @unittest.skipUnless(hasattr(wp, "bit_count"), "wp.bit_count needs Warp > 1.18 (GH-2071)")
+    def test_bit_count_matches_cpu(self):
+        _run_with_metal_enabled(self, _BIT_COUNT_SNIPPET, timeout=600)
+
+    def test_texture_sample_adjoint_not_silent(self):
+        _run_with_metal_enabled(self, _TEXTURE_ADJ_SNIPPET, timeout=300)
 
 
 if __name__ == "__main__":
