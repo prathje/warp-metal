@@ -241,11 +241,62 @@ _LOOP_SNIPPET = textwrap.dedent(
 )
 
 
+_REASSIGN_SNIPPET = textwrap.dedent(
+    """
+    import numpy as np
+
+    # Re-binding the loop target in the body (``i = i + 3``) makes Warp copy
+    # the new value back into the loop variable at the end of the body. A C
+    # loop driven by that variable skipped iterations forward and never
+    # terminated in reverse (the copy outran the decrement): a GPU hang.
+    @wp.kernel
+    def k_const(a: wp.array(dtype=float), out: wp.array(dtype=float)):
+        t = wp.tid()
+        s = float(0.0)
+        for i in range(20):
+            i = i + 3
+            s += a[t] * float(i)
+        out[t] = s + float(i)
+
+    @wp.kernel
+    def k_dyn(a: wp.array(dtype=float), n: int, out: wp.array(dtype=float)):
+        t = wp.tid()
+        s = float(0.0)
+        for i in range(n, 0, -1):
+            s += a[t] * float(i)
+            i += 2
+            s += a[t] * float(i) * 0.5
+        out[t] = s
+
+    data = np.random.default_rng(3).uniform(-1.0, 1.0, 16).astype(np.float32)
+    for k in (k_const, k_dyn):
+        res = {}
+        for dev in ("cpu", "metal:0"):
+            a = wp.array(data, dtype=float, device=dev, requires_grad=True)
+            out = wp.zeros(16, dtype=float, device=dev, requires_grad=True)
+            args = [a, 9, out] if k is k_dyn else [a, out]
+            tape = wp.Tape()
+            with tape:
+                wp.launch(k, dim=16, inputs=args, device=dev)
+            tape.backward(grads={out: wp.ones(16, dtype=float, device=dev)})
+            res[dev] = (out.numpy(), a.grad.numpy())
+        for idx in (0, 1):
+            np.testing.assert_allclose(
+                res["metal:0"][idx], res["cpu"][idx], rtol=1e-5, atol=1e-5, err_msg=f"{k.key} {idx}"
+            )
+    print("reassign ok")
+    """
+)
+
+
 @unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
 @unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
 class TestMetalLoopIRDevice(unittest.TestCase):
     def test_long_constant_loops_match_cpu(self):
         _run_with_metal_enabled(self, _LOOP_SNIPPET, timeout=600)
+
+    def test_reassigned_loop_target_matches_cpu(self):
+        _run_with_metal_enabled(self, _REASSIGN_SNIPPET, timeout=300)
 
 
 _BIT_COUNT_SNIPPET = textwrap.dedent(

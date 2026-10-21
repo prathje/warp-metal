@@ -15772,7 +15772,7 @@ _ARRAY_CTYPE_ELEM_PAT = re.compile(r"^wp::array_t<\s*(.+?)\s*>$")
 
 def _materialize_for_loop_vars(lines: list[str]) -> list[str]:
     """Give AST-emitted ``for`` loops a private counter when their iteration
-    variable is read after the loop.
+    variable is read after the loop or written inside it.
 
     Warp's IR draws each iteration value from a ``range_t`` iterator, so
     after a loop that ran to completion the variable holds the *last*
@@ -15804,14 +15804,33 @@ def _materialize_for_loop_vars(lines: list[str]) -> list[str]:
                 last_use[name] = j
     rewrite: dict[int, re.Match[str]] = {}
     for i, m in loops:
+        iv_ref = f"var_{m.group('iv')}"
+        write_pat = None
+        written = False
         depth = 0
         close = None
         for j in range(i, len(lines)):
-            depth += lines[j].count("{") - lines[j].count("}")
+            ln = lines[j]
+            depth += ln.count("{") - ln.count("}")
             if depth <= 0:
                 close = j
                 break
-        if close is not None and last_use.get(m.group("iv"), -1) > close:
+            if j > i and not written and iv_ref in ln:
+                if write_pat is None:
+                    write_pat = re.compile(
+                        rf"(?:\b{iv_ref}\s*(?:[-+*/%&|^]|<<|>>)?=(?!=)|\+\+\s*{iv_ref}\b|--\s*{iv_ref}\b"
+                        rf"|\b{iv_ref}\s*(?:\+\+|--)|&\s*\(?\s*{iv_ref}\b"
+                        # statement-level call on it, e.g. ``wp::assign(var_X, var_Y);``
+                        # (adjoint calls only read the primal)
+                        rf"|^\s*(?!(?:if|while|for|switch|return)\b|(?:wp::)?(?:wp_)?adj_)(?:wp::)?\w+\s*\(\s*&?\s*{iv_ref}\b)"
+                    )
+                written = write_pat.search(ln) is not None
+        # The body writes the variable itself: Warp's IR re-binds a
+        # reassigned loop target (``i = i + 3``) by copying the new value
+        # back at the end of the body, which must not move a C loop driven by
+        # that variable (it skipped iterations forward and never terminated
+        # in reverse). Python iteration ignores the write; the counter does too.
+        if close is not None and (written or last_use.get(m.group("iv"), -1) > close):
             rewrite[i] = m
     out: list[str] = []
     n_it = 0
