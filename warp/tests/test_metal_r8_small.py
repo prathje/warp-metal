@@ -14,6 +14,8 @@
 * Metal's Python-side hash-grid build, BVH/mesh refit and winding-number
   precompute stand in for native CUDA calls and must not be recorded on an
   active ``wp.Tape``.
+* ``metal_fp64 = "emulate"`` evaluates float64 transcendentals in float32:
+  Warp warns once per kernel that does so (also on a warm artifact-cache load).
 
 Each case runs in a subprocess (see ``test_metal_launch``).
 """
@@ -276,6 +278,74 @@ _BSR_TRANSPOSE_BODY = 'import numpy as np\nimport warp.sparse as sp\nM = "metal:
 class TestMetalR8BsrTranspose(unittest.TestCase):
     def test_bsr_set_transpose_matches_cpu_and_captures(self):
         _run_with_metal_enabled(self, _BSR_TRANSPOSE_BODY, timeout=600)
+
+
+_F64_FP32_WARN_BODY = textwrap.dedent(
+    """
+    import contextlib
+    import io
+    import numpy as np
+
+    @wp.func
+    def soft_exp(x: wp.float64):
+        return wp.exp(x) + wp.sqrt(x)
+
+    @wp.kernel(module="unique")
+    def k_trans(a: wp.array[wp.float64], b: wp.array[wp.float64]):
+        i = wp.tid()
+        b[i] = soft_exp(a[i]) + wp.pow(a[i], wp.float64(1.5))
+
+    @wp.kernel(module="unique")
+    def k_exact(a: wp.array[wp.float64], b: wp.array[wp.float64]):
+        i = wp.tid()
+        # sqrt is correctly rounded softfloat; a float32 transcendental is not
+        # an fp64 one (``* 0`` keeps the result bit-comparable with CPU).
+        b[i] = wp.sqrt(a[i]) * a[i] / wp.float64(3.0) + wp.float64(wp.sin(wp.float32(a[i]))) * wp.float64(0.0)
+
+    for k in (k_trans, k_exact):
+        wp.set_module_options({"metal_fp64": "emulate"}, module=k.module)
+
+    x = np.linspace(0.1, 2.0, 37)
+    outs = {}
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        for dev in ("metal:0", "cpu"):
+            a = wp.array(x, dtype=wp.float64, device=dev)
+            for k in (k_trans, k_exact):
+                b = wp.zeros_like(a)
+                for _ in range(3):
+                    wp.launch(k, dim=a.shape[0], inputs=[a, b], device=dev)
+                outs[(dev, k.key)] = b.numpy()
+    log = err.getvalue()
+    hits = [ln for ln in log.splitlines() if "evaluated in float32" in ln]
+    assert len(hits) == 1, log
+    assert "'k_trans'" in hits[0] and "wp.exp()" in hits[0] and "wp.pow()" in hits[0], hits
+    assert "sqrt" not in hits[0].split(" on float64")[0], hits
+    # Exact parts stay bit-exact; the fp32 transcendentals carry fp32 error only.
+    np.testing.assert_array_equal(outs[("metal:0", k_exact.key)], outs[("cpu", k_exact.key)])
+    np.testing.assert_allclose(outs[("metal:0", k_trans.key)], outs[("cpu", k_trans.key)], rtol=1e-6)
+
+    # A new process would load the artifact from the on-disk cache without
+    # re-running codegen; that path must warn as well.
+    import warp._src.codegen_metal as cm
+
+    cm._f64_fp32_warned.clear()
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        with cm._kernel_fp64_mode(k_trans):
+            art = cm._generate_msl_kernel_cached(k_trans)
+    assert art.fp32_transcendentals == ("exp", "pow"), art.fp32_transcendentals
+    assert "evaluated in float32" in err.getvalue(), err.getvalue()
+    print("fp64 transcendental warning OK")
+    """
+)
+
+
+@unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
+@unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
+class TestMetalR8Fp64EmulateWarning(unittest.TestCase):
+    def test_fp32_transcendental_warns_once_per_kernel(self):
+        _run_with_metal_enabled(self, _F64_FP32_WARN_BODY, timeout=600)
 
 
 if __name__ == "__main__":

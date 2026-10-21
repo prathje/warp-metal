@@ -15377,6 +15377,9 @@ class MetalKernelArtifact:
     # The kernel calls ``wp.print``/``wp.printf`` (compiled out); a warm
     # cache load re-applies ``warp.config.metal_print`` from this.
     has_print: bool = False
+    # Builtins that ``metal_fp64 = "emulate"`` evaluated in fp32 on float64
+    # operands (``exp``, ``pow``, ...); a warm cache load warns from this too.
+    fp32_transcendentals: tuple[str, ...] = ()
     # Per-array shape slot size in ``__shapes_packed`` (each array gets
     # ``shape_packed_slot`` int32s, padded with zeros). Warp arrays cap
     # at 4 dims so 4 is plenty.
@@ -16658,6 +16661,60 @@ def _handle_metal_print(kernel_name: str) -> None:
     )
 
 
+# ``wp::<fn>(var_a[, var_b])`` calls of the builtins ``metal_fp64 = "emulate"``
+# evaluates in float32 (see ``_F64_EMU_FP32_UNARY`` / ``_BINARY``). ``sqrt``
+# and ``rsqrt`` are not listed: they are correctly rounded softfloat.
+_F64_EMU_FP32_CALL_PAT = re.compile(
+    r"\bwp::(" + "|".join(_F64_EMU_FP32_UNARY + _F64_EMU_FP32_BINARY) + r")\s*\(\s*(var_\w+)(?:\s*,\s*(var_\w+))?\s*\)"
+)
+# Kernels already warned about (one warning per kernel per process).
+_f64_fp32_warned: set[str] = set()
+
+
+def _f64_fp32_transcendental_calls(lines, var_ctypes: dict[str, str]) -> tuple[str, ...]:
+    """Builtins in ``lines`` that emulated fp64 evaluates in fp32 on a float64 operand."""
+    fns: list[str] = []
+    for ln in lines:
+        if "wp::" not in ln:
+            continue
+        for m in _F64_EMU_FP32_CALL_PAT.finditer(ln):
+            operands = [a for a in (m.group(2), m.group(3)) if a]
+            if m.group(1) not in fns and any(
+                var_ctypes.get(a[len("var_") :], "") in ("wp::float64", "float64") for a in operands
+            ):
+                fns.append(m.group(1))
+    return tuple(fns)
+
+
+def _warn_f64_fp32_transcendentals(kernel, fns: tuple[str, ...]) -> None:
+    """Warn once per kernel when emulated fp64 lowers a transcendental to fp32.
+
+    ``metal_fp64 = "emulate"`` computes float64 arithmetic exactly but
+    evaluates ``exp``/``log``/``sin``/``pow``/... in float32 and widens the
+    result (documented under :data:`warp.config.metal_fp64`). A module can
+    opt into emulation on its user's behalf, so name the kernel and the
+    functions. ``"demote"`` needs no warning of its own: every float64
+    operation is float32 there, and Warp already documents that mode as such.
+    ``fns`` comes from the artifact, so a warm artifact-cache load warns too.
+    """
+    if not fns:
+        return
+    key = f"{getattr(getattr(kernel, 'module', None), 'name', '')}:{getattr(kernel, 'key', kernel)}"
+    if key in _f64_fp32_warned:
+        return
+    _f64_fp32_warned.add(key)
+    from warp._src.logger import log_warning as warn  # noqa: PLC0415
+
+    names = ", ".join(f"wp.{fn}()" for fn in fns)
+    warn(
+        f"Kernel {getattr(kernel, 'key', kernel)!r}: {names} on float64 values "
+        f"{'is' if len(fns) == 1 else 'are'} evaluated in float32 on Metal devices "
+        f"(metal_fp64 = 'emulate' computes float64 arithmetic and sqrt exactly, but "
+        f"transcendental functions carry single-precision error).",
+        category=UserWarning,
+    )
+
+
 def _artifact_display_name(kernel, adj) -> str:
     """MSL entry-point suffix for a kernel: the def name, qualified by its
     enclosing factory for closure kernels.
@@ -16875,6 +16932,16 @@ def _generate_msl_kernel_uncached(
     # Component stores into array elements inside inlined ``@wp.func``
     # bodies (``arr[i][j, k] = x`` on an array the function was passed).
     _ast_nodes = _lower_inlined_array_slots(_ast_nodes, adj)
+    # Emulated-fp64 transcendentals that run in fp32 (warned per kernel by
+    # ``_generate_msl_kernel_cached``, also on a warm cache load).
+    _fp32_transcendentals = (
+        _f64_fp32_transcendental_calls(
+            _ast_emit(_ast_nodes),
+            {**{str(_v.label): _v.ctype() for _v in adj.variables}, **_inlined_var_ctypes},
+        )
+        if _fp64_mode() == "emulate"
+        else ()
+    )
     # Drop statically-dead branches (geom-type constants baked by kernel
     # builders) BEFORE the view/field folds — dead mesh-only branches
     # reference array struct fields that are never assigned for the live
@@ -20763,6 +20830,7 @@ def _generate_msl_kernel_uncached(
     _artifact = MetalKernelArtifact(
         name=artifact_name,
         has_print=_has_print,
+        fp32_transcendentals=_fp32_transcendentals,
         source=source,
         input_names=base_input_names + inplace_input_names + init_input_names + extra_input_names,
         output_names=final_output_names,
@@ -21279,6 +21347,7 @@ def _generate_msl_kernel_cached(
             _touch_artifact_salt_dir(key)
             if cached.has_print:
                 _handle_metal_print(adj.fun_name)
+            _warn_f64_fp32_transcendentals(kernel, cached.fp32_transcendentals)
             return cached
         failed = _load_cached_failure(key)
         if failed is not None:
@@ -21291,6 +21360,7 @@ def _generate_msl_kernel_cached(
         raise
     if key is not None:
         _store_cached_artifact(key, artifact)
+    _warn_f64_fp32_transcendentals(kernel, artifact.fp32_transcendentals)
     return artifact
 
 
