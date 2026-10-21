@@ -6,6 +6,9 @@
 * Reverse-mode ``tile_load`` / ``tile_store`` on a partial edge tile: the
   gradient scatter/gather must skip the elements outside the array, as the
   forward pass does.
+* Metal's Python-side hash-grid build, BVH/mesh refit and winding-number
+  precompute stand in for native CUDA calls and must not be recorded on an
+  active ``wp.Tape``.
 
 Each case runs in a subprocess (see ``test_metal_launch``).
 """
@@ -103,6 +106,50 @@ class TestMetalR8TileAdjointEdge(unittest.TestCase):
             self,
             "check(k_linear, [(20, 7), (3, 7), (3, 1)], (20, 3), dim=(2, 1))\ncheck(k_linear, [(2, 2), (1, 2), (1, 1)], (2, 1))\n",
         )
+
+
+_TAPE_BODY = textwrap.dedent(
+    """
+    import io
+    import contextlib
+    import numpy as np
+
+    @wp.kernel
+    def square(x: wp.array[wp.vec3], y: wp.array[float]):
+        i = wp.tid()
+        y[i] = wp.dot(x[i], x[i])
+
+    dev = "metal:0"
+    rng = np.random.default_rng(0)
+    pts = wp.array(rng.uniform(0.0, 2.0, (64, 3)).astype(np.float32), dtype=wp.vec3, device=dev, requires_grad=True)
+    y = wp.zeros(64, device=dev, requires_grad=True)
+    grid = wp.HashGrid(8, 8, 8, device=dev)
+    tri = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int32).reshape(-1)
+    quad = wp.array([[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0]], dtype=wp.vec3, device=dev)
+    mesh = wp.Mesh(points=quad, indices=wp.array(tri, dtype=int, device=dev), support_winding_number=True)
+
+    tape = wp.Tape()
+    with tape:
+        grid.build(pts, 0.25)
+        mesh.refit()
+        wp.launch(square, dim=64, inputs=[pts], outputs=[y], device=dev)
+    keys = [launch[0].key for launch in tape.launches if not callable(launch)]
+    assert keys == [square.key], keys
+
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err), contextlib.redirect_stdout(err):
+        tape.backward(grads={y: wp.ones(64, device=dev)})
+    assert "incorrect gradients" not in err.getvalue(), err.getvalue()
+    np.testing.assert_allclose(pts.grad.numpy(), 2.0 * pts.numpy(), rtol=1e-6)
+    """
+)
+
+
+@unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
+@unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
+class TestMetalR8InternalLaunchesOffTape(unittest.TestCase):
+    def test_hash_grid_build_and_mesh_refit_not_recorded(self):
+        _run_with_metal_enabled(self, _TAPE_BODY, timeout=600)
 
 
 if __name__ == "__main__":
