@@ -982,8 +982,9 @@ class TestMetalR3Locals(unittest.TestCase):
         _run_with_metal_enabled(self, snippet, timeout=120)
 
     def test_struct_array_element_arrays_capture(self):
-        # Constant-element reads bind the element's array at launch and
-        # cannot be captured. Runtime-element reads go through a pointer table
+        # Constant-element reads bind the element's array at launch; a graph
+        # replays them while the record still references that array and raises
+        # once it is rebound. Runtime-element reads go through a pointer table
         # that a graph refreshes from the records before every replay, so a
         # record rebound after the capture is seen; a graph that itself writes
         # the struct array is rejected (the refresh could not see the writes).
@@ -1014,13 +1015,24 @@ class TestMetalR3Locals(unittest.TestCase):
             ids = wp.zeros(1, dtype=int, device=dev)
             wp.launch(kc, 2, [data, out], device=dev)
             np.testing.assert_allclose(out.numpy(), [1.0, 2.0])
+            with wp.ScopedCapture(device=dev) as capc:
+                wp.launch(kc, 2, [data, out], device=dev)
+            out.zero_()
+            g.vals.assign([3.0, 4.0])
+            wp.capture_launch(capc.graph)
+            np.testing.assert_allclose(out.numpy(), [3.0, 4.0])
+            keep = g.vals
+            g.vals = wp.array([5.0, 6.0], dtype=float, device=dev)
+            data.assign(wp.array([g], dtype=G, device=dev))
             try:
-                with wp.ScopedCapture(device=dev):
-                    wp.launch(kc, 2, [data, out], device=dev)
+                wp.capture_launch(capc.graph)
             except RuntimeError as e:
-                assert "cannot be captured" in str(e), e
+                assert "different array than when the graph was captured" in str(e), e
             else:
-                raise AssertionError("capturing a constant-element array-field read was not rejected")
+                raise AssertionError("replaying a constant-element read after a rebind was not rejected")
+            g.vals = keep
+            data.assign(wp.array([g], dtype=G, device=dev))
+            g.vals.assign([1.0, 2.0])
 
             with wp.ScopedCapture(device=dev) as cap:
                 wp.launch(kd, 2, [ids, data, out], device=dev)
