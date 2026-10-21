@@ -320,6 +320,28 @@ _TEXTURE_ADJ_SNIPPET = textwrap.dedent(
     """
 )
 
+_POISSON_SNIPPET = textwrap.dedent(
+    """
+    from warp._src.codegen_metal import MetalCodegenError
+
+    @wp.kernel
+    def counts(seed: int, rate: float, out: wp.array[wp.uint32]):
+        i = wp.tid()
+        rng = wp.rand_init(seed, i)
+        out[i] = wp.poisson(rng, rate)
+
+    out = wp.zeros(16, dtype=wp.uint32, device="metal:0")
+    try:
+        wp.launch(counts, out.shape, [7, 15.0, out], device="metal:0")
+        out.numpy()
+    except MetalCodegenError as e:
+        assert "poisson" in str(e), e
+    else:
+        raise AssertionError("wp.poisson ran on Metal; compare it with the CPU sampler (GH-2083) before allowing it")
+    print("poisson loud")
+    """
+)
+
 
 @unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
 @unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
@@ -329,6 +351,10 @@ class TestMetalUpstreamBuiltins(unittest.TestCase):
     @unittest.skipUnless(hasattr(wp, "bit_count"), "wp.bit_count needs Warp > 1.18 (GH-2071)")
     def test_bit_count_matches_cpu(self):
         _run_with_metal_enabled(self, _BIT_COUNT_SNIPPET, timeout=600)
+
+    def test_poisson_is_loud(self):
+        # No Metal sampler yet; upstream also changed the CPU one (GH-2083).
+        _run_with_metal_enabled(self, _POISSON_SNIPPET, timeout=300)
 
     def test_texture_sample_adjoint_not_silent(self):
         _run_with_metal_enabled(self, _TEXTURE_ADJ_SNIPPET, timeout=300)
