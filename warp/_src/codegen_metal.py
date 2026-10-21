@@ -5842,6 +5842,290 @@ inline wp_mesh_query_point_t wp_mesh_query_point_sign_winding_number(
         id, point, max_dist, query.sign, query.face, query.u, query.v, accuracy, winding_number_threshold);
     return query;
 }
+// Reverse mode of the closest-point queries (warp/native/mesh.h): every
+// ``adj_mesh_query_point*`` variant (sign by ray casting, parity, normal or
+// winding number, no sign, and the furthest-point query, which upstream
+// differentiates with the closest-point adjoint too) reduces to
+// ``adj_mesh_query_point_no_sign``: look up the face the forward pass picked
+// and pull the barycentric duals back to the query point through
+// ``adj_closest_point_to_triangle`` (warp/native/intersect.h). The sign, the
+// face index, ``max_dist`` and the sign parameters get no gradient, and the
+// vertex adjoints are dropped, as upstream. Like upstream there is no
+// ``result`` check: a miss carries zero barycentric duals.
+//
+// ``wp_adj_closest_point_to_triangle`` is the generated upstream adjoint
+// without its gotos (MSL has none): ``region`` is the label the forward pass
+// jumps to, a ``label k`` block runs only for ``region == k`` and a statement
+// after it for ``region >= k``. Statements that only touch the vertex duals
+// or the always-zero ``adj_where`` chain are left out; the rest keep the
+// upstream order and operations so non-finite intermediates propagate the
+// same way.
+inline void wp_adj_closest_point_to_triangle(
+    float3 var_a, float3 var_b, float3 var_c, float3 var_p, thread float3& adj_p, float2 adj_ret)
+{
+    const float var_5 = 0.0f;
+    const float var_9 = 1.0f;
+    float3 var_11 = float3(0.0f), var_31 = float3(0.0f);
+    float var_12 = 0.0f, var_13 = 0.0f, var_19 = 0.0f, var_20 = 0.0f, var_21 = 0.0f, var_22 = 0.0f, var_23 = 0.0f;
+    float var_32 = 0.0f, var_33 = 0.0f, var_39 = 0.0f, var_40 = 0.0f, var_41 = 0.0f, var_42 = 0.0f, var_43 = 0.0f;
+    float var_51 = 0.0f, var_52 = 0.0f, var_53 = 0.0f, var_54 = 0.0f, var_55 = 0.0f, var_56 = 0.0f, var_57 = 0.0f;
+    float var_58 = 0.0f, var_68 = 0.0f, var_69 = 0.0f, var_70 = 0.0f;
+    int region = 6;
+    const float3 var_0 = var_b - var_a;
+    const float3 var_1 = var_c - var_a;
+    const float3 var_2 = var_p - var_a;
+    const float var_3 = wp_bvh_dot3(var_0, var_2);
+    const float var_4 = wp_bvh_dot3(var_1, var_2);
+    if ((var_3 <= var_5) && (var_4 <= var_5)) {
+        region = 0;
+    } else {
+        var_11 = var_p - var_b;
+        var_12 = wp_bvh_dot3(var_0, var_11);
+        var_13 = wp_bvh_dot3(var_1, var_11);
+        if ((var_12 >= var_5) && (var_13 <= var_12)) {
+            region = 1;
+        } else {
+            var_19 = var_3 * var_13;
+            var_20 = var_12 * var_4;
+            var_21 = var_19 - var_20;
+            var_22 = var_3 - var_12;
+            var_23 = var_3 / var_22;
+            if ((var_21 <= var_5) && (var_3 >= var_5) && (var_12 <= var_5)) {
+                region = 2;
+            } else {
+                var_31 = var_p - var_c;
+                var_32 = wp_bvh_dot3(var_0, var_31);
+                var_33 = wp_bvh_dot3(var_1, var_31);
+                if ((var_33 >= var_5) && (var_32 <= var_33)) {
+                    region = 3;
+                } else {
+                    var_39 = var_32 * var_4;
+                    var_40 = var_3 * var_33;
+                    var_41 = var_39 - var_40;
+                    var_42 = var_4 - var_33;
+                    var_43 = var_4 / var_42;
+                    if ((var_41 <= var_5) && (var_4 >= var_5) && (var_33 <= var_5)) {
+                        region = 4;
+                    } else {
+                        var_51 = var_12 * var_33;
+                        var_52 = var_32 * var_13;
+                        var_53 = var_51 - var_52;
+                        var_54 = var_13 - var_12;
+                        var_55 = var_13 - var_12;
+                        var_56 = var_32 - var_33;
+                        var_57 = var_55 + var_56;
+                        var_58 = var_54 / var_57;
+                        if ((var_53 <= var_5) && ((var_13 - var_12) >= var_5) && ((var_32 - var_33) >= var_5)) {
+                            region = 5;
+                        } else {
+                            var_68 = var_53 + var_41;
+                            var_69 = var_68 + var_21;
+                            var_70 = var_9 / var_69;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    float3 adj_0 = float3(0.0f), adj_1 = float3(0.0f), adj_2 = float3(0.0f);
+    float3 adj_11 = float3(0.0f), adj_31 = float3(0.0f);
+    float adj_3 = 0.0f, adj_4 = 0.0f, adj_12 = 0.0f, adj_13 = 0.0f, adj_19 = 0.0f, adj_20 = 0.0f;
+    float adj_21 = 0.0f, adj_22 = 0.0f, adj_23 = 0.0f, adj_28 = 0.0f, adj_32 = 0.0f, adj_33 = 0.0f;
+    float adj_39 = 0.0f, adj_40 = 0.0f, adj_41 = 0.0f, adj_42 = 0.0f, adj_43 = 0.0f, adj_48 = 0.0f;
+    float adj_51 = 0.0f, adj_52 = 0.0f, adj_53 = 0.0f, adj_54 = 0.0f, adj_55 = 0.0f, adj_56 = 0.0f;
+    float adj_57 = 0.0f, adj_58 = 0.0f, adj_65 = 0.0f, adj_68 = 0.0f, adj_69 = 0.0f, adj_70 = 0.0f;
+    float adj_71 = 0.0f, adj_72 = 0.0f, adj_73 = 0.0f, adj_74 = 0.0f;
+    if (region == 6) {
+        const float var_71 = var_41 * var_70;
+        const float var_72 = var_21 * var_70;
+        adj_74 += adj_ret.x;
+        adj_71 += adj_ret.y;
+        adj_73 += adj_74;
+        adj_72 -= adj_74;
+        adj_71 -= adj_73;
+        adj_21 += var_70 * adj_72;
+        adj_70 += var_21 * adj_72;
+        adj_41 += var_70 * adj_71;
+        adj_70 += var_41 * adj_71;
+        adj_69 -= adj_70 * (var_70) / var_69;
+        adj_68 += adj_69;
+        adj_21 += adj_69;
+        adj_53 += adj_68;
+        adj_41 += adj_68;
+        (void)var_72;
+    }
+    if (region == 5) {
+        adj_65 += adj_ret.y;
+        adj_58 -= adj_65;
+    }
+    if (region >= 5) {
+        adj_54 += adj_58 / var_57;
+        adj_57 -= adj_58 * (var_58) / var_57;
+        adj_55 += adj_57;
+        adj_56 += adj_57;
+        adj_32 += adj_56;
+        adj_33 -= adj_56;
+        adj_13 += adj_55;
+        adj_12 -= adj_55;
+        adj_13 += adj_54;
+        adj_12 -= adj_54;
+        adj_51 += adj_53;
+        adj_52 -= adj_53;
+        adj_32 += var_13 * adj_52;
+        adj_13 += var_32 * adj_52;
+        adj_12 += var_33 * adj_51;
+        adj_33 += var_12 * adj_51;
+    }
+    if (region == 4) {
+        adj_48 += adj_ret.x;
+        adj_43 -= adj_48;
+    }
+    if (region >= 4) {
+        adj_4 += adj_43 / var_42;
+        adj_42 -= adj_43 * (var_43) / var_42;
+        adj_4 += adj_42;
+        adj_33 -= adj_42;
+        adj_39 += adj_41;
+        adj_40 -= adj_41;
+        adj_3 += var_33 * adj_40;
+        adj_33 += var_3 * adj_40;
+        adj_32 += var_4 * adj_39;
+        adj_4 += var_32 * adj_39;
+    }
+    if (region >= 3) {
+        adj_1 += var_31 * adj_33;
+        adj_31 += var_1 * adj_33;
+        adj_0 += var_31 * adj_32;
+        adj_31 += var_0 * adj_32;
+        adj_p += adj_31;
+    }
+    if (region == 2) {
+        adj_28 += adj_ret.x;
+        adj_23 += adj_ret.y;
+        adj_23 -= adj_28;
+    }
+    if (region >= 2) {
+        adj_3 += adj_23 / var_22;
+        adj_22 -= adj_23 * (var_23) / var_22;
+        adj_3 += adj_22;
+        adj_12 -= adj_22;
+        adj_19 += adj_21;
+        adj_20 -= adj_21;
+        adj_12 += var_4 * adj_20;
+        adj_4 += var_12 * adj_20;
+        adj_3 += var_13 * adj_19;
+        adj_13 += var_3 * adj_19;
+    }
+    if (region >= 1) {
+        adj_1 += var_11 * adj_13;
+        adj_11 += var_1 * adj_13;
+        adj_0 += var_11 * adj_12;
+        adj_11 += var_0 * adj_12;
+        adj_p += adj_11;
+    }
+    adj_1 += var_2 * adj_4;
+    adj_2 += var_1 * adj_4;
+    adj_0 += var_2 * adj_3;
+    adj_2 += var_0 * adj_3;
+    adj_p += adj_2;
+}
+inline void wp_adj_mesh_closest_point(ulong id, float3 point, int face, float adj_u, float adj_v, thread float3& adj_point)
+{
+    wp_mesh_desc_t mesh = wp_mesh_get_desc(id);
+    const device int* tri_indices = wp_bvh_int_ptr(mesh.indices);
+    const float3 p = wp_bvh_load_v3(mesh.points, tri_indices[face * 3 + 0]);
+    const float3 q = wp_bvh_load_v3(mesh.points, tri_indices[face * 3 + 1]);
+    const float3 r = wp_bvh_load_v3(mesh.points, tri_indices[face * 3 + 2]);
+    wp_adj_closest_point_to_triangle(p, q, r, point, adj_point, float2(adj_u, adj_v));
+}
+// Struct forms: ``(id, point, max_dist, <params>, ret, adj_id, adj_point,
+// adj_max_dist, <adj params>, adj_ret)``.
+template <typename AI, typename AD>
+inline void wp_adj_mesh_query_point(ulong id, float3 point, float max_dist, const thread wp_mesh_query_point_t& ret,
+    AI adj_id, thread float3& adj_point, AD adj_max_dist, const thread wp_mesh_query_point_t& adj_ret)
+{
+    wp_adj_mesh_closest_point(id, point, ret.face, adj_ret.u, adj_ret.v, adj_point);
+}
+template <typename AI, typename AD>
+inline void wp_adj_mesh_query_point_no_sign(ulong id, float3 point, float max_dist,
+    const thread wp_mesh_query_point_t& ret, AI adj_id, thread float3& adj_point, AD adj_max_dist,
+    const thread wp_mesh_query_point_t& adj_ret)
+{
+    wp_adj_mesh_closest_point(id, point, ret.face, adj_ret.u, adj_ret.v, adj_point);
+}
+template <typename AI, typename AD>
+inline void wp_adj_mesh_query_furthest_point_no_sign(ulong id, float3 point, float min_dist,
+    const thread wp_mesh_query_point_t& ret, AI adj_id, thread float3& adj_point, AD adj_min_dist,
+    const thread wp_mesh_query_point_t& adj_ret)
+{
+    wp_adj_mesh_closest_point(id, point, ret.face, adj_ret.u, adj_ret.v, adj_point);
+}
+template <typename E, typename AI, typename AD, typename AE>
+inline void wp_adj_mesh_query_point_sign_normal(ulong id, float3 point, float max_dist, E epsilon,
+    const thread wp_mesh_query_point_t& ret, AI adj_id, thread float3& adj_point, AD adj_max_dist, AE adj_epsilon,
+    const thread wp_mesh_query_point_t& adj_ret)
+{
+    wp_adj_mesh_closest_point(id, point, ret.face, adj_ret.u, adj_ret.v, adj_point);
+}
+template <typename N, typename S, typename AI, typename AD, typename AN, typename AS>
+inline void wp_adj_mesh_query_point_sign_parity(ulong id, float3 point, float max_dist, N n_sample,
+    S perturbation_scale, const thread wp_mesh_query_point_t& ret, AI adj_id, thread float3& adj_point,
+    AD adj_max_dist, AN adj_n_sample, AS adj_perturbation_scale, const thread wp_mesh_query_point_t& adj_ret)
+{
+    wp_adj_mesh_closest_point(id, point, ret.face, adj_ret.u, adj_ret.v, adj_point);
+}
+template <typename A, typename T, typename AI, typename AD, typename AA, typename AT>
+inline void wp_adj_mesh_query_point_sign_winding_number(ulong id, float3 point, float max_dist, A accuracy,
+    T threshold, const thread wp_mesh_query_point_t& ret, AI adj_id, thread float3& adj_point, AD adj_max_dist,
+    AA adj_accuracy, AT adj_threshold, const thread wp_mesh_query_point_t& adj_ret)
+{
+    wp_adj_mesh_closest_point(id, point, ret.face, adj_ret.u, adj_ret.v, adj_point);
+}
+// Out-parameter forms: ``(id, point, max_dist, [inside,] face, u, v, <params>,
+// adj_id, adj_point, adj_max_dist, [adj_inside,] adj_face, adj_u, adj_v,
+// <adj params>, adj_ret)``.
+template <typename AI, typename AD, typename AF, typename AR>
+inline void wp_adj_mesh_query_point_no_sign(ulong id, float3 point, float max_dist, int face, float u, float v,
+    AI adj_id, thread float3& adj_point, AD adj_max_dist, AF adj_face, float adj_u, float adj_v, AR adj_ret)
+{
+    wp_adj_mesh_closest_point(id, point, face, adj_u, adj_v, adj_point);
+}
+template <typename AI, typename AD, typename AF, typename AR>
+inline void wp_adj_mesh_query_furthest_point_no_sign(ulong id, float3 point, float min_dist, int face, float u,
+    float v, AI adj_id, thread float3& adj_point, AD adj_min_dist, AF adj_face, float adj_u, float adj_v, AR adj_ret)
+{
+    wp_adj_mesh_closest_point(id, point, face, adj_u, adj_v, adj_point);
+}
+template <typename AI, typename AD, typename AS, typename AF, typename AR>
+inline void wp_adj_mesh_query_point(ulong id, float3 point, float max_dist, float inside, int face, float u, float v,
+    AI adj_id, thread float3& adj_point, AD adj_max_dist, AS adj_inside, AF adj_face, float adj_u, float adj_v,
+    AR adj_ret)
+{
+    wp_adj_mesh_closest_point(id, point, face, adj_u, adj_v, adj_point);
+}
+template <typename E, typename AI, typename AD, typename AS, typename AF, typename AE, typename AR>
+inline void wp_adj_mesh_query_point_sign_normal(ulong id, float3 point, float max_dist, float inside, int face,
+    float u, float v, E epsilon, AI adj_id, thread float3& adj_point, AD adj_max_dist, AS adj_inside, AF adj_face,
+    float adj_u, float adj_v, AE adj_epsilon, AR adj_ret)
+{
+    wp_adj_mesh_closest_point(id, point, face, adj_u, adj_v, adj_point);
+}
+template <typename N, typename S, typename AI, typename AD, typename AS, typename AF, typename AN, typename AP,
+          typename AR>
+inline void wp_adj_mesh_query_point_sign_parity(ulong id, float3 point, float max_dist, float inside, int face,
+    float u, float v, N n_sample, S perturbation_scale, AI adj_id, thread float3& adj_point, AD adj_max_dist,
+    AS adj_inside, AF adj_face, float adj_u, float adj_v, AN adj_n_sample, AP adj_perturbation_scale, AR adj_ret)
+{
+    wp_adj_mesh_closest_point(id, point, face, adj_u, adj_v, adj_point);
+}
+template <typename A, typename T, typename AI, typename AD, typename AS, typename AF, typename AA, typename AT,
+          typename AR>
+inline void wp_adj_mesh_query_point_sign_winding_number(ulong id, float3 point, float max_dist, float inside,
+    int face, float u, float v, A accuracy, T threshold, AI adj_id, thread float3& adj_point, AD adj_max_dist,
+    AS adj_inside, AF adj_face, float adj_u, float adj_v, AA adj_accuracy, AT adj_threshold, AR adj_ret)
+{
+    wp_adj_mesh_closest_point(id, point, face, adj_u, adj_v, adj_point);
+}
 // A mesh descriptor starts with its BVH descriptor, so the generic bvh
 // query machinery reads the right tree straight from a mesh id; item
 // bounds in that descriptor are the per-triangle AABBs, matching the
@@ -11291,6 +11575,12 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     # barycentric coords w.r.t. the ray origin and direction (ports of
     # mesh.h / intersect.h; the vertex adjoints are dropped upstream too).
     (re.compile(r"\bwp::adj_mesh_query_ray\b"), "wp_adj_mesh_query_ray"),
+    (re.compile(r"\bwp::adj_mesh_query_point_sign_parity\b"), "wp_adj_mesh_query_point_sign_parity"),
+    (re.compile(r"\bwp::adj_mesh_query_point_sign_normal\b"), "wp_adj_mesh_query_point_sign_normal"),
+    (re.compile(r"\bwp::adj_mesh_query_point_sign_winding_number\b"), "wp_adj_mesh_query_point_sign_winding_number"),
+    (re.compile(r"\bwp::adj_mesh_query_point_no_sign\b"), "wp_adj_mesh_query_point_no_sign"),
+    (re.compile(r"\bwp::adj_mesh_query_furthest_point_no_sign\b"), "wp_adj_mesh_query_furthest_point_no_sign"),
+    (re.compile(r"\bwp::adj_mesh_query_point\b"), "wp_adj_mesh_query_point"),
     (re.compile(r"\bwp::adj_mesh_eval_position\b"), "wp_adj_mesh_eval_position"),
     (re.compile(r"\bwp::adj_mesh_eval_velocity\b"), "wp_adj_mesh_eval_velocity"),
     (re.compile(r"\bwp::mesh_query_ray\b"), "wp_mesh_query_ray"),
