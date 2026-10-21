@@ -22394,24 +22394,17 @@ def _struct_field_launch_value(fwd_args, arg_by_name, root_label: str, fpath: tu
     """
     idx, arg = arg_by_name[root_label]
     value = fwd_args[idx]
-    if fpath and fpath[0].startswith("[") and fpath[0] != "[*]":
-        from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
-
-        if get_dispatcher()._record_state is not None:
-            # The element records are resolved to buffers on the host at
-            # launch; a replay would keep reading the arrays bound at
-            # capture time even after ``data.assign(...)`` rebinds them.
-            # (Pointer tables, ``"[*]"``, are refreshed before every replay
-            # instead; see ``_struct_array_ptr_table``.)
-            raise RuntimeError(
-                f"Metal: kernel reads array fields of the elements of {root_label!r} (a wp.array of a struct "
-                "with array members), which cannot be captured into a Metal graph; launch it outside "
-                "wp.ScopedCapture"
-            )
     if fpath and fpath[0] == "[*]":
         return _struct_array_ptr_table(value, arg.type.dtype, fpath[1:])
     if fpath and fpath[0].startswith("["):
-        return _struct_array_elem_field_value(value, arg.type.dtype, int(fpath[0][1:-1]), fpath[1:])
+        k = int(fpath[0][1:-1])
+        field = _struct_array_elem_field_value(value, arg.type.dtype, k, fpath[1:])
+        from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
+
+        dispatcher = get_dispatcher()
+        if dispatcher._record_state is not None:
+            _struct_array_elem_field_recorded(dispatcher, root_label, value, arg.type.dtype, k, fpath[1:])
+        return field
     for comp in fpath:
         if value is None:
             return None
@@ -22676,6 +22669,105 @@ def _struct_array_ptr_rows(arr, struct_type, fpath: tuple[str, ...]):
     return table, bufs
 
 
+def _struct_array_elem_field_recorded(dispatcher, root_label, arr, struct_type, k: int, fpath) -> None:
+    """Guard a constant-index element field binding recorded into a Metal graph.
+
+    The launch binds the array that field ``fpath`` of element ``k`` of
+    ``arr`` references now (:func:`_struct_array_elem_field_value`) straight
+    into the recorded command. A CUDA graph instead reads the element record
+    on the device at every replay, so it follows a record rebound to another
+    array between replays. The recorded binding cannot follow that, so the
+    graph checks before every replay that the record still resolves to the
+    same Metal buffer, offset, shape and strides as at capture, and raises
+    otherwise (capture again after rebinding). Writes to the bound array's
+    contents, and to the element's other fields, need no check: the command
+    binds that buffer and the struct array, and reads both on the GPU.
+
+    A graph whose own commands write ``arr`` is rejected at ``end_record``
+    (``source``), since the host check before a replay cannot see those
+    writes.
+    """
+    import weakref  # noqa: PLC0415
+
+    from warp._src.context import _metal_find_buffer  # noqa: PLC0415
+
+    if arr is None or getattr(arr, "ptr", None) is None:
+        return
+    st = dispatcher._record_state
+    seen = st.setdefault("elem_field_checks", {})
+    key = (int(arr.ptr), k, tuple(fpath))
+    refs = seen.setdefault(key, [])
+    if any(r() is arr for r in refs):
+        return  # this recording already checks that binding
+    arr_ref = weakref.ref(arr)
+    refs.append(arr_ref)
+    captured = _struct_array_elem_field_resolve(arr, struct_type, k, fpath)
+    what = f"field {'.'.join(fpath)!r} of element {k} of {root_label!r}"
+
+    def check() -> None:
+        a = arr_ref()
+        if a is None:
+            return  # the struct array is gone; the command keeps the buffers it bound alive
+        now = _struct_array_elem_field_resolve(a, struct_type, k, fpath)
+        if now != captured:
+            raise RuntimeError(
+                f"Metal: {what} (a wp.array of a struct with array members) references a different array than "
+                "when the graph was captured; a Metal graph binds the array the element referenced at capture "
+                "time and cannot follow the record. Capture the graph again after rebinding element array members."
+            )
+
+    src_buf, _ = _metal_find_buffer(int(arr.ptr))
+    dispatcher.add_record_refresh(check, source=src_buf)
+
+
+def _struct_array_elem_field_resolve(arr, struct_type, k: int, fpath):
+    """What field ``fpath`` of element ``k`` of ``arr`` binds now: ``None`` for
+    a null record, else ``(buffer id, offset, shape, strides)``. The buffer is
+    compared by identity: an array freed and replaced by a new allocation at
+    the same address is a different Metal buffer."""
+    from warp._src.context import _metal_find_buffer  # noqa: PLC0415
+
+    if k >= arr.shape[0]:
+        return None
+    rec = _struct_array_elem_field_record(arr, struct_type, k, fpath)
+    if rec is None:
+        return None
+    data, shape, strides = rec
+    buf, off = _metal_find_buffer(data)
+    return (None if buf is None else id(buf), data if buf is None else int(off), shape, strides)
+
+
+def _struct_array_elem_field_record(arr, struct_type, k: int, fpath):
+    """``(data, shape, strides)`` of the ``array_t`` record in field ``fpath``
+    of element ``k`` of ``arr`` (host-visible storage, after a sync), or
+    ``None`` for a null record."""
+    import ctypes  # noqa: PLC0415
+
+    import numpy as np  # noqa: PLC0415
+
+    if not arr.is_contiguous:
+        raise RuntimeError("Metal: struct arrays with array members must be contiguous")
+    from warp._src.context import _metal_ptrs_shared  # noqa: PLC0415
+    from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
+
+    # Wait for queued writes to the records (``data.assign(...)``).
+    get_dispatcher().sync(torch=_metal_ptrs_shared(int(arr.ptr)))
+    np_dtype = struct_type.numpy_dtype()
+    nbytes = np.dtype(np_dtype).itemsize
+    raw = (ctypes.c_char * nbytes).from_address(int(arr.ptr) + k * int(arr.strides[0]))
+    rec = np.frombuffer(bytes(raw), dtype=np_dtype)[0]
+    for comp in fpath[:-1]:
+        rec = rec[comp]
+    a = rec[fpath[-1]]
+    data = int(a["data"])
+    if data == 0:
+        return None
+    ndim = int(a["ndim"])
+    shape = tuple(int(x) for x in a["shape"][:ndim])
+    strides = tuple(int(x) for x in a["strides"][:ndim])
+    return data, shape, strides
+
+
 def _struct_array_elem_field_value(arr, struct_type, k: int, fpath: tuple[str, ...]):
     """The ``wp.array`` stored in field ``fpath`` of element ``k`` of struct array ``arr``.
 
@@ -22684,36 +22776,16 @@ def _struct_array_elem_field_value(arr, struct_type, k: int, fpath: tuple[str, .
     whatever the host last wrote; struct arrays of array handles are built
     on the host and not rewritten by kernels.
     """
-    import ctypes  # noqa: PLC0415
-
-    import numpy as np  # noqa: PLC0415
-
     if arr is None or getattr(arr, "ptr", None) is None or k >= arr.shape[0]:
         return None
-    if not arr.is_contiguous:
-        raise RuntimeError("Metal: struct arrays with array members must be contiguous")
-    from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
-
-    # Wait for queued writes to the records (``data.assign(...)``).
-    from warp._src.context import _metal_ptrs_shared  # noqa: PLC0415
-
-    get_dispatcher().sync(torch=_metal_ptrs_shared(int(arr.ptr)))
-    np_dtype = struct_type.numpy_dtype()
-    nbytes = np.dtype(np_dtype).itemsize
-    raw = (ctypes.c_char * nbytes).from_address(int(arr.ptr) + k * int(arr.strides[0]))
-    rec = np.frombuffer(bytes(raw), dtype=np_dtype)[0]
+    rec = _struct_array_elem_field_record(arr, struct_type, k, fpath)
+    if rec is None:
+        return None
+    data, shape, strides = rec
     t = struct_type
     for comp in fpath[:-1]:
-        rec = rec[comp]
         t = t.vars[comp].type
     field_type = t.vars[fpath[-1]].type
-    a = rec[fpath[-1]]
-    data = int(a["data"])
-    if data == 0:
-        return None
-    ndim = int(a["ndim"])
-    shape = tuple(int(x) for x in a["shape"][:ndim])
-    strides = tuple(int(x) for x in a["strides"][:ndim])
     import warp as wp  # noqa: PLC0415
 
     return wp.array(ptr=data, shape=shape, strides=strides, dtype=field_type.dtype, device=arr.device)

@@ -2036,8 +2036,9 @@ class MetalDispatcher:
                         keep[1]()
                 raise MetalDispatchError(
                     "A captured kernel reads array members of a struct array that a command in the same graph "
-                    "writes (or whose writes are unknown); the per-replay refresh of its pointer table could "
-                    "not see those writes. Launch the reading kernel outside the capture."
+                    "writes (or whose writes are unknown); the per-replay refresh of its pointer table (or check "
+                    "of its element bindings) could not see those writes. Launch the reading kernel outside the "
+                    "capture."
                 )
         graph = MetalGraph(
             icb=st["icb"],
