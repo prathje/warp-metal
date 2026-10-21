@@ -606,6 +606,67 @@ class TestMetalR4Kamino(unittest.TestCase):
             """,
         )
 
+    def test_metal_translation_holds_codegen_lock(self):
+        # A CPU codegen of another kernel on another thread rebuilds the shared
+        # helper's adjoint. Started between the Metal build and the inliner, it
+        # must wait for the translation (``_codegen_lock``) instead of swapping
+        # in the CPU form of ``wp.tile_fft`` under it.
+        _run(
+            self,
+            """
+            import os
+            import threading
+
+            import warp._src.codegen_metal as cm
+
+            os.environ["WARP_METAL_DISABLE_ARTIFACT_CACHE"] = "1"
+            wp.config.cache_kernels = False
+            M, N = 1, 16
+
+            @wp.func
+            def fft_row(x: wp.array2d[wp.vec2f], y: wp.array2d[wp.vec2f]):
+                t = wp.tile_load(x, shape=(M, N))
+                wp.tile_fft(t)
+                wp.tile_store(y, t)
+
+            @wp.kernel(module="unique")
+            def k_metal(x: wp.array2d[wp.vec2f], y: wp.array2d[wp.vec2f]):
+                fft_row(x, y)
+
+            @wp.kernel(module="unique")
+            def k_cpu(x: wp.array2d[wp.vec2f], y: wp.array2d[wp.vec2f]):
+                fft_row(x, y)
+
+            def cpu_codegen():
+                m = k_cpu.module
+                m._run_codegen(m.resolve_options(wp.config, block_dim=1) | {"block_dim": 1, "output_arch": None}, True)
+
+            orig = cm._ast_inline
+            other = []
+
+            def inline_with_concurrent_cpu_build(*args, **kwargs):
+                if not other:
+                    t = threading.Thread(target=cpu_codegen)
+                    other.append(t)
+                    t.start()
+                    t.join(timeout=3.0)  # finishes at once unless the lock holds it off
+                return orig(*args, **kwargs)
+
+            cm._ast_inline = inline_with_concurrent_cpu_build
+            try:
+                art = cm.generate_msl_kernel(k_metal, block_dim=1)
+            finally:
+                cm._ast_inline = orig
+                other[0].join()
+            xr = np.random.default_rng(1).standard_normal((M, N, 2)).astype(np.float32)
+            x = wp.array(xr, dtype=wp.vec2f, device="metal:0")
+            y = wp.zeros((M, N), dtype=wp.vec2f, device="metal:0")
+            wp.launch_tiled(k_metal, dim=[1], inputs=[x, y], device="metal:0", block_dim=1)
+            r = y.numpy()
+            np.testing.assert_allclose(r[..., 0] + 1j * r[..., 1], np.fft.fft(xr[..., 0] + 1j * xr[..., 1]), atol=1e-3)
+            """,
+        )
+
     def test_block_model_switch_restores_unset_flags(self):
         # A kernel that never took the coop model at block_dim=32 has no coop
         # flags set. Switching to the serial model and back restored them as

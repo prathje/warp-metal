@@ -21570,8 +21570,18 @@ def _store_cached_failure(key: str, exc: Exception) -> None:
 def generate_msl_kernel(
     kernel, block_dim: int | None = None, adjoint: bool = False, grad_args: tuple[str, ...] = ()
 ) -> MetalKernelArtifact:
-    """Return the MSL artifact for a Warp ``Kernel`` (see ``_generate_msl_kernel_cached``)."""
-    with _kernel_fp64_mode(kernel):
+    """Return the MSL artifact for a Warp ``Kernel`` (see ``_generate_msl_kernel_cached``).
+
+    Runs under Warp's ``_codegen_lock``, as ``Module._run_codegen`` does for
+    CPU/CUDA: the Metal build and the translation read ``kernel.adj`` and the
+    shared ``@wp.func`` adjoints, which a CPU/CUDA build (or another Metal
+    translation) on another thread would otherwise rebuild in between. The
+    translation is pure Python (no dispatcher, allocation or PSO compile) and
+    the lock is re-entrant, so a nested launch on the same thread is fine.
+    """
+    from warp._src.codegen import _codegen_lock  # noqa: PLC0415
+
+    with _codegen_lock, _kernel_fp64_mode(kernel):
         return _generate_msl_kernel_cached(kernel, block_dim=block_dim, adjoint=adjoint, grad_args=grad_args)
 
 
