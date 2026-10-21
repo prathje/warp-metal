@@ -12055,8 +12055,12 @@ _TILE_CONST_STMT_PAT = re.compile(r"^\s*var_(\w+)\s*=\s*wp::tile_(zeros|ones)\s*
 
 
 def _ir_call_args(line: str, pat: re.Pattern) -> list[list[str]]:
-    """Comma-split argument lists of every ``pat`` call on ``line``."""
-    return [[a.strip() for a in m.group(1).split(",")] for m in pat.finditer(line)]
+    """Comma-split argument lists of every ``pat`` call on ``line``.
+
+    The argument list is ``pat``'s last group (``_TILE_MATMUL_ASSIGN_PAT``
+    captures the assigned label first).
+    """
+    return [[a.strip() for a in m.group(pat.groups).split(",")] for m in pat.finditer(line)]
 
 
 def _fold_tile_transpose_views(
