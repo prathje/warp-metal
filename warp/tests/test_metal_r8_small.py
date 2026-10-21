@@ -6,6 +6,9 @@
 * Reverse-mode ``tile_load`` / ``tile_store`` on a partial edge tile: the
   gradient scatter/gather must skip the elements outside the array, as the
   forward pass does.
+* A ``tile_transpose`` copy read element-wise by a user ``tile_map`` in the
+  reverse pass (warp_nn's LSTM cell) is a read, not a write that would make
+  the copy stale.
 * Metal's Python-side hash-grid build, BVH/mesh refit and winding-number
   precompute stand in for native CUDA calls and must not be recorded on an
   active ``wp.Tape``.
@@ -60,6 +63,20 @@ _TILE_ADJ_PRELUDE = textwrap.dedent(
         C += wp.tile_broadcast(wp.tile_load(b, shape=(T, 1), offset=(j * T, 0)), shape=(T, T))
         wp.tile_store(y, wp.tile_transpose(C), offset=(i * T, j * T))
 
+    @wp.func
+    def cell_fn(c: float, a: float, b: float):
+        return wp.tanh(a) * c + b * b
+
+    # warp_nn LSTMCell shape: a transposed load feeds a user tile_map, the
+    # result is stored transposed.
+    @wp.kernel
+    def k_transpose_tile_map(x: wp.array2d[float], a: wp.array2d[float], b: wp.array2d[float], y: wp.array2d[float]):
+        tc = wp.tile_transpose(wp.tile_load(x, shape=(T, T), offset=(0, 0)))
+        ta = wp.tile_load(a, shape=(T, T), offset=(0, 0))
+        tb = wp.tile_load(b, shape=(T, T), offset=(0, 0))
+        c = wp.tile_map(cell_fn, tc, ta, tb)
+        wp.tile_store(y, wp.tile_transpose(c), offset=(0, 0))
+
     def grads(dev, kern, in_shapes, out_shape, dim, block_dim):
         rng = np.random.default_rng(7)
         ins = [wp.array(rng.standard_normal(s).astype(np.float32), device=dev, requires_grad=True) for s in in_shapes]
@@ -100,6 +117,13 @@ class TestMetalR8TileAdjointEdge(unittest.TestCase):
 
     def test_partial_tile_1d_grad(self):
         _run(self, "check(k_scale_1d, [(21,)], (21,), dim=2)\n")
+
+    def test_transpose_copy_read_by_tile_map_grad(self):
+        _run(
+            self,
+            "check(k_transpose_tile_map, [(T, T), (T, T), (T, T)], (T, T))\n"
+            "check(k_transpose_tile_map, [(5, 3), (3, 5), (3, 5)], (5, 3))\n",
+        )
 
     def test_partial_tile_linear_layer_grad(self):
         _run(

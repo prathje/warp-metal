@@ -12055,6 +12055,10 @@ def _swap_tile_extract(line: str, t_label: str, s_label: str) -> str:
     return re.sub(r"\bwp::tile_extract\s*\(([^()]*)\)", repl, line)
 
 
+# ``var_X = var_T.c[<index>];``: one tile element copied into a plain local.
+_TILE_ELEMENT_READ_STMT_PAT = re.compile(r"^\s*var_(\w+)\s*=\s*var_(\w+)\.c\[\s*[\w\s+*-]+\]\s*;\s*$")
+
+
 def _tile_mention_roles(line: str, label: str) -> list[str]:
     """Role of each mention of tile ``label`` on IR statement ``line``.
 
@@ -12072,6 +12076,11 @@ def _tile_mention_roles(line: str, label: str) -> list[str]:
     if n == 0:
         return []
     roles: list[str] = []
+    m_el = _TILE_ELEMENT_READ_STMT_PAT.match(line)
+    if m_el is not None and m_el.group(2) == label and m_el.group(1) != label:
+        # ``var_X = var_<label>.c[i];`` copies one element into another local
+        # (the user ``tile_map`` expansion): a read, not a member write.
+        return ["r"]
     if re.search(rf"(?:[.\[&*]\s*{tok}\b|\b{tok}\s*(?:\.|\[|->|=(?!=)))", line):
         return ["w"] * n
     if re.match(r"^\s*wp::adj_\w+\s*(?:<[^()]*>)?\s*\(", line):
