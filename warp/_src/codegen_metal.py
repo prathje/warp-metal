@@ -12351,7 +12351,7 @@ _TILE_STORE_INDEXED_PAT = re.compile(r"\bwp::tile_store_indexed\s*\(([^)]*)\)")
 _TILE_ATOMIC_ADD_PAT = re.compile(
     r"\bvar_(\w+)\s*=\s*wp::tile_atomic_add\s*<\s*"
     r"(wp::vec_t<\d+,\s*wp::\w+>|wp::\w+|wp_vec\d+_\w+|wp_mat\d+x\d+_\w+)"
-    r"\s*,\s*\w+\s*>\s*\(([^)]*)\)"
+    r"\s*,\s*(\w+)\s*>\s*\(([^)]*)\)"
 )
 _TILE_CHOLESKY_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_cholesky\s*<[^()]*>\s*\(([^)]*)\)")
 _TILE_CHOLESKY_SOLVE_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_cholesky_solve\s*<[^()]*>\s*\(([^)]*)\)")
@@ -12387,6 +12387,18 @@ def _build_flat_base_expr(arr_name: str, lead_idx_args: list[str], inner_dims: i
     return " + ".join(terms)
 
 
+def _tile_lead_guard(arr_name: str, lead_idx_args: list[str]) -> str:
+    """MSL condition that every leading (non-tiled) index lies inside ``arr_name``.
+
+    ``"true"`` when the tile spans all of the array's dimensions. CPU/CUDA
+    bounds-check every dimension of a tile access (``tile_global_t::index``),
+    so a leading offset past the array zero-fills a load and skips a store.
+    """
+    if not lead_idx_args:
+        return "true"
+    return " && ".join(f"({ix}) >= 0 && ({ix}) < (int){arr_name}_shape[{d}]" for d, ix in enumerate(lead_idx_args))
+
+
 def _tile_grad_slots(
     arr_name: str,
     lead_idx_args: list[str],
@@ -12406,7 +12418,7 @@ def _tile_grad_slots(
     component of a vec-element tile.
 
     ``in_bounds`` is the MSL condition under which the element lies inside
-    the array's tiled dimensions. The forward load zero-fills, and the
+    the array (its leading indices and tiled dimensions). The forward load zero-fills, and the
     forward store skips, every element outside them (a partial tile at the
     array's edge), so the reverse pass must skip those elements too: an
     unguarded scatter would write past the array and alias other rows.
@@ -12416,6 +12428,7 @@ def _tile_grad_slots(
     scalar_inner_dims = (2 if two_d else 1) + (1 if vec_n else 0)
     base_expr = _build_flat_base_expr(arr_name, lead_idx_args, inner_dims=scalar_inner_dims)
     row_dim = f"(int){arr_name}_shape[{len(lead_idx_args)}]"
+    lead_ok = _tile_lead_guard(arr_name, lead_idx_args)
     if two_d:
         row_stride = f"{arr_name}_shape[{len(lead_idx_args) + 1}]"
         col_dim = f"(int){arr_name}_shape[{len(lead_idx_args) + 1}]"
@@ -12429,7 +12442,7 @@ def _tile_grad_slots(
     for i in range(rows):
         for j in range(cols):
             flat = f"{base_expr} + (({row_off}) + {i}) * ({row_stride}) + (({col_off}) + {j})"
-            guard = f"(({row_off}) + {i}) >= 0 && (({row_off}) + {i}) < {row_dim}"
+            guard = f"({lead_ok}) && (({row_off}) + {i}) >= 0 && (({row_off}) + {i}) < {row_dim}"
             if col_dim is not None:
                 guard += f" && (({col_off}) + {j}) >= 0 && (({col_off}) + {j}) < {col_dim}"
             k = i * cols + j
@@ -12589,6 +12602,18 @@ def _translate_tile_intrinsics(
             # ``col_off=0`` so the same helper signature works.
             row_off, col_off = offsets[0], "0"
         is_f64_src = arr_name in f64_arr_names
+        # Source extents for the zero-fill guards below. ``<arr>_shape`` only
+        # exists for real array args; anything else keeps the unchecked load.
+        shaped = arr_name in shaped_array_names
+        n_lead = len(lead_idx_args)
+        lead_ok = _tile_lead_guard(arr_name, lead_idx_args) if shaped else "true"
+        ext_rows = f"(int){arr_name}_shape[{n_lead}]"
+        ext_cols = f"(int){arr_name}_shape[{n_lead + 1}]" if two_d else "1"
+
+        def _in_src(r: str, c: str) -> str:
+            # ``(r, c)`` lies inside the source (leading indices included).
+            return f"({lead_ok}) && ({r}) >= 0 && ({r}) < {ext_rows} && ({c}) >= 0 && ({c}) < {ext_cols}"
+
         if is_f64_src and (lhs in distributed_tiles or lhs in smem_tiles):
             raise MetalCodegenError(
                 f"MSL codegen: tile_load from a demoted float64 array into a lane-distributed or "
@@ -12603,30 +12628,41 @@ def _translate_tile_intrinsics(
                 )
             return (
                 f"{{ const int _dl_i = ({row_off}) + {_COOP_LANE}; "
-                f"var_{lhs} = (_dl_i >= 0 && _dl_i < (int){arr_name}_shape[{len(lead_idx_args)}]) "
+                f"var_{lhs} = (({lead_ok}) && _dl_i >= 0 && _dl_i < (int){arr_name}_shape[{len(lead_idx_args)}]) "
                 f"? {arr}[{base_expr} + _dl_i] : {_sc_zero(msl_scalar)}; }}"
             )
         # Shape (1,1) collapses to a scalar local (see ``_msl_var_type``);
         # there's no wp_tile_1x1 struct/helper, so emit a direct subscript.
         if rows == 1 and cols == 1:
             elem = f"{arr}[{base_expr} + ({row_off}) * ({row_stride}) + ({col_off})]"
-            return f"var_{lhs} = {_f64_elem_read(elem) if is_f64_src else elem}"
+            elem = _f64_elem_read(elem) if is_f64_src else elem
+            if shaped:
+                # Out-of-range single element reads as zero, like a larger tile.
+                elem = f"(({_in_src(row_off, col_off)}) ? {elem} : {_sc_zero(msl_scalar)})"
+            return f"var_{lhs} = {elem}"
         # Vec-element tile: route to the vec-element helper. The
         # helper folds the ``n_elem`` scaling into its inner index, so
         # ``row_stride`` here is in ELEMENTS (1 for a 1-D tile of
         # ``vec_t<n_elem, scalar>`` over a 1-D backing array).
         if vec_n_elem > 0:
-            if is_f64_src:
-                # Demoted source: the ``_load`` helper would assign the raw
-                # ``ulong`` bits into a float slot (a silent integer->float
-                # conversion), so emit the helper's loop inline with the
-                # bit-pattern conversion on every element.
+            if is_f64_src or shaped:
+                # Inline the helper's loop: a demoted source needs the
+                # bit-pattern conversion on every element (the ``_load``
+                # helper would assign the raw ``ulong`` bits into a float
+                # slot), and a known source extent zero-fills the elements
+                # of a partial edge tile instead of reading past the array.
+                elem = f"{arr}[{base_expr} + _tl_e + _tl_k]"
+                elem = f"wp_f64_to_f32({elem})" if is_f64_src else elem
+                if shaped:
+                    elem = (
+                        f"(({_in_src(f'({row_off}) + _tl_i', f'({col_off}) + _tl_j')}) ? {elem} : "
+                        f"{_sc_zero(msl_scalar)})"
+                    )
                 return (
                     f"{{ for (int _tl_i = 0; _tl_i < {rows}; ++_tl_i) for (int _tl_j = 0; _tl_j < {cols}; ++_tl_j) {{ "
                     f"const int _tl_e = ((({row_off}) + _tl_i) * ({row_stride}) + (({col_off}) + _tl_j)) * {vec_n_elem}; "
                     f"for (int _tl_k = 0; _tl_k < {vec_n_elem}; ++_tl_k) "
-                    f"var_{lhs}.c[(_tl_i * {cols} + _tl_j) * {vec_n_elem} + _tl_k] = "
-                    f"wp_f64_to_f32({arr}[{base_expr} + _tl_e + _tl_k]); }} }}"
+                    f"var_{lhs}.c[(_tl_i * {cols} + _tl_j) * {vec_n_elem} + _tl_k] = {elem}; }} }}"
                 )
             helper = f"wp_tile_{rows}x{cols}_vec{vec_n_elem}_{msl_scalar}_load"
             return f"var_{lhs} = {helper}({arr}, {base_expr}, {row_stride}, {row_off}, {col_off})"
@@ -12637,12 +12673,17 @@ def _translate_tile_intrinsics(
             off, srows, scols, _sc = smem_tiles[lhs]
             n = srows * scols
             slot = f"({_SMEM_ARENA_NAME} + {off})"
+            elem = f"{arr}[{base_expr} + (({row_off}) + (int)_tl_i) * ({row_stride}) + (({col_off}) + (int)_tl_j)]"
+            if shaped:
+                elem = (
+                    f"(({_in_src(f'({row_off}) + (int)_tl_i', f'({col_off}) + (int)_tl_j')}) ? {elem} : "
+                    f"{_sc_zero(msl_scalar)})"
+                )
             return (
                 "do { threadgroup_barrier(metal::mem_flags::mem_threadgroup); "
                 f"for (uint _tl_e = _coop_lane; _tl_e < {n}u; _tl_e += 32u) {{ "
                 f"uint _tl_i = _tl_e / {scols}u; uint _tl_j = _tl_e - _tl_i * {scols}u; "
-                f"{slot}[_tl_e] = {arr}[{base_expr} + (({row_off}) + (int)_tl_i) * ({row_stride}) "
-                f"+ (({col_off}) + (int)_tl_j)]; }} "
+                f"{slot}[_tl_e] = {elem}; }} "
                 "threadgroup_barrier(metal::mem_flags::mem_threadgroup); } while (0)"
             )
         # NB: cooperative tile_load into a *private* struct was tried and
@@ -12658,18 +12699,13 @@ def _translate_tile_intrinsics(
         # out of anything else keep the unchecked overload.
         n_rows_expr = None
         n_cols_expr = None
-        if arr_name in shaped_array_names:
-            n_lead = len(lead_idx_args)
-            if two_d:
-                # Both tile offsets were consumed as such, so the tile spans
-                # array dims ``n_lead`` and ``n_lead + 1``.
-                n_rows_expr = f"(int){arr_name}_shape[{n_lead}]"
-                n_cols_expr = f"(int){arr_name}_shape[{n_lead + 1}]"
-            else:
-                # True 1-D tile: it walks the array's innermost dim, and any
-                # leading array indices were parsed as slice indices.
-                n_rows_expr = f"(int){arr_name}_shape[{n_lead}]"
-                n_cols_expr = "1"
+        if shaped:
+            # A 2-D tile spans array dims ``n_lead`` and ``n_lead + 1``; a
+            # true 1-D tile walks dim ``n_lead`` (any leading array indices
+            # were parsed as slice indices). A leading index outside the
+            # array zero-fills the whole tile: report zero rows.
+            n_rows_expr = ext_rows if lead_ok == "true" else f"(({lead_ok}) ? {ext_rows} : 0)"
+            n_cols_expr = ext_cols
         if is_f64_src:
             # Same loop as the ``_load`` helper (bounds-checked zero-fill when
             # the extents are known), converting each element's double bits.
@@ -12915,7 +12951,10 @@ def _translate_tile_intrinsics(
         msl_scalar = _SCALAR_CTYPE_TO_MSL.get(dtype_token)
         if msl_scalar is None:
             return m.group(0)
-        args = [a.strip() for a in m.group(3).split(",")]
+        # ``tile_atomic_add<T, BoundsCheck>``: CPU/CUDA skip out-of-range
+        # elements (returning zero for them) unless the check is compiled out.
+        bounds_check = m.group(3) != "false"
+        args = [a.strip() for a in m.group(4).split(",")]
         arr = args[0]
         tile_var = args[-1]
         tile_label = tile_var[len("var_") :] if tile_var.startswith("var_") else tile_var
@@ -12940,6 +12979,23 @@ def _translate_tile_intrinsics(
         def _elem(i: str, j: str) -> str:
             return f"{arr}[{base_expr} + (({row_off}) + {i}) * ({row_stride}) + (({col_off}) + {j})]"
 
+        # Same guard as the checked ``repl_store``: an element of a partial
+        # edge tile outside the destination is skipped and its previous
+        # value reads as zero. Unguarded, it aliased the next row (or ran
+        # past the array) whenever the added value was non-zero there.
+        checked = bounds_check and arr_name in shaped_array_names
+        lead_ok = _tile_lead_guard(arr_name, lead_idx_args)
+        n_lead = len(lead_idx_args)
+        n_rows_expr = f"(int){arr_name}_shape[{n_lead}]"
+        n_cols_expr = f"(int){arr_name}_shape[{n_lead + 1}]" if two_d else "1"
+
+        def _guarded(i: str, j: str, fetch: str) -> str:
+            if not checked:
+                return fetch
+            r, c = f"(({row_off}) + {i})", f"(({col_off}) + {j})"
+            ok = f"({lead_ok}) && {r} >= 0 && {r} < {n_rows_expr} && {c} >= 0 && {c} < {n_cols_expr}"
+            return f"(({ok}) ? {fetch} : {_sc_zero(msl_scalar)})"
+
         # A demoted float64 destination is plain ``device ulong*`` and goes
         # through the lock-emulated helper (see ``_F64_ATOMIC_HELPERS``).
         if arr_name in f64_arr_names:
@@ -12954,7 +13010,7 @@ def _translate_tile_intrinsics(
 
         # Single-element tile is a plain scalar local on both sides.
         if rows == 1 and cols == 1:
-            return f"var_{lhs} = {_fetch_add(_elem('0', '0'), tile_var)}"
+            return f"var_{lhs} = {_guarded('0', '0', _fetch_add(_elem('0', '0'), tile_var))}"
         # Multi-element: the result tile local is already declared by the
         # generic local-decl pass, so only fill it — one pre-add value per
         # element. (Re-declaring here is a redefinition error in MSL.)
@@ -12963,7 +13019,7 @@ def _translate_tile_intrinsics(
             f"for (int _ta_i = 0; _ta_i < {rows}; ++_ta_i) "
             f"for (int _ta_j = 0; _ta_j < {cols}; ++_ta_j) "
             f"var_{lhs}.c[_ta_i * {cols} + _ta_j] = "
-            f"{_fetch_add(_elem('_ta_i', '_ta_j'), f'{tile_var}.c[_ta_i * {cols} + _ta_j]')}; "
+            f"{_guarded('_ta_i', '_ta_j', _fetch_add(_elem('_ta_i', '_ta_j'), f'{tile_var}.c[_ta_i * {cols} + _ta_j]'))}; "
             "} while (0)"
         )
 
@@ -19186,7 +19242,8 @@ def _generate_msl_kernel_uncached(
                         _finalize(
                             f"{indent}for (int _al_e = {_COOP_LANE}; _al_e < {rows * cols}; _al_e += {coop_block_n}) {{ "
                             f"const int _al_i = _al_e / {cols}; const int _al_j = _al_e - _al_i * {cols}; "
-                            f"if ((({_roff}) + _al_i) >= 0 && (({_roff}) + _al_i) < {_rdim}{_cguard}) "
+                            f"if (({_tile_lead_guard(arr_name, _lead)}) && "
+                            f"(({_roff}) + _al_i) >= 0 && (({_roff}) + _al_i) < {_rdim}{_cguard}) "
                             f"wp_adj_accum(&{grad_name}[{_base} + (({_roff}) + _al_i) * ({_rstride}) + (({_coff}) + _al_j)], "
                             f"{adj_tile}.c[_al_e]); }}"
                         )

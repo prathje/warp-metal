@@ -134,6 +134,96 @@ class TestMetalR8TileAdjointEdge(unittest.TestCase):
         )
 
 
+_TILE_EDGE_BODY = textwrap.dedent(
+    """
+    import numpy as np
+
+    TR, TC = 8, 4
+
+    @wp.kernel(module="unique")
+    def k_atomic(x: wp.array2d[float], y: wp.array2d[float], prev: wp.array2d[float]):
+        i, j = wp.tid()
+        t = wp.tile_load(x, shape=(TR, TC), offset=(i * TR, j * TC))
+        p = wp.tile_atomic_add(y, t + wp.tile_ones(shape=(TR, TC), dtype=float), offset=(i * TR, j * TC))
+        wp.tile_store(prev, p, offset=(i * TR, j * TC))
+
+    @wp.kernel(module="unique")
+    def k_load11(x: wp.array2d[float], y: wp.array2d[float]):
+        i, j = wp.tid()
+        s = wp.tile_sum(wp.tile_load(x, shape=(1, 1), offset=(i, j)))
+        wp.tile_atomic_add(y, wp.tile_ones(shape=(1, 1), dtype=float) * s[0], offset=(0, 0))
+
+    @wp.kernel(module="unique")
+    def k_lead_sum(x: wp.array3d[float], y: wp.array[float]):
+        b = wp.tid()
+        wp.tile_atomic_add(y, wp.tile_sum(wp.tile_load(x, shape=(1, TR, TC), offset=(b, 0, 0))), offset=(0,))
+
+    @wp.kernel(module="unique")
+    def k_vec_sum(x: wp.array[wp.vec3], y: wp.array[float]):
+        i = wp.tid()
+        s = wp.tile_reduce(wp.add, wp.tile_load(x, shape=(TR,), offset=(i * TR,)))
+        wp.tile_atomic_add(y, wp.tile_ones(shape=(1,), dtype=float) * wp.dot(s[0], wp.vec3(1.0)), offset=(0,))
+
+    @wp.kernel(module="unique")
+    def k_lead_sq(x: wp.array3d[float], y: wp.array3d[float]):
+        b, i = wp.tid()
+        t = wp.tile_load(x, shape=(1, TR, TC), offset=(b, i * TR, 0))
+        wp.tile_store(y, t * t, offset=(b, i * TR, 0))
+
+    rng = np.random.default_rng(0)
+    X = rng.standard_normal((20, 9)).astype(np.float32)
+    X3 = rng.standard_normal((6, 13, TC)).astype(np.float32)
+    V = rng.standard_normal((40, 3)).astype(np.float32)
+
+    # Every array is a view into a larger buffer, so an element written or
+    # read past the view (aliasing the next row or slab) is observable.
+    def atomic(dev):
+        x = wp.array(X, device=dev)[:13, :7]
+        yb, pb = wp.zeros((20, 9), device=dev), wp.zeros((20, 9), device=dev)
+        yb[:13, :7].fill_(0.5)
+        wp.launch_tiled(k_atomic, dim=(2, 2), inputs=[x, yb[:13, :7], pb[:13, :7]], device=dev, block_dim=32)
+        return yb.numpy(), pb.numpy()
+
+    def load11(dev):
+        y = wp.zeros((1, 1), device=dev)
+        wp.launch_tiled(k_load11, dim=(4, 3), inputs=[wp.array(X, device=dev)[:3, :2], y], device=dev, block_dim=32)
+        return (y.numpy(),)
+
+    def lead_sum(dev):
+        y = wp.zeros(1, device=dev)
+        wp.launch_tiled(k_lead_sum, dim=5, inputs=[wp.array(X3[:, :TR], device=dev)[:3], y], device=dev, block_dim=32)
+        return (y.numpy(),)
+
+    def vec_sum(dev):
+        y = wp.zeros(1, device=dev)
+        x = wp.array(V, dtype=wp.vec3, device=dev)[:21]
+        wp.launch_tiled(k_vec_sum, dim=3, inputs=[x, y], device=dev, block_dim=32)
+        return (y.numpy(),)
+
+    def lead_grad(dev):
+        xb = wp.array(X3, device=dev, requires_grad=True)
+        yb = wp.zeros(X3.shape, device=dev, requires_grad=True)
+        tape = wp.Tape()
+        with tape:
+            wp.launch_tiled(k_lead_sq, dim=(5, 2), inputs=[xb[:3], yb[:3]], device=dev, block_dim=32)
+        yb.grad.fill_(1.0)
+        tape.backward()
+        return yb.numpy(), xb.grad.numpy(), yb.grad.numpy()
+
+    for fn in (atomic, load11, lead_sum, vec_sum, lead_grad):
+        for r, g in zip(fn("cpu"), fn("metal:0")):
+            np.testing.assert_allclose(g, r, rtol=1e-5, atol=1e-5, err_msg=fn.__name__)
+    """
+)
+
+
+@unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
+@unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
+class TestMetalR8TileEdgeBounds(unittest.TestCase):
+    def test_partial_tile_atomic_load_and_leading_index_bounds(self):
+        _run_with_metal_enabled(self, _TILE_EDGE_BODY, timeout=600)
+
+
 _TAPE_BODY = textwrap.dedent(
     """
     import io
