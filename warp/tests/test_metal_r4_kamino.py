@@ -667,6 +667,56 @@ class TestMetalR4Kamino(unittest.TestCase):
             """,
         )
 
+    def test_artifact_cache_key_covers_callee_ir(self):
+        # The on-disk artifact key must change when a called ``@wp.func``'s
+        # IR does (here: rebuilt by a CPU codegen of another kernel), so an
+        # artifact translated from foreign helper IR can never be stored under
+        # the key of the Metal-built one. It must also be the same in a fresh
+        # process.
+        _run(
+            self,
+            """
+            import os
+            import subprocess
+            import sys
+
+            import warp._src.codegen_metal as cm
+
+            wp.config.cache_kernels = False
+            M, N = 1, 16
+
+            @wp.func
+            def fft_row(x: wp.array2d[wp.vec2f], y: wp.array2d[wp.vec2f]):
+                t = wp.tile_load(x, shape=(M, N))
+                wp.tile_fft(t)
+                wp.tile_store(y, t)
+
+            @wp.kernel(module="unique")
+            def k_metal(x: wp.array2d[wp.vec2f], y: wp.array2d[wp.vec2f]):
+                fft_row(x, y)
+
+            @wp.kernel(module="unique")
+            def k_cpu(x: wp.array2d[wp.vec2f], y: wp.array2d[wp.vec2f]):
+                fft_row(x, y)
+
+            adj = cm._ensure_adj_built(k_metal, block_dim=1)
+            key = cm._artifact_cache_key(k_metal, adj)
+            assert key is not None
+            if os.environ.get("_KEY_ONLY"):
+                print("KEY", key)
+                raise SystemExit(0)
+
+            m = k_cpu.module
+            m._run_codegen(m.resolve_options(wp.config, block_dim=1) | {"block_dim": 1, "output_arch": None}, True)
+            assert k_metal.adj.blocks is adj.blocks  # only the helper was rebuilt
+            assert cm._artifact_cache_key(k_metal, k_metal.adj) != key
+
+            out = subprocess.run([sys.executable, __file__], env=dict(os.environ, _KEY_ONLY="1"),
+                                 capture_output=True, text=True, check=True).stdout
+            assert f"KEY {key}" in out, out
+            """,
+        )
+
     def test_block_model_switch_restores_unset_flags(self):
         # A kernel that never took the coop model at block_dim=32 has no coop
         # flags set. Switching to the serial model and back restored them as

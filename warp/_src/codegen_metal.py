@@ -21179,7 +21179,9 @@ def _generate_msl_kernel_uncached(
 # v11: native packed arrays go bindless (``ptr_table`` / ``__arg_ptrs``).
 # v17: Warp's deep kernel content hash joins the key (callee closures), and
 # user-function native names in the hashed body are canonicalised.
-_ARTIFACT_CACHE_VERSION = 17
+# v18: the IR of called ``@wp.func`` helpers joins the key (a helper rebuilt
+# with other builder options produced a different artifact under one key).
+_ARTIFACT_CACHE_VERSION = 18
 _codegen_source_hash_cached: str | None = None
 
 
@@ -21352,6 +21354,28 @@ def _canonical_user_call_names(body: str, adj) -> str:
     return pat.sub(repl, body)
 
 
+def _callee_ir_digest(adj) -> str:
+    """Hash of the forward IR of every user function ``adj`` calls, transitively.
+
+    Deterministic across processes: callees in call order, each as its
+    canonicalised forward body plus its locals' types and constants.
+    """
+    import hashlib  # noqa: PLC0415
+
+    h = hashlib.sha256()
+    for func_adj, blocks in _callee_ir_snapshot(adj):
+        if not blocks:
+            h.update(b"<unbuilt>\x00")
+            continue
+        h.update(_canonical_user_call_names("\n".join(blocks[0].body_forward), func_adj).encode("utf-8"))
+        h.update(b"\x00")
+        for v in getattr(func_adj, "variables", None) or ():
+            const = getattr(v, "constant", None)
+            h.update(f"{v.label}:{v.ctype()}={const!r};".encode())
+        h.update(b"\x01")
+    return h.hexdigest()
+
+
 def _artifact_cache_key(kernel, adj) -> str | None:
     """Cache key over everything the generated artifact depends on."""
     import hashlib  # noqa: PLC0415
@@ -21372,6 +21396,7 @@ def _artifact_cache_key(kernel, adj) -> str | None:
         const_sig = ";".join(
             f"{v.label}={v.constant!r}" for v in adj.variables if getattr(v, "constant", None) is not None
         )
+        callee_ir = _callee_ir_digest(adj)
     except Exception:
         return None
     import warp  # noqa: PLC0415
@@ -21389,6 +21414,10 @@ def _artifact_cache_key(kernel, adj) -> str | None:
         str(opts.get("output_arch")),
         const_sig,
         body,
+        # The IR of every called ``@wp.func`` as the inliner will splice it.
+        # ``content_hash`` covers their source, but not the builder options
+        # their IR was built with.
+        callee_ir,
         # Native dispatch compiles prologue-free artifacts (outputs bind
         # in place); MLX artifacts carry init shadows. Never mix.
         f"native={bool(warp.config.metal_native_dispatch)}",
