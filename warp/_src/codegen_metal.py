@@ -22688,7 +22688,6 @@ def _struct_array_elem_field_recorded(dispatcher, root_label, arr, struct_type, 
     writes.
     """
     import ctypes  # noqa: PLC0415
-    import weakref  # noqa: PLC0415
 
     from warp._src.context import _metal_find_buffer  # noqa: PLC0415
 
@@ -22697,11 +22696,14 @@ def _struct_array_elem_field_recorded(dispatcher, root_label, arr, struct_type, 
     st = dispatcher._record_state
     seen = st.setdefault("elem_field_checks", {})
     key = (int(arr.ptr), k, tuple(fpath))
-    refs = seen.setdefault(key, [])
-    if any(r() is arr for r in refs):
+    held = seen.setdefault(key, [])
+    if any(a is arr for a in held):
         return  # this recording already checks that binding
-    arr_ref = weakref.ref(arr)
-    refs.append(arr_ref)
+    # Held by the check (not a weak reference): the launch argument may be a
+    # temporary view or ``wp.array(ptr=...)`` wrapper of a longer-lived struct
+    # array whose records the caller keeps rewriting; the graph's command keeps
+    # the record buffer alive either way.
+    held.append(arr)
     captured = _struct_array_elem_field_resolve(arr, struct_type, k, fpath)
     what = f"field {'.'.join(fpath)!r} of element {k} of {root_label!r}"
     # Fast path: the record's data / shape / strides / ndim bytes as captured.
@@ -22723,16 +22725,13 @@ def _struct_array_elem_field_recorded(dispatcher, root_label, arr, struct_type, 
     cap_buf = _metal_find_buffer(int.from_bytes(cap_key[0:8], "little"))[0] if cap_key is not None else None
 
     def check() -> None:
-        a = arr_ref()
-        if a is None:
-            return  # the struct array is gone; the command keeps the buffers it bound alive
-        if cap_key is not None and captured is not None and rec_key(int(a.ptr)) == cap_key:
+        if cap_key is not None and captured is not None and rec_key(int(arr.ptr)) == cap_key:
             # Same record bytes: still the same Metal buffer? (Freed and
             # reallocated at the same address is a different buffer.)
             buf, _off = _metal_find_buffer(int.from_bytes(cap_key[0:8], "little"))
             if buf is not None and buf is cap_buf:
                 return
-        now = _struct_array_elem_field_resolve(a, struct_type, k, fpath)
+        now = _struct_array_elem_field_resolve(arr, struct_type, k, fpath)
         if now != captured:
             raise RuntimeError(
                 f"Metal: {what} (a wp.array of a struct with array members) references a different array than "

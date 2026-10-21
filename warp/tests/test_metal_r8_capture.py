@@ -219,6 +219,42 @@ class TestMetalR8Capture(unittest.TestCase):
             """,
         )
 
+    def test_temporary_struct_array_argument_still_checked(self):
+        # The struct array passed to the launch may be a temporary (a view, or a
+        # wp.array(ptr=...) wrapper) that is collected after the capture while
+        # the records it shares with a longer-lived array keep changing; the
+        # check must not stop with it.
+        _run(
+            self,
+            """
+            import gc
+
+            dev = "metal:0"
+            # (temporary argument, index in ``items`` of its element 0)
+            for view, k in (
+                (lambda d: d[1:], 1),
+                (lambda d: wp.array(ptr=d.ptr, shape=d.shape, dtype=Info, device=dev), 0),
+            ):
+                items = [mk_info(dev, 100.0), mk_info(dev, 200.0), mk_info(dev, 300.0)]
+                d = wp.array(items, dtype=Info, device=dev)
+                out = wp.zeros((6, 6), dtype=float, device=dev)
+                with wp.ScopedCapture(device=dev) as cap:
+                    wp.launch(read0, 6, [view(d), out], device=dev)
+                gc.collect()
+                wp.capture_launch(cap.graph)
+                assert out.numpy()[0, 2] == 100.0 * (k + 1)
+                s = Info()
+                s.x, s.k, s.a, s.b, s.c = items[k].x, items[k].k, mk_info(dev, 700.0).a, items[k].b, items[k].c
+                d.assign(wp.array([s if i == k else it for i, it in enumerate(items)], dtype=Info, device=dev))
+                try:
+                    wp.capture_launch(cap.graph)
+                except RuntimeError as e:
+                    assert "references a different array than when the graph was captured" in str(e), e
+                else:
+                    raise AssertionError(f"stale replay after rebinding through a temporary: {out.numpy()[:, 2]}")
+            """,
+        )
+
     def test_dynamic_index_rebind_follows_record(self):
         # Pointer tables (runtime element index) are rebuilt before every
         # replay, so a rebound record is followed like on CUDA.
