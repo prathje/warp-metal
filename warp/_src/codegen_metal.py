@@ -4931,6 +4931,26 @@ struct wp_mesh_query_ray_t {
     float3 normal;
     bool result;
 };
+// Dual accumulation of the query structs (``adj_q += adj_r`` when a query is
+// copied or returned from a ``@wp.func``), as their operator+= in mesh.h.
+inline thread wp_mesh_query_point_t& operator+=(thread wp_mesh_query_point_t& a, wp_mesh_query_point_t b) {
+    a.result = a.result || b.result;
+    a.sign += b.sign;
+    a.face += b.face;
+    a.u += b.u;
+    a.v += b.v;
+    return a;
+}
+inline thread wp_mesh_query_ray_t& operator+=(thread wp_mesh_query_ray_t& a, wp_mesh_query_ray_t b) {
+    a.result = a.result || b.result;
+    a.sign += b.sign;
+    a.face += b.face;
+    a.t += b.t;
+    a.u += b.u;
+    a.v += b.v;
+    a.normal += b.normal;
+    return a;
+}
 typedef wp_bvh_query_t wp_mesh_query_aabb_t;
 // Plain non-fused sums, matching the native wp::dot / wp::length_sq
 // (component products summed left-to-right, no fma contraction).
