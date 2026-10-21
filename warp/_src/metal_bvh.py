@@ -368,6 +368,7 @@ class MetalBvh:
         """
         dev = self.device
         n_leaf = self.leaf_nodes.shape[0]
+        # Like CUDA's native refit, these launches stay off any active wp.Tape.
         if n_leaf:
             warp.launch(
                 _bvh_refit_leaves,
@@ -382,6 +383,7 @@ class MetalBvh:
                 ],
                 outputs=[self.node_lowers, self.node_uppers],
                 device=dev,
+                record_tape=False,
             )
         for level in self.level_nodes:
             warp.launch(
@@ -390,6 +392,7 @@ class MetalBvh:
                 inputs=[level, self.child_left, self.child_right],
                 outputs=[self.node_lowers, self.node_uppers],
                 device=dev,
+                record_tape=False,
             )
 
     def rebuild(self, constructor: int | None = None) -> None:
@@ -507,6 +510,7 @@ class MetalMesh:
             inputs=[self.points, self.indices],
             outputs=[self.tri_lowers, self.tri_uppers],
             device=self.device,
+            record_tape=False,
         )
 
     def _write_mesh_fields(self) -> None:

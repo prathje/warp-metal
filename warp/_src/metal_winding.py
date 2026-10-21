@@ -372,6 +372,7 @@ def compute_solid_angle_props(bvh, points, indices) -> np.ndarray:
         ],
         outputs=[props],
         device=cpu,
+        record_tape=False,
     )
     out = props.numpy().view(np.float32).reshape(num_nodes, -1)
     if out.shape[1] != PROPS_FLOATS:

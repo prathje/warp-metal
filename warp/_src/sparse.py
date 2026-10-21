@@ -2991,6 +2991,10 @@ def bsr_set_transpose(
         # Increase dest array sizes if needed
         _bsr_ensure_fits(dest, nnz=nnz)
 
+        if getattr(dest.device, "is_metal", False) and wp.config.metal_native_dispatch:
+            _bsr_set_transpose_metal(dest, src, src_scale, nnz)
+            return
+
         from warp._src.context import _get_apic_capture_for_device, runtime  # noqa: PLC0415
 
         if _use_host_native_op(dest.values.device):
@@ -3043,6 +3047,34 @@ def bsr_set_transpose(
     wp.launch(
         _bsr_transpose_values,
         dim=(dest.nnz, *dest.block_shape),
+        device=dest.device,
+        inputs=[
+            src.ncol,
+            dest.scalar_type(src_scale),
+            src.offsets,
+            src.row_counts,
+            src.columns,
+            src.scalar_values,
+            block_index_map,
+            dest.offsets,
+            dest.row_counts,
+            dest.columns,
+        ],
+        outputs=[dest.scalar_values],
+    )
+
+
+def _bsr_set_transpose_metal(dest: BsrMatrix, src: BsrMatrix, src_scale: Any, nnz: int) -> None:
+    """Compact ``bsr_set_transpose`` on Metal from device dispatches only, so it
+    records into a Metal graph capture (see :mod:`warp._src.metal_sparse`)."""
+    from warp._src.metal_sparse import bsr_transpose_topology_metal  # noqa: PLC0415
+
+    block_index_map = bsr_transpose_topology_metal(src, dest, nnz)
+    dest._refresh_nnz_transfer_if_pending()
+    _bsr_set_compact_row_counts(dest)
+    wp.launch(
+        _bsr_transpose_values,
+        dim=(nnz, *dest.block_shape),
         device=dest.device,
         inputs=[
             src.ncol,

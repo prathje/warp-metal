@@ -388,7 +388,8 @@ applications that never touch ``warp.config`` can choose from the shell.
   ``fma``, comparisons, conversions, and ``floor``/``ceil``/``trunc``/``round``
   are correctly rounded and bit-exact with a CPU run. Transcendental functions
   (``exp``, ``log``, ``sin``, ``cos``, ``pow``, ...) are evaluated in ``float32``
-  and widened, so they carry single-precision error. Roughly 30x slower than
+  and widened, so they carry single-precision error; Warp warns once per
+  kernel that calls one on a ``float64`` value. Roughly 30x slower than
   ``float32`` on the same GPU. Requires native dispatch
   (:data:`metal_native_dispatch`); reverse-mode (adjoint) kernels over
   ``float64`` values are not supported in this mode.

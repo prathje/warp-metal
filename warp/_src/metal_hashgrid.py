@@ -268,12 +268,16 @@ class MetalHashGrid:
         point_ids = self.point_ids[:num_points]
         point_cells = self.point_cells[:num_points]
         point_cell = self._point_cell[:num_points]
+        # These launches stand in for the native build CUDA runs, which no
+        # wp.Tape records; recording them would only make tape.backward()
+        # warn about their enable_backward=False kernels.
         warp.launch(
             _hg_count_cells,
             dim=num_points,
             inputs=[points, cell_width_inv, self.dim_x, self.dim_y, self.dim_z],
             outputs=[point_cell, self._counts],
             device=dev,
+            record_tape=False,
         )
         warp.launch(
             _hg_block_sums,
@@ -281,12 +285,14 @@ class MetalHashGrid:
             inputs=[self._counts, self.num_cells],
             outputs=[self._block_sums],
             device=dev,
+            record_tape=False,
         )
         warp.launch(
             _hg_scan_block_sums,
             dim=1,
             inputs=[self._block_sums, self._num_blocks],
             device=dev,
+            record_tape=False,
         )
         warp.launch(
             _hg_scan_within_block,
@@ -294,6 +300,7 @@ class MetalHashGrid:
             inputs=[self._counts, self.num_cells, self._block_sums],
             outputs=[self.cell_starts, self.cell_ends, self._cursor],
             device=dev,
+            record_tape=False,
         )
         warp.launch(
             _hg_scatter,
@@ -301,6 +308,7 @@ class MetalHashGrid:
             inputs=[point_cell, self._cursor],
             outputs=[point_ids, point_cells],
             device=dev,
+            record_tape=False,
         )
         warp.launch(
             _hg_sort_cell_ids,
@@ -308,6 +316,7 @@ class MetalHashGrid:
             inputs=[self.cell_starts, self.cell_ends],
             outputs=[point_ids],
             device=dev,
+            record_tape=False,
         )
 
     def _write_descriptor(self) -> None:
