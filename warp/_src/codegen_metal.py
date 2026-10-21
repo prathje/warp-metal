@@ -21340,7 +21340,10 @@ def _generate_msl_kernel_uncached(
 # user-function native names in the hashed body are canonicalised.
 # v18: the IR of called ``@wp.func`` helpers joins the key (a helper rebuilt
 # with other builder options produced a different artifact under one key).
-_ARTIFACT_CACHE_VERSION = 18
+# v19: captured constants are keyed by a value-based canonical form
+# (``_canonical_constant``) instead of ``repr``, which held object addresses
+# for vector/matrix/struct constants and changed the key in every process.
+_ARTIFACT_CACHE_VERSION = 19
 _codegen_source_hash_cached: str | None = None
 
 
@@ -21513,6 +21516,82 @@ def _canonical_user_call_names(body: str, adj) -> str:
     return pat.sub(repl, body)
 
 
+class _NonCanonicalConstant(Exception):
+    """A captured constant has no value-based canonical form; the kernel is not disk-cached."""
+
+
+def _canonical_constant(value) -> str:
+    """Process-independent, injective text form of a captured ``Var.constant``.
+
+    Covers everything the constant contributes to codegen: its Python/Warp
+    type (including vector/matrix shape and scalar dtype) and its exact value
+    (float bit patterns, raw ctypes storage bytes). Two constants share a form
+    only if they are of the same type with the same bits, so two different
+    constants never share a disk-cache entry. ``repr`` is not usable: vector,
+    matrix and struct instances print their address.
+
+    Raises ``_NonCanonicalConstant`` for any type it does not know; the caller
+    then skips the disk cache for the kernel rather than guess.
+    """
+    import ctypes  # noqa: PLC0415
+    import enum  # noqa: PLC0415
+    import struct as _struct  # noqa: PLC0415
+
+    import warp._src.types as wpt  # noqa: PLC0415
+    from warp._src.codegen import StructInstance, Var  # noqa: PLC0415
+
+    def tname(t) -> str:
+        return f"{t.__module__}.{t.__qualname__}"
+
+    def canon(v) -> str:
+        t = type(v)
+        if v is None:
+            return "None"
+        if t is bool:
+            return f"bool:{int(v)}"
+        if isinstance(v, (enum.IntEnum, enum.IntFlag)):
+            return f"{tname(t)}:int:{int(v)}"
+        if t is int:
+            return f"int:{v}"
+        if t is float:
+            return f"float:{_struct.unpack('<Q', _struct.pack('<d', v))[0]:016x}"
+        if t is str:
+            return f"str:{v!r}"
+        if t in wpt.scalar_types:
+            return f"{t.__name__}({canon(v.value)})"
+        if isinstance(v, ctypes.Array) and hasattr(t, "_wp_scalar_type_"):
+            # Vector / matrix / quaternion / transform: exact storage bytes
+            # (float16/bfloat16 are stored as their uint16 bits).
+            shape = getattr(t, "_shape_", (getattr(t, "_length_", None),))
+            return (
+                f"{tname(t)}<{getattr(t._wp_scalar_type_, '__name__', t._wp_scalar_type_)},"
+                f"{tuple(shape)},{t._length_}>:{bytes(v).hex()}"
+            )
+        if wpt.is_native_type(t):
+            info = t._wp_native_type_
+            fields = ",".join(f"{name}={canon(getattr(v, name))}" for name, _ in info.fields)
+            return f"native:{info.native_name}{{{fields}}}"
+        if isinstance(v, StructInstance):
+            fields = ",".join(
+                f"{key}:{Var.type_to_ctype(var.type)}={canon(getattr(v, key))}" for key, var in v._cls.vars.items()
+            )
+            return f"struct:{v.native_name}{{{fields}}}"
+        try:
+            import numpy as np  # noqa: PLC0415
+        except ImportError:  # pragma: no cover
+            np = None
+        if np is not None:
+            if isinstance(v, np.generic):
+                return f"np.{v.dtype.str}:{v.tobytes().hex()}"
+            if isinstance(v, np.ndarray) and v.dtype.kind in "biufc":
+                return f"ndarray.{v.dtype.str}{v.shape}:{np.ascontiguousarray(v).tobytes().hex()}"
+        if t is tuple or t is list:
+            return f"{t.__name__}[{len(v)}]({','.join(canon(x) for x in v)})"
+        raise _NonCanonicalConstant(f"no canonical form for captured constant of type {tname(t)}")
+
+    return canon(value)
+
+
 def _callee_ir_digest(adj) -> str:
     """Hash of the forward IR of every user function ``adj`` calls, transitively.
 
@@ -21530,7 +21609,7 @@ def _callee_ir_digest(adj) -> str:
         h.update(b"\x00")
         for v in getattr(func_adj, "variables", None) or ():
             const = getattr(v, "constant", None)
-            h.update(f"{v.label}:{v.ctype()}={const!r};".encode())
+            h.update(f"{v.label}:{v.ctype()}={_canonical_constant(const)};".encode())
         h.update(b"\x01")
     return h.hexdigest()
 
@@ -21553,7 +21632,9 @@ def _artifact_cache_key(kernel, adj) -> str | None:
         # entry and the second model silently loads the first model's
         # kernel.
         const_sig = ";".join(
-            f"{v.label}={v.constant!r}" for v in adj.variables if getattr(v, "constant", None) is not None
+            f"{v.label}={_canonical_constant(v.constant)}"
+            for v in adj.variables
+            if getattr(v, "constant", None) is not None
         )
         callee_ir = _callee_ir_digest(adj)
     except Exception:

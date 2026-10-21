@@ -717,6 +717,146 @@ class TestMetalR4Kamino(unittest.TestCase):
             """,
         )
 
+    def test_artifact_cache_key_deterministic_with_aggregate_constants(self):
+        # Vector/matrix/quaternion constants used to enter the on-disk artifact key
+        # through ``repr``, which prints the object's address: the key changed
+        # in every process, so those kernels never hit the disk cache. The key
+        # must be identical in fresh processes with different hash seeds.
+        _run(
+            self,
+            """
+            import os
+            import subprocess
+            import sys
+
+            import warp._src.codegen_metal as cm
+
+            wp.config.cache_kernels = False
+
+            # Warp accepts vector/matrix/quaternion instances as global
+            # constants (struct instances are not; ``_canonical_constant``
+            # covers them anyway, see the ulp test).
+            M = wp.constant(wp.mat33(1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0))
+            KD = wp.constant(wp.vec3(0.1, 0.2, 0.3))
+            Q = wp.constant(wp.quat(0.0, 0.0, 0.0, 1.0))
+
+            @wp.func
+            def apply(v: wp.vec3) -> wp.vec3:
+                return wp.quat_rotate(Q, M * v) + KD
+
+            @wp.kernel(module="unique")
+            def k(x: wp.array[wp.vec3], y: wp.array[wp.vec3]):
+                i = wp.tid()
+                y[i] = apply(x[i]) + M[0]
+
+            adj = cm._ensure_adj_built(k, block_dim=1)
+            callee_consts = [
+                type(v.constant).__name__
+                for f_adj, _ in cm._callee_ir_snapshot(adj)
+                for v in f_adj.variables
+                if v.constant is not None
+            ]
+            # The case under test: aggregate constants inside the callee.
+            assert any("mat" in c for c in callee_consts), callee_consts
+            assert any("quat" in c for c in callee_consts), callee_consts
+            # Before the fix these reprs held addresses.
+            assert any(" at 0x" in repr(v.constant) for f_adj, _ in cm._callee_ir_snapshot(adj) for v in f_adj.variables)
+            key = cm._artifact_cache_key(k, adj)
+            assert key is not None
+            if os.environ.get("_KEY_ONLY"):
+                print("KEY", key)
+                raise SystemExit(0)
+            for seed in ("1", "2"):
+                out = subprocess.run([sys.executable, __file__],
+                                     env=dict(os.environ, _KEY_ONLY="1", PYTHONHASHSEED=seed),
+                                     capture_output=True, text=True, check=True).stdout
+                assert f"KEY {key}" in out, (seed, out)
+            """,
+        )
+
+    def test_artifact_cache_key_separates_constants_one_ulp_apart(self):
+        # The canonical form of a captured constant must be injective: two
+        # constants that differ in a single float ulp (scalar, vector element,
+        # struct field) must never share a disk-cache entry, and a constant
+        # type without a canonical form disables the disk cache for the kernel.
+        _run(
+            self,
+            """
+            import numpy as np
+
+            import warp._src.codegen_metal as cm
+
+            wp.config.cache_kernels = False
+            canon = cm._canonical_constant
+
+            a = 0.1
+            b = float(np.nextafter(a, 1.0))
+            assert canon(a) != canon(b)
+            assert canon(wp.float32(a)) != canon(wp.float32(b))
+            assert canon(wp.float32(a)) != canon(wp.float64(a))  # same value, other dtype
+            assert canon(0.0) != canon(-0.0)
+            assert canon(1) != canon(1.0) != canon(True)
+            fa = np.float32(0.1)
+            fb = np.nextafter(fa, np.float32(1.0))
+            assert canon(wp.vec3(fa, 0.0, 0.0)) != canon(wp.vec3(fb, 0.0, 0.0))
+            assert canon(wp.vec3(1.0, 2.0, 3.0)) != canon(wp.vec3d(1.0, 2.0, 3.0))
+            assert canon(wp.vec4(1.0, 2.0, 3.0, 4.0)) != canon(wp.mat22(1.0, 2.0, 3.0, 4.0))  # shape
+            assert canon(wp.vec3h(0.1, 0.0, 0.0)) != canon(wp.vec3h(0.2, 0.0, 0.0))  # half storage bits
+            assert canon(wp.vec3(1.0, 2.0, 3.0)) == canon(wp.vec3(1.0, 2.0, 3.0))
+
+            @wp.struct
+            class S:
+                x: float
+                v: wp.vec2
+
+            s1, s2 = S(), S()
+            s1.x = s2.x = 1.0
+            s1.v = wp.vec2(fa, 0.0)
+            s2.v = wp.vec2(fb, 0.0)
+            assert canon(s1) != canon(s2)
+
+            try:
+                canon(object())
+            except cm._NonCanonicalConstant:
+                pass
+            else:
+                raise AssertionError("unknown constant types must not get a canonical form")
+
+            # End to end: keys of two kernels that differ only in a captured
+            # constant one ulp apart, inside a called @wp.func.
+            def make(c):
+                C = wp.constant(wp.vec3(c, 0.0, 0.0))
+
+                @wp.func
+                def f(v: wp.vec3) -> wp.vec3:
+                    return v + C
+
+                @wp.kernel(module="unique")
+                def k(x: wp.array[wp.vec3]):
+                    i = wp.tid()
+                    x[i] = f(x[i])
+
+                return k
+
+            keys = []
+            for c in (fa, fb):
+                k = make(c)
+                keys.append(cm._artifact_cache_key(k, cm._ensure_adj_built(k, block_dim=1)))
+            assert None not in keys and keys[0] != keys[1], keys
+
+            # A kernel whose callee captures an unknown constant type is not disk-cached.
+            k = make(fa)
+            adj = cm._ensure_adj_built(k, block_dim=1)
+            f_adj = cm._callee_ir_snapshot(adj)[0][0]
+            v = next(v for v in f_adj.variables if v.constant is not None)
+            saved, v.constant = v.constant, object()
+            try:
+                assert cm._artifact_cache_key(k, adj) is None
+            finally:
+                v.constant = saved
+            """,
+        )
+
     def test_block_model_switch_restores_unset_flags(self):
         # A kernel that never took the coop model at block_dim=32 has no coop
         # flags set. Switching to the serial model and back restored them as
