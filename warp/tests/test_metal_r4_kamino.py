@@ -558,6 +558,54 @@ class TestMetalR4Kamino(unittest.TestCase):
             """,
         )
 
+    def test_metal_ir_rebuilt_after_other_kernel_rebuilds_shared_func(self):
+        # A ``@wp.func`` adjoint is shared by every kernel calling it, and the
+        # Metal inliner splices ``func.adj.blocks``. A CPU compile of another
+        # kernel (other module) rebuilds the helper with CPU builder options;
+        # a later regeneration of the Metal kernel that keeps its own IR (a
+        # float64 mode change on a serial kernel) must not inline that body.
+        # ``wp.tile_fft`` emits a different form without ``metal_backend``,
+        # which Metal cannot translate.
+        _run(
+            self,
+            """
+            import os
+
+            os.environ["WARP_METAL_DISABLE_ARTIFACT_CACHE"] = "1"
+            wp.config.cache_kernels = False
+            M, N = 1, 16
+
+            @wp.func
+            def fft_row(x: wp.array2d[wp.vec2f], y: wp.array2d[wp.vec2f]):
+                t = wp.tile_load(x, shape=(M, N))
+                wp.tile_fft(t)
+                wp.tile_store(y, t)
+
+            @wp.kernel(module="unique")
+            def k_metal(x: wp.array2d[wp.vec2f], y: wp.array2d[wp.vec2f]):
+                fft_row(x, y)
+
+            @wp.kernel(module="unique")
+            def k_cpu(x: wp.array2d[wp.vec2f], y: wp.array2d[wp.vec2f]):
+                fft_row(x, y)
+
+            xr = np.random.default_rng(1).standard_normal((M, N, 2)).astype(np.float32)
+            expected = np.fft.fft(xr[..., 0] + 1j * xr[..., 1], axis=-1)
+
+            def run(k, dev):
+                x = wp.array(xr, dtype=wp.vec2f, device=dev)
+                y = wp.zeros((M, N), dtype=wp.vec2f, device=dev)
+                wp.launch_tiled(k, dim=[1], inputs=[x, y], device=dev, block_dim=1)
+                r = y.numpy()
+                np.testing.assert_allclose(r[..., 0] + 1j * r[..., 1], expected, atol=1e-3)
+
+            run(k_metal, "metal:0")
+            run(k_cpu, "cpu")
+            wp.config.metal_fp64 = "demote"
+            run(k_metal, "metal:0")
+            """,
+        )
+
     def test_metal_module_options_do_not_change_module_hash(self):
         # ``metal_*`` module options are Metal-only: CPU/CUDA module hashes
         # (and so their kernel caches) must not change when one is set.

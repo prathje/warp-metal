@@ -16760,6 +16760,28 @@ def _check_deterministic_mode_supported(kernel, adj) -> None:
         )
 
 
+def _callee_ir_snapshot(adj) -> tuple:
+    """``(func_adj, func_adj.blocks)`` for every user function ``adj`` calls, transitively."""
+    out = []
+    seen = {id(adj)}
+    stack = [adj]
+    while stack:
+        cur = stack.pop()
+        for func in getattr(cur, "called_user_functions", None) or ():
+            func_adj = getattr(func, "adj", None)
+            if func_adj is None or id(func_adj) in seen:
+                continue
+            seen.add(id(func_adj))
+            out.append((func_adj, getattr(func_adj, "blocks", None)))
+            stack.append(func_adj)
+    return tuple(out)
+
+
+def _callee_ir_current(snapshot) -> bool:
+    """Whether no callee in ``snapshot`` (see ``_callee_ir_snapshot``) was rebuilt since."""
+    return all(getattr(func_adj, "blocks", None) is blocks for func_adj, blocks in snapshot)
+
+
 def _ensure_adj_built(kernel, block_dim: int | None = None, enable_backward: bool = False):
     """Build the kernel's forward IR if it hasn't been already; return the adj.
 
@@ -16810,14 +16832,21 @@ def _ensure_adj_built(kernel, block_dim: int | None = None, enable_backward: boo
         _check_deterministic_mode_supported(kernel, adj)
         adj._metal_built_backward = backward
         adj._metal_ir_blocks = adj.blocks
+        adj._metal_ir_callee_blocks = _callee_ir_snapshot(adj)
         adj._metal_ir_ok = True
 
     # A CPU/CUDA compile of the same kernel rebuilds ``kernel.adj`` with its
     # own builder options (``Adjoint.build`` makes a new ``blocks`` list), so
     # the IR no longer is the Metal one even though ``_metal_ir_ok`` is still
     # set. Translating it emitted e.g. ``&((s).scale)`` on a flattened struct
-    # param. Rebuild at the width the Metal IR was built with.
-    if getattr(adj, "_metal_ir_ok", False) and getattr(adj, "_metal_ir_blocks", None) is not adj.blocks:
+    # param. The same holds for every ``@wp.func`` the kernel calls: the
+    # inliner splices ``func.adj.blocks``, which any other kernel's build
+    # (CPU/CUDA, or Metal at another width) replaces. Rebuild at the width
+    # the Metal IR was built with; that also rebuilds the callees.
+    if getattr(adj, "_metal_ir_ok", False) and (
+        getattr(adj, "_metal_ir_blocks", None) is not adj.blocks
+        or not _callee_ir_current(getattr(adj, "_metal_ir_callee_blocks", ()))
+    ):
         adj._metal_ir_ok = False
         stale_coop_n = getattr(adj, "_metal_coop_block_n", 0)
         if stale_coop_n > 0:
