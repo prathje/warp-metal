@@ -491,6 +491,73 @@ class TestMetalR4Kamino(unittest.TestCase):
             """,
         )
 
+    def test_metal_ir_rebuilt_after_cpu_compile_of_same_kernel(self):
+        # A CPU (or CUDA) compile rebuilds ``kernel.adj`` with its own builder
+        # options. A later Metal regeneration (here: a float64 mode change
+        # after the first Metal launch) must rebuild the Metal IR rather than
+        # translate the CPU-built one. ``cache_kernels = False`` forces the CPU
+        # compile; with a warm kernel cache the CPU launch skipped codegen,
+        # which made this flaky (it failed only after the cache was cleared).
+        _run(
+            self,
+            """
+            wp.config.cache_kernels = False
+
+            @wp.struct
+            class S:
+                scale: wp.float64
+                n: int
+
+            @wp.kernel
+            def k(a: wp.array[wp.float64], s: S, out: wp.array[float]):
+                i = wp.tid()
+                x = a[i] * s.scale + wp.float64(1.0)
+                out[i] = wp.float32(x - a[i] * s.scale) + wp.float32(s.n)
+
+            def run(dev):
+                a = wp.array([1.0, 3.0], dtype=wp.float64, device=dev)
+                s = S()
+                s.scale = wp.float64(1.0e8)
+                s.n = 2
+                o = wp.zeros(2, dtype=float, device=dev)
+                wp.launch(k, dim=2, inputs=[a, s, o], device=dev)
+                return o.numpy()
+
+            try:
+                run("metal:0")
+            except Exception:
+                pass  # the default mode may reject float64 arguments
+            wp.set_module_options({"metal_fp64": "emulate"})
+            np.testing.assert_array_equal(run("cpu"), 3.0)
+            np.testing.assert_array_equal(run("metal:0"), 3.0)
+
+            # float32 only: Metal launch, CPU compile, Metal regeneration.
+            @wp.struct
+            class T:
+                scale: float
+                n: int
+
+            @wp.kernel
+            def k2(a: wp.array[float], t: T, out: wp.array[float]):
+                i = wp.tid()
+                out[i] = a[i] * t.scale + float(t.n)
+
+            def run2(dev):
+                a = wp.array([1.0, 3.0], dtype=float, device=dev)
+                t = T()
+                t.scale = 2.0
+                t.n = 1
+                o = wp.zeros(2, dtype=float, device=dev)
+                wp.launch(k2, dim=2, inputs=[a, t, o], device=dev)
+                return o.numpy()
+
+            np.testing.assert_array_equal(run2("metal:0"), [3.0, 7.0])
+            np.testing.assert_array_equal(run2("cpu"), [3.0, 7.0])
+            wp.set_module_options({"metal_fp64": "demote"})
+            np.testing.assert_array_equal(run2("metal:0"), [3.0, 7.0])
+            """,
+        )
+
     def test_metal_module_options_do_not_change_module_hash(self):
         # ``metal_*`` module options are Metal-only: CPU/CUDA module hashes
         # (and so their kernel caches) must not change when one is set.

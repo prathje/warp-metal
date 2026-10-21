@@ -16809,7 +16809,20 @@ def _ensure_adj_built(kernel, block_dim: int | None = None, enable_backward: boo
         _normalize_adj_ir(adj)
         _check_deterministic_mode_supported(kernel, adj)
         adj._metal_built_backward = backward
+        adj._metal_ir_blocks = adj.blocks
         adj._metal_ir_ok = True
+
+    # A CPU/CUDA compile of the same kernel rebuilds ``kernel.adj`` with its
+    # own builder options (``Adjoint.build`` makes a new ``blocks`` list), so
+    # the IR no longer is the Metal one even though ``_metal_ir_ok`` is still
+    # set. Translating it emitted e.g. ``&((s).scale)`` on a flattened struct
+    # param. Rebuild at the width the Metal IR was built with.
+    if getattr(adj, "_metal_ir_ok", False) and getattr(adj, "_metal_ir_blocks", None) is not adj.blocks:
+        adj._metal_ir_ok = False
+        stale_coop_n = getattr(adj, "_metal_coop_block_n", 0)
+        if stale_coop_n > 0:
+            _build(stale_coop_n, bool(getattr(adj, "_metal_built_backward", False)))
+            adj._metal_coop_plan = _coop_block_classify(adj, honest=True)
 
     def _has_reverse() -> bool:
         # The IR always carries ``body_reverse`` lines; what a backward-
