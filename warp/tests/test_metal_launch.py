@@ -7840,6 +7840,114 @@ class TestMetalCoopTiles(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet, timeout=240)
 
+    def test_block_model_bookkeeping(self):
+        # Backward artifacts are cached per block model; a wide-block kernel's
+        # reverse pass raises even after a serial backward of the same kernel;
+        # stale PSO facts under a reused id are ignored; the MLX path refuses
+        # wide blocks it cannot check against the pipeline limit.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+            from warp._src import codegen_metal as cm
+
+            @wp.func_native(\"\"\"
+            #if defined(__CUDA_ARCH__)
+            __syncthreads();
+            #endif
+            \"\"\")
+            def block_sync(): ...
+
+            @wp.kernel(module="unique")
+            def scale_sync(a: wp.array[wp.float32], out: wp.array[wp.float32]):
+                tid = wp.tid()
+                v = a[tid] * float(wp.block_dim())
+                block_sync()
+                out[tid] = v
+
+            dev = 'metal:0'
+            n = 128
+            a = wp.array(np.ones(n, np.float32), device=dev, requires_grad=True)
+            out = wp.zeros(n, dtype=wp.float32, device=dev, requires_grad=True)
+            # Serial model (block_dim 1): forward and backward work.
+            tape = wp.Tape()
+            with tape:
+                wp.launch(scale_sync, dim=n, inputs=[a, out], block_dim=1, device=dev)
+            out.grad = wp.ones(n, dtype=wp.float32, device=dev)
+            tape.backward()
+            np.testing.assert_array_equal(a.grad.numpy(), np.ones(n))
+            keys = list(scale_sync._metal_adj_cache)
+            assert keys and all(k[0] == 'serial' for k in keys), keys
+            # Wide model (block_dim 64): forward uses the real width ...
+            out.zero_()
+            wp.launch(scale_sync, dim=n, inputs=[a, out], block_dim=64, device=dev)
+            np.testing.assert_array_equal(out.numpy(), np.full(n, 64.0))
+            # ... and its reverse pass is refused, not served from the serial entry.
+            try:
+                wp.launch(scale_sync, dim=n, inputs=[a, out], adj_inputs=[a.grad, out.grad], adj_outputs=[],
+                          adjoint=True, block_dim=64, device=dev)
+                wp.synchronize_device(dev)
+            except Exception as e:
+                assert 'wide-block' in str(e), e
+            else:
+                raise AssertionError('wide-block reverse must raise')
+
+            # A stale fact under the id of a live PSO (as after a freed PSO's address is reused).
+            pso = scale_sync._metal_native_pso
+            saved = cm._PSO_GRID_ONLY.get(id(pso))
+            cm._PSO_GRID_ONLY[id(pso)] = (object(), True)
+            assert cm._pso_grid_only(pso) is False
+            if saved is not None:
+                cm._PSO_GRID_ONLY[id(pso)] = saved
+            saved_max = cm._PSO_MAX_THREADS.get(id(pso))
+            cm._PSO_MAX_THREADS[id(pso)] = (object(), 4)
+            assert cm._pso_max_threads(pso) == int(pso.maxTotalThreadsPerThreadgroup())
+
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=180)
+
+        # MLX dispatch path (its allocator is picked at wp.init(), so in its own process).
+        mlx_snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            @wp.func_native(\"\"\"
+            #if defined(__CUDA_ARCH__)
+            __syncthreads();
+            #endif
+            \"\"\")
+            def block_sync(): ...
+
+            @wp.kernel(module="unique")
+            def scale_sync(a: wp.array[wp.float32], out: wp.array[wp.float32]):
+                tid = wp.tid()
+                v = a[tid] * float(wp.block_dim())
+                block_sync()
+                out[tid] = v
+
+            assert not wp.config.metal_native_dispatch
+            dev = 'metal:0'
+            a = wp.array(np.ones(128, np.float32), device=dev)
+            out = wp.zeros(128, dtype=wp.float32, device=dev)
+            try:
+                wp.launch(scale_sync, dim=128, inputs=[a, out], block_dim=64, device=dev)
+                wp.synchronize_device(dev)
+            except RuntimeError as e:
+                assert 'native dispatch' in str(e), e
+            else:
+                raise AssertionError('the MLX path must refuse wide blocks')
+            """
+        )
+        saved = os.environ.get("WARP_METAL_NATIVE_DISPATCH")
+        os.environ["WARP_METAL_NATIVE_DISPATCH"] = "0"
+        try:
+            _run_with_metal_enabled(self, mlx_snippet, timeout=180)
+        finally:
+            if saved is None:
+                os.environ.pop("WARP_METAL_NATIVE_DISPATCH")
+            else:
+                os.environ["WARP_METAL_NATIVE_DISPATCH"] = saved
+
     def test_integer_and_nan_reductions(self):
         # int32 tile_sum/min/max are exact; float min/max follow Warp's
         # fmin/fmax semantics (a NaN operand is ignored unless all are NaN),

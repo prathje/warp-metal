@@ -23352,18 +23352,26 @@ def _get_or_build_metal_kernel_native(
 
     _drop_stale_fp64_artifacts(kernel)
     if adjoint:
+        # A kernel object can carry several forward block models (see
+        # ``_switch_block_model``); its backward artifacts are per model too.
+        _switch_block_model(kernel, block_dim)
+        model_key = _block_model_key(block_dim)
+        if model_key.startswith("wide") and getattr(kernel.adj, "_metal_coop_block_n", 0) == block_dim:
+            raise MetalCodegenError(
+                f"Kernel {kernel.adj.fun_name!r}: reverse mode of a wide-block (barrier) kernel is not supported on Metal"
+            )
         cache = getattr(kernel, "_metal_adj_cache", None)
         if cache is None:
             cache = {}
             kernel._metal_adj_cache = cache
-        hit = cache.get(grad_args)
+        hit = cache.get((model_key, grad_args))
         if hit is not None:
             return hit
         artifact = generate_msl_kernel(kernel, block_dim=block_dim, adjoint=True, grad_args=grad_args)
         wrapped = _wrap_msl_for_native_dispatch(artifact)
         pso = get_dispatcher().compile(wrapped, f"custom_kernel_{artifact.name}")
         _note_native_pso(pso, wrapped)
-        cache[grad_args] = (artifact, pso)
+        cache[(model_key, grad_args)] = (artifact, pso)
         return artifact, pso
 
     _switch_block_model(kernel, block_dim)
@@ -23689,10 +23697,19 @@ _MSL_FUNC_HEAD_PAT = re.compile(
 )
 _MSL_CALL_NAME_PAT = re.compile(r"\b([A-Za-z_]\w*)\s*\(")
 _MSL_BRACE_PAT = re.compile(r"[{}]")
-# PSO id -> whether the launcher may pick any threadgroup shape for it
-# (see ``_grid_only_source``); PSO id -> ``maxTotalThreadsPerThreadgroup``.
-_PSO_GRID_ONLY: dict[int, bool] = {}
-_PSO_MAX_THREADS: dict[int, int] = {}
+# PSO id -> ``(pso, whether the launcher may pick any threadgroup shape for
+# it)`` (see ``_grid_only_source``); PSO id -> ``(pso,
+# maxTotalThreadsPerThreadgroup)``. The PSO is kept with its facts: a fact
+# looked up by a bare id could belong to a freed PSO whose address a new one
+# reuses (a stale ``grid_only`` would give a barrier kernel a spanning
+# threadgroup).
+_PSO_GRID_ONLY: dict[int, tuple] = {}
+_PSO_MAX_THREADS: dict[int, tuple] = {}
+
+
+def _pso_grid_only(pso) -> bool:
+    entry = _PSO_GRID_ONLY.get(id(pso))
+    return entry is not None and entry[0] is pso and entry[1]
 
 
 def _msl_function_bodies(header: str) -> dict[str, list[str]]:
@@ -23759,18 +23776,22 @@ def _grid_only_source(src: str) -> bool:
 
 def _note_native_pso(pso, wrapped: str) -> None:
     """Record launch-shape facts about a freshly compiled native PSO."""
-    if pso is not None and id(pso) not in _PSO_GRID_ONLY:
-        _PSO_GRID_ONLY[id(pso)] = _grid_only_source(wrapped)
+    if pso is None:
+        return
+    entry = _PSO_GRID_ONLY.get(id(pso))
+    if entry is None or entry[0] is not pso:
+        _PSO_GRID_ONLY[id(pso)] = (pso, _grid_only_source(wrapped))
 
 
 def _pso_max_threads(pso) -> int:
-    n = _PSO_MAX_THREADS.get(id(pso))
-    if n is None:
-        try:
-            n = int(pso.maxTotalThreadsPerThreadgroup())
-        except Exception:
-            n = 1024
-        _PSO_MAX_THREADS[id(pso)] = n
+    entry = _PSO_MAX_THREADS.get(id(pso))
+    if entry is not None and entry[0] is pso:
+        return entry[1]
+    try:
+        n = int(pso.maxTotalThreadsPerThreadgroup())
+    except Exception:
+        n = 1024
+    _PSO_MAX_THREADS[id(pso)] = (pso, n)
     return n
 
 
@@ -24666,7 +24687,7 @@ def launch_metal_kernel_native(
             tg = (min(64, grid_x), 1, 1)
         # The PSO's own limit (lower for kernels with many registers).
         max_threads = _pso_max_threads(pso)
-        grid_only = _PSO_GRID_ONLY.get(id(pso), False)
+        grid_only = _pso_grid_only(pso)
         if grid_only and tg[0] > max_threads:
             tg = (max_threads, 1, 1)
         if len(dims) >= 2 and tg[0] < 64 and grid_only:
@@ -25415,6 +25436,16 @@ def _launch_metal_kernel(
     # parameter is intentionally ignored here; distributed-tile kernels
     # (``coop_block_n > 0``) instead group each block's lanes on y.
     if coop_block_n > 0:
+        if coop_block_n > _COOP_BLOCK_DIM:
+            # The native path checks a wide block against the pipeline's
+            # maxTotalThreadsPerThreadgroup (lower for kernels with many
+            # registers); MLX exposes no pipeline to ask, and Metal leaves an
+            # oversized threadgroup undefined. One SIMD group always fits.
+            raise RuntimeError(
+                f"Kernel '{kernel.key}' runs as a {coop_block_n}-thread threadgroup per block (wide-block "
+                "model), which the MLX dispatch path cannot check against the pipeline's thread limit; "
+                "enable native dispatch (warp.config.metal_native_dispatch / WARP_METAL_NATIVE_DISPATCH=1)."
+            )
         tg = (coop_block_n, 1, 1) if getattr(artifact, "coop_tid1d", False) else (1, coop_block_n, 1)
     elif len(dims) == 1:
         tg = (min(256, grid_x), 1, 1)
