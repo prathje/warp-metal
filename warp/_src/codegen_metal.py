@@ -22687,6 +22687,7 @@ def _struct_array_elem_field_recorded(dispatcher, root_label, arr, struct_type, 
     (``source``), since the host check before a replay cannot see those
     writes.
     """
+    import ctypes  # noqa: PLC0415
     import weakref  # noqa: PLC0415
 
     from warp._src.context import _metal_find_buffer  # noqa: PLC0415
@@ -22703,11 +22704,34 @@ def _struct_array_elem_field_recorded(dispatcher, root_label, arr, struct_type, 
     refs.append(arr_ref)
     captured = _struct_array_elem_field_resolve(arr, struct_type, k, fpath)
     what = f"field {'.'.join(fpath)!r} of element {k} of {root_label!r}"
+    # Fast path: the record's data / shape / strides / ndim bytes as captured.
+    # The replay has synced before the refresh hooks run.
+    rec_off = k * int(arr.strides[0]) if k < arr.shape[0] else None
+    if rec_off is not None:
+        t = struct_type
+        for comp in fpath[:-1]:
+            rec_off += getattr(t.ctype, comp).offset
+            t = t.vars[comp].type
+        rec_off += getattr(t.ctype, fpath[-1]).offset
+
+    def rec_key(ptr):
+        raw = ctypes.string_at(ptr + rec_off, 50)
+        return raw[0:8] + raw[16:50]  # skip ``grad``
+
+    cap_key = rec_key(int(arr.ptr)) if rec_off is not None else None
+    # Held so the identity test below cannot match a new buffer that reuses its id.
+    cap_buf = _metal_find_buffer(int.from_bytes(cap_key[0:8], "little"))[0] if cap_key is not None else None
 
     def check() -> None:
         a = arr_ref()
         if a is None:
             return  # the struct array is gone; the command keeps the buffers it bound alive
+        if cap_key is not None and captured is not None and rec_key(int(a.ptr)) == cap_key:
+            # Same record bytes: still the same Metal buffer? (Freed and
+            # reallocated at the same address is a different buffer.)
+            buf, _off = _metal_find_buffer(int.from_bytes(cap_key[0:8], "little"))
+            if buf is not None and buf is cap_buf:
+                return
         now = _struct_array_elem_field_resolve(a, struct_type, k, fpath)
         if now != captured:
             raise RuntimeError(
