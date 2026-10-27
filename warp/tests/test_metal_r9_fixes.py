@@ -585,6 +585,44 @@ class TestMetalR9Fixes(unittest.TestCase):
         )
         _run_with_metal_native(self, snippet, timeout=240)
 
+    def test_numpy_integer_launch_dims(self):
+        # CPU/CUDA canonicalize dim with operator.index(); Metal raised a
+        # TypeError for dim=np.int64(n) (and numpy entries in a sequence).
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            @wp.kernel(module="unique")
+            def k(a: wp.array(dtype=float)):
+                i = wp.tid()
+                a[i] = float(i)
+
+            @wp.kernel(module="unique")
+            def k2(a: wp.array2d(dtype=float)):
+                i, j = wp.tid()
+                a[i, j] = float(i * 10 + j)
+
+            for dim in (np.int64(4), [np.int32(4)], (np.int64(4),), np.uint16(4)):
+                res = {}
+                for dev in ("cpu", "metal:0"):
+                    a = wp.zeros(4, dtype=float, device=dev)
+                    wp.launch(k, dim=dim, inputs=[a], device=dev)
+                    res[dev] = a.numpy()
+                np.testing.assert_array_equal(res["metal:0"], res["cpu"], err_msg=repr(dim))
+            res = {}
+            for dev in ("cpu", "metal:0"):
+                a = wp.zeros((3, 4), dtype=float, device=dev)
+                wp.launch(k2, dim=(np.int64(3), np.int32(4)), inputs=[a], device=dev)
+                res[dev] = a.numpy()
+            np.testing.assert_array_equal(res["metal:0"], res["cpu"])
+            # empty launches with numpy extents are no-ops (no argument validation), as on CPU
+            for dim in (np.int64(0), (np.int32(0), np.int64(3))):
+                for dev in ("cpu", "metal:0"):
+                    wp.launch(k, dim=dim, inputs=[wp.zeros(4, dtype=wp.vec3, device=dev)], device=dev)
+            """
+        )
+        _run_with_metal_native(self, snippet, timeout=240)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -12661,6 +12661,13 @@ def launch(
             kernel = kernel.add_overload(fwd_types)
         from warp._src.codegen_metal import MetalLaunch, launch_metal_kernel  # noqa: PLC0415
 
+        # NumPy integer extents (``dim=np.int64(n)``) as on CPU/CUDA, which
+        # go through ``_canonicalize_dim`` below.
+        if not isinstance(dim, int) and not (
+            isinstance(dim, (tuple, list)) and all(isinstance(d, int) for d in dim)
+        ):
+            dim = _canonicalize_dim(dim)
+
         if record_cmd:
             # Store the spec and re-dispatch on each ``.launch()`` — see
             # ``MetalLaunch`` for the (lack of) replay optimisation.
