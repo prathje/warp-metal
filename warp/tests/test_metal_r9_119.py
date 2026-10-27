@@ -485,6 +485,11 @@ class TestMetalUpstream119(unittest.TestCase):
                         assert msg in str(e), (d, msg, e)
                     else:
                         raise AssertionError(f"{d}: {msg} mismatch not rejected")
+                # An empty launch packs nothing, so nothing is checked (Newton
+                # converts zero-joint models this way).
+                for empty_dim in (0, (0,)):
+                    wp.launch(read_regular, empty_dim, inputs=[wp.zeros(0, dtype=wp.int32, device=d)], outputs=[out],
+                              device=d)
                 cmd = wp.launch(read_regular, 3, inputs=[a], outputs=[out], device=d, record_cmd=True)
                 try:
                     cmd.set_param_at_index(0, wp.zeros(3, dtype=wp.int32, device=d))

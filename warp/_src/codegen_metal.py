@@ -25841,7 +25841,10 @@ def launch_metal_kernel(
     adj_outputs=(),
 ):
     """Dispatch a Warp kernel on a Metal device (see ``_launch_metal_kernel``)."""
-    _validate_metal_array_args(kernel, inputs, outputs)
+    # Like ``wp.launch`` on CPU/CUDA, which packs (and so checks) the
+    # arguments only for a non-empty launch.
+    if all(int(d) > 0 for d in ((dim,) if isinstance(dim, int) else dim)):
+        _validate_metal_array_args(kernel, inputs, outputs)
     with _kernel_fp64_mode(kernel):
         return _launch_metal_kernel(
             kernel,
