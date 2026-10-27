@@ -327,6 +327,37 @@ class TestMetalR3Locals(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet, timeout=120)
 
+    def test_matrix_slice_stores(self):
+        # ``m[a:b, c] = v``, ``m[r, a:b] = v`` and ``m[a:b, c:d] = n`` lower to
+        # templated 4-argument ``wp::assign_inplace`` (Newton's implicit MPM
+        # strain-mode kernels, upstream 2026-10).
+        snippet = _snippet(
+            """
+            @wp.kernel
+            def k(out: wp.array[wp.mat44], out3: wp.array[wp.mat33]):
+                i = wp.tid()
+                m = wp.mat44(0.0)
+                m[1:3, 2] = wp.vec2(1.0 + float(i), 2.0)
+                m[0, 1:4] = wp.vec3(3.0, 4.0, 5.0 * float(i))
+                m[2:4, 0:2] = wp.mat22(6.0, 7.0, 8.0, 9.0 + float(i))
+                m[3, ::-2] = wp.vec2(-1.0, -2.0)
+                out[i] = m
+                a = wp.mat33(0.0)
+                a[0:2, 1] = wp.vec2(1.0, 2.0 * float(i))
+                out3[i] = a
+
+            def run(dev):
+                o = wp.zeros(3, dtype=wp.mat44, device=dev)
+                o3 = wp.zeros(3, dtype=wp.mat33, device=dev)
+                wp.launch(k, 3, [o, o3], device=dev)
+                return o.numpy(), o3.numpy()
+
+            res = compare(run)
+            assert np.abs(res["cpu"][0]).sum() > 0
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
     def test_fixed_array_adjoint(self):
         # The dual of a fixed array is a second fixed array that the
         # element adjoints accumulate into, as on CPU.

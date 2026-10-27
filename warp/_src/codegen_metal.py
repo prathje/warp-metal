@@ -7318,6 +7318,31 @@ _MISC_MATH_HELPERS: dict[str, str] = {
         "        d[jj++] = wp_mat_extract(m, row, j);\n"
         "}"
     ),
+    # Matrix slice store (see the 4-arg ``wp::assign_inplace<...>`` rule);
+    # mirrors the slice ``assign_inplace`` overloads of ``warp/native/mat.h``.
+    "wp_mat_slice_store": (
+        "template <typename M, typename V>\n"
+        "inline void wp_mat_slice_store(thread M& m, wp_slice_t rs, wp_slice_t cs, V v) {\n"
+        "    int ii = 0;\n"
+        "    for (int i = rs.start; (rs.step > 0) ? (i < rs.stop) : (i > rs.stop); i += rs.step, ++ii) {\n"
+        "        int jj = 0;\n"
+        "        for (int j = cs.start; (cs.step > 0) ? (j < cs.stop) : (j > cs.stop); j += cs.step, ++jj)\n"
+        "            wp_mat_elem_store(m, i, j, wp_mat_extract(v, ii, jj));\n"
+        "    }\n"
+        "}\n"
+        "template <typename M, typename V>\n"
+        "inline void wp_mat_slice_store(thread M& m, wp_slice_t rs, int col, V v) {\n"
+        "    int ii = 0;\n"
+        "    for (int i = rs.start; (rs.step > 0) ? (i < rs.stop) : (i > rs.stop); i += rs.step)\n"
+        "        wp_mat_elem_store(m, i, col, v[ii++]);\n"
+        "}\n"
+        "template <typename M, typename V>\n"
+        "inline void wp_mat_slice_store(thread M& m, int row, wp_slice_t cs, V v) {\n"
+        "    int jj = 0;\n"
+        "    for (int j = cs.start; (cs.step > 0) ? (j < cs.stop) : (j > cs.stop); j += cs.step)\n"
+        "        wp_mat_elem_store(m, row, j, v[jj++]);\n"
+        "}"
+    ),
     "wp_argmin": (
         "template <typename V, int N>\n"
         "inline uint wp_argmin_impl(V v) {\n"
@@ -11296,6 +11321,16 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
             r"\s*\(\s*([^,()]+?)\s*,\s*([^,()]+?)\s*,\s*([^,()]+?)\s*\)"
         ),
         r"wp_mat_slice_assign(var_\1, \2, \3, \4)",
+    ),
+    # ``wp::assign_inplace<...>(m, r, c, x)`` — matrix slice store
+    # ``m[a:b, c] = x`` / ``m[r, a:b] = x`` / ``m[a:b, c:d] = x`` (the
+    # ``assign_inplace`` slice overloads of ``warp/native/mat.h``).
+    (
+        re.compile(
+            r"\bwp::assign_inplace\s*<[^<>()]*>\s*\(\s*([^,()]+?)\s*,\s*([^,()]+?)\s*,"
+            r"\s*([^,()]+?)\s*,\s*([^,()]+?)\s*\)"
+        ),
+        r"wp_mat_slice_store(\1, \2, \3, \4)",
     ),
     # ``wp::assign_inplace<N>(v, s, x)`` — vector slice store ``v[a:b] = x``.
     (
