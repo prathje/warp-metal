@@ -2515,6 +2515,10 @@ def _inline_one_adj_call(
             f"function inlining exceeded max depth {max_depth} — possible recursion in {fn_overload.key!r}"
         )
 
+    if getattr(fn_overload, "custom_grad_func", None) is not None:
+        return _inline_custom_grad_call(
+            fn_overload, caller_args, fn_map, depth, max_depth, const_ints_out, struct_locals_out, var_types
+        )
     _ensure_func_backward_built(fn_overload)
     if getattr(fn_overload, "native_snippet", None) is not None:
         # Without an ``adj_snippet`` the native adjoint is empty, so the call
@@ -2702,6 +2706,138 @@ def _inline_one_adj_call(
         replay_nodes = [_DoWhileZero(raw="", body=tuple(_rewrite_returns_to_breaks(replay_nodes, None, ret_flag)))]
 
     return [*decls, *replay_nodes, *reverse_nodes]
+
+
+def _inline_custom_grad_call(
+    fn_overload,
+    caller_args: tuple[str, ...],
+    fn_map: dict[str, list[Any]],
+    depth: int,
+    max_depth: int,
+    const_ints_out: dict[str, int],
+    struct_locals_out: dict[str, Any],
+    var_types: dict[str, str],
+) -> list[Node]:
+    """Inline ``adj_<func>(...)`` for a ``@wp.func`` with a ``@wp.func_grad``.
+
+    Native codegen emits the adjoint of such a function as the gradient
+    function's *forward* body (``custom_reverse_mode``): its parameters are
+    the primal inputs followed by the adjoints of the return values, and
+    ``wp.adjoint[x]`` names the caller's adjoint slot of input ``x``. Splice
+    that body with the same call ABI as :func:`_inline_one_adj_call` (the
+    automatic adjoint of the primal body used to be inlined instead).
+    """
+    from warp._src.codegen import Struct  # noqa: PLC0415
+    from warp._src.codegen_metal import (  # noqa: PLC0415
+        MetalCodegenError,
+        _msl_constant_str,
+        _msl_local_init,
+        _msl_var_type,
+    )
+
+    grad_fn = fn_overload.custom_grad_func
+    if getattr(grad_fn, "native_snippet", None) is not None or getattr(fn_overload, "native_snippet", None):
+        raise MetalCodegenError(f"custom gradient of native function {fn_overload.key!r} is not supported on Metal")
+    fwd_adj = fn_overload.adj
+    n_params = len(fwd_adj.args)
+    n_rets = len(fwd_adj.return_var or ())
+    n_args = len(caller_args)
+    fwd_args = caller_args[:n_params]
+    if n_args == 2 * n_params + n_rets:
+        # Single return, or a custom adjoint (which takes no primal outputs).
+        adj_args = caller_args[n_params : 2 * n_params]
+        adj_rets = caller_args[2 * n_params :]
+    elif n_args == 2 * (n_params + n_rets):
+        adj_args = caller_args[n_params + n_rets : 2 * n_params + n_rets]
+        adj_rets = caller_args[2 * n_params + n_rets :]
+    else:
+        raise MetalCodegenError(
+            f"custom adjoint of {fn_overload.key!r}: unexpected call arity ({n_args} arguments for "
+            f"{n_params} parameters and {n_rets} return values)"
+        )
+
+    from warp.config import DeterministicMode  # noqa: PLC0415
+
+    gadj = grad_fn.adj
+    # Built with the Metal kernel options (plain atomics, CPU-style dispatch),
+    # every time: another backend's build may have left its own IR behind.
+    gadj.skip_build = False
+    gadj.build(
+        builder=None,
+        default_builder_options={
+            "enable_backward": False,
+            "output_arch": None,
+            "block_dim": 1,
+            "metal_backend": True,
+            "deterministic": DeterministicMode.NOT_GUARANTEED,
+            "deterministic_max_records": 0,
+        },
+    )
+    gparams = [a.label for a in gadj.args]
+    if len(gparams) != n_params + len(adj_rets):
+        raise MetalCodegenError(
+            f"custom adjoint of {fn_overload.key!r}: {len(gparams)} gradient-function parameters for "
+            f"{n_params} inputs and {len(adj_rets)} return adjoints"
+        )
+    inline_id = _next_inline_id()
+    subs: dict[str, str] = {}
+    for i, pname in enumerate(gparams):
+        if i < n_params:
+            subs[f"var_{pname}"] = fwd_args[i]
+            subs[f"adj_{pname}"] = adj_args[i]
+        else:
+            subs[f"var_{pname}"] = adj_rets[i - n_params]
+    param_set = set(gparams)
+    body = list(gadj.blocks[0].body_forward)
+    for var in gadj.variables:
+        if var.label in param_set:
+            continue
+        subs[f"var_{var.label}"] = f"var_{inline_id}__{var.label}"
+    for tmp in set(_SYNTH_TMP_PAT.findall("\n".join(body))):
+        subs[f"var_{tmp}"] = f"var_{inline_id}__{tmp}"
+    if any(re.search(r"\breturn\b|\bgoto\b", ln) for ln in body if not ln.lstrip().startswith("//")):
+        raise MetalCodegenError(
+            f"custom adjoint of {fn_overload.key!r}: early returns in a @wp.func_grad body are not supported on Metal"
+        )
+    body = [_substitute_var_refs(line, subs) for line in body]
+    query_iters = query_iterator_vars(gadj, subs)
+    nodes, skip = fold(parse(body), query_iter_vars=query_iters)
+
+    callee_fn_map = _build_function_overload_table(gadj)
+    if callee_fn_map:
+        merged: dict[str, list[Any]] = {k: list(v) for k, v in fn_map.items()}
+        for k, v in callee_fn_map.items():
+            existing = merged.get(k, [])
+            seen = {id(o) for o in existing}
+            merged[k] = existing + [o for o in v if id(o) not in seen]
+        fn_map = merged
+    decls: list[Node] = []
+    for var in gadj.variables:
+        if var.label in param_set:
+            continue
+        try:
+            var_types[f"{inline_id}__{var.label}"] = var.ctype()
+        except Exception:
+            pass
+        if isinstance(var.type, Struct):
+            struct_locals_out[f"{inline_id}__{var.label}"] = var.type
+            continue
+        ctype = var.ctype()
+        if ctype == "wp::range_t" or var.label in skip:
+            continue
+        try:
+            msl_type = _msl_var_type(ctype)
+        except Exception:
+            continue
+        mangled = f"var_{inline_id}__{var.label}"
+        if var.constant is None:
+            decls.append(_RawLine(raw=f"    {msl_type} {mangled}{_msl_local_init(msl_type)};"))
+        else:
+            decls.append(_RawLine(raw=f"    const {msl_type} {mangled} = {_msl_constant_str(var.constant, msl_type)};"))
+            if isinstance(var.constant, int) and not isinstance(var.constant, bool):
+                const_ints_out[f"{inline_id}__{var.label}"] = var.constant
+    nodes = _inline_walk(nodes, fn_map, depth + 1, max_depth, const_ints_out, struct_locals_out, var_types)
+    return [*decls, *nodes]
 
 
 def _inline_walk(

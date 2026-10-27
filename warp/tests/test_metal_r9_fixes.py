@@ -503,6 +503,88 @@ class TestMetalR9Fixes(unittest.TestCase):
         )
         _run_with_metal_native(self, snippet, timeout=240)
 
+    def test_custom_func_grad_matches_cpu(self):
+        # @wp.func_grad replaces a function's adjoint. Metal inlined the
+        # automatic adjoint of the primal body instead, so a clipped gradient
+        # came out unclipped and side effects in the gradient never ran.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+            @wp.func
+            def clipped_sq(x: float) -> float:
+                return x * x
+            @wp.func_grad(clipped_sq)
+            def adj_clipped_sq(x: float, adj_ret: float):
+                wp.adjoint[x] += wp.clamp(2.0 * x * adj_ret, -1.0, 1.0)
+
+            @wp.func
+            def two(x: float, y: float):
+                return x * y, x + y
+            @wp.func_grad(two)
+            def adj_two(x: float, y: float, adj_r0: float, adj_r1: float):
+                wp.adjoint[x] += 10.0 * adj_r0 + adj_r1
+                wp.adjoint[y] += 100.0 * adj_r0
+
+            @wp.func
+            def counter_increment(counter: wp.array(dtype=int), idx: int):
+                return wp.atomic_add(counter, idx, 1)
+            @wp.func_replay(counter_increment)
+            def replay_counter_increment(counter: wp.array(dtype=int), idx: int):
+                return idx
+
+            @wp.kernel(module="unique")
+            def k(x: wp.array(dtype=float), counter: wp.array(dtype=int), y: wp.array(dtype=float)):
+                i = wp.tid()
+                a, b = two(x[i], 2.0 * x[i])
+                slot = counter_increment(counter, 0)
+                y[i] = clipped_sq(x[i]) + a + b + x[i] * float(slot)
+            r = {}
+            for d in ("cpu", "metal:0"):
+                x = wp.array(np.linspace(-2, 2, 8).astype(np.float32), dtype=float, device=d, requires_grad=True)
+                c = wp.zeros(1, dtype=int, device=d)
+                y = wp.zeros(8, dtype=float, device=d, requires_grad=True)
+                t = wp.Tape()
+                with t:
+                    wp.launch(k, dim=8, inputs=[x, c, y], device=d)
+                t.backward(grads={y: wp.ones(8, dtype=float, device=d)})
+                r[d] = (y.numpy(), x.grad.numpy(), c.numpy())
+            for a, b in zip(r["cpu"], r["metal:0"]):
+                np.testing.assert_allclose(b, a, rtol=1e-6)
+
+            @wp.func
+            def side_effect(counter: wp.array(dtype=int), v: float) -> float:
+                wp.atomic_add(counter, 0, 1)
+                return v
+
+            @wp.func
+            def scale(counter: wp.array(dtype=int), x: float, s: float) -> float:
+                return x * s
+
+            @wp.func_grad(scale)
+            def adj_scale(counter: wp.array(dtype=int), x: float, s: float, adj_ret: float):
+                wp.adjoint[x] += side_effect(counter, adj_ret * s)
+                wp.adjoint[s] += adj_ret * x
+
+            @wp.kernel(module="unique")
+            def k2(counter: wp.array(dtype=int), x: wp.array(dtype=float), s: wp.array(dtype=float), out: wp.array(dtype=float)):
+                i = wp.tid()
+                out[i] = scale(counter, x[i], s[i])
+
+            for d in ("cpu", "metal:0"):
+                counter = wp.zeros(1, dtype=int, device=d)
+                x = wp.array([3.0], dtype=float, device=d, requires_grad=True)
+                s = wp.array([2.0], dtype=float, device=d, requires_grad=True)
+                out = wp.zeros(1, dtype=float, device=d, requires_grad=True)
+                t = wp.Tape()
+                with t:
+                    wp.launch(k2, dim=1, inputs=[counter, x, s, out], device=d)
+                t.backward(grads={out: wp.ones(1, dtype=float, device=d)})
+                assert counter.numpy()[0] == 1, (d, counter.numpy())
+                assert x.grad.numpy()[0] == 2.0 and s.grad.numpy()[0] == 3.0, d
+            """
+        )
+        _run_with_metal_native(self, snippet, timeout=240)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
