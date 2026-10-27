@@ -21310,9 +21310,9 @@ def _generate_msl_kernel_uncached(
         # launcher binds a 1-element placeholder and skips its copy-back.
         final_output_names = ["__wp_unused_out"]
 
-    # A lane-dependent ``wp.tile()`` kernel that only sums into memory runs
-    # every lane (see ``_lane_sum_unfoldable``); others keep the serial model.
-    _lane_unfold = coop_block_n == 0 and _lane_tile_value(forward_lines) and _lane_sum_unfoldable(forward_lines)
+    # A ``wp.tile()`` kernel that only sums into memory runs every lane (see
+    # ``_lane_sum_unfoldable``); others keep the serial model.
+    _lane_unfold = coop_block_n == 0 and _lane_sum_unfoldable(forward_lines)
     _artifact = MetalKernelArtifact(
         name=artifact_name,
         has_print=_has_print,
@@ -24695,34 +24695,6 @@ def _maybe_staged_arg(value) -> bool:
 _TILE_LANE_OP_PAT = re.compile(r"\bwp::tile_scatter_(?:masked|add)\s*(?:<[^()]*>)?\s*\(\s*var_\w+\s*,\s*var_(\w+)\s*,")
 
 
-_LANE_ASSIGN_PAT = re.compile(r"^\s*var_(\w+)\s*=(?!=)(.*)$")
-_LANE_WP_ASSIGN_PAT = re.compile(r"^\s*wp::assign\s*\(\s*var_(\w+)\s*,(.*)\)\s*;\s*$")
-_LANE_IF_PAT = re.compile(r"^\s*if\s*\((.*)\)\s*\{\s*$")
-_LANE_VAR_PAT = re.compile(r"\bvar_(\w+)\b")
-
-
-def _lane_tainted_labels(lines: list[str], lane: str) -> set[str]:
-    """Labels whose value may depend on ``lane`` (data or enclosing ``if``)."""
-    tainted = {lane}
-    changed = True
-    while changed:
-        changed = False
-        guards: list[bool] = []
-        for ln in lines:
-            m = _LANE_IF_PAT.match(ln)
-            if m is not None:
-                guards.append(any(v in tainted for v in _LANE_VAR_PAT.findall(m.group(1))))
-                continue
-            ctrl = any(guards)
-            m = _LANE_ASSIGN_PAT.match(ln) or _LANE_WP_ASSIGN_PAT.match(ln)
-            if m is not None and m.group(1) not in tainted:
-                if ctrl or any(v in tainted for v in _LANE_VAR_PAT.findall(m.group(2))):
-                    tainted.add(m.group(1))
-                    changed = True
-            guards = guards[: max(0, len(guards) - ln.count("}"))] if "}" in ln and "{" not in ln else guards
-    return tainted
-
-
 def _lane_indexes_tile_op(lines: list[str]) -> bool:
     """Whether a tile scatter is indexed by the lane of a 2-D ``wp.tid()``."""
     text = "\n".join(lines)
@@ -24730,17 +24702,9 @@ def _lane_indexes_tile_op(lines: list[str]) -> bool:
     return m is not None and any(lm.group(1) == m.group(1) for lm in _TILE_LANE_OP_PAT.finditer(text))
 
 
-def _lane_tile_value(lines: list[str]) -> bool:
-    """Whether a ``wp.tile(x)`` packs a value that depends on the lane of a 2-D ``wp.tid()``."""
-    text = "\n".join(lines)
-    m = re.search(r"builtin_tid2d\s*\(\s*var_\w+\s*,\s*var_(\w+)\s*\)", text)
-    if m is None:
-        return False
-    ctors = [tm.group(2) for tm in _TILE_BUILTIN_TILE_PAT.finditer(text)]
-    if not ctors:
-        return False
-    tainted = _lane_tainted_labels(lines, m.group(1))
-    return any(c in tainted for c in ctors)
+_TID2D_PAT = re.compile(r"\bbuiltin_tid2d\s*\(\s*var_\w+\s*,\s*var_\w+\s*\)")
+_TILE_SUM_RESULT_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_sum\s*\(")
+_TILE_ATOMIC_ADD_ARGS_PAT = re.compile(r"\bwp::(adj_)?tile_atomic_add\s*(?:<[^()]*>)?\s*\(([^()]*)\)")
 
 
 # Tile ops of a kernel that only sums per-thread values into global memory:
@@ -24750,20 +24714,36 @@ _TILE_OP_NAME_PAT = re.compile(r"\bwp::((?:adj_)?tile\w*)\s*[<(]")
 
 
 def _lane_sum_unfoldable(lines: list[str]) -> bool:
-    """Whether a lane-dependent tile kernel can run every lane as its own block.
+    """Whether a lane-dim tile kernel can run every lane as its own block.
 
-    A kernel whose only tile ops are ``wp.tile()`` of a per-thread value,
-    ``tile_sum`` of it and ``tile_atomic_add`` of the sum into an array
-    computes the same total when each lane adds its own value (atomically),
-    so the launcher keeps the lane dim instead of folding it to lane 0 (CUDA
-    and a CPU ``wp.launch(dim=(n, B), block_dim=B)`` both add every lane).
-    ``wp.block_dim()`` (lowered to 1) rules it out.
+    A kernel with a 2-D ``wp.tid()`` whose only tile ops are ``wp.tile()``,
+    ``tile_sum`` of it and ``tile_atomic_add`` of that (single-element) sum
+    into an array computes the same total when each lane adds its own
+    value atomically, so the launcher keeps the lane dim instead of folding
+    it to lane 0: that is what CUDA (and a CPU ``wp.launch(dim=(n, B),
+    block_dim=B)``) computes, whether or not the value depends on the lane.
+    The decision does not depend on the value, so the forward and the
+    adjoint artifact (replay + reverse) always agree. Any other
+    ``tile_atomic_add`` operand (a full ``wp.tile(x)``) is per-lane on CUDA
+    and keeps the serial model, as does ``wp.block_dim()`` (lowered to 1).
     """
-    text = "\n".join(lines)
-    if "builtin_block_dim" in text:
+    text = "\n".join(ln for ln in lines if not ln.lstrip().startswith("//"))
+    if "builtin_block_dim" in text or _TID2D_PAT.search(text) is None:
+        return False
+    if _TILE_BUILTIN_TILE_PAT.search(text) is None:
         return False
     ops = {m.group(1) for m in _TILE_OP_NAME_PAT.finditer(text)}
-    return bool(ops) and ops <= _LANE_SUM_TILE_OPS and "tile_atomic_add" in ops
+    if not ops <= _LANE_SUM_TILE_OPS or not ({"tile_atomic_add", "adj_tile_atomic_add"} & ops):
+        return False
+    sums = {m.group(1) for m in _TILE_SUM_RESULT_PAT.finditer(text)}
+    for m in _TILE_ATOMIC_ADD_ARGS_PAT.finditer(text):
+        args = [a.strip() for a in m.group(2).split(",")]
+        # forward: (array, offsets..., tile); reverse: forward args, their
+        # adjoints, then adj_ret, so the tile is the last forward arg.
+        tile = args[(len(args) - 1) // 2 - 1] if m.group(1) else args[-1]
+        if not tile.startswith("var_") or tile[len("var_") :] not in sums:
+            return False
+    return True
 
 
 def _lane_tile_launch_error(kernel, block_dim: int) -> str:

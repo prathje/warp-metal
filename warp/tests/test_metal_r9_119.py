@@ -561,6 +561,63 @@ class TestMetalUpstream119(unittest.TestCase):
         )
         _run_with_metal_native(self, snippet, timeout=600)
 
+    def test_lane_sum_unfold_covers_adjoint_and_any_value(self):
+        # The sum-only pattern must run every lane in the reverse pass too
+        # (the adjoint's index wrapping once hid the lane from the detection,
+        # so x.grad got lane 0 of each block only), and whatever the value
+        # depends on: a lane-uniform value, or one that depends on the lane
+        # only through a loop bound, also summed one lane per block.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            TS = 64
+
+            @wp.kernel(module="unique")
+            def sq_sum(x: wp.array(dtype=float), out: wp.array(dtype=float)):
+                b, lane = wp.tid()
+                v = x[b * TS + lane]
+                wp.tile_atomic_add(out, wp.tile_sum(wp.tile(v * v)))
+
+            @wp.kernel(module="unique")
+            def uniform_sum(out: wp.array(dtype=float)):
+                b, lane = wp.tid()
+                wp.tile_atomic_add(out, wp.tile_sum(wp.tile(1.0)))
+
+            @wp.kernel(module="unique")
+            def loop_sum(x: wp.array(dtype=float), out: wp.array(dtype=float)):
+                b, lane = wp.tid()
+                v = float(0.0)
+                k = int(0)
+                while k < lane:
+                    v = v + x[k]
+                    k += 1
+                for j in range(lane):
+                    v += 1.0
+                wp.tile_atomic_add(out, wp.tile_sum(wp.tile(v)))
+
+            xs = np.random.default_rng(3).random(3 * TS).astype(np.float32)
+            res = {}
+            for d in ("cpu", "metal:0"):
+                x = wp.array(xs, device=d, requires_grad=True)
+                out = wp.zeros(1, dtype=float, device=d, requires_grad=True)
+                tape = wp.Tape()
+                with tape:
+                    wp.launch(sq_sum, dim=(3, TS), block_dim=TS, inputs=[x, out], device=d)
+                tape.backward(grads={out: wp.ones(1, dtype=float, device=d)})
+                vals = [out.numpy()[0]]
+                for k, args in ((uniform_sum, []), (loop_sum, [x])):
+                    o = wp.zeros(1, dtype=float, device=d)
+                    wp.launch(k, dim=(3, TS), block_dim=TS, inputs=[*args, o], device=d)
+                    vals.append(o.numpy()[0])
+                res[d] = (np.array(vals), x.grad.numpy())
+            np.testing.assert_allclose(res["metal:0"][0], res["cpu"][0], rtol=1e-5)
+            np.testing.assert_allclose(res["metal:0"][1], res["cpu"][1], rtol=1e-6)
+            np.testing.assert_allclose(res["cpu"][1], 2.0 * xs, rtol=1e-6)
+            """
+        )
+        _run_with_metal_native(self, snippet, timeout=600)
+
     def test_unported_tile_reductions_raise(self):
         # Metal has no lowering for these yet. 1.19 changed their CPU/CUDA
         # results (GH-2000 tile_sum axis gradients, GH-2003/GH-1781 scan
