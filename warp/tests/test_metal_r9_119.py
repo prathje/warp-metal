@@ -499,6 +499,60 @@ class TestMetalUpstream119(unittest.TestCase):
         )
         _run_with_metal_native(self, snippet, timeout=240)
 
+    def test_lane_values_in_serial_tile_kernels(self):
+        # Serial tile kernels run one thread per block. A wp.tile() of a
+        # per-thread value then kept lane 0's value only: fem.integrate()'s
+        # scalar reduction (tile_atomic_add(out, tile_sum(tile(val)))) summed
+        # one quadrature point per block on Metal (pre-existing; surfaced by
+        # 1.19's fem quadrature-cache tests). That pattern now runs every
+        # lane; any other lane-dependent wp.tile() kernel raises.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+            import warp.fem as fem
+
+            @fem.integrand
+            def one(s: fem.Sample):
+                return 1.0
+
+            @fem.integrand
+            def elt(s: fem.Sample):
+                return float(s.element_index)
+
+            res = {}
+            for d in ("cpu", "metal:0"):
+                out = []
+                for geo in (fem.Grid2D(res=wp.vec2i(3)), fem.Grid3D(res=wp.vec3i(2, 3, 1))):
+                    domain = fem.Cells(geo)
+                    for order in (0, 2):
+                        q = fem.RegularQuadrature(domain, order=order)
+                        for f in (one, elt):
+                            out.append(float(fem.integrate(f, quadrature=q, domain=domain, device=d)))
+                res[d] = out
+            np.testing.assert_allclose(res["metal:0"], res["cpu"], rtol=1e-5)
+
+            TS = 64
+
+            @wp.kernel
+            def per_block(x: wp.array(dtype=float), out: wp.array(dtype=float)):
+                b, lane = wp.tid()
+                v = x[b * TS + lane]
+                t = wp.tile_sum(wp.tile(v))
+                wp.tile_store(out, t, offset=b)
+
+            x = wp.ones(2 * TS, dtype=float, device="metal:0")
+            out = wp.zeros(2, dtype=float, device="metal:0")
+            try:
+                wp.launch(per_block, dim=(2, TS), block_dim=TS, inputs=[x, out], device="metal:0")
+                wp.synchronize_device("metal:0")
+            except RuntimeError as e:
+                assert "lane of wp.tid()" in str(e), e
+            else:
+                raise AssertionError(f"lane-dependent wp.tile() ran serially: {out.numpy()}")
+            """
+        )
+        _run_with_metal_native(self, snippet, timeout=600)
+
     def test_unported_tile_reductions_raise(self):
         # Metal has no lowering for these yet. 1.19 changed their CPU/CUDA
         # results (GH-2000 tile_sum axis gradients, GH-2003/GH-1781 scan
