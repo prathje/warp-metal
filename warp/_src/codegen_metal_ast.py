@@ -31,6 +31,7 @@ Design constraints:
 from __future__ import annotations
 
 import dataclasses
+import functools
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -727,15 +728,61 @@ def emit(nodes: list[Node]) -> list[str]:
     pair around a recursive walk of their body.
     """
     out: list[str] = []
-    _emit_into(nodes, out)
+    _emit_into(nodes, out, [0])
     return out
 
 
-def _emit_into(nodes, out: list[str]) -> None:
+@functools.lru_cache(maxsize=4096)
+def _var_write_pat(name: str) -> re.Pattern[str]:
+    """Statements that may write the local ``var_<name>``: (compound)
+    assignment, increment / decrement, taking its address, or a
+    statement-level call on it (``wp::assign(var_X, ...)``; adjoint calls
+    only read the primal). Over-approximates, which only costs a copy."""
+    ref = rf"var_{name}"
+    return re.compile(
+        rf"(?:\b{ref}\s*(?:[-+*/%&|^]|<<|>>)?=(?!=)|\+\+\s*{ref}\b|--\s*{ref}\b"
+        rf"|\b{ref}\s*(?:\+\+|--)|&\s*\(?\s*{ref}\b"
+        rf"|^\s*(?!(?:if|while|for|switch|return)\b|(?:wp::)?(?:wp_)?adj_)(?:wp::)?\w+\s*\(\s*&?\s*{ref}\b)"
+    )
+
+
+def _loop_bound_captures(n: For, k: int) -> tuple[list[str], str, str]:
+    """Freeze a ``for`` loop's stop / step when its body writes a variable
+    they read.
+
+    ``wp::range`` (warp/native/range.h) evaluates start / stop / step once,
+    when the range object is built; a C ``for`` header re-reads its
+    condition and increment every iteration. A loop that reassigns its own
+    bound (``for i in range(0, n, s): n = n - 1``, which Warp's IR writes
+    back into the very local the header reads) therefore ran a different
+    number of iterations on Metal. Such bounds are copied into ``const int``
+    locals right before the loop (``wp::range`` takes ``int``, so the
+    conversion matches). Loops whose bounds the body never writes are
+    emitted unchanged.
+    """
+    exprs = {"stop": n.stop, "step": n.step}
+    refs = {key: set(re.findall(r"\bvar_(\w+)\b", e)) for key, e in exprs.items()}
+    names = refs["stop"] | refs["step"]
+    if not names:
+        return [], n.stop, n.step
+    body: list[str] = []
+    _emit_into(list(n.body), body, [0])
+    written = {nm for nm in names if any(_var_write_pat(nm).search(ln) for ln in body if f"var_{nm}" in ln)}
+    pre: list[str] = []
+    out = dict(exprs)
+    for key, e in exprs.items():
+        if refs[key] & written:
+            cap = f"wp_rng{k}_{key}_{n.range_var}"
+            pre.append(f"const int {cap} = ({e});")
+            out[key] = cap
+    return pre, out["stop"], out["step"]
+
+
+def _emit_into(nodes, out: list[str], counter: list[int]) -> None:
     for n in nodes:
         if isinstance(n, If):
             out.append(n.raw_open)
-            _emit_into(list(n.body), out)
+            _emit_into(list(n.body), out, counter)
             out.append(n.raw_close)
         elif isinstance(n, For):
             # Match the existing ``_preprocess_for_loops`` output, which
@@ -750,27 +797,31 @@ def _emit_into(nodes, out: list[str]) -> None:
             # var inside an early-break path. We therefore *don't* re-
             # declare with ``int`` here; just assign in the init clause.
             iv = n.iter_var
-            if n.step == "1":
+            pre, stop, step = _loop_bound_captures(n, counter[0])
+            if pre:
+                counter[0] += 1
+                out.extend(pre)
+            if step == "1":
                 inc = f"++var_{iv}"
             else:
-                inc = f"var_{iv} += {n.step}"
+                inc = f"var_{iv} += {step}"
             # NB: emits ``<`` regardless of step sign. A post-emit pass
             # in :mod:`codegen_metal` rewrites ``<`` to ``>`` for
             # negative-step ranges (see ``_fix_negative_step_for_loops``).
-            out.append(f"for (var_{iv} = {n.start}; var_{iv} < {n.stop}; {inc}) {{")
-            _emit_into(list(n.body), out)
+            out.append(f"for (var_{iv} = {n.start}; var_{iv} < {stop}; {inc}) {{")
+            _emit_into(list(n.body), out, counter)
             out.append("}")
         elif isinstance(n, While):
             # Same column-0 convention as ``_preprocess_while_loops``.
             out.append("while (true) {")
-            _emit_into(list(n.body), out)
+            _emit_into(list(n.body), out, counter)
             out.append("}")
         elif isinstance(n, _DoWhileZero):
             # Inlined function bodies that contain mid-function returns get
             # wrapped in ``do { ... } while (0);`` so the rewritten breaks
             # exit the whole region in one hop. MSL accepts ``do/while``.
             out.append("do {")
-            _emit_into(list(n.body), out)
+            _emit_into(list(n.body), out, counter)
             out.append("} while (0);")
         else:
             out.append(n.raw)
