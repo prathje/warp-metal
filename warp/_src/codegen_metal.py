@@ -714,6 +714,18 @@ def _emit_big_vec_struct(name: str, n: int, msl_scalar: str) -> str:
     else:
         body_lines.append(f"    return ({msl_scalar})metal::precise::sqrt(float({sum_sq}));")
     body_lines.append("}")
+    if msl_scalar == _F64_EMU_MSL and n == 3:
+        # ``wp.cross`` on an emulated ``vec3d``: ``metal::cross`` only takes
+        # native float / half vectors (warp/native/vec.h order of terms).
+        body_lines.append(
+            f"namespace metal {{ inline {name} cross({name} a, {name} b) {{ return {name}_make("
+            "a.c[1] * b.c[2] - a.c[2] * b.c[1], a.c[2] * b.c[0] - a.c[0] * b.c[2], "
+            "a.c[0] * b.c[1] - a.c[1] * b.c[0]); } }"
+        )
+        body_lines.append(
+            f"inline void wp_adj_cross({name} a, {name} b, thread {name}& aa, thread {name}& ab, {name} r) "
+            "{ aa += metal::cross(b, r); ab += metal::cross(r, a); }"
+        )
     body_lines.append(f"inline {name} wp_normalize({name} v) {{")
     body_lines.append(f"    {msl_scalar} l = wp_length(v);")
     body_lines.append(f"    {name} r;")
@@ -17246,6 +17258,82 @@ def _struct_field_path_type(root_type, fpath: tuple[str, ...]):
     return t
 
 
+_F64_CAST_PAT = re.compile(r"\bwp::float64\s*\(")
+
+
+def _reject_fp64_values(adj, lines: list[str], inlined_var_ctypes: dict[str, str]) -> None:
+    """Under ``metal_fp64 = "error"``, raise for any float64 *value* the
+    kernel computes with (a ``wp.float64`` / ``vec3d`` / ``mat22d`` ... local,
+    scalar parameter or cast).
+
+    Apple GPUs have no fp64. The value translators lower such values to
+    float32, which "demote" opts into; in the default "error" mode only
+    float64 array storage used to raise, so ``wp.vec3d`` math silently ran
+    in single precision. Array arguments keep their own check (and
+    message); pointers into them are skipped here.
+    """
+    ctypes: dict[str, str] = {}
+    for a in adj.args:
+        try:
+            ctypes[str(a.label)] = a.ctype()
+        except Exception:
+            pass
+    for v in adj.variables:
+        ctypes[str(v.label)] = v.ctype()
+    for lbl, ct in inlined_var_ctypes.items():
+        ctypes.setdefault(str(lbl), ct)
+
+    def _is_value(ct: str) -> bool:
+        return "wp::float64" in ct and not ct.rstrip().endswith("*") and "array_t" not in ct
+
+    # A float64 struct / array element loaded and only ever cast to a narrower
+    # type (``wp.float32(p.nu)``, warp.fem's float64 parameters) does no fp64
+    # arithmetic: the conversion rounds exactly as on CPU, so it stays legal.
+    def_line: dict[str, str] = {}
+    uses: dict[str, list[str]] = {}
+    for ln in lines:
+        m = re.match(r"^\s*var_(\w+)\s*=", ln)
+        lhs = m.group(1) if m else None
+        if lhs is not None:
+            def_line.setdefault(lhs, ln)
+        if "var_" in ln:
+            for name in set(_VAR_REF_PAT.findall(ln)):
+                if name != lhs:
+                    uses.setdefault(name, []).append(ln)
+
+    def _load_then_narrowed(name: str) -> bool:
+        d = def_line.get(name, "")
+        if not re.match(rf"^\s*var_{name}\s*=\s*wp::load\s*\(", d):
+            return False
+        cast = re.compile(rf"\bwp::(?!float64\b)(\w+)\s*\(\s*var_{name}\s*\)")
+        return all(
+            len(re.findall(rf"\bvar_{name}\b", u)) == len(cast.findall(u)) and not u.lstrip().startswith("wp::adj_")
+            for u in uses.get(name, [])
+        )
+
+    culprit = None
+    for ln in lines:
+        if "wp::float64" in ln and _F64_CAST_PAT.search(ln):
+            culprit = f"a float64 cast in {ln.strip()!r}"
+            break
+        if "var_" not in ln:
+            continue
+        for name in _VAR_REF_PAT.findall(ln):
+            ct = ctypes.get(name)
+            if ct is not None and _is_value(ct) and not (ct == "wp::float64" and _load_then_narrowed(name)):
+                culprit = f"'{name}' of type {ct} in {ln.strip()!r}"
+                break
+        if culprit:
+            break
+    if culprit is None:
+        return
+    raise MetalCodegenError(
+        f"Kernel {adj.fun_name!r} computes with float64 values ({culprit}) — MSL has no fp64. "
+        "Use float32, or set warp.config.metal_fp64 (WARP_METAL_FP64) to 'demote' (compute in float32) "
+        "or 'emulate' (software float64)"
+    )
+
+
 def _struct_arg_array_ndims(adj, fields: dict[str, tuple[str, tuple[str, ...]]]) -> dict[str, int]:
     """ndim of each flattened struct-arg array field (synthetic label -> ndim)."""
     arg_types = {a.label: a.type for a in adj.args}
@@ -17427,6 +17515,8 @@ def _generate_msl_kernel_uncached(
     # reference array struct fields that are never assigned for the live
     # geom types.
     _ast_nodes = _ast_fold_const_branches(_ast_nodes, adj, _inlined_const_ints)
+    if _fp64_mode() == "error":
+        _reject_fp64_values(adj, _ast_emit(_ast_nodes), _inlined_var_ctypes)
     # Emulated-fp64 transcendentals that run in fp32 (warned per kernel by
     # ``_generate_msl_kernel_cached``, also on a warm cache load). Scanned
     # after the dead-branch fold, so a statically dead call does not warn.

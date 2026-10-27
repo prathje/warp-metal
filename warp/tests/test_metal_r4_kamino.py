@@ -446,6 +446,15 @@ class TestMetalR4Kamino(unittest.TestCase):
                 wp.launch(k, dim=2, inputs=[a, o], device=dev)
                 return o.numpy()
 
+            # float64 values raise in the default "error" mode; "demote"
+            # computes them in float32.
+            try:
+                run("metal:0")
+            except Exception as e:
+                assert "float64" in str(e), e
+            else:
+                raise AssertionError("float64 values ran in metal_fp64='error' mode")
+            wp.set_module_options({"metal_fp64": "demote"})
             demoted = run("metal:0")
             wp.set_module_options({"metal_fp64": "emulate"})
             np.testing.assert_array_equal(run("metal:0"), 1.0)

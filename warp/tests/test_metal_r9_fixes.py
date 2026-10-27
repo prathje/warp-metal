@@ -295,6 +295,132 @@ class TestMetalR9Fixes(unittest.TestCase):
         )
         _run_with_metal_native(self, snippet, timeout=240)
 
+    _FP64_KERNELS = textwrap.dedent(
+        """
+        import numpy as np
+
+        @wp.kernel(module="unique")
+        def k_vec(p: wp.array(dtype=wp.vec3), out: wp.array(dtype=float)):
+            a = wp.vec3d(wp.float64(p[0][0]), wp.float64(p[0][1]), wp.float64(p[0][2]))
+            b = wp.vec3d(wp.float64(p[1][0]), wp.float64(p[1][1]), wp.float64(p[1][2]))
+            out[0] = float(wp.length_sq(wp.cross(a, b)))
+
+        @wp.kernel(module="unique")
+        def k_scalar(x: wp.array(dtype=wp.vec3), out: wp.array(dtype=float)):
+            big = wp.float64(x[0][0]) * wp.float64(1.0e8)
+            out[0] = float((big + wp.float64(x[0][1])) - big)
+
+        @wp.kernel(module="unique")
+        def k_param(x: wp.array(dtype=wp.vec3), s: wp.float64, out: wp.array(dtype=float)):
+            out[0] = x[0][0] * float(s)
+
+        @wp.kernel(module="unique")
+        def k_f32(x: wp.array(dtype=wp.vec3), out: wp.array(dtype=float)):
+            out[0] = wp.length(x[0])
+
+        p_np = np.array([[1.0e4 + 0.3, 2.0e4 + 0.7, 3.1], [1.0e4 + 0.2, 2.0e4 + 0.9, 3.3]], dtype=np.float32)
+
+        def run(k, dev, extra=(), grad=False):
+            p = wp.array(p_np, dtype=wp.vec3, device=dev, requires_grad=grad)
+            out = wp.zeros(1, dtype=float, device=dev, requires_grad=grad)
+            tape = wp.Tape()
+            with tape:
+                wp.launch(k, dim=1, inputs=[p, *extra, out], device=dev)
+            if grad:
+                tape.backward(grads={out: wp.ones(1, dtype=float, device=dev)})
+                return out.numpy()[0], p.grad.numpy()
+            return out.numpy()[0]
+        """
+    )
+
+    def test_fp64_values_error_mode_raises(self):
+        # metal_fp64 = "error" (default): float64 locals, casts and scalar
+        # parameters used to compute silently in float32 (vec3d cross: 3.6064e7
+        # vs CPU 3.6030e7); they now raise like float64 arrays do.
+        snippet = self._FP64_KERNELS + textwrap.dedent(
+            """
+            from warp._src.codegen_metal import MetalCodegenError
+            assert wp.config.metal_fp64 == "error"
+            for k, extra in [(k_vec, ()), (k_scalar, ()), (k_param, (wp.float64(2.0),))]:
+                run(k, "cpu", extra)
+                try:
+                    run(k, "metal:0", extra)
+                except MetalCodegenError as e:
+                    assert "float64" in str(e) and "metal_fp64" in str(e), str(e)
+                else:
+                    raise AssertionError(f"{k.key}: float64 values on Metal did not raise in 'error' mode")
+            # float32-only kernels are unaffected
+            assert np.isclose(run(k_f32, "metal:0"), run(k_f32, "cpu"))
+
+            # A float64 field that is only loaded and cast down does no fp64
+            # arithmetic; the conversion rounds exactly as on the CPU.
+            @wp.struct
+            class P:
+                nu: wp.float64
+
+            @wp.kernel(module="unique")
+            def k_field(p: P, out: wp.array(dtype=float)):
+                out[0] = wp.float32(p.nu) * 3.0
+
+            @wp.kernel(module="unique")
+            def k_field_math(p: P, out: wp.array(dtype=float)):
+                out[0] = wp.float32(p.nu * p.nu)
+
+            pv = P()
+            pv.nu = wp.float64(1.0 / 3.0)
+            res = {}
+            for dev in ("cpu", "metal:0"):
+                o = wp.zeros(1, dtype=float, device=dev)
+                wp.launch(k_field, dim=1, inputs=[pv, o], device=dev)
+                res[dev] = o.numpy()[0]
+            assert res["cpu"] == res["metal:0"], res
+            try:
+                wp.launch(k_field_math, dim=1, inputs=[pv, wp.zeros(1, dtype=float, device="metal:0")],
+                          device="metal:0")
+            except MetalCodegenError:
+                pass
+            else:
+                raise AssertionError("float64 field arithmetic on Metal did not raise in 'error' mode")
+            """
+        )
+        _run_with_metal_native(self, snippet, timeout=240)
+
+    def test_fp64_values_demote_mode_computes_float32(self):
+        # "demote" is the explicit opt-in to float32 arithmetic for float64
+        # values: same result as the float32 math, not the CPU's double.
+        snippet = self._FP64_KERNELS + textwrap.dedent(
+            """
+            wp.config.metal_fp64 = "demote"
+            @wp.kernel(module="unique")
+            def k_vec32(p: wp.array(dtype=wp.vec3), out: wp.array(dtype=float)):
+                out[0] = wp.length_sq(wp.cross(p[0], p[1]))
+
+            got = run(k_vec, "metal:0")
+            expected = run(k_vec32, "metal:0")
+            assert np.isclose(got, expected, rtol=1e-6), (got, expected)
+            assert np.isclose(run(k_param, "metal:0", (wp.float64(2.0),)), run(k_param, "cpu", (wp.float64(2.0),)))
+            """
+        )
+        _run_with_metal_native(self, snippet, timeout=240)
+
+    def test_fp64_values_emulate_mode_matches_cpu(self):
+        # "emulate" computes float64 exactly; vec3d cross (and its adjoint)
+        # had no wp_f64 overload and failed to compile.
+        snippet = self._FP64_KERNELS + textwrap.dedent(
+            """
+            wp.config.metal_fp64 = "emulate"
+            for k, extra in [(k_vec, ()), (k_scalar, ()), (k_param, (wp.float64(2.0),))]:
+                c = run(k, "cpu", extra)
+                m = run(k, "metal:0", extra)
+                assert c == m, (k.key, c, m)
+            c_out, c_grad = run(k_vec, "cpu", grad=True)
+            m_out, m_grad = run(k_vec, "metal:0", grad=True)
+            assert c_out == m_out, (c_out, m_out)
+            np.testing.assert_allclose(m_grad, c_grad, rtol=1e-6)
+            """
+        )
+        _run_with_metal_native(self, snippet, timeout=240)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
