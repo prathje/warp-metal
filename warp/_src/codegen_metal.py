@@ -24448,6 +24448,14 @@ def _native_pack_scalar_arg(arg_var, value) -> tuple[bytes, int]:
             ct = ctypes.c_float
         else:
             raise MetalCodegenError(f"Native dispatch: don't know how to pack scalar arg of type {wp_type!r}")
+    from warp._src import types as _wpt  # noqa: PLC0415
+
+    # Half-precision scalars bind their IEEE bits, as ``pack_arg`` does for CPU/CUDA.
+    if wp_type is _wpt.float16 or wp_type is _wpt.bfloat16:
+        raw = value.value if isinstance(value, wp_type) else value
+        to_bits = _wpt.float_to_half_bits if wp_type is _wpt.float16 else _wpt.float_to_bfloat16_bits
+        packed = ct(to_bits(raw))
+        return bytes(packed), ctypes.sizeof(packed)
     packed = ct(value)
     return bytes(packed), ctypes.sizeof(packed)
 

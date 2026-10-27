@@ -330,6 +330,34 @@ class TestMetalUpstream119(unittest.TestCase):
         )
         _run_with_metal_native(self, snippet, timeout=240)
 
+    def test_float16_scalar_params_match_cpu(self):
+        # warp.optim.linear.FSAI (GH-2039) launches kernels with float16
+        # scalar params; native dispatch must bind their half bits (it raised
+        # a TypeError packing a wp.float16 value).
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            @wp.kernel
+            def k(a: wp.array(dtype=wp.float16), s: wp.float16, o: wp.array(dtype=wp.float16)):
+                i = wp.tid()
+                o[i] = a[i] * s + s
+
+            res = {}
+            for d in ("cpu", "metal:0"):
+                a = wp.array(np.linspace(-2, 2, 9).astype(np.float16), device=d)
+                o = wp.zeros(9, dtype=wp.float16, device=d)
+                out = []
+                for s in (wp.float16(1.5), 0.25, np.float16(-3.0)):
+                    wp.launch(k, 9, [a, s, o], device=d)
+                    out.append(o.numpy().copy())
+                res[d] = out
+            for c, m in zip(res["cpu"], res["metal:0"]):
+                np.testing.assert_array_equal(m, c)
+            """
+        )
+        _run_with_metal_native(self, snippet, timeout=240)
+
     def test_unported_tile_reductions_raise(self):
         # Metal has no lowering for these yet. 1.19 changed their CPU/CUDA
         # results (GH-2000 tile_sum axis gradients, GH-2003/GH-1781 scan
