@@ -21,7 +21,7 @@ pointers, so — exactly like ``metal_bvh.py`` — the Metal model is:
 
 * Build the cell tables ON THE GPU with ordinary Warp kernels (a counting
   sort): per-point cell index (same ``floor(p * cell_width_inv)`` +
-  origin-offset + modulo math as ``hash_grid_index()``), a per-cell
+  non-negative modulo math as ``hash_grid_index()``), a per-cell
   histogram via ``atomic_add``, a two-level exclusive scan over the cells,
   an atomic scatter of point ids into their cell ranges, and finally a
   per-cell sort of the ids so every cell lists its points in ascending
@@ -74,14 +74,20 @@ def _hg_count_cells(
     point_cell: warp.array(dtype=warp.int32),
     counts: warp.array(dtype=warp.int32),
 ):
-    # Mirrors hash_grid_index() in warp/native/hashgrid.h: floor toward -inf,
-    # +2^20 origin offset, clamp at 0, modulo the grid dims.
+    # Mirrors hash_grid_index() in warp/native/hashgrid.h (GH-2119): floor
+    # toward -inf, then a non-negative modulo of the grid dims.
     i = warp.tid()
     p = points[i]
-    x = warp.max(0, int(warp.floor(p[0] * cell_width_inv)) + 1048576)
-    y = warp.max(0, int(warp.floor(p[1] * cell_width_inv)) + 1048576)
-    z = warp.max(0, int(warp.floor(p[2] * cell_width_inv)) + 1048576)
-    cell = (z % dim_z) * (dim_x * dim_y) + (y % dim_y) * dim_x + (x % dim_x)
+    cx = int(warp.floor(p[0] * cell_width_inv)) % dim_x
+    cy = int(warp.floor(p[1] * cell_width_inv)) % dim_y
+    cz = int(warp.floor(p[2] * cell_width_inv)) % dim_z
+    if cx < 0:
+        cx += dim_x
+    if cy < 0:
+        cy += dim_y
+    if cz < 0:
+        cz += dim_z
+    cell = cz * (dim_x * dim_y) + cy * dim_x + cx
     point_cell[i] = cell
     warp.atomic_add(counts, cell, 1)
 

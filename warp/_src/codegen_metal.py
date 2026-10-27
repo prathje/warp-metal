@@ -6787,13 +6787,14 @@ inline wp_hash_grid_desc_t wp_hash_grid_get_desc(ulong id) {
     return *reinterpret_cast<const device wp_hash_grid_desc_t*>(id);
 }
 inline int wp_hash_grid_index(const thread wp_hash_grid_desc_t& grid, int x, int y, int z) {
-    const int origin = 1 << 20;
-    x = metal::max(0, x + origin);
-    y = metal::max(0, y + origin);
-    z = metal::max(0, z + origin);
+    // Mirrors hash_grid_index() in warp/native/hashgrid.h (GH-2119):
+    // non-negative modulo of the virtual cell coordinate.
     int cx = x % grid.dim_x;
     int cy = y % grid.dim_y;
     int cz = z % grid.dim_z;
+    if (cx < 0) cx += grid.dim_x;
+    if (cy < 0) cy += grid.dim_y;
+    if (cz < 0) cz += grid.dim_z;
     return cz * (grid.dim_x * grid.dim_y) + cy * grid.dim_x + cx;
 }
 struct wp_hash_grid_query_t {

@@ -9935,6 +9935,9 @@ class TestMetalHashGrid(unittest.TestCase):
                 "duplicates": (np.repeat(rng.uniform(-3, 3, size=(50, 3)), 40, axis=0), 0.5, (10, 10, 10)),
                 "boundaries": (np.round(rng.uniform(-8, 8, size=(3000, 3)) * 2) / 2, 0.5, (32, 32, 32)),
                 "big_grid": (rng.uniform(-100, 100, size=(6000, 3)), 1.0, (64, 64, 64)),
+                # GH-2119: beyond the old -2^20 cell origin the indexing used to
+                # clamp; 1.19 wraps with a non-negative modulo instead.
+                "far_negative": (rng.uniform(-2.0, 2.0, size=(800, 3)) - 3.0e6, 1.0, (16, 16, 16)),
             }
             for name, (pts_np, radius, dims) in cases.items():
                 pts_np = pts_np.astype(np.float32)
