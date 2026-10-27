@@ -251,6 +251,64 @@ class TestMetalR3Locals(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet, timeout=180)
 
+    def test_struct_arg_array_field_truthiness(self):
+        # Newton's VBD soft-contact filter (``if not data.features: return True``
+        # inside an inlined function) tests a ``wp.array`` field of a struct
+        # kernel arg for ``None``; ``if``, ``not`` and the phi select must all
+        # test the field's packed shape on Metal.
+        snippet = _snippet(
+            """
+            @wp.struct
+            class S:
+                features: wp.array[wp.vec3i]
+                count: wp.array[wp.int32]
+                n: int
+
+            @wp.func
+            def enabled(i: int, s: S) -> bool:
+                if not s.features:
+                    return True
+                if i >= wp.min(s.count[0], s.n):
+                    return False
+                return s.features[i][0] >= 0
+
+            @wp.func
+            def has(s: S) -> int:
+                r = 5
+                if s.features:
+                    r = 9
+                return r
+
+            @wp.kernel
+            def k(s: S, out: wp.array[int]):
+                i = wp.tid()
+                v = wp.where(enabled(i, s), 1, 0) + 10 * has(s)
+                if s.count:
+                    v += 100
+                if not s.features:
+                    v += 1000
+                out[i] = v
+
+            def run(dev):
+                res = []
+                for empty in (False, True):
+                    s = S()
+                    if not empty:
+                        s.features = wp.array([[1, 0, 0], [-1, 0, 0], [2, 0, 0], [3, 0, 0]], dtype=wp.vec3i, device=dev)
+                    s.count = wp.array([3], dtype=wp.int32, device=dev)
+                    s.n = 4
+                    out = wp.zeros(4, dtype=int, device=dev)
+                    wp.launch(k, 4, [s, out], device=dev)
+                    res.append(out.numpy())
+                return res
+
+            res = compare(run)
+            assert res["cpu"][0].tolist() == [191, 190, 191, 190], res["cpu"]
+            assert res["cpu"][1].tolist() == [1151] * 4, res["cpu"]
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=180)
+
     def test_fixed_array_adjoint(self):
         # The dual of a fixed array is a second fixed array that the
         # element adjoints accumulate into, as on CPU.

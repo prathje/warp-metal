@@ -4856,6 +4856,26 @@ def _apply_view_rewrites(
                         )
                     )
                     continue
+        # Array truthiness on a resolved alias: ``not s.arr`` lowers to
+        # ``wp::unot(var_A)`` and the phi after ``if s.arr:`` / ``else`` to
+        # ``wp::where(var_A, x, y)``, where ``A`` is the field load (or a
+        # whole-array copy of it). Name the backing array so the flat-side
+        # array-truth lowering tests its packed shape; the load itself is
+        # dropped above, so the alias would otherwise dangle.
+        if isinstance(n, Assign) and isinstance(n.expr, Builtin) and n.expr.name in ("unot", "where") and n.expr.args:
+            truth_l = _strip_var_prefix(n.expr.args[0].strip())
+            if truth_l is not None and truth_l in view_aliases and not view_aliases[truth_l][1]:
+                truth_args = (f"var_{view_aliases[truth_l][0]}", *n.expr.args[1:])
+                indent = _leading_indent(n.raw)
+                new_expr_raw = f"wp::{n.expr.name}({', '.join(truth_args)})"
+                out.append(
+                    Assign(
+                        raw=f"{indent}var_{n.lhs} = {new_expr_raw};",
+                        lhs=n.lhs,
+                        expr=Builtin(raw=new_expr_raw, name=n.expr.name, args=truth_args),
+                    )
+                )
+                continue
         # ``wp::lower_bound(arr, ...)`` on a resolved alias (struct-arg
         # array field / backed field load) — substitute the backing array
         # name; the flat-side translator appends the shape bounds. Only
@@ -5056,10 +5076,17 @@ def _apply_view_rewrites(
 
         # 3. Recurse into structured bodies.
         if isinstance(n, If):
+            # ``if s.arr:`` on a resolved alias: name the backing array (see
+            # the truthiness rewrite above).
+            cond, raw_open = n.cond, n.raw_open
+            m_truth = re.fullmatch(r"\s*(!?)\s*\(?\s*var_(\w+)\s*\)?\s*", cond)
+            if m_truth and m_truth.group(2) in view_aliases and not view_aliases[m_truth.group(2)][1]:
+                cond = f"{m_truth.group(1)}var_{view_aliases[m_truth.group(2)][0]}"
+                raw_open = f"{_leading_indent(n.raw_open)}if ({cond}) {{"
             out.append(
                 If(
                     raw=n.raw,
-                    cond=n.cond,
+                    cond=cond,
                     body=tuple(
                         _apply_view_rewrites(
                             n.body,
@@ -5071,7 +5098,7 @@ def _apply_view_rewrites(
                             field_ptr_backing,
                         )
                     ),
-                    raw_open=n.raw_open,
+                    raw_open=raw_open,
                     raw_close=n.raw_close,
                 )
             )

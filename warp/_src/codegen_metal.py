@@ -8619,6 +8619,7 @@ def _emit_tile_matmul(r: int, k: int, n: int, msl_scalar: str, trans_a: bool = F
     (see ``_fold_tile_transpose_views``). The arithmetic and summation order
     are the same as for the plain helper on a materialised transpose.
     """
+
     # A 1x1 tile is a plain scalar local (see ``_msl_var_type``).
     def _ty(a: int, b: int) -> str:
         return msl_scalar if a == 1 and b == 1 else f"wp_tile_{a}x{b}_{msl_scalar}"
@@ -8956,11 +8957,7 @@ _NATIVE_BLOCK_SYNC_PAT = re.compile(r"__syncthreads\s*\(\s*\)")
 
 def _wide_block_dim(block_dim: int | None) -> bool:
     """A block width the wide-block model can run (a multiple of the SIMD width above it)."""
-    return (
-        block_dim is not None
-        and _COOP_BLOCK_DIM < block_dim <= _WIDE_BLOCK_MAX
-        and block_dim % _COOP_BLOCK_DIM == 0
-    )
+    return block_dim is not None and _COOP_BLOCK_DIM < block_dim <= _WIDE_BLOCK_MAX and block_dim % _COOP_BLOCK_DIM == 0
 
 
 def _wide_block_eligible(adj) -> bool:
@@ -9264,6 +9261,7 @@ def _coop_collectives_uniform(
     def block_index(rhs: str) -> bool:
         m_div = _COOP_BLOCK_INDEX_PAT.match(rhs)
         return bool(m_div) and m_div.group(1) in tid1d_labels and m_div.group(2) in bd_labels
+
     # Enclosing loops (innermost last) and the loops a lane-dependent
     # ``break`` / ``continue`` (``goto end_X`` / ``goto start_X``) has made
     # divergent: the rest of such a loop runs with a subset of the lanes, and
@@ -13671,7 +13669,9 @@ def _translate_tile_intrinsics(
         if any(lb in smem_tiles or lb in coldist_tiles or lb in distributed_tiles for lb in labels) or any(
             tile_var_vec_n.get(lb, 0) for lb in labels
         ):
-            raise MetalCodegenError(f"MSL codegen: reverse of tile_matmul on these tiles is not supported ({m.group(0)!r})")
+            raise MetalCodegenError(
+                f"MSL codegen: reverse of tile_matmul on these tiles is not supported ({m.group(0)!r})"
+            )
         if any(d[2] == _F64_EMU_MSL for d in dims):
             raise MetalCodegenError(
                 f"MSL codegen: reverse of tile_matmul on emulated float64 tiles is not supported ({m.group(0)!r})"
@@ -13778,9 +13778,7 @@ def _translate_tile_intrinsics(
             )
         if in_n == 1:
             return f"{{ for (int _ab_i = 0; _ab_i < {l_n}; ++_ab_i) {adj_src} += {el(adj_tile, l_n, '_ab_i')}; }}"
-        loop = (
-            f"for (int _ab_r = 0; _ab_r < {l_rows}; ++_ab_r) for (int _ab_c = 0; _ab_c < {l_cols}; ++_ab_c) "
-        )
+        loop = f"for (int _ab_r = 0; _ab_r < {l_rows}; ++_ab_r) for (int _ab_c = 0; _ab_c < {l_cols}; ++_ab_c) "
         tgt = el(adj_tile, l_n, f"_ab_r * {l_cols} + _ab_c")
         src_2d = s_label in tile_2d_labels
         if src_2d and in_cols == 1 and in_rows == l_rows:
@@ -17018,8 +17016,11 @@ def _ensure_adj_built(kernel, block_dim: int | None = None, enable_backward: boo
             if _wide_block_eligible(adj):
                 adj._metal_coop_block_n = block_dim
                 adj._metal_coop_plan = _CoopPlan(
-                    coldist={}, full=set(), tid1d="builtin_tid1d(" in "\n".join(adj.blocks[0].body_forward),
-                    reverse_ok=False, singleton=frozenset(),
+                    coldist={},
+                    full=set(),
+                    tid1d="builtin_tid1d(" in "\n".join(adj.blocks[0].body_forward),
+                    reverse_ok=False,
+                    singleton=frozenset(),
                 )
             else:
                 _build(1, _has_reverse())
@@ -19257,6 +19258,10 @@ def _generate_msl_kernel_uncached(
         r"^(?P<indent>\s*)if\s*\(\s*(?P<neg>!?)\s*(?:\(\s*var_(?P<n1>\w+)\s*\)|var_(?P<n2>\w+))\s*\)\s*\{\s*$"
     )
     array_arg_labels_local = {a.label for a in adj.args if _is_array_arg(a)}
+    # ``wp.array`` fields of struct args bind as synthetic array args with
+    # their own packed shape (zeroed for a ``None`` field), so they take the
+    # same truth test; the view fold names them in place of the field load.
+    array_arg_labels_local |= {v.label for v in struct_field_array_vars}
     array_truth_unot_pat = re.compile(r"wp::unot\(\s*var_(?P<name>\w+)\s*\)")
     array_truth_adj_where_pat = re.compile(r"wp::adj_where\(\s*var_(?P<name>\w+)\s*,")
     array_truth_where_pat = re.compile(
@@ -24736,8 +24741,14 @@ def _array_params_aliasing(inputs: list, outputs: list):
 _ALIAS_VARIANT_CACHE_MAX = 64
 
 
-def _alias_variant_pso(kernel, artifact, topology: tuple[tuple[str, str, int], ...], offsets: tuple[int, ...],
-                       adjoint: bool, grad_args: tuple[str, ...]):
+def _alias_variant_pso(
+    kernel,
+    artifact,
+    topology: tuple[tuple[str, str, int], ...],
+    offsets: tuple[int, ...],
+    adjoint: bool,
+    grad_args: tuple[str, ...],
+):
     """``(pso, offsets binding or None)`` for a launch that binds overlapping
     memory to several array params.
 
