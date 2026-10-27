@@ -232,6 +232,69 @@ class TestMetalR9Fixes(unittest.TestCase):
         )
         _run_with_metal_native(self, snippet, timeout=240)
 
+    def test_strided_and_reversed_tile_views_match_cpu(self):
+        # tile_view types carry the slice step in their strides; Metal's
+        # materialized copy used unit steps and right-aligned dropped dims,
+        # so t[::2, ::2], t[::-1, :], t[:, 7] and chained slices read the
+        # wrong elements (forward and gradient).
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            M, N = 16, 32
+
+            @wp.kernel(module="unique")
+            def k_strided(src: wp.array2d[float], dst: wp.array2d[float]):
+                t = wp.tile_load(src, shape=(M, N))
+                wp.tile_store(dst, t[::2, ::2])
+
+            @wp.kernel(module="unique")
+            def k_reverse(src: wp.array2d[float], dst: wp.array2d[float]):
+                t = wp.tile_load(src, shape=(M, N))
+                wp.tile_store(dst, t[::-1, 3:9:2])
+
+            @wp.kernel(module="unique")
+            def k_neg_stop(src: wp.array2d[float], dst: wp.array2d[float]):
+                t = wp.tile_load(src, shape=(M, N))
+                wp.tile_store(dst, t[7:-100:-1, 100::-3])
+
+            @wp.kernel(module="unique")
+            def k_column(src: wp.array2d[float], dst: wp.array1d[float]):
+                t = wp.tile_load(src, shape=(M, N))
+                wp.tile_store(dst, t[:, 7])
+
+            @wp.kernel(module="unique")
+            def k_chain(src: wp.array2d[float], dst: wp.array1d[float]):
+                t = wp.tile_load(src, shape=(M, N))
+                a = t[::-1, :]
+                b = a[1:, 5]
+                wp.tile_store(dst, b[::2])
+
+            src_np = np.random.default_rng(7).random((M, N), dtype=np.float32)
+            cases = [
+                (k_strided, (M // 2, N // 2)),
+                (k_reverse, (M, 3)),
+                (k_neg_stop, (8, 11)),
+                (k_column, (M,)),
+                (k_chain, (8,)),
+            ]
+            for k, shape in cases:
+                res = {}
+                for dev in ("cpu", "metal:0"):
+                    src = wp.array(src_np, dtype=float, requires_grad=True, device=dev)
+                    dst = wp.zeros(shape, dtype=float, requires_grad=True, device=dev)
+                    with wp.Tape() as tape:
+                        wp.launch_tiled(k, dim=[1], inputs=[src, dst], block_dim=32, device=dev)
+                    adj = np.arange(1, int(np.prod(shape)) + 1, dtype=np.float32).reshape(shape)
+                    dst.grad = wp.array(adj, dtype=float, device=dev)
+                    tape.backward()
+                    res[dev] = (dst.numpy().copy(), src.grad.numpy().copy())
+                np.testing.assert_array_equal(res["metal:0"][0], res["cpu"][0], err_msg=k.key)
+                np.testing.assert_array_equal(res["metal:0"][1], res["cpu"][1], err_msg=k.key + " grad")
+            """
+        )
+        _run_with_metal_native(self, snippet, timeout=240)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -65,6 +65,23 @@ def full_tile_shape(ctype: str) -> tuple[int, ...] | None:
     return dims if dims else None
 
 
+_STRIDE_T_PAT = re.compile(r"wp::tile_stride_t<\s*(-?[\d\s,-]*)>")
+
+
+def tile_strides(ctype: str) -> tuple[int, ...] | None:
+    """Element strides of the first ``tile_stride_t<...>`` in ``ctype``.
+
+    A ``tile_view`` result type carries strides in its source storage (a
+    slice step multiplies the parent's stride, a negative step makes it
+    negative); register tiles have none (row-major contiguous).
+    """
+    m = _STRIDE_T_PAT.search(ctype)
+    if m is None:
+        return None
+    vals = tuple(int(d) for d in m.group(1).split(",") if d.strip())
+    return vals if vals else None
+
+
 def collapse_shape(dims: tuple[int, ...], what: str = "tile") -> tuple[int, int]:
     """``(rows, cols)`` of the private struct holding a tile of shape ``dims``.
 
@@ -246,7 +263,10 @@ class TileExt:
         tile_var_vec_n: dict[str, int],
         var_ctypes: dict[str, str],
         view_aliases: dict | None = None,
+        const_ints: dict[str, int] | None = None,
     ):
+        self.const_ints = const_ints or {}
+        self._axis_maps: dict[str, list[tuple[int, int]]] = {}
         self.dims = tile_var_dims
         self.vec_n = tile_var_vec_n
         self.ctypes = var_ctypes
@@ -332,6 +352,110 @@ class TileExt:
         )
         return f"for (int _tv_k = 0; _tv_k < {n}; ++_tv_k) {{ {body} }}"
 
+    def _const(self, expr: str) -> int | None:
+        e = expr.strip()
+        if e.startswith("var_"):
+            return self.const_ints.get(e[len("var_") :])
+        try:
+            return int(e)
+        except ValueError:
+            return None
+
+    def _axis_map(self, view: str, pshape_full: tuple[int, ...], vshape: tuple[int, ...]) -> list[tuple[int, int]]:
+        """``(parent_dim, step)`` for every dim of a window view.
+
+        ``tile_view`` (warp/_src/builtins.py) keeps a sliced dim with stride
+        ``parent_stride * step`` and drops a dim indexed by an integer; the
+        offsets are the view origin in parent coordinates. The parent is a
+        row-major private copy here, so each view dim is matched back to its
+        parent dim and step from the strides in the two IR types. A match
+        that is not unique raises instead of guessing.
+        """
+        from warp._src.codegen_metal import MetalCodegenError  # noqa: PLC0415
+
+        hit = self._axis_maps.get(view)
+        if hit is not None:
+            return hit
+        v = self.views[view]
+        pd, vd = len(pshape_full), len(vshape)
+        vstr = tile_strides(self.ctypes.get(view, ""))
+        pstr = tile_strides(self.ctypes.get(v.parent, ""))
+        if pstr is None:
+            pshape_ct = full_tile_shape(self.ctypes.get(v.parent, ""))
+            if pshape_ct is not None:
+                pstr = tuple(math.prod(pshape_ct[d + 1 :]) for d in range(len(pshape_ct)))
+        if vstr is None or pstr is None or len(vstr) != vd or len(pstr) != pd:
+            # No stride information (or a rank this check cannot line up):
+            # keep the unit-step, right-aligned window of older IR.
+            res = [(pd - vd + i, 1) for i in range(vd)]
+            self._axis_maps[view] = res
+            return res
+        offs = list(v.offsets) + ["0"] * (pd - len(v.offsets))
+
+        def fits(d: int, i: int) -> int | None:
+            if vshape[i] == 1:
+                # A unit dim never moves; any step addresses its origin.
+                return 0 if pstr[d] == 0 or vstr[i] % pstr[d] == 0 else None
+            if pstr[d] == 0 or vstr[i] % pstr[d] != 0:
+                return None
+            step = vstr[i] // pstr[d]
+            if step == 0:
+                return None
+            off = self._const(offs[d])
+            if off is not None:
+                last = off + (vshape[i] - 1) * step
+                if not (0 <= off < pshape_full[d] and 0 <= last < pshape_full[d]):
+                    return None
+            return step
+
+        sols: list[list[tuple[int, int]]] = []
+
+        def search(i: int, d0: int, acc: list[tuple[int, int]]) -> None:
+            if len(sols) > 1:
+                return
+            if i == vd:
+                sols.append(list(acc))
+                return
+            # Leave room for the remaining view dims.
+            for d in range(d0, pd - (vd - i - 1)):
+                st = fits(d, i)
+                if st is not None:
+                    acc.append((d, st))
+                    search(i + 1, d + 1, acc)
+                    acc.pop()
+
+        if vd == pd:
+            res = []
+            for i in range(vd):
+                st = fits(i, i)
+                if st is None:
+                    raise MetalCodegenError(
+                        f"MSL codegen: cannot map tile view 'var_{view}' (strides {vstr}) onto its parent "
+                        f"(strides {pstr}) on Metal"
+                    )
+                res.append((i, st))
+        else:
+            search(0, 0, [])
+            if len(sols) != 1:
+                raise MetalCodegenError(
+                    f"MSL codegen: the axes of tile view 'var_{view}' (shape {vshape}, strides {vstr}) cannot be "
+                    f"matched uniquely to its parent (shape {pshape_full}, strides {pstr}) on Metal"
+                )
+            res = sols[0]
+        self._axis_maps[view] = res
+        return res
+
+    def is_unit_window(self, view: str) -> bool:
+        """True for a window view with unit steps and no dropped dims."""
+        v = self.views.get(view)
+        pshape, vshape = self._shape(v.parent) if v else None, self._shape(view)
+        if v is None or v.kind != "window" or pshape is None or vshape is None:
+            return False
+        pd = len(v.offsets) if v.offsets else len(pshape)
+        pshape_full = (1,) * max(0, pd - len(pshape)) + tuple(pshape)
+        amap = self._axis_map(view, pshape_full, vshape)
+        return len(vshape) == pd and all(d == i and (st == 1 or vshape[i] == 1) for i, (d, st) in enumerate(amap))
+
     def _window_map(self, view: str) -> tuple[callable, callable] | None:
         """(view_flat -> parent_flat expression builder, n) for a window view."""
         v = self.views[view]
@@ -347,6 +471,7 @@ class TileExt:
         if len(pshape_full) < pd:
             pshape_full = (1,) * (pd - len(pshape_full)) + tuple(pshape_full)
         vd = len(vshape)
+        amap = self._axis_map(view, tuple(pshape_full), tuple(vshape))
 
         def build(k: str) -> str:
             # view coordinates from the flat index (row-major)
@@ -364,12 +489,22 @@ class TileExt:
                 # A stride of 1 means every later dim has extent 1: their
                 # coordinates are 0 (an ``(R, 1)`` column, not a diagonal).
                 rem = f"(({rem}) % {stride})" if stride != 1 else "0"
-            # right-align into the parent rank
+            # place each view coordinate on its parent dim, scaled by the step
             pc: list[str] = []
             for d in range(pd):
-                vi = d - (pd - vd)
                 off = offs[d] if d < len(offs) else "0"
-                pc.append(f"(({off}) + {coords[vi]})" if vi >= 0 else f"({off})")
+                vis = [vi for vi, (pdim, _st) in enumerate(amap) if pdim == d]
+                if not vis:
+                    pc.append(f"({off})")
+                    continue
+                vi = vis[0]
+                st = amap[vi][1]
+                if coords[vi] == "0" or st == 0:
+                    pc.append(f"({off})")
+                elif st == 1:
+                    pc.append(f"(({off}) + {coords[vi]})")
+                else:
+                    pc.append(f"(({off}) + {coords[vi]} * ({st}))")
             terms = []
             for d in range(pd):
                 stride = math.prod(pshape_full[d + 1 :])
@@ -539,7 +674,7 @@ class TileExt:
             raise MetalCodegenError(f"MSL codegen: tile view changes the element type ({line.strip()!r})")
         # Keep the core translator's matmul / solve writeback informed about
         # 2-D window views of 2-D parents.
-        if self.view_aliases is not None and v.kind == "window" and len(v.offsets) == 2:
+        if self.view_aliases is not None and v.kind == "window" and len(v.offsets) == 2 and self.is_unit_window(lhs):
             prows, pcols, scalar = self.dims[v.parent]
             rows, cols, _ = self.dims[lhs]
             if not self.vec_n.get(lhs, 0) and rows * cols > 1 and prows * pcols > 1:

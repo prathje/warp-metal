@@ -14742,6 +14742,15 @@ def _translate_tile_intrinsics(
         if parent_dims is None:
             return m.group(0)
         prows, pcols, _ = parent_dims
+        _vstr = _mtiles.tile_strides(m.group(0))
+        if _vstr is not None and _vstr != ((pcols, 1) if m.group(4) else (pcols,)):
+            # This copy walks a unit-step window of a row-major parent; a
+            # strided, reversed or column-dropping view would read the wrong
+            # elements. (``codegen_metal_tiles.TileExt`` lowers those.)
+            raise MetalCodegenError(
+                f"MSL codegen: tile view 'var_{lhs}' with strides {_vstr} is not supported here on Metal "
+                f"(statement: {m.group(0)!r})"
+            )
         if view_aliases is not None:
             view_aliases[lhs] = (parent_label, prows, pcols, rows, cols, msl_scalar, row_off, col_off)
         # Materialise as a struct copy using direct indexing into the
@@ -18879,7 +18888,17 @@ def _generate_msl_kernel_uncached(
     _tile_ext_ctypes = {str(v.label): v.ctype() for v in adj.variables}
     for _lbl_i, _ct_i in _inlined_var_ctypes.items():
         _tile_ext_ctypes.setdefault(str(_lbl_i), _ct_i)
-    tile_ext = _mtiles.TileExt(forward_lines, tile_var_dims, tile_var_vec_n, _tile_ext_ctypes, view_aliases)
+    tile_ext = _mtiles.TileExt(
+        forward_lines,
+        tile_var_dims,
+        tile_var_vec_n,
+        _tile_ext_ctypes,
+        view_aliases,
+        const_ints={
+            **{str(v.label): v.constant for v in adj.variables if type(getattr(v, "constant", None)) is int},
+            **{str(k): c for k, c in _inlined_const_ints.items() if type(c) is int},
+        },
+    )
     tile_2d_labels |= tile_ext.rank2_labels()
     # Set of (N, scalar) pairs for which we emitted the cooperative
     # variant of ``tile_cholesky``. Drives kernel-scope threadgroup
