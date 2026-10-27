@@ -6357,6 +6357,11 @@ class Bvh:
             if self._constructor != BvhConstructor.CUBQL:
                 raise ValueError("Cannot rebuild a non-cuBQL BVH with constructor='cubql'; create a new BVH instead")
 
+            if getattr(self, "_metal", None) is not None:
+                # Metal trees are host-built; the native device rebuild does
+                # not know the Metal descriptor id.
+                self._metal.rebuild(int(constructor))
+                return
             if self.device.is_cpu:
                 self.runtime.core.wp_bvh_rebuild_host(self.id, constructor)
             else:

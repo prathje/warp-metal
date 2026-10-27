@@ -623,6 +623,45 @@ class TestMetalR9Fixes(unittest.TestCase):
         )
         _run_with_metal_native(self, snippet, timeout=240)
 
+    def test_cubql_bvh_rebuild_matches_cpu(self):
+        # Bvh.rebuild() of a cuBQL tree called the native CUDA rebuild with
+        # the Metal descriptor id (a no-op here), so queries kept using the
+        # stale tree after the items moved.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            if not wp.is_cubql_available():
+                raise SystemExit(0)
+
+            @wp.kernel(module="unique")
+            def q(bvh: wp.uint64, lo: wp.vec3, hi: wp.vec3, hits: wp.array(dtype=int)):
+                query = wp.bvh_query_aabb(bvh, lo, hi)
+                i = int(0)
+                while wp.bvh_query_next(query, i):
+                    hits[i] = 1
+
+            rng = np.random.default_rng(123)
+            lo0 = rng.random((100, 3)) * 5.0
+            hi0 = lo0 + rng.random((100, 3)) * 5.0
+            lo1 = rng.random((100, 3)) * 5.0
+            hi1 = lo1 + rng.random((100, 3)) * 5.0
+            res = {}
+            for dev in ("cpu", "metal:0"):
+                lo = wp.array(lo0, dtype=wp.vec3, device=dev)
+                hi = wp.array(hi0, dtype=wp.vec3, device=dev)
+                bvh = wp.Bvh(lo, hi, constructor="cubql", leaf_size=1)
+                lo.assign(lo1)
+                hi.assign(hi1)
+                bvh.rebuild()
+                hits = wp.zeros(100, dtype=int, device=dev)
+                wp.launch(q, dim=1, inputs=[bvh.id, wp.vec3(2.0), wp.vec3(8.0), hits], device=dev)
+                res[dev] = hits.numpy()
+            np.testing.assert_array_equal(res["metal:0"], res["cpu"])
+            """
+        )
+        _run_with_metal_native(self, snippet, timeout=240)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
