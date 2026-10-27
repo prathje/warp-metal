@@ -85,15 +85,17 @@ def struct_field_layout(ftype) -> tuple[str, int] | None:
     return info[1], ctypes.sizeof(ct) // 4
 
 
+# The 32-bit members after ``tex``, in layout order (``texture*_t`` in
+# texture.h: the extents, then the packed ``metadata`` word).
 _INT_MEMBERS = {
-    "wp_texture1d_t": ("width", "num_channels", "dtype"),
-    "wp_texture2d_t": ("width", "height", "num_channels", "dtype"),
-    "wp_texture3d_t": ("width", "height", "depth", "num_channels", "dtype"),
+    "wp_texture1d_t": ("width", "metadata"),
+    "wp_texture2d_t": ("width", "height", "metadata"),
+    "wp_texture3d_t": ("width", "height", "depth", "metadata"),
 }
 
 
 def int_members(msl: str) -> tuple[str, ...]:
-    """The ``int32`` members of a texture struct, in layout order after ``tex``."""
+    """The 32-bit members of a texture struct, in layout order after ``tex``."""
     return _INT_MEMBERS[msl]
 
 
@@ -101,17 +103,21 @@ def struct_field_read(msl: str, buf: str, base: str) -> str:
     """Rebuild a texture struct from flat float32 struct storage."""
     lo = f"as_type<uint>({buf}[{base}])"
     hi = f"as_type<uint>({buf}[({base}) + 1])"
-    n_ints = len(_INT_MEMBERS[msl])
-    ints = ", ".join(f"as_type<int>({buf}[({base}) + {2 + k}])" for k in range(n_ints))
+    members = _INT_MEMBERS[msl]
+    ints = ", ".join(
+        f"as_type<{'uint' if name == 'metadata' else 'int'}>({buf}[({base}) + {2 + k}])"
+        for k, name in enumerate(members)
+    )
     return f"{msl}{{((ulong({hi}) << 32) | ulong({lo})), {ints}}}"
 
 
 _FIELD_PTR_PAT = re.compile(r"^\s*var_(?P<ptr>\w+)\s*=\s*&\s*\(\s*var_(?P<tex>\w+)\s*\.\s*(?P<field>\w+)\s*\)\s*;\s*$")
 _LOAD_PAT = re.compile(r"^(?P<indent>\s*)var_(?P<lhs>\w+)\s*=\s*wp::load\s*\(\s*var_(?P<ptr>\w+)\s*\)\s*;\s*$")
+# Members a kernel reads by field address (the ``vars`` of ``wp.Texture*``).
 _FIELDS = {
-    "wp_texture1d_t": ("width", "num_channels", "dtype"),
-    "wp_texture2d_t": ("width", "height", "num_channels", "dtype"),
-    "wp_texture3d_t": ("width", "height", "depth", "num_channels", "dtype"),
+    "wp_texture1d_t": ("width",),
+    "wp_texture2d_t": ("width", "height"),
+    "wp_texture3d_t": ("width", "height", "depth"),
 }
 
 
@@ -272,9 +278,9 @@ def kernel_uses_textures(adj) -> bool:
 # inside the sampler helper bodies only (``#pragma clang fp contract`` is
 # scoped to the enclosing compound statement).
 _HELPERS = r"""
-struct wp_texture1d_t { ulong tex; int width; int num_channels; int dtype; };
-struct wp_texture2d_t { ulong tex; int width; int height; int num_channels; int dtype; };
-struct wp_texture3d_t { ulong tex; int width; int height; int depth; int num_channels; int dtype; };
+struct wp_texture1d_t { ulong tex; int width; uint metadata; };
+struct wp_texture2d_t { ulong tex; int width; int height; uint metadata; };
+struct wp_texture3d_t { ulong tex; int width; int height; int depth; uint metadata; };
 struct wp_tex_desc_t {
     int ndim; int num_channels; int dtype; int filter_mode;
     int mip_filter_mode; int num_mip_levels; int addr_u; int addr_v;
@@ -284,80 +290,132 @@ struct wp_tex_desc_t {
     int mip_w[16]; int mip_h[16]; int mip_d[16];
 };
 inline const device wp_tex_desc_t& wp_tex_desc(ulong h) { return *reinterpret_cast<const device wp_tex_desc_t*>(h); }
+// Address modes: 0 WRAP, 1 CLAMP, 2 MIRROR, 3 BORDER. ``wp::min`` / ``wp::max``
+// on the CPU are fmin / fmax (a NaN operand yields the other one).
+inline bool wp_tex_periodic(int mode) { return mode == 0 || mode == 2; }
+// cpu_texture_normalized_coord(): reduce periodic coordinates first.
+inline float wp_tex_norm_coord(float coord, int normalized, int base_dim, int mode) {
+    #pragma clang fp contract(off)
+    if (wp_tex_periodic(mode)) {
+        const float period = (normalized ? 1.0f : float(base_dim)) * (mode == 2 ? 2.0f : 1.0f);
+        coord = metal::precise::fmod(coord, period);
+        if (coord < 0.0f) coord += period;
+    }
+    return normalized ? coord : coord / float(base_dim);
+}
+// cpu_apply_address_mode_1d()
 inline float wp_tex_addr_coord(float coord, int size, int mode) {
     #pragma clang fp contract(off)
-    float texel = coord * size - 0.5f;
-    float fsize = (float)size;
-    if (mode == 0) {
-        texel = texel - metal::floor(texel / fsize) * fsize;
-        if (texel < 0) texel += fsize;
-    } else if (mode == 1) {
-        if (texel < 0.0f) texel = 0.0f;
-        if (texel > fsize - 1.0f) texel = fsize - 1.0f;
-    } else if (mode == 2) {
-        float period = 2.0f * fsize;
-        texel = texel - metal::floor(texel / period) * period;
-        if (texel < 0) texel += period;
-        if (texel >= fsize) texel = period - texel - 1.0f;
-    }
+    float texel = coord * float(size) - 0.5f;
+    if (mode == 1)
+        texel = metal::fmax(0.0f, metal::fmin(texel, float(size - 1)));
+    else if (!wp_tex_periodic(mode))
+        texel = metal::fmax(-2.0f, metal::fmin(texel, float(size)));
     return texel;
 }
-inline int wp_tex_clamp_index(int idx, int size) { return (idx < 0) ? 0 : ((idx >= size) ? size - 1 : idx); }
-inline int wp_tex_addr_index(int idx, int size, int mode) {
-    if (mode == 0) { int m = idx % size; if (m < 0) m += size; return m; }
+// C++ ``int64(floor(x))``; the CPU reference (AArch64) converts NaN to 0.
+inline long wp_tex_floor_l(float x) { return metal::isnan(x) ? 0l : long(metal::floor(x)); }
+inline long wp_tex_clamp_index(long idx, int size) { return (idx < 0) ? 0 : ((idx >= size) ? size - 1 : idx); }
+// cpu_apply_address_mode_index()
+inline long wp_tex_addr_index(long idx, int size, int mode) {
+    if (mode == 0) { long m = idx % long(size); if (m < 0) m += size; return m; }
     if (mode == 1) return wp_tex_clamp_index(idx, size);
     if (mode == 2) {
-        int period = 2 * size; int m = idx % period; if (m < 0) m += period;
+        long period = 2 * long(size); long m = idx % period; if (m < 0) m += period;
         if (m >= size) return period - m - 1;
         return m;
     }
     return idx;
 }
-inline float wp_tex_decode(ulong level_data, int dtype, int idx) {
+// floor(r * num / den) of a finite float ``r`` (num, den >= 1), clamped to
+// [lo, hi], exactly. The CPU evaluates it in double precision, where the
+// product is exact; Metal has no double, so work on r's integer significand.
+inline long wp_tex_floor_scaled(float r, int num, int den, long lo, long hi) {
+    const uint bits = as_type<uint>(r);
+    const bool neg = (bits >> 31) != 0u;
+    int ex = int((bits >> 23) & 0xffu);
+    ulong mant = ulong(bits & 0x7fffffu);
+    if (ex == 0) { if (mant == 0ul) return metal::clamp(0l, lo, hi); ex = 1; }
+    else mant |= 0x800000ul;
+    const int e = ex - 150;  // |r| = mant * 2^e
+    // magnitude = whole + frac / den, frac in [0, den)
+    ulong whole; bool has_frac;
+    const ulong d = ulong(den), n = ulong(num);
+    if (e >= 0) {
+        if (e >= 40) return neg ? lo : hi;
+        const ulong m = mant << e;
+        const ulong q = m / d, rem = m % d;
+        if (q > ulong(metal::max(metal::abs(lo), metal::abs(hi))) + 1ul) return neg ? lo : hi;
+        whole = q * n + (rem * n) / d;
+        has_frac = ((rem * n) % d) != 0ul;
+    } else {
+        const ulong p = mant * n;  // < 2^55
+        const int sh = -e;
+        const ulong p_hi = sh >= 63 ? 0ul : (p >> sh);
+        const bool lost = sh >= 63 ? (p != 0ul) : ((p & ((1ul << sh) - 1ul)) != 0ul);
+        whole = p_hi / d;
+        has_frac = lost || (p_hi % d) != 0ul;
+    }
+    const long cap = metal::max(metal::abs(lo), metal::abs(hi)) + 1l;
+    long v = whole > ulong(cap) ? cap : long(whole);
+    if (neg) v = -v - (has_frac ? 1l : 0l);
+    return metal::clamp(v, lo, hi);
+}
+// cpu_nearest_texel_index()
+inline long wp_tex_nearest_index(float coord, int normalized, int base_dim, int level_dim, int mode) {
+    const int den = normalized ? 1 : base_dim;
+    if (wp_tex_periodic(mode)) {
+        if (!metal::isfinite(coord)) return wp_tex_addr_index(0l, level_dim, mode);
+        const float period = (normalized ? 1.0f : float(base_dim)) * (mode == 2 ? 2.0f : 1.0f);
+        // fmod is exact; negative remainders are kept, as on the CPU.
+        const float reduced = metal::fabs(coord) < period ? coord : metal::precise::fmod(coord, period);
+        const long bound = 4l * long(level_dim) + 4l;
+        return wp_tex_addr_index(wp_tex_floor_scaled(reduced, level_dim, den, -bound, bound), level_dim, mode);
+    }
+    long idx;
+    if (metal::isnan(coord)) idx = level_dim;  // fmin(NaN, level_dim)
+    else if (metal::isinf(coord)) idx = coord > 0.0f ? long(level_dim) : -1l;
+    else idx = wp_tex_floor_scaled(coord, level_dim, den, -1l, long(level_dim));
+    return wp_tex_addr_index(idx, level_dim, mode);
+}
+inline float wp_tex_decode(ulong level_data, int dtype, ulong idx) {
     switch (dtype) {
     case 0: return reinterpret_cast<const device uchar*>(level_data)[idx] / 255.0f;
     case 1: return reinterpret_cast<const device ushort*>(level_data)[idx] / 65535.0f;
-    case 6: return reinterpret_cast<const device uint*>(level_data)[idx] / 4294967295.0f;
+    case 6: return float(reinterpret_cast<const device uint*>(level_data)[idx]);
     case 3: { float v = reinterpret_cast<const device char*>(level_data)[idx] / 127.0f; return v < -1.0f ? -1.0f : v; }
     case 4: { float v = reinterpret_cast<const device short*>(level_data)[idx] / 32767.0f; return v < -1.0f ? -1.0f : v; }
-    case 7: { float v = reinterpret_cast<const device int*>(level_data)[idx] / 2147483647.0f; return v < -1.0f ? -1.0f : v; }
+    case 7: return float(reinterpret_cast<const device int*>(level_data)[idx]);
     case 5: return float(reinterpret_cast<const device half*>(level_data)[idx]);
     default: return reinterpret_cast<const device float*>(level_data)[idx];
     }
 }
-inline float wp_tex_fetch(const device wp_tex_desc_t& t, int level, int x, int y, int z, int ch) {
+inline float wp_tex_fetch(const device wp_tex_desc_t& t, int level, long x, long y, long z, int ch) {
     const int w = t.mip_w[level], h = t.mip_h[level], d = t.mip_d[level];
     if (x < 0 || x >= w || y < 0 || y >= h || z < 0 || z >= d || ch < 0 || ch >= t.num_channels) return 0.0f;
-    int idx = ((z * h + y) * w + x) * t.num_channels + ch;
+    const ulong idx = ((ulong(z) * ulong(h) + ulong(y)) * ulong(w) + ulong(x)) * ulong(t.num_channels) + ulong(ch);
     return wp_tex_decode(t.mip_data[level], t.dtype, idx);
 }
 inline float wp_tex_sample_level(const device wp_tex_desc_t& t, int level, float u, float v, float wc, int ch) {
     #pragma clang fp contract(off)
     const int nd = t.ndim;
     const int w = t.mip_w[level], h = t.mip_h[level], d = t.mip_d[level];
-    float cu = t.normalized ? u : (u / (float)t.width);
-    float cv = t.normalized ? v : (v / (float)t.height);
-    float cw = t.normalized ? wc : (wc / (float)t.depth);
-    float tx = wp_tex_addr_coord(cu, w, t.addr_u);
-    float ty = nd > 1 ? wp_tex_addr_coord(cv, h, t.addr_v) : 0.0f;
-    float tz = nd > 2 ? wp_tex_addr_coord(cw, d, t.addr_w) : 0.0f;
     if (t.filter_mode == 0) {
-        int x = (int)metal::floor(tx + 0.5f);
-        int y = (int)metal::floor(ty + 0.5f);
-        int z = (int)metal::floor(tz + 0.5f);
-        if (t.addr_u != 3) x = wp_tex_clamp_index(x, w);
-        if (nd > 1 && t.addr_v != 3) y = wp_tex_clamp_index(y, h);
-        if (nd > 2 && t.addr_w != 3) z = wp_tex_clamp_index(z, d);
-        return wp_tex_fetch(t, level, x, nd > 1 ? y : 0, nd > 2 ? z : 0, ch);
+        const long x = wp_tex_nearest_index(u, t.normalized, t.width, w, t.addr_u);
+        const long y = nd > 1 ? wp_tex_nearest_index(v, t.normalized, t.height, h, t.addr_v) : 0l;
+        const long z = nd > 2 ? wp_tex_nearest_index(wc, t.normalized, t.depth, d, t.addr_w) : 0l;
+        return wp_tex_fetch(t, level, x, y, z, ch);
     }
-    int x0 = (int)metal::floor(tx); int x1 = x0 + 1; float fx = tx - x0;
+    const float tx = wp_tex_addr_coord(wp_tex_norm_coord(u, t.normalized, t.width, t.addr_u), w, t.addr_u);
+    long x0 = wp_tex_floor_l(tx); long x1 = x0 + 1; const float fx = tx - float(x0);
     x0 = wp_tex_addr_index(x0, w, t.addr_u); x1 = wp_tex_addr_index(x1, w, t.addr_u);
     if (nd == 1) {
         float v0 = wp_tex_fetch(t, level, x0, 0, 0, ch);
         float v1 = wp_tex_fetch(t, level, x1, 0, 0, ch);
         return v0 * (1.0f - fx) + v1 * fx;
     }
-    int y0 = (int)metal::floor(ty); int y1 = y0 + 1; float fy = ty - y0;
+    const float ty = wp_tex_addr_coord(wp_tex_norm_coord(v, t.normalized, t.height, t.addr_v), h, t.addr_v);
+    long y0 = wp_tex_floor_l(ty); long y1 = y0 + 1; const float fy = ty - float(y0);
     y0 = wp_tex_addr_index(y0, h, t.addr_v); y1 = wp_tex_addr_index(y1, h, t.addr_v);
     if (nd == 2) {
         float v00 = wp_tex_fetch(t, level, x0, y0, 0, ch);
@@ -368,7 +426,8 @@ inline float wp_tex_sample_level(const device wp_tex_desc_t& t, int level, float
         float v1 = v01 * (1.0f - fx) + v11 * fx;
         return v0 * (1.0f - fy) + v1 * fy;
     }
-    int z0 = (int)metal::floor(tz); int z1 = z0 + 1; float fz = tz - z0;
+    const float tz = wp_tex_addr_coord(wp_tex_norm_coord(wc, t.normalized, t.depth, t.addr_w), d, t.addr_w);
+    long z0 = wp_tex_floor_l(tz); long z1 = z0 + 1; const float fz = tz - float(z0);
     z0 = wp_tex_addr_index(z0, d, t.addr_w); z1 = wp_tex_addr_index(z1, d, t.addr_w);
     float v000 = wp_tex_fetch(t, level, x0, y0, z0, ch);
     float v100 = wp_tex_fetch(t, level, x1, y0, z0, ch);
@@ -394,9 +453,10 @@ inline float wp_tex_sample_ch(ulong h, float u, float v, float w, int ch, float 
     float cl = lod < 0.0f ? 0.0f : lod;
     float max_lod = (float)(t.num_mip_levels - 1);
     cl = cl > max_lod ? max_lod : cl;
-    int level0 = (int)metal::floor(cl);
+    // ``(int)floor(NaN)`` is 0 on the CPU reference (AArch64).
+    int level0 = metal::isnan(cl) ? 0 : (int)metal::floor(cl);
     if (t.num_mip_levels <= 1 || t.mip_filter_mode == 0) {
-        int nearest = (int)metal::floor(cl + 0.5f);
+        int nearest = metal::isnan(cl) ? 0 : (int)metal::floor(cl + 0.5f);
         if (nearest >= t.num_mip_levels) nearest = t.num_mip_levels - 1;
         return wp_tex_sample_level(t, nearest, u, v, w, ch);
     }
@@ -404,6 +464,7 @@ inline float wp_tex_sample_ch(ulong h, float u, float v, float w, int ch, float 
     if (level1 >= t.num_mip_levels) level1 = t.num_mip_levels - 1;
     float fl = cl - (float)level0;
     float a = wp_tex_sample_level(t, level0, u, v, w, ch);
+    if (level1 == level0 || fl == 0.0f) return a;
     float b = wp_tex_sample_level(t, level1, u, v, w, ch);
     return a * (1.0f - fl) + b * fl;
 }

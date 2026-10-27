@@ -153,6 +153,105 @@ class TestMetalUpstream119(unittest.TestCase):
         )
         _run_with_metal_native(self, snippet, timeout=240)
 
+    def test_texture_sampling_matches_cpu_bit_exact(self):
+        # GH-1301 / GH-2065: the 1.19 CPU sampler reduces periodic
+        # coordinates first, rounds CLOSEST lookups from the original
+        # coordinate in double precision, keeps BORDER lookups at large or
+        # tiny coordinates outside the texture, and samples 32-bit integer
+        # textures (closest only) without normalization. The texture
+        # parameter struct now packs the format into one metadata word.
+        snippet = textwrap.dedent(
+            """
+            import itertools
+
+            import numpy as np
+
+            @wp.kernel
+            def k1(tex: wp.Texture1D, u: wp.array(dtype=float), o: wp.array(dtype=wp.vec2f)):
+                i = wp.tid()
+                o[i] = wp.texture_sample(tex, u[i], dtype=wp.vec2f)
+
+            @wp.kernel
+            def k2(tex: wp.Texture2D, u: wp.array(dtype=wp.vec2f), lod: float, o: wp.array(dtype=float)):
+                i = wp.tid()
+                o[i] = wp.texture_sample(tex, u[i], lod=lod, dtype=float)
+
+            @wp.kernel
+            def k2a(texs: wp.array(dtype=wp.Texture2D), u: wp.array(dtype=wp.vec2f), o: wp.array(dtype=float),
+                    w: wp.array(dtype=int)):
+                i = wp.tid()
+                t = texs[i % 2]
+                o[i] = wp.texture_sample(t, u[i], dtype=float)
+                w[i] = t.width * 100 + t.height
+
+            def coords(rng, n, size, normalized):
+                scale = 1.0 if normalized else float(size)
+                k = rng.integers(-3 * size, 3 * size, n)
+                edge = (k / size * scale).astype(np.float32)
+                c = [rng.uniform(-3, 3, n) * scale, edge, np.nextafter(edge, np.float32(np.inf)),
+                     np.nextafter(edge, np.float32(-np.inf)), ((k + 0.5) / size) * scale, rng.uniform(-1e7, 1e7, n),
+                     np.array([1e30, -1e30, np.inf, -np.inf, np.nan, -1e-45, 1e-45, -1e-40, 0.0, -0.0])]
+                return np.concatenate(c).astype(np.float32)
+
+            def same(a, b):
+                return bool(((a.view(np.uint32) == b.view(np.uint32)) | (np.isnan(a) & np.isnan(b))).all())
+
+            data_rng = np.random.default_rng(0)
+            dtypes = [(np.float32, False), (np.uint8, False), (np.float16, False), (np.int32, True), (np.uint32, True)]
+            modes = list(wp.TextureAddressMode)
+            filters = list(wp.TextureFilterMode)
+            for (npdt, int32), mode, filt, norm in itertools.product(dtypes, modes, filters, (True, False)):
+                if int32 and filt == wp.TextureFilterMode.LINEAR:
+                    continue
+                tag = f"{np.dtype(npdt).name} {mode.name} {filt.name} normalized={norm}"
+                if np.issubdtype(npdt, np.integer):
+                    info = np.iinfo(npdt)
+                    d1 = data_rng.integers(max(info.min, -2**30), min(info.max, 2**30), (7, 2)).astype(npdt)
+                    d2 = data_rng.integers(max(info.min, -2**30), min(info.max, 2**30), (5, 6)).astype(npdt)
+                else:
+                    d1 = data_rng.standard_normal((7, 2)).astype(npdt)
+                    d2 = data_rng.standard_normal((5, 6)).astype(npdt)
+                mips = 1 if int32 else 2
+                res = {}
+                for dev in ("cpu", "metal:0"):
+                    rng = np.random.default_rng(1)
+                    kw = dict(filter_mode=filt, address_mode=mode, normalized_coords=norm, device=dev)
+                    t1 = wp.Texture1D(d1, **kw)
+                    t2 = wp.Texture2D(d2, num_mip_levels=mips, mip_filter_mode=filt, **kw)
+                    u1 = coords(rng, 24, 7, norm)
+                    o1 = wp.zeros(len(u1), dtype=wp.vec2f, device=dev)
+                    wp.launch(k1, dim=len(u1), inputs=[t1, wp.array(u1, device=dev), o1], device=dev)
+                    out = [o1.numpy()]
+                    u2 = np.stack([coords(rng, 24, 6, norm), np.roll(coords(rng, 24, 5, norm), 7)], 1)
+                    for lod in (-1.0, 0.0, 0.5, 1.0) if mips > 1 else (-1.0,):
+                        o2 = wp.zeros(len(u2), dtype=float, device=dev)
+                        wp.launch(k2, dim=len(u2), inputs=[t2, wp.array(u2, dtype=wp.vec2f, device=dev), lod, o2],
+                                  device=dev)
+                        out.append(o2.numpy())
+                    res[dev] = out
+                for i, (a, b) in enumerate(zip(res["cpu"], res["metal:0"])):
+                    assert same(a, b), f"{tag} output {i}: cpu {a.ravel()[:8]} metal {b.ravel()[:8]}"
+
+            # Arrays of textures read the packed descriptor struct from a buffer.
+            a = data_rng.standard_normal((4, 5)).astype(np.float32)
+            b = data_rng.standard_normal((6, 3)).astype(np.float32)
+            res = {}
+            for dev in ("cpu", "metal:0"):
+                ta = wp.Texture2D(a, address_mode=wp.TextureAddressMode.WRAP, device=dev)
+                tb = wp.Texture2D(b, filter_mode=wp.TextureFilterMode.CLOSEST, device=dev)
+                texs = wp.array([ta, tb], dtype=wp.Texture2D, device=dev)
+                u = wp.array(np.random.default_rng(2).uniform(-2, 2, (16, 2)).astype(np.float32), dtype=wp.vec2f,
+                             device=dev)
+                o = wp.zeros(16, dtype=float, device=dev)
+                w = wp.zeros(16, dtype=int, device=dev)
+                wp.launch(k2a, dim=16, inputs=[texs, u, o, w], device=dev)
+                res[dev] = (o.numpy(), w.numpy())
+            assert same(res["cpu"][0], res["metal:0"][0]), res
+            np.testing.assert_array_equal(res["cpu"][1], res["metal:0"][1])
+            """
+        )
+        _run_with_metal_native(self, snippet, timeout=600)
+
     def test_unported_tile_reductions_raise(self):
         # Metal has no lowering for these yet. 1.19 changed their CPU/CUDA
         # results (GH-2000 tile_sum axis gradients, GH-2003/GH-1781 scan
