@@ -780,12 +780,30 @@ class TileExt:
             return f"{var}.c[_am_k]"
 
         call_args = [el(a, t) for a, t in zip(ins, tiled, strict=True)]
+        if _requires_original_output(fn):
+            # Builtins registered with ``require_original_output_arg`` (exp,
+            # sqrt, tanh, pow, div, ...) take the forward result too; pass
+            # it recomputed, as ``tile_map_call_adj`` in tile.h does (GH-2031).
+            call_args.append(f"{fn}({', '.join(call_args)})")
         call_args += [el(a, t) for a, t in zip(adj_ins, tiled, strict=True)]
         call_args.append(el(adj_ret, True))
         call = f"{adj_name}({', '.join(call_args)})"
         if n == 1:
             return call
         return f"for (int _am_k = 0; _am_k < {n}; ++_am_k) {{ {call}; }}"
+
+
+def _requires_original_output(fn: str) -> bool:
+    """True when the builtin ``fn`` names has an adjoint that takes its forward result."""
+    name = fn
+    for prefix in ("wp::", "wp_", "metal::precise::", "metal::fast::", "metal::"):
+        if name.startswith(prefix):
+            name = name[len(prefix) :]
+            break
+    from warp._src.context import builtin_functions  # noqa: PLC0415
+
+    func = builtin_functions.get(name)
+    return bool(getattr(func, "require_original_output_arg", False))
 
 
 _VEC_FILL_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_(zeros|ones|full)\s*(<.*?>)\s*\(([^;]*?)\)(?=\s*;)")
