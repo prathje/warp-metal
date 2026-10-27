@@ -17290,9 +17290,13 @@ def _reject_fp64_values(adj, lines: list[str], inlined_var_ctypes: dict[str, str
     def _is_value(ct: str) -> bool:
         return "wp::float64" in ct and not ct.rstrip().endswith("*") and "array_t" not in ct
 
-    # A float64 struct / array element loaded and only ever cast to a narrower
-    # type (``wp.float32(p.nu)``, warp.fem's float64 parameters) does no fp64
-    # arithmetic: the conversion rounds exactly as on CPU, so it stays legal.
+    # A float64 struct / array element loaded and only ever cast to float32
+    # or float16 (``wp.float32(p.nu)``, ``float(p.nu)``, warp.fem's float64 parameters) does no
+    # fp64 arithmetic: the value is read as the correctly rounded float32, which
+    # is what the CPU's cast produces (float16 rounds through float32 on the
+    # CPU as well), so it stays legal. Integer casts and predicates are not
+    # exact on the demoted value (``wp.int32(2.9999999999)`` truncates 3.0f,
+    # ``isfinite(1e300)`` sees inf) and raise.
     def_line: dict[str, str] = {}
     uses: dict[str, list[str]] = {}
     for ln in lines:
@@ -17309,7 +17313,7 @@ def _reject_fp64_values(adj, lines: list[str], inlined_var_ctypes: dict[str, str
         d = def_line.get(name, "")
         if not re.match(rf"^\s*var_{name}\s*=\s*wp::load\s*\(", d):
             return False
-        cast = re.compile(rf"\bwp::(?!float64\b)(\w+)\s*\(\s*var_{name}\s*\)")
+        cast = re.compile(rf"\bwp::(?:float|float32|float16|half)\s*\(\s*var_{name}\s*\)")
         return all(
             len(re.findall(rf"\bvar_{name}\b", u)) == len(cast.findall(u)) and not u.lstrip().startswith("wp::adj_")
             for u in uses.get(name, [])
