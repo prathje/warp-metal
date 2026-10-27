@@ -18204,7 +18204,11 @@ def tile_matmul_lto_dispatch_func(
         or not options.get("enable_mathdx_gemm", True)
     ):
         # CPU/no-MathDx dispatch (or mathdx GEMM disabled via module option)
-        if lto_precision == "tf32" and builder is not None and builder.target is not None:
+        # The Metal backend builds its IR without a builder; its matmul helper
+        # always runs at the operand precision, so it falls back as well.
+        if lto_precision == "tf32" and (
+            (builder is not None and builder.target is not None) or options.get("metal_backend")
+        ):
             log_warning(
                 "tile_matmul() cannot honor precision='tf32' for this compilation; falling back to default precision."
             )

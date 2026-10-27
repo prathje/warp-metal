@@ -8652,8 +8652,10 @@ def _emit_tile_matmul(r: int, k: int, n: int, msl_scalar: str, trans_a: bool = F
     parts.append(f"                s = metal::fma({a_elem}, {b_elem}, s);")
     parts.append("            }")
     # ``beta * C + alpha * s`` is also a fused-multiply-add candidate.
+    # As BLAS and ``scalar_matmul`` in tile_matmul.h (GH-2079): C is not
+    # read when beta is zero, so NaN/Inf in C cannot leak through 0 * C.
     c_el = _el("C", r, n, f"i*{n} + j")
-    parts.append(f"            {c_el} = metal::fma(alpha, s, beta * {c_el});")
+    parts.append(f"            {c_el} = (beta != {_sc_zero(msl_scalar)}) ? metal::fma(alpha, s, beta * {c_el}) : alpha * s;")
     parts.append("        }")
     parts.append("    }")
     parts.append("}")
