@@ -689,6 +689,56 @@ class TestMetalR9Fixes(unittest.TestCase):
         )
         _run_with_metal_native(self, snippet, timeout=240)
 
+    def test_custom_func_grad_loop_return_in_kernel_loop_matches_cpu(self):
+        # The loop-nested return flag of an inlined @wp.func_grad body must be
+        # reset at every call: here the gradient runs once per iteration of
+        # a kernel loop and returns from inside its own loop only for some
+        # calls. Also covers continue / break and a vector return adjoint.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            @wp.func
+            def fa(x: wp.array(dtype=float), i: int, m: int) -> wp.vec3:
+                return wp.vec3(x[i] * float(m), 2.0 * x[i], 0.0)
+
+            @wp.func_grad(fa)
+            def adj_fa(x: wp.array(dtype=float), i: int, m: int, adj_ret: wp.vec3):
+                for a in range(5):
+                    if a == 1:
+                        continue
+                    if a == 4 and i > 3:
+                        break
+                    if a == m:
+                        return
+                    wp.adjoint[x][i] += adj_ret[0] * float(a + 1) + adj_ret[1]
+                wp.adjoint[x][i] += 1000.0
+
+            @wp.kernel(module="unique")
+            def k(n: int, x: wp.array(dtype=float), y: wp.array(dtype=float)):
+                i = wp.tid()
+                s = float(0.0)
+                for m in range(n):
+                    s += wp.dot(fa(x, i, (m + i) % 6), wp.vec3(1.0, 2.0, 3.0))
+                y[i] = s
+
+            r = {}
+            for d in ("cpu", "metal:0"):
+                x = wp.array(np.ones(6, dtype=np.float32), dtype=float, device=d, requires_grad=True)
+                y = wp.zeros(6, dtype=float, device=d, requires_grad=True)
+                t = wp.Tape()
+                with t:
+                    wp.launch(k, dim=6, inputs=[5, x, y], device=d)
+                t.backward(grads={y: wp.ones(6, dtype=float, device=d)})
+                r[d] = (y.numpy(), x.grad.numpy())
+            # every thread mixes returning and non-returning calls
+            assert np.all(r["cpu"][1] > 1000.0) and np.all(r["cpu"][1] < 5000.0), r["cpu"][1]
+            for a, b in zip(r["cpu"], r["metal:0"]):
+                np.testing.assert_array_equal(b, a)
+            """
+        )
+        _run_with_metal_native(self, snippet, timeout=240)
+
     def test_skew_adjoint_matches_cpu(self):
         # wp::adj_skew had no Metal lowering (featherstone's eval_rigid_id
         # adjoint): a MetalCodegenError naming the intrinsic.
