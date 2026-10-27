@@ -21311,10 +21311,8 @@ def _generate_msl_kernel_uncached(
         final_output_names = ["__wp_unused_out"]
 
     # A lane-dependent ``wp.tile()`` kernel that only sums into memory runs
-    # every lane (see ``_lane_sum_unfoldable``); other lane uses raise.
-    _lane_unfold = (
-        coop_block_n == 0 and _lane_indexes_tile_op(forward_lines) and _lane_sum_unfoldable(forward_lines)
-    )
+    # every lane (see ``_lane_sum_unfoldable``); others keep the serial model.
+    _lane_unfold = coop_block_n == 0 and _lane_tile_value(forward_lines) and _lane_sum_unfoldable(forward_lines)
     _artifact = MetalKernelArtifact(
         name=artifact_name,
         has_print=_has_print,
@@ -24726,24 +24724,22 @@ def _lane_tainted_labels(lines: list[str], lane: str) -> set[str]:
 
 
 def _lane_indexes_tile_op(lines: list[str]) -> bool:
-    """Whether a tile op needs the lane of a 2-D ``wp.tid()``.
+    """Whether a tile scatter is indexed by the lane of a 2-D ``wp.tid()``."""
+    text = "\n".join(lines)
+    m = re.search(r"builtin_tid2d\s*\(\s*var_\w+\s*,\s*var_(\w+)\s*\)", text)
+    return m is not None and any(lm.group(1) == m.group(1) for lm in _TILE_LANE_OP_PAT.finditer(text))
 
-    Either a tile scatter indexed by the lane, or a ``wp.tile(x)`` whose
-    per-thread value depends on it: a serial tile kernel runs one thread
-    per block, so the other lanes' values would silently be dropped (the
-    pattern behind ``warp.fem.integrate``'s scalar reduction).
-    """
+
+def _lane_tile_value(lines: list[str]) -> bool:
+    """Whether a ``wp.tile(x)`` packs a value that depends on the lane of a 2-D ``wp.tid()``."""
     text = "\n".join(lines)
     m = re.search(r"builtin_tid2d\s*\(\s*var_\w+\s*,\s*var_(\w+)\s*\)", text)
     if m is None:
         return False
-    lane = m.group(1)
-    if any(lm.group(1) == lane for lm in _TILE_LANE_OP_PAT.finditer(text)):
-        return True
     ctors = [tm.group(2) for tm in _TILE_BUILTIN_TILE_PAT.finditer(text)]
     if not ctors:
         return False
-    tainted = _lane_tainted_labels(lines, lane)
+    tainted = _lane_tainted_labels(lines, m.group(1))
     return any(c in tainted for c in ctors)
 
 
@@ -24759,8 +24755,9 @@ def _lane_sum_unfoldable(lines: list[str]) -> bool:
     A kernel whose only tile ops are ``wp.tile()`` of a per-thread value,
     ``tile_sum`` of it and ``tile_atomic_add`` of the sum into an array
     computes the same total when each lane adds its own value (atomically),
-    so the launcher keeps the lane dim instead of folding it (and instead of
-    raising). ``wp.block_dim()`` (lowered to 1) rules it out.
+    so the launcher keeps the lane dim instead of folding it to lane 0 (CUDA
+    and a CPU ``wp.launch(dim=(n, B), block_dim=B)`` both add every lane).
+    ``wp.block_dim()`` (lowered to 1) rules it out.
     """
     text = "\n".join(lines)
     if "builtin_block_dim" in text:
@@ -24771,8 +24768,7 @@ def _lane_sum_unfoldable(lines: list[str]) -> bool:
 
 def _lane_tile_launch_error(kernel, block_dim: int) -> str:
     return (
-        f"Kernel '{kernel.key}' uses the lane of wp.tid() in a tile op (a tile scatter index, or a wp.tile() "
-        "of a per-thread value). On Metal tile kernels run "
+        f"Kernel '{kernel.key}' indexes a tile scatter with the lane of wp.tid(). On Metal tile kernels run "
         "one thread per block (the lane always reads as 0) unless every tile op has a per-lane lowering and "
         f"the launch uses block_dim=32 (got block_dim={block_dim}); restructure the kernel or launch with "
         "block_dim=32."

@@ -509,8 +509,9 @@ class TestMetalUpstream119(unittest.TestCase):
         # per-thread value then kept lane 0's value only: fem.integrate()'s
         # scalar reduction (tile_atomic_add(out, tile_sum(tile(val)))) summed
         # one quadrature point per block on Metal (pre-existing; surfaced by
-        # 1.19's fem quadrature-cache tests). That pattern now runs every
-        # lane; any other lane-dependent wp.tile() kernel raises.
+        # 1.19's fem quadrature-cache tests). That sum-only pattern now runs
+        # every lane; other lane-dependent wp.tile() kernels keep the serial
+        # model (lane 0, as a CPU wp.launch_tiled with block_dim 1).
         snippet = textwrap.dedent(
             """
             import numpy as np
@@ -536,24 +537,26 @@ class TestMetalUpstream119(unittest.TestCase):
                 res[d] = out
             np.testing.assert_allclose(res["metal:0"], res["cpu"], rtol=1e-5)
 
+            # Launched explicitly with a lane dim, every lane is a thread on CPU
+            # too (block_dim resolves to 1 there), so the per-lane sums agree.
             TS = 64
 
             @wp.kernel
-            def per_block(x: wp.array(dtype=float), out: wp.array(dtype=float)):
+            def lane_sum(x: wp.array(dtype=float), out: wp.array(dtype=float)):
                 b, lane = wp.tid()
-                v = x[b * TS + lane]
-                t = wp.tile_sum(wp.tile(v))
-                wp.tile_store(out, t, offset=b)
+                v = float(0.0)
+                if lane % 3 != 0:
+                    v = x[b * TS + lane]
+                wp.tile_atomic_add(out, wp.tile_sum(wp.tile(v)), offset=0)
 
-            x = wp.ones(2 * TS, dtype=float, device="metal:0")
-            out = wp.zeros(2, dtype=float, device="metal:0")
-            try:
-                wp.launch(per_block, dim=(2, TS), block_dim=TS, inputs=[x, out], device="metal:0")
-                wp.synchronize_device("metal:0")
-            except RuntimeError as e:
-                assert "lane of wp.tid()" in str(e), e
-            else:
-                raise AssertionError(f"lane-dependent wp.tile() ran serially: {out.numpy()}")
+            xs = np.random.default_rng(5).random(3 * TS).astype(np.float32)
+            sums = {}
+            for d in ("cpu", "metal:0"):
+                out = wp.zeros(1, dtype=float, device=d)
+                wp.launch(lane_sum, dim=(3, TS), block_dim=TS, inputs=[wp.array(xs, device=d), out], device=d)
+                sums[d] = out.numpy()[0]
+            np.testing.assert_allclose(sums["metal:0"], sums["cpu"], rtol=1e-5)
+            np.testing.assert_allclose(sums["cpu"], xs[np.arange(3 * TS) % TS % 3 != 0].sum(), rtol=1e-5)
             """
         )
         _run_with_metal_native(self, snippet, timeout=600)
