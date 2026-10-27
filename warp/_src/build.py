@@ -174,6 +174,8 @@ def build_cpu(
     obj_path = obj_path.encode("utf-8")
 
     flags_list = extra_flags.split()
+    if flags_list and flags_list[-1] == "-mllvm":
+        raise ValueError("-mllvm requires one LLVM option argument")
     for include_dir in _get_extra_include_dirs(extra_include_dirs):
         flags_list.extend(("-I", include_dir))
     flags_array = (ctypes.c_char_p * (len(flags_list) + 1))(*[f.encode("utf-8") for f in flags_list], None)
@@ -576,6 +578,7 @@ def build_lto_dot(
     ldb=None,
     ldc=None,
     aligned_bases=(False, False, False),
+    precision=None,
 ):
     """Compile (or fetch from the LTO cache) a cuBLASDx GEMM ``C = alpha * A @ B + beta * C``.
 
@@ -600,6 +603,10 @@ def build_lto_dot(
         ldb: Leading dimension of B in elements, or ``None`` when dense.
         ldc: Leading dimension of C in elements, or ``None`` when dense.
         aligned_bases: Whether the base pointer of A, B, and C is known to be 16-byte aligned.
+        precision: ``"tf32"`` for TF32 input precision with ``float32`` accumulation, or
+            ``None`` to compute in the operand precision. Storage remains ``float32`` and
+            Tensor Core use depends on the GEMM configuration. The precision codes in the
+            LTO symbol keep the variants apart.
 
     Returns:
         ``(lto_symbol, lto_code_data)`` for the variant that compiled.
@@ -637,6 +644,15 @@ def build_lto_dot(
     (a_dtype, a_prec, a_type) = cublasdx_type_map(adtype)
     (b_dtype, b_prec, b_type) = cublasdx_type_map(bdtype)
     (c_dtype, c_prec, c_type) = cublasdx_type_map(cdtype)
+
+    if precision == "tf32":
+        # Request TF32 input precision without changing float32 storage.
+        # C keeps F32 so accumulation stays in float32.
+        # The tile_matmul dispatch has already rejected non-float32 operands.
+        a_prec = 4  # COMMONDX_PRECISION_TF32
+        b_prec = 4
+    elif precision is not None:
+        raise ValueError(f"build_lto_dot() precision must be None or 'tf32', got {precision!r}")
     a_arrangement = cublasdx_arrangement_map(alayout)
     b_arrangement = cublasdx_arrangement_map(blayout)
     c_arrangement = cublasdx_arrangement_map(clayout)

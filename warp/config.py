@@ -90,7 +90,7 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return value not in ("0", "false", "off")
 
 
-version: str = "1.18.0"
+version: str = "1.19.0rc1"
 """Warp version string"""
 
 verify_fp: bool = False
@@ -308,23 +308,30 @@ This setting can be overridden at the module level by setting the
 ``"enable_mathdx_fft"`` module option.
 """
 
-cpu_compiler_flags: str | None = None
+cpu_compiler_flags: str | None = (
+    "-march=native -mllvm=-inline-threshold=9000 -mllvm=-inline-cold-callsite-threshold=3000"
+    " -mllvm=-slp-recursion-max-depth=4"
+)
 """Flags controlling CPU kernel compilation.
 
-Warp acts as a compiler driver for the embedded Clang frontend. The flag
-``-march=native`` is intercepted and triggers host CPU feature detection
-(equivalent to ``llvm::sys::getHostCPUName()`` + ``getHostCPUFeatures()``).
-All other flags are passed through to the Clang frontend as-is.
+The default detects host CPU features, raises LLVM's inlining thresholds,
+and limits SLP recursion depth to four instead of LLVM's default 12. Set this
+to ``None`` to retain host feature detection with LLVM's default inlining
+thresholds and SLP recursion depth.
+``""`` compiles for a generic CPU target. A flag string can include
+``-march=native``, Clang frontend flags, and LLVM arguments in either
+``-mllvm <option>`` or ``-mllvm=<option>`` form. Use ``-fno-vectorize`` to
+disable loop vectorization or ``-fno-slp-vectorize`` to disable SLP
+vectorization for a module.
 
-The value controls both CPU target detection and extra compiler flags:
+The ``"cpu_compiler_flags"`` module option replaces this global string for
+that module. Use ``"-march=native"`` to keep host feature detection while
+using LLVM's default inlining thresholds and SLP recursion depth. ``None`` at
+the module level inherits the global setting.
 
-- ``None`` (default): detect host CPU features (equivalent to ``"-march=native"``).
-- ``""``: disable host CPU detection; compile for a generic target.
-- ``"-march=native"``: explicitly detect host CPU features.
-- ``"-march=native -fno-vectorize"``: detect host CPU + pass ``-fno-vectorize``.
-- ``"-fno-vectorize"``: generic target + pass ``-fno-vectorize``.
-
-Changing this setting invalidates the kernel cache.
+The resolved flag string is part of the module cache key.
+LLVM options are a power-user feature with process-wide caveats; see
+:ref:`cpu-llvm-compiler-options`.
 """
 
 llvm_cuda: bool = False
@@ -687,7 +694,8 @@ option.
 deterministic_debug: bool = False
 """Enable debug diagnostics for deterministic execution mode.
 
-When enabled, deterministic scatter overflows may emit device-side diagnostics.
+When enabled, deterministic buffer overflows and slot-assignment mismatches may
+emit device-side diagnostics, including during CUDA graph replay.
 This setting is intended for debugging capacity issues and should remain disabled
 for normal execution, especially when CUDA graph capture is performance-critical.
 """

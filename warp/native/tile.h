@@ -5,11 +5,24 @@
 
 // Internal lane-participation masks for tile warp collectives, not logical
 // tile masks. Keep this block before builtin.h because its tile headers use it.
+//
+// Each macro is guarded so a build targeting a different lane width can
+// pre-define the whole set consistently, without patching this file. Nothing in
+// this tree pre-defines them, so the definitions below are what every build here
+// gets.
+#ifndef WP_TILE_WARP_SIZE
 #define WP_TILE_WARP_SIZE 32
+#endif
 
+#ifndef WP_TILE_LANE_MASK_ALL
 #define WP_TILE_LANE_MASK_ALL 0xffffffffu
+#endif
+#ifndef WP_TILE_LANE_MASK_POPC
 #define WP_TILE_LANE_MASK_POPC(mask) __popc(mask)
+#endif
+#ifndef WP_TILE_LANE_MASK_FFS
 #define WP_TILE_LANE_MASK_FFS(mask) __ffs(mask)
+#endif
 
 using wp_tile_lane_mask_bits_t = decltype(WP_TILE_LANE_MASK_ALL);
 
@@ -1182,10 +1195,12 @@ template <typename T, int... Dims> auto tile_register()
     return tile_register_t<T, tile_layout_register_t<tile_shape_t<Dims...>>>();
 }
 
+// must match tile.alignment in Python types.py
+constexpr int tile_alignment = 16;
+
 inline CUDA_CALLABLE int tile_align(int num_bytes)
 {
-    // note this much match value in Python types.py
-    const int alignment = 16;
+    const int alignment = tile_alignment;
 
     const int num_bytes_abs = num_bytes < 0 ? -num_bytes : num_bytes;
     const int sign = num_bytes < 0 ? -1 : 1;
@@ -1336,10 +1351,12 @@ public:
         // Keep this path separate from the checked CPU arithmetic below. NVRTC
         // targeting sm_89 otherwise fails to hoist repeated shared-memory
         // address calculations in tiled kernels.
-        const unsigned int offset = smem_base[WP_TILE_THREAD_IDX];
+        // The counter is kept in alignment units so the compiler can prove each
+        // offset is aligned and vectorize shared-memory accesses to the tile.
+        const unsigned int offset = smem_base[WP_TILE_THREAD_IDX] * tile_alignment;
 
         // one entry per-thread so no need for synchronization
-        smem_base[WP_TILE_THREAD_IDX] += tile_align(num_bytes);
+        smem_base[WP_TILE_THREAD_IDX] += tile_align(num_bytes) / tile_alignment;
 #else
         const int thread_idx = WP_TILE_THREAD_IDX;
         const unsigned int offset = smem_base[thread_idx];
@@ -1869,7 +1886,8 @@ template <typename T, typename L, bool Owner_ = true> struct tile_shared_t {
                 // use shared memory atomics to accumulate gradients
                 // since for broadcast tiles (e.g.: a bias vector) multiple incoming threads
                 // may map to a single location in shared memory
-                tile_adj_atomic_add_value(&grad(linear), tile.data[i]);
+                // Convert contributions to this tile's gradient dtype before accumulation.
+                tile_adj_atomic_add_value(&grad(linear), T(tile.data[i]));
         }
 
         WP_TILE_SYNC();
@@ -1994,7 +2012,7 @@ template <typename T, typename L, bool Owner_ = true> struct tile_shared_t {
                     char* dest_bytes = reinterpret_cast<char*>(dest.data.data) + base_bytes;
                     float4* dest128 = reinterpret_cast<float4*>(dest_bytes);
                     assert(((uint64_t)data.ptr) % sizeof(float4) == 0 && "shared tile pointer not 16-byte aligned");
-                    const float4* src128 = (const float4*)data.ptr;
+                    const float4* src128 = reinterpret_cast<const float4*>(data.ptr);
 
                     using F4Layout
                         = tile_layout_strided_t<typename tile_shape_f4<typename Layout::Shape, (int)sizeof(T)>::type>;
@@ -2153,7 +2171,7 @@ template <typename T, typename L, bool Owner_ = true> struct tile_shared_t {
                     const char* src_bytes = reinterpret_cast<const char*>(src.data.data) + base_bytes;
                     const float4* src128 = reinterpret_cast<const float4*>(src_bytes);
                     assert(((uint64_t)data.ptr) % sizeof(float4) == 0 && "shared tile pointer not 16-byte aligned");
-                    float4* dest128 = (float4*)data.ptr;
+                    float4* dest128 = reinterpret_cast<float4*>(data.ptr);
 
                     using F4Layout
                         = tile_layout_strided_t<typename tile_shape_f4<typename Layout::Shape, (int)sizeof(T)>::type>;
@@ -2535,7 +2553,8 @@ template <typename T, typename Shape, typename Strides, bool RequiresGrad> inlin
 
     // initialize tile to quiet nan
     uint32_t qnanbits = 0x7FC00000;
-    float qnan = *(float*)(&qnanbits);
+    float qnan;
+    memcpy(&qnan, &qnanbits, sizeof(qnan));
 
     for (int i = WP_TILE_THREAD_IDX; i < size; i += WP_TILE_BLOCK_DIM)
         data[i] = T(qnan);
@@ -4238,16 +4257,50 @@ inline CUDA_CALLABLE void adj_tile_map(
     adj_to_tile<Shape>(adj_t8, adj_r8);
 }
 
+// Builtins registered with require_original_output_arg=True (e.g. exp, sqrt, div, pow) have adjoints that also take
+// the forward result, e.g. adj_exp(x, ret, adj_x, adj_ret). These helpers call that form when the adjoint accepts it,
+// recomputing ret as adj_cw_div does below, and otherwise the form without it that user functions and other builtins
+// use. Passing 0 makes overload resolution prefer the `int` overload whenever its return type is well-formed.
+template <typename AdjOp, typename Op, typename T, typename AdjT, typename AdjRet>
+inline CUDA_CALLABLE auto tile_map_call_adj(AdjOp adj_op, Op op, T x, AdjT& adj_x, AdjRet adj_ret, int)
+    -> decltype(adj_op(x, op(x), adj_x, adj_ret), void())
+{
+    adj_op(x, op(x), adj_x, adj_ret);
+}
+
+template <typename AdjOp, typename Op, typename T, typename AdjT, typename AdjRet>
+inline CUDA_CALLABLE void tile_map_call_adj(AdjOp adj_op, Op op, T x, AdjT& adj_x, AdjRet adj_ret, long)
+{
+    adj_op(x, adj_x, adj_ret);
+}
+
+template <typename AdjOp, typename Op, typename T, typename U, typename AdjT, typename AdjU, typename AdjRet>
+inline CUDA_CALLABLE auto
+tile_map_call_adj(AdjOp adj_op, Op op, T x, U y, AdjT& adj_x, AdjU& adj_y, AdjRet adj_ret, int)
+    -> decltype(adj_op(x, y, op(x, y), adj_x, adj_y, adj_ret), void())
+{
+    adj_op(x, y, op(x, y), adj_x, adj_y, adj_ret);
+}
+
+template <typename AdjOp, typename Op, typename T, typename U, typename AdjT, typename AdjU, typename AdjRet>
+inline CUDA_CALLABLE void
+tile_map_call_adj(AdjOp adj_op, Op op, T x, U y, AdjT& adj_x, AdjU& adj_y, AdjRet adj_ret, long)
+{
+    adj_op(x, y, adj_x, adj_y, adj_ret);
+}
+
 // We wrap the operator in a lambda so that we don't have to do overload resolution for things like e.g.: wp.sin()
 // this is important because many of the builtin operators don't follow particular conventions on references for
 // the `adj_ret` parameter, which means it's not possible to figure out the overload we need using simple casting.
 // The return type is automatically deduced from the operation result using decltype.
+// adj_op reaches tile_map_call_adj() through a forwarding lambda whose return type is decltype(adj_op(args...)), so
+// a call with the wrong arguments is a substitution failure rather than a hard error.
 
 #define tile_unary_map(op, a) tile_map([](auto x) { return op(x);}, a)
-#define adj_tile_unary_map(op, a, adj_op, adj_a, adj_ret) adj_tile_map([](auto x) { return op(x);}, a, [](auto x, auto& adj_x, auto adj_ret) { adj_op(x, adj_x, adj_ret);}, adj_a, adj_ret)
+#define adj_tile_unary_map(op, a, adj_op, adj_a, adj_ret) adj_tile_map([](auto x) { return op(x);}, a, [](auto x, auto& adj_x, auto adj_ret) { wp::tile_map_call_adj([](auto&&... args) -> decltype(adj_op(args...)) { return adj_op(args...);}, [](auto x) { return op(x);}, x, adj_x, adj_ret, 0);}, adj_a, adj_ret)
 
 #define tile_binary_map(op, a, b) tile_map([](auto x, auto y) { return op(x, y);}, a, b)
-#define adj_tile_binary_map(op, a, b, adj_op, adj_a, adj_b, adj_ret) adj_tile_map([](auto x, auto y) { return op(x, y);}, a, b, [](auto x, auto y, auto& adj_x, auto& adj_y, auto adj_ret) { adj_op(x, y, adj_x, adj_y, adj_ret);}, adj_a, adj_b, adj_ret)
+#define adj_tile_binary_map(op, a, b, adj_op, adj_a, adj_b, adj_ret) adj_tile_map([](auto x, auto y) { return op(x, y);}, a, b, [](auto x, auto y, auto& adj_x, auto& adj_y, auto adj_ret) { wp::tile_map_call_adj([](auto&&... args) -> decltype(adj_op(args...)) { return adj_op(args...);}, [](auto x, auto y) { return op(x, y);}, x, y, adj_x, adj_y, adj_ret, 0);}, adj_a, adj_b, adj_ret)
 
 // Wrapper for scalar adj_div to match the 5-arg interface expected by adj_tile_binary_map.
 // Scalar adj_div takes 6 args (includes ret), but adj_tile_binary_map only passes 5.
@@ -5947,8 +6000,8 @@ inline CUDA_CALLABLE void adj_tile_assign(
     tile_register_t<typename TileA::Type, GradLayout> staged;
 
     // linear_from_register() is monotone, so after the first invalid
-    // register slot all later slots are invalid too. The accumulation loop
-    // uses the same guard before reading staged.data[reg].
+    // register slot all later slots are invalid too. grad_add() uses the
+    // same guard before reading staged.data[reg].
     WP_PRAGMA_UNROLL
     for (int reg = 0; reg < GradLayout::NumRegs; ++reg) {
         int linear = GradLayout::linear_from_register(reg);
@@ -5972,16 +6025,9 @@ inline CUDA_CALLABLE void adj_tile_assign(
     // zeroing must complete before accumulating into (potentially aliasing) src gradients
     WP_TILE_SYNC();
 
-    WP_PRAGMA_UNROLL
-    for (int reg = 0; reg < GradLayout::NumRegs; ++reg) {
-        int linear = GradLayout::linear_from_register(reg);
-        if (!GradLayout::valid(linear)) {
-            break;
-        }
-        src.grad(GradLayout::coord_from_linear(linear)) += staged.data[reg];
-    }
-
-    WP_TILE_SYNC();
+    // src may be a broadcast view whose coordinates share one gradient element;
+    // grad_add() accumulates atomically for such non-unique layouts
+    src.grad_add(staged);
 }
 
 template <

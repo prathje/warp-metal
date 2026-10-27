@@ -389,6 +389,19 @@ def test_range_constant():
     wp.expect_eq(s, -3)
 
 
+@wp.kernel
+def test_range_constant_empty():
+    count = int(0)
+
+    for _i in range(100, 2, 1):
+        count += 1
+
+    for _i in range(2, 100, -1):
+        count += 1
+
+    wp.expect_eq(count, 0)
+
+
 N = wp.constant(3)
 
 
@@ -1947,6 +1960,54 @@ class TestCodeGen(unittest.TestCase):
         builder.codegen("cuda")
         return builder.build_meta()
 
+    def test_max_unroll_uses_range_trip_count(self):
+        """Verify ``max_unroll`` is compared against the exact trip count of constant ``range()`` loops."""
+
+        @wp.kernel(module="unique", module_options={"max_unroll": 4})
+        def dividing_ranges():
+            for _i in range(0, 8, 2):
+                pass
+            for _i in range(8, 0, -2):
+                pass
+
+        @wp.kernel(module="unique", module_options={"max_unroll": 4})
+        def nondividing_ranges():
+            for _i in range(0, 9, 2):
+                pass
+            for _i in range(8, -1, -2):
+                pass
+
+        @wp.kernel(module="unique", module_options={"max_unroll": 4})
+        def empty_ranges():
+            for _i in range(9, 0, 1):
+                pass
+            for _i in range(0, 9, -1):
+                pass
+
+        def count_dynamic_loops(kernel):
+            self._codegen_cpu_source(kernel)
+            return len([line for line in kernel.adj.blocks[0].body_forward if line.lstrip().startswith("start_for_")])
+
+        self.assertEqual(count_dynamic_loops(dividing_ranges), 0)
+        self.assertEqual(count_dynamic_loops(nondividing_ranges), 2)
+        self.assertEqual(count_dynamic_loops(empty_ranges), 0)
+
+    def test_empty_constant_loop_does_not_hide_outer_mutation(self):
+        """Verify an empty constant loop does not hide a constant mutated in an enclosing dynamic loop."""
+
+        @wp.kernel(module="unique")
+        def shadowed_by_empty_loop(n: int, out: wp.array[float]):
+            i = 5
+            for _j in range(n):
+                # the range is empty, so this loop never rebinds ``i``
+                for i in range(20, 0):
+                    out[0] = float(i)
+                i = i + 1
+            out[0] = float(i)
+
+        with self.assertRaisesRegex(wp.WarpCodegenError, r"Error mutating a constant i inside a dynamic loop"):
+            self._codegen_cpu_source(shadowed_by_empty_loop)
+
     def test_module_enable_backward_controls_function_adjoint_codegen(self):
         """Verify called-function adjoint codegen follows the effective ``enable_backward`` setting."""
 
@@ -2556,12 +2617,12 @@ class TestCodeGen(unittest.TestCase):
             def invalid_kernel():
                 return
 
-    def test_replace_static_expressions_replaces_call_in_ast(self):
-        """Replace resolvable ``wp.static`` calls in the abstract syntax tree.
+    def test_replace_static_expressions_substitutes_calls_in_view(self):
+        """Substitute resolvable ``wp.static`` calls into a per-adjoint view of the tree.
 
-        The walker mutates ``adj.tree`` by replacing each resolvable call with an
-        ``ast.Constant`` or, for a function result, an ``ast.Name``. This pins the
-        deferred-replacement application step.
+        Each call becomes an ``ast.Constant`` or, for a function result, an
+        ``ast.Name`` in ``adj.tree``, while the shared tree keeps the calls so
+        redeclarations resolve their own values from it.
         """
         _value_a = 7
         _value_b = 13
@@ -2571,20 +2632,63 @@ class TestCodeGen(unittest.TestCase):
             out[i] = wp.static(_value_a)
             out[i] += wp.static(_value_b)
 
+        def find_static_calls(tree):
+            return [
+                node
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "static"
+            ]
+
         adj = codegen.Adjoint(_kernel_with_two_statics)
 
-        # No wp.static Calls should remain in the tree after replacement.
-        remaining_static_calls = [
-            node
-            for node in ast.walk(adj.tree)
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "static"
-        ]
-        self.assertEqual(remaining_static_calls, [])
+        # No wp.static Calls should remain in the adjoint's tree after replacement.
+        self.assertEqual(find_static_calls(adj.tree), [])
 
         # Both constants should appear as ast.Constant nodes in the tree.
         constants = {node.value for node in ast.walk(adj.tree) if isinstance(node, ast.Constant)}
         self.assertIn(_value_a, constants)
         self.assertIn(_value_b, constants)
+
+        # The shared pristine tree is untouched and still holds the calls.
+        shared = codegen._shared_source_for_code(_kernel_with_two_statics.__code__)
+        self.assertIsNot(adj.tree, shared.tree)
+        self.assertEqual(len(find_static_calls(shared.tree)), 2)
+
+        # Only the paths to replaced calls are copied; untouched statements are aliased.
+        self.assertIs(adj.tree.body[0].body[0], shared.tree.body[0].body[0])  # i = wp.tid()
+        self.assertIsNot(adj.tree.body[0].body[1], shared.tree.body[0].body[1])
+
+        # The view no longer matches the shared tree's derived caches.
+        self.assertIsNone(adj._shared_source)
+
+    def test_substitute_nodes_one_frame_per_level(self):
+        """Copy a deep path to a replacement with one stack frame per tree level."""
+        depth = 2000
+        leaf = ast.Name("x", ast.Load())
+        root = leaf
+        ancestors = set()
+        for _ in range(depth):
+            root = ast.Call(func=ast.Name("f", ast.Load()), args=[root], keywords=[])
+            ancestors.add(root)
+
+        stack_depth = 0
+        frame = sys._getframe()
+        while frame is not None:
+            stack_depth += 1
+            frame = frame.f_back
+        limit = sys.getrecursionlimit()
+        sys.setrecursionlimit(stack_depth + depth + 100)
+        try:
+            view = codegen._substitute_nodes(root, {leaf: ast.Constant(1)}, ancestors)
+        finally:
+            sys.setrecursionlimit(limit)
+
+        original = root
+        for _ in range(depth):
+            self.assertIsNot(view, original)
+            view, original = view.args[0], original.args[0]
+        self.assertEqual(view.value, 1)
+        self.assertIs(original, leaf)
 
     def test_replace_static_expressions_defers_loop_var_reference(self):
         """Defer ``wp.static`` calls that reference a loop variable.
@@ -2793,6 +2897,7 @@ add_kernel_test(
     devices=devices,
 )
 add_kernel_test(TestCodeGen, name="test_range_constant", kernel=test_range_constant, dim=1, devices=devices)
+add_kernel_test(TestCodeGen, name="test_range_constant_empty", kernel=test_range_constant_empty, dim=1, devices=devices)
 add_kernel_test(
     TestCodeGen,
     name="test_range_constant_dynamic_nested",

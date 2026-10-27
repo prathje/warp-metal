@@ -647,6 +647,46 @@ DECLARE_INT_OPS(uint16)
 DECLARE_INT_OPS(uint32)
 DECLARE_INT_OPS(uint64)
 
+inline CUDA_CALLABLE int32 bit_count(uint32 x)
+{
+#if defined(__CUDA_ARCH__)
+    return __popc(static_cast<unsigned int>(x));
+#elif defined(__clang__) || defined(__GNUC__)
+    return __builtin_popcount(static_cast<unsigned int>(x));
+#else
+    int32 count = 0;
+    while (x) {
+        x &= x - uint32(1);
+        ++count;
+    }
+    return count;
+#endif
+}
+
+inline CUDA_CALLABLE int32 bit_count(uint64 x)
+{
+#if defined(__CUDA_ARCH__)
+    return __popcll(static_cast<unsigned long long>(x));
+#elif defined(__clang__) || defined(__GNUC__)
+    return __builtin_popcountll(static_cast<unsigned long long>(x));
+#else
+    int32 count = 0;
+    while (x) {
+        x &= x - uint64(1);
+        ++count;
+    }
+    return count;
+#endif
+}
+
+inline CUDA_CALLABLE int32 bit_count(uint8 x) { return bit_count(static_cast<uint32>(x)); }
+inline CUDA_CALLABLE int32 bit_count(uint16 x) { return bit_count(static_cast<uint32>(x)); }
+// Convert signed inputs to their unsigned width before widening to avoid sign extension.
+inline CUDA_CALLABLE int32 bit_count(int8 x) { return bit_count(static_cast<uint8>(x)); }
+inline CUDA_CALLABLE int32 bit_count(int16 x) { return bit_count(static_cast<uint16>(x)); }
+inline CUDA_CALLABLE int32 bit_count(int32 x) { return bit_count(static_cast<uint32>(x)); }
+inline CUDA_CALLABLE int32 bit_count(int64 x) { return bit_count(static_cast<uint64>(x)); }
+
 /* C++ integer division truncates toward zero; adjust signed, non-exact
    results with opposite signs to round toward negative infinity. */
 template <typename T> inline CUDA_CALLABLE T floordiv_signed(T a, T b)
@@ -1999,6 +2039,18 @@ template <int N> inline CUDA_CALLABLE int tid(size_t index, const launch_bounds_
     return static_cast<int>(coord.i);
 }
 
+// CPU code generation selects the common linear-coordinate specialization once
+// outside the task loop. CUDA and generic CPU paths continue to use tid().
+template <bool Linear, int N> inline int linear_tid(size_t index, const launch_bounds_t<N>& bounds)
+{
+    if constexpr (Linear) {
+        static_assert(N == 1, "The linear wp.tid() specialization requires one-dimensional kernel coordinates");
+        return static_cast<int>(index);
+    } else {
+        return tid(index, bounds);
+    }
+}
+
 template <int N> inline CUDA_CALLABLE_DEVICE void tid(int& i, int& j, size_t index, const launch_bounds_t<N>& bounds)
 {
     launch_coord_t coord = launch_coord(index, bounds);
@@ -2123,7 +2175,7 @@ template <> inline CUDA_CALLABLE int64 atomic_add(int64* buf, int64 value)
     buf[0] += value;
     return old;
 #else  // CUDA compiled by NVRTC
-    unsigned long long int* buf_as_ull = (unsigned long long int*)buf;
+    unsigned long long int* buf_as_ull = reinterpret_cast<unsigned long long int*>(buf);
     unsigned long long int unsigned_value = static_cast<unsigned long long int>(value);
     unsigned long long int result = atomicAdd(buf_as_ull, unsigned_value);
     return static_cast<int64>(result);

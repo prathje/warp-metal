@@ -4,12 +4,16 @@
 import ast
 import inspect
 import textwrap
+import weakref
 from collections.abc import Callable
+from contextlib import contextmanager
 from typing import Any, NamedTuple
 
 import warp as wp
 import warp._src.fem.operator as operator
 from warp._src.codegen import Struct, StructInstance, get_annotations, resolve_closure_or_global
+from warp._src.context import capture_pause, capture_resume, is_conditional_graph_supported
+from warp._src.deterministic import det_buffer_allocation_scope
 from warp._src.fem import cache
 from warp._src.fem.domain import GeometryDomain
 from warp._src.fem.field import (
@@ -39,7 +43,6 @@ from warp._src.fem.types import (
     NULL_DOF_INDEX,
     NULL_ELEMENT_INDEX,
     NULL_NODE_INDEX,
-    NULL_QP_INDEX,
     OUTSIDE,
     DofIndex,
     Domain,
@@ -49,9 +52,26 @@ from warp._src.fem.types import (
 )
 from warp._src.fem.utils import type_zero_element
 from warp._src.logger import log_warning
-from warp._src.types import is_array, type_length, type_repr, type_scalar_type, type_size, type_to_warp
+from warp._src.types import (
+    concrete_array_type,
+    is_array,
+    type_length,
+    type_repr,
+    type_scalar_type,
+    type_size,
+    type_to_warp,
+)
 from warp._src.utils import array_cast, array_scan
-from warp.sparse import BsrMatrix, bsr_axpy, bsr_compress, bsr_set_from_triplets, bsr_set_zero, bsr_zeros
+from warp.sparse import (
+    BsrMatrix,
+    BsrTripletMap,
+    bsr_axpy,
+    bsr_compress,
+    bsr_set_from_mapped_values,
+    bsr_set_from_triplets,
+    bsr_set_zero,
+    bsr_zeros,
+)
 
 __all__ = ["integrate", "interpolate"]
 
@@ -61,6 +81,27 @@ _BSR_CAPACITY_REUSE = "reuse"
 _BSR_CONSTRUCTION_AUTO = "auto"
 _BSR_CONSTRUCTION_TRIPLETS = "triplets"
 _BSR_CONSTRUCTION_ROW_COMPRESS = "row_compress"
+
+_BSR_CONSTRUCTION_MAPPED = "mapped"
+_BSR_CONSTRUCTION_MAPPED_ATOMIC = "mapped_atomic"
+_fem_bsr_triplet_maps = weakref.WeakKeyDictionary()
+
+
+@contextmanager
+def _persistent_allocation_scope(device, capturing):
+    """Allocate retained FEM state outside a live CUDA graph."""
+    # CUDA capture pause/resume and conditional graph nodes share the same
+    # CUDA Toolkit and driver 12.4 requirement.
+    can_pause_capture = capturing and is_conditional_graph_supported()
+    if can_pause_capture:
+        paused_graph = capture_pause(device=device)
+        try:
+            yield
+        finally:
+            capture_resume(paused_graph, device=device)
+    else:
+        with det_buffer_allocation_scope(device, capturing):
+            yield
 
 
 def _bsr_values_as_3d_array(values: wp.array, block_shape: tuple[int, int]) -> wp.array:
@@ -84,10 +125,18 @@ def _normalize_fem_bsr_options(bsr_options: dict[str, Any] | None) -> tuple[dict
         )
 
     construction = sparse_options.pop("construction", _BSR_CONSTRUCTION_TRIPLETS)
-    if construction not in (_BSR_CONSTRUCTION_AUTO, _BSR_CONSTRUCTION_TRIPLETS, _BSR_CONSTRUCTION_ROW_COMPRESS):
+    supported_construction = (
+        _BSR_CONSTRUCTION_AUTO,
+        _BSR_CONSTRUCTION_TRIPLETS,
+        _BSR_CONSTRUCTION_ROW_COMPRESS,
+        _BSR_CONSTRUCTION_MAPPED,
+        _BSR_CONSTRUCTION_MAPPED_ATOMIC,
+    )
+    if construction not in supported_construction:
         raise ValueError(
             f"Unsupported BSR construction policy: {construction}. Expected '{_BSR_CONSTRUCTION_AUTO}', "
-            f"'{_BSR_CONSTRUCTION_TRIPLETS}', or '{_BSR_CONSTRUCTION_ROW_COMPRESS}'"
+            f"'{_BSR_CONSTRUCTION_TRIPLETS}', '{_BSR_CONSTRUCTION_ROW_COMPRESS}', "
+            f"'{_BSR_CONSTRUCTION_MAPPED}', or '{_BSR_CONSTRUCTION_MAPPED_ATOMIC}'"
         )
 
     if "inplace" in sparse_options:
@@ -926,6 +975,7 @@ def get_integrate_bilinear_kernel(
     trial: TrialField,
     output_dtype,
     accumulate_dtype,
+    fused_mapped_atomic: bool,
 ):
     SampleType = domain.geometry.sample_type
 
@@ -940,6 +990,7 @@ def get_integrate_bilinear_kernel(
         values: ValueStruct,
         triplet_rows: wp.array(dtype=int),
         triplet_cols: wp.array(dtype=int),
+        triplet_blocks: wp.array(dtype=int),
         triplet_values: wp.array3d(dtype=output_dtype),
     ):
         test_local_node_index, trial_node, test_dof, trial_dof = wp.tid()
@@ -998,7 +1049,12 @@ def get_integrate_bilinear_kernel(
                 val_sum += accumulate_dtype(qp_weight * vol) * accumulate_dtype(val)
 
             block_offset = element * max_nodes_per_element + trial_node
-            triplet_values[block_offset, test_dof, trial_dof] = output_dtype(val_sum)
+            if wp.static(fused_mapped_atomic):
+                block_index = triplet_blocks[block_offset]
+                if block_index >= 0:
+                    wp.atomic_add(triplet_values, block_index, test_dof, trial_dof, output_dtype(val_sum))
+            else:
+                triplet_values[block_offset, test_dof, trial_dof] = output_dtype(val_sum)
 
             # Set row and column indices
             if test_dof == 0 and trial_dof == 0:
@@ -1013,7 +1069,8 @@ def get_integrate_bilinear_kernel(
                     trial_node_index = NULL_NODE_INDEX  # will get ignored when converting to bsr
                 if triplet_rows:
                     triplet_rows[block_offset] = test_node_index
-                triplet_cols[block_offset] = trial_node_index
+                if triplet_cols:
+                    triplet_cols[block_offset] = trial_node_index
 
     return integrate_kernel_fn
 
@@ -1026,6 +1083,7 @@ def get_integrate_bilinear_nodal_kernel(
     test: TestField,
     output_dtype,
     accumulate_dtype,
+    fused_mapped_atomic: bool,
 ):
     SampleType = domain.geometry.sample_type
 
@@ -1037,6 +1095,7 @@ def get_integrate_bilinear_nodal_kernel(
         values: ValueStruct,
         triplet_rows: wp.array(dtype=int),
         triplet_cols: wp.array(dtype=int),
+        triplet_blocks: wp.array(dtype=int),
         triplet_values: wp.array3d(dtype=output_dtype),
     ):
         local_node_index, test_dof, trial_dof = wp.tid()
@@ -1045,7 +1104,8 @@ def get_integrate_bilinear_nodal_kernel(
         if partition_node_index == NULL_NODE_INDEX:
             if triplet_rows:
                 triplet_rows[local_node_index] = -1
-            triplet_cols[local_node_index] = -1
+            if triplet_cols:
+                triplet_cols[local_node_index] = -1
             return
 
         element_beg, element_end = test.space_restriction.node_element_range(test_restriction_arg, partition_node_index)
@@ -1097,10 +1157,16 @@ def get_integrate_bilinear_nodal_kernel(
 
                 val_sum += accumulate_dtype(node_weight * vol) * accumulate_dtype(val)
 
-        triplet_values[local_node_index, test_dof, trial_dof] = output_dtype(val_sum)
+        if wp.static(fused_mapped_atomic):
+            block_index = triplet_blocks[local_node_index]
+            if block_index >= 0:
+                wp.atomic_add(triplet_values, block_index, test_dof, trial_dof, output_dtype(val_sum))
+        else:
+            triplet_values[local_node_index, test_dof, trial_dof] = output_dtype(val_sum)
         if triplet_rows:
             triplet_rows[local_node_index] = partition_node_index
-        triplet_cols[local_node_index] = partition_node_index
+        if triplet_cols:
+            triplet_cols[local_node_index] = partition_node_index
 
     return integrate_kernel_fn
 
@@ -1168,6 +1234,7 @@ def _generate_integrate_kernel(
     trial: TrialField | None,
     output_dtype: type,
     accumulate_dtype: type,
+    fused_mapped_atomic: bool,
     kernel_options: dict[str, Any] | None = None,
 ) -> wp.Kernel:
     output_dtype = type_scalar_type(output_dtype)
@@ -1176,7 +1243,13 @@ def _generate_integrate_kernel(
 
     # Check if kernel exist in cache
     field_names = tuple((k, f.name) for k, f in arguments.field_args.items())
-    kernel_suffix = ("itg", field_names, cache.pod_type_key(output_dtype), cache.pod_type_key(accumulate_dtype))
+    kernel_suffix = (
+        "itg",
+        field_names,
+        cache.pod_type_key(output_dtype),
+        cache.pod_type_key(accumulate_dtype),
+        fused_mapped_atomic,
+    )
 
     if quadrature is not None:
         kernel_suffix = (quadrature.name, *kernel_suffix)
@@ -1251,6 +1324,7 @@ def _generate_integrate_kernel(
                 test=test,
                 output_dtype=output_dtype,
                 accumulate_dtype=accumulate_dtype,
+                fused_mapped_atomic=fused_mapped_atomic,
             )
         elif isinstance(test, LocalTestField):
             integrate_kernel_fn = get_integrate_bilinear_local_kernel(
@@ -1273,6 +1347,7 @@ def _generate_integrate_kernel(
                 trial=trial,
                 output_dtype=output_dtype,
                 accumulate_dtype=accumulate_dtype,
+                fused_mapped_atomic=fused_mapped_atomic,
             )
 
     kernel, _FieldStruct, _ValueStruct = cache.get_integrand_kernel(
@@ -1297,6 +1372,7 @@ def _generate_auxiliary_kernels(
     test: TestField | None,
     trial: TrialField | None,
     accumulate_dtype: type,
+    fused_mapped_atomic: bool,
     device,
     kernel_options: dict[str, Any] | None = None,
 ) -> list[tuple[wp.Kernel, int]]:
@@ -1322,7 +1398,13 @@ def _generate_auxiliary_kernels(
         if not device.is_cuda or qp_eval_count < 3 * dispatch_tile_size * test.domain.element_count():
             dispatch_tile_size = 1
         dispatch_kernel = make_bilinear_dispatch_kernel(
-            test, trial, quadrature, accumulate_dtype, dispatch_tile_size, kernel_options
+            test,
+            trial,
+            quadrature,
+            accumulate_dtype,
+            dispatch_tile_size,
+            kernel_options=kernel_options,
+            fused_mapped_atomic=fused_mapped_atomic,
         )
 
     return ((dispatch_kernel, dispatch_tile_size),)
@@ -1666,6 +1748,19 @@ def _launch_integrate_kernel(
 
     output_values_require_grad = isinstance(output, BsrMatrix) and output.values.requires_grad
     row_compress_bsr = construction_policy in (_BSR_CONSTRUCTION_ROW_COMPRESS, _BSR_CONSTRUCTION_AUTO)
+    mapped_bsr = construction_policy in (_BSR_CONSTRUCTION_MAPPED, _BSR_CONSTRUCTION_MAPPED_ATOMIC)
+
+    if mapped_bsr and topology != "compact":
+        raise ValueError("Mapped FEM assembly requires bsr_options['topology']='compact'")
+    if mapped_bsr and add_to_output:
+        raise NotImplementedError("Mapped FEM assembly does not support add=True")
+    if mapped_bsr and sparse_bsr_options.get("prune_numerical_zeros", False):
+        raise ValueError("Mapped FEM assembly requires bsr_options['prune_numerical_zeros']=False")
+    if isinstance(output, BsrMatrix) and not mapped_bsr:
+        # A non-mapped assembly may rewrite the matrix topology in place while
+        # retaining the same arrays. Invalidate any cached contribution map so
+        # later mapped reuse fails instead of silently using stale block indices.
+        _fem_bsr_triplet_maps.pop(output, None)
 
     # If we're doing row-local compression or padded assembly,
     # we need to pre-compute per-row capacity.
@@ -1712,35 +1807,79 @@ def _launch_integrate_kernel(
             _require_bsr_capacity(bsr_result, nnz, "fem.integrate()")
             bsr_result.nnz = nnz
     elif bsr_result is None:
-        bsr_result = bsr_zeros(
-            rows_of_blocks=test.space_partition.node_count(),
-            cols_of_blocks=trial.space_partition.node_count(),
-            block_type=block_type,
-            device=device,
-        )
+        bsr_args = {
+            "rows_of_blocks": test.space_partition.node_count(),
+            "cols_of_blocks": trial.space_partition.node_count(),
+            "block_type": block_type,
+            "device": device,
+        }
+        if mapped_bsr and device.is_cuda and device.is_capturing:
+            # The returned matrix outlives the graph just like its cached map.
+            # Allocate its retained storage outside capture so destroying the
+            # setup graph does not invalidate later capacity="reuse" calls.
+            with _persistent_allocation_scope(device, capturing=True):
+                bsr_result = bsr_zeros(**bsr_args, nnz_capacity=nnz)
+        else:
+            bsr_result = bsr_zeros(**bsr_args)
+
+    # Mapped assembly: the first call (or any call with capacity='auto') goes through the regular
+    # triplet path and records the triplet-to-block map; calls with capacity='reuse' then only
+    # update values through that map.
+    triplet_map = None
+    if mapped_bsr and capacity_policy == _BSR_CAPACITY_REUSE:
+        triplet_map = _fem_bsr_triplet_maps.get(bsr_result)
+        if triplet_map is None:
+            raise RuntimeError(
+                "Mapped FEM assembly with bsr_options['capacity']='reuse' requires output from an earlier mapped assembly"
+            )
+        triplet_map.validate(bsr_result)
+        if nnz > triplet_map.triplet_count:
+            raise RuntimeError(
+                "Mapped FEM assembly contribution count exceeds the one used to build the map; "
+                "rebuild it with bsr_options['capacity']='auto'"
+            )
+        # The contribution count is a host-side upper bound, which may have been tightened since
+        # the map was built (e.g., by space_restriction.node_count_sync()). Keep the map's layout;
+        # the extra slots belong to inactive nodes and are mapped to -1.
+        nnz = triplet_map.triplet_count
+    elif mapped_bsr:
+        # The map topology must not depend on the values of the first assembly
+        sparse_bsr_options.setdefault("prune_numerical_zeros", False)
+
+    fused_mapped_atomic = construction_policy == _BSR_CONSTRUCTION_MAPPED_ATOMIC and triplet_map is not None
 
     if row_compress_bsr:
         triplet_rows = None
         triplet_cols = bsr_result.columns[:nnz]
         triplet_values = _bsr_values_as_3d_array(bsr_result.values[:nnz], bsr_result.block_shape)
     else:
-        triplet_rows = cache.borrow_temporary(temporary_store, shape=(nnz,), dtype=int, device=device)
-        triplet_cols = cache.borrow_temporary(temporary_store, shape=(nnz,), dtype=int, device=device)
-        triplet_values = cache.borrow_temporary(
-            temporary_store,
-            shape=(
-                nnz,
-                test.node_dof_count,
-                trial.node_dof_count,
-            ),
-            dtype=output_dtype,
-            device=device,
-        )
+        if fused_mapped_atomic:
+            triplet_rows = None
+            triplet_cols = None
+            triplet_values = _bsr_values_as_3d_array(bsr_result.values[: bsr_result.nnz], bsr_result.block_shape)
+            triplet_values.zero_()
+        else:
+            if triplet_map is None:
+                triplet_rows = cache.borrow_temporary(temporary_store, shape=(nnz,), dtype=int, device=device)
+                triplet_cols = cache.borrow_temporary(temporary_store, shape=(nnz,), dtype=int, device=device)
+            else:
+                triplet_rows = None
+                triplet_cols = None
+            triplet_values = cache.borrow_temporary(
+                temporary_store,
+                shape=(
+                    nnz,
+                    test.node_dof_count,
+                    trial.node_dof_count,
+                ),
+                dtype=output_dtype,
+                device=device,
+            )
 
     if nodal:
         wp.launch(
             kernel=kernel,
-            dim=triplet_values.shape,
+            dim=(nnz, test.node_dof_count, trial.node_dof_count),
             inputs=[
                 domain_elt_arg,
                 domain_elt_index_arg,
@@ -1749,6 +1888,7 @@ def _launch_integrate_kernel(
                 value_struct_values,
                 triplet_rows,
                 triplet_cols,
+                triplet_map._triplet_blocks if fused_mapped_atomic else None,
                 triplet_values,
             ],
             device=device,
@@ -1795,9 +1935,11 @@ def _launch_integrate_kernel(
                 category=UserWarning,
                 stacklevel=2,
             )
-            if triplet_rows:
+            if triplet_map is not None and not fused_mapped_atomic:
+                triplet_values.zero_()
+            if triplet_rows is not None:
                 triplet_rows.fill_(-1)
-            else:
+            if triplet_cols is not None:
                 triplet_cols.fill_(-1)
         else:
             dispatch_kernel, dispatch_tile_size = auxiliary_kernels[0]
@@ -1824,6 +1966,7 @@ def _launch_integrate_kernel(
                     local_result,
                     triplet_rows,
                     triplet_cols,
+                    triplet_map._triplet_blocks if fused_mapped_atomic else None,
                     triplet_values,
                 ],
                 device=device,
@@ -1832,6 +1975,11 @@ def _launch_integrate_kernel(
         local_result.release()
 
     else:
+        if triplet_cols is not None and not row_compress_bsr:
+            # The kernel only writes the node-element slots of active test nodes,
+            # and the restriction may have more slots than active references
+            triplet_cols.fill_(NULL_NODE_INDEX)
+
         trial_partition_arg = trial.space_partition.partition_arg_value(device)
         wp.launch(
             kernel=kernel,
@@ -1852,6 +2000,7 @@ def _launch_integrate_kernel(
                 value_struct_values,
                 triplet_rows,
                 triplet_cols,
+                triplet_map._triplet_blocks if fused_mapped_atomic else None,
                 triplet_values,
             ],
             device=device,
@@ -1860,14 +2009,39 @@ def _launch_integrate_kernel(
     if row_compress_bsr:
         bsr_compress(bsr_result, inplace=not output_values_require_grad, **sparse_bsr_options)
     else:
-        if capacity_policy == _BSR_CAPACITY_REUSE and topology == "compact":
-            _require_bsr_capacity(bsr_result, nnz, "fem.integrate()")
-        bsr_set_from_triplets(
-            bsr_result, rows=triplet_rows, columns=triplet_cols, values=triplet_values, **sparse_bsr_options
-        )
-        triplet_rows.release()
-        triplet_values.release()
-        triplet_cols.release()
+        if not fused_mapped_atomic:
+            if triplet_map is not None:
+                bsr_set_from_mapped_values(bsr_result, triplet_map, triplet_values, reduction="gather")
+            else:
+                if capacity_policy == _BSR_CAPACITY_REUSE and topology == "compact":
+                    _require_bsr_capacity(bsr_result, nnz, "fem.integrate()")
+                built_map = None
+                if mapped_bsr:
+                    # Rebuild the cached map in place when possible. Otherwise, allocate new storage:
+                    # the map is retained by _fem_bsr_triplet_maps, so its storage must not be owned
+                    # by a captured graph. Only the allocation leaves the graph; the map is still built
+                    # by captured work.
+                    built_map = _fem_bsr_triplet_maps.get(bsr_result)
+                    if built_map is None or built_map.capacity < nnz:
+                        with _persistent_allocation_scope(device, device.is_cuda and device.is_capturing):
+                            built_map = BsrTripletMap(capacity=nnz, device=device)
+                bsr_set_from_triplets(
+                    bsr_result,
+                    rows=triplet_rows,
+                    columns=triplet_cols,
+                    values=triplet_values,
+                    build_mapping=built_map,
+                    **sparse_bsr_options,
+                )
+                if mapped_bsr:
+                    _fem_bsr_triplet_maps[bsr_result] = built_map
+
+        if triplet_rows is not None:
+            triplet_rows.release()
+        if not fused_mapped_atomic:
+            triplet_values.release()
+        if triplet_cols is not None:
+            triplet_cols.release()
 
     if add_to_output:
         bsr_axpy(y=output, x=bsr_result, topology=topology)
@@ -1951,6 +2125,24 @@ def integrate(
           :func:`warp.sparse.bsr_compress()`. For row compression, :func:`warp.sparse.bsr_compress()`
           uses ``inplace=False`` when ``output.values.requires_grad`` is true; non-differentiable outputs use
           in-place compression for the lowest memory overhead.
+          ``construction="mapped"`` assembles from triplets and caches the resulting triplet-to-block map
+          (see ``build_mapping`` in :func:`warp.sparse.bsr_set_from_triplets`) when ``capacity="auto"``;
+          calls with ``capacity="reuse"`` on the same output matrix then skip topology construction and
+          perform atomic-free gather reduction through the cached map.
+          ``construction="mapped_atomic"`` reuses the same map and fuses atomic accumulation directly into
+          the integration kernel, avoiding temporary triplet-value storage. Its floating-point
+          accumulation order is non-deterministic; use ``construction="mapped"`` when run-to-run
+          deterministic reduction is required.
+          Both mapped policies require compact topology. They are intended for repeated assembly whose mesh,
+          spaces, restrictions, and quadrature topology remain unchanged; call again with ``capacity="auto"``
+          to rebuild the map after any of those change. Building the map does not synchronize with the host;
+          calling ``output.nnz_sync()`` once after it has been built tightens the launch dimensions of
+          subsequent mapped assemblies.
+          Between mapped calls, no other operation may modify the output matrix, including another
+          :func:`integrate` or :func:`interpolate` call writing through a different assembly strategy, and
+          the mapped assembly strategy must remain unchanged. Non-mapped FEM writes invalidate the cached map,
+          but in-place changes made by custom kernels or external libraries cannot be detected; violating this
+          requirement has undefined behavior.
     """
     if fields is None:
         fields = {}
@@ -1958,8 +2150,7 @@ def integrate(
     if values is None:
         values = {}
 
-    if device is None:
-        device = wp.get_device()
+    device = wp.get_device(device)
 
     # Apple GPUs have no double precision; fall back to single-precision
     # accumulation on Metal devices rather than failing at codegen time —
@@ -2056,6 +2247,14 @@ def integrate(
     else:
         output_dtype = type_to_warp(output_dtype)
 
+    fused_mapped_atomic = (
+        trial is not None
+        and bsr_options is not None
+        and bsr_options.get("construction") == _BSR_CONSTRUCTION_MAPPED_ATOMIC
+        and bsr_options.get("capacity", _BSR_CAPACITY_AUTO) == _BSR_CAPACITY_REUSE
+    )
+    integrate_kernel_fused_atomic = fused_mapped_atomic and not isinstance(test, LocalTestField)
+
     kernel, field_arg_values, value_struct_values = _generate_integrate_kernel(
         integrand=integrand,
         domain=domain,
@@ -2065,6 +2264,7 @@ def integrate(
         trial=trial,
         accumulate_dtype=accumulate_dtype,
         output_dtype=output_dtype,
+        fused_mapped_atomic=integrate_kernel_fused_atomic,
         kernel_options=kernel_options,
     )
 
@@ -2073,6 +2273,7 @@ def integrate(
         test=test,
         trial=trial,
         accumulate_dtype=accumulate_dtype,
+        fused_mapped_atomic=fused_mapped_atomic,
         device=device,
         kernel_options=kernel_options,
     )
@@ -2218,17 +2419,11 @@ def _get_dof_value_function(
         node_coords = space.basis.node_coords_in_element(
             elt_arg, topo_arg, basis_arg, element_index, node_index_in_element
         )
-        node_weight = space.basis.element_inner_weight(
-            elt_arg,
-            topo_arg,
-            basis_arg,
-            element_index,
-            node_coords,
-            node_index_in_element,
-            NULL_QP_INDEX,
+        node_dual_weight = space.basis.node_dual_weight(
+            elt_arg, topo_arg, basis_arg, element_index, node_index_in_element
         )
-        local_value_map = space.local_value_map_inner(elt_arg, element_index, node_coords)
-        dof_value = space.dof_value(space_value, node_weight, local_value_map)
+        local_inverse_value_map = space.local_inverse_value_map_inner(elt_arg, element_index, node_coords)
+        dof_value = space.dof_value(space_value, node_dual_weight, local_inverse_value_map)
 
         return dof_value
 
@@ -2385,6 +2580,33 @@ def get_interpolate_jacobian_at_nodes_kernel(
 
         return vol_sum
 
+    @wp.func
+    def first_sample_element_index(
+        element_beg: int,
+        element_end: int,
+        trial_node: int,
+        domain_arg: domain.ElementArg,
+        domain_index_arg: domain.ElementIndexArg,
+        dest_node_arg: space_restriction.NodeArg,
+        dest_basis_arg: dest_space.basis.BasisArg,
+        dest_topo_arg: dest_space.topology.TopologyArg,
+        trial_topo_arg: trial.space.topology.TopologyArg,
+    ):
+        for n in range(element_beg, element_end):
+            node_element_index = space_restriction.node_element_index(dest_node_arg, n)
+            element_index = domain.element_index(domain_index_arg, node_element_index.domain_element_index)
+            if trial_node < trial.space.topology.element_node_count(domain_arg, trial_topo_arg, element_index):
+                coords = dest_space.basis.node_coords_in_element(
+                    domain_arg,
+                    dest_topo_arg,
+                    dest_basis_arg,
+                    element_index,
+                    node_element_index.node_index_in_element,
+                )
+                if coords[0] != OUTSIDE:
+                    return n
+        return element_end
+
     dof_value_fn = _get_dof_value_function(dest_space)
 
     def interpolate_jacobian_kernel_fn(
@@ -2398,6 +2620,7 @@ def get_interpolate_jacobian_at_nodes_kernel(
         fields: FieldStruct,
         values: ValueStruct,
         triplet_rows: wp.array(dtype=int),
+        row_offsets: wp.array[int],
         triplet_cols: wp.array(dtype=int),
         triplet_values: wp.array3d(dtype=value_type),
     ):
@@ -2424,6 +2647,21 @@ def get_interpolate_jacobian_at_nodes_kernel(
         trial_dof_index = DofIndex(trial_node, trial_dof)
         trial_topo_arg = _get_trial_arg().topo_arg
         node_weight = local_scalar_type(1.0)
+
+        if wp.static(reduction == "first"):
+            # Evaluate only the selected entry; a break would skip its backward replay.
+            element_beg = first_sample_element_index(
+                element_beg,
+                element_end,
+                trial_node,
+                domain_arg,
+                domain_index_arg,
+                dest_node_arg,
+                dest_basis_arg,
+                dest_topo_arg,
+                trial_topo_arg,
+            )
+            element_end = wp.min(element_beg + 1, element_end)
 
         for n in range(element_beg, element_end):
             node_element_index = space_restriction.node_element_index(dest_node_arg, n)
@@ -2475,7 +2713,11 @@ def get_interpolate_jacobian_at_nodes_kernel(
             )
 
             if wp.static(reduction == "first"):
-                block_offset = local_node_index * max_nodes_per_element + trial_node
+                # COO storage is restriction-ordered; BSR capacity is packed by partition row.
+                row_offset = (
+                    local_node_index * max_nodes_per_element if triplet_rows else row_offsets[partition_node_index]
+                )
+                block_offset = row_offset + trial_node
             else:
                 if wp.static(reduction == "weighted_average"):
                     vol = domain.element_measure(domain_arg, sample)
@@ -2496,9 +2738,6 @@ def get_interpolate_jacobian_at_nodes_kernel(
                 if triplet_rows:
                     triplet_rows[block_offset] = partition_node_index
                 triplet_cols[block_offset] = trial_node_index
-
-            if wp.static(reduction == "first"):
-                break
 
     return interpolate_jacobian_kernel_fn
 
@@ -2687,7 +2926,7 @@ def _generate_interpolate_kernel(
     # Check if kernel exist in cache
     field_names = tuple((k, f.name) for k, f in arguments.field_args.items())
 
-    kernel_suffix = ("itp", *field_names, domain.name, type(dest).__name__)
+    kernel_suffix = ("itp", *field_names, domain.name, concrete_array_type(dest).__name__)
 
     if space_restriction is not None:
         kernel_suffix = (kernel_suffix, space_restriction.space_partition.name, reduction)
@@ -2852,6 +3091,7 @@ def _allocate_interpolate_jacobian_triplets(
         dtype=dest.scalar_type,
         shape=(nnz, *dest.block_shape),
         device=device,
+        requires_grad=dest.values.requires_grad,
     )
     triplet_rows.fill_(-1)
     return triplet_rows, triplet_cols, triplet_values
@@ -2868,6 +3108,17 @@ def _validate_interpolate_jacobian_dest(
         )
     if dest.block_shape[1] != trial.node_dof_count:
         raise RuntimeError(f"'dest' matrix blocks must have {trial.node_dof_count} columns")
+
+
+@wp.kernel(enable_backward=False)
+def _fill_interpolate_bsr_row_capacities(
+    partition_node_indices: wp.array[int],
+    max_nodes_per_element: int,
+    row_capacities: wp.array[int],
+):
+    row = partition_node_indices[wp.tid()]
+    if row != NULL_NODE_INDEX:
+        row_capacities[row] = max_nodes_per_element
 
 
 def _interpolate_jacobian_row_compress_storage(
@@ -2911,6 +3162,14 @@ def _launch_interpolate_kernel(
     elt_index_arg = domain.element_index_arg_value(device=device)
 
     sparse_bsr_options, capacity_policy, construction_policy = _normalize_fem_bsr_options(bsr_options)
+    if construction_policy in (_BSR_CONSTRUCTION_MAPPED, _BSR_CONSTRUCTION_MAPPED_ATOMIC):
+        raise NotImplementedError(
+            "Mapped BSR construction is currently supported by fem.integrate() bilinear assembly only"
+        )
+    if isinstance(dest, BsrMatrix):
+        # Sparse interpolation may rewrite topology data without replacing its
+        # arrays, which invalidates any contribution map cached by integrate().
+        _fem_bsr_triplet_maps.pop(dest, None)
     topology = sparse_bsr_options.get("topology", "compact")
     padded_bsr = topology == "padded"
     dest_values_require_grad = isinstance(dest, BsrMatrix) and dest.values.requires_grad
@@ -2957,35 +3216,44 @@ def _launch_interpolate_kernel(
                 space_restriction.node_count() if reduction == "first" else space_restriction.total_node_element_count()
             )
 
-            if row_compress_bsr and reduction == "first":
-                if construction_policy == _BSR_CONSTRUCTION_AUTO:
-                    row_compress_bsr = False
-                else:
-                    raise RuntimeError(
-                        "fem.interpolate() with bsr_options['construction']='row_compress' does not support "
-                        "reduction='first' with a space restriction"
-                    )
-
             if row_compress_bsr:
                 _validate_interpolate_jacobian_dest(
                     point_index_count=space_restriction.space_partition.node_count(),
                     trial=trial,
                     dest=dest,
                 )
-                capacity_nnz = evaluation_point_count * max_nodes_per_element
-                bsr_set_zero(dest, topology="padded")
-                wp.launch(
-                    _fill_integrate_bsr_offsets_from_row_groups,
-                    dim=dest.nrow + 1,
-                    device=dest.device,
-                    inputs=[
-                        dest.nrow,
-                        space_restriction.partition_element_offsets(),
-                        max_nodes_per_element,
-                        dest.offsets,
-                        dest.row_counts,
-                    ],
-                )
+                if reduction == "first":
+                    capacity_nnz = evaluation_point_count * max_nodes_per_element
+                    if capacity_policy == _BSR_CAPACITY_REUSE:
+                        _require_bsr_capacity(dest, capacity_nnz, "fem.interpolate()")
+                    row_capacities = cache.borrow_temporary(temporary_store, shape=dest.nrow, dtype=int, device=device)
+                    row_capacities.zero_()
+                    wp.launch(
+                        _fill_interpolate_bsr_row_capacities,
+                        dim=interpolation_point_count,
+                        inputs=[space_restriction.node_partition_indices(), max_nodes_per_element],
+                        outputs=[row_capacities],
+                        device=device,
+                        record_tape=False,
+                    )
+                    bsr_set_zero(dest, topology="padded", row_capacity=row_capacities, nnz_capacity=capacity_nnz)
+                    wp.copy(dest.row_counts, row_capacities)
+                    row_capacities.release()
+                else:
+                    capacity_nnz = evaluation_point_count * max_nodes_per_element
+                    bsr_set_zero(dest, topology="padded")
+                    wp.launch(
+                        _fill_integrate_bsr_offsets_from_row_groups,
+                        dim=dest.nrow + 1,
+                        device=dest.device,
+                        inputs=[
+                            dest.nrow,
+                            space_restriction.partition_element_offsets(),
+                            max_nodes_per_element,
+                            dest.offsets,
+                            dest.row_counts,
+                        ],
+                    )
                 triplet_rows, triplet_cols, triplet_values = _interpolate_jacobian_row_compress_storage(
                     dest=dest,
                     capacity_nnz=capacity_nnz,
@@ -3023,6 +3291,11 @@ def _launch_interpolate_kernel(
                 elif capacity_policy == _BSR_CAPACITY_REUSE:
                     _require_bsr_capacity(dest, evaluation_point_count * max_nodes_per_element, "fem.interpolate()")
 
+            row_offsets = None
+            if row_compress_bsr and reduction == "first":
+                # Compression rewrites offsets; retain the candidate layout for backward.
+                row_offsets = wp.clone(dest.offsets) if dest_values_require_grad else dest.offsets
+
             wp.launch(
                 kernel=kernel,
                 dim=(interpolation_point_count, max_nodes_per_element, trial.node_dof_count),
@@ -3037,6 +3310,7 @@ def _launch_interpolate_kernel(
                     field_arg_values,
                     value_struct_values,
                     triplet_rows,
+                    row_offsets,
                     triplet_cols,
                     triplet_values,
                 ],
@@ -3247,7 +3521,10 @@ def interpolate(
           ``construction="triplets"`` forces temporary COO triplet construction, while
           ``construction="row_compress"`` forces row-ordered candidate writes followed by
           :func:`warp.sparse.bsr_compress()`. Non-differentiable outputs use in-place compression for the
-          lowest memory overhead. Row compression for quadrature interpolation requires matching evaluation and
+          lowest memory overhead. At nodes, ``reduction="first"`` evaluates the same owning element as triplet
+          construction and packs one trial-element stencil per active restriction node. Storage is bounded by
+          the restriction node-count upper bound times the trial stencil size, without a device readback.
+          Row compression for quadrature interpolation requires matching evaluation and
           indexed point counts.
     """
 
@@ -3262,8 +3539,7 @@ def interpolate(
     if values is None:
         values = {}
 
-    if device is None:
-        device = wp.get_device()
+    device = wp.get_device(device)
 
     if not isinstance(integrand, Integrand):
         raise ValueError("integrand must be tagged with @integrand decorator")

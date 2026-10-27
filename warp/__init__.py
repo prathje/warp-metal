@@ -38,6 +38,7 @@ _register_module_source("warp.autograd", "warp._src.autograd")
 _register_module_source("warp.geometry", "warp._src.geometry.delaunay")
 _register_module_source("warp.geometry.marching_cubes", "warp._src.geometry.marching_cubes")
 _register_module_source("warp.geometry.sparse_marching_cubes", "warp._src.geometry.sparse_marching_cubes")
+_register_module_source("warp.geometry.surface_nets", "warp._src.geometry.surface_nets")
 _register_module_source("warp.math", "warp._src.math")
 _register_module_source("warp.sparse", "warp._src.sparse")
 _register_module_source("warp.utils", "warp._src.utils")
@@ -295,6 +296,7 @@ from warp._src.context import is_cuda_available as is_cuda_available
 
 from warp._src.build import clear_kernel_cache as clear_kernel_cache
 from warp._src.build import clear_lto_cache as clear_lto_cache
+from warp._src.context import get_cpu_kernel_cache_key as get_cpu_kernel_cache_key
 
 from warp._src.context import print_diagnostics as print_diagnostics
 
@@ -307,6 +309,7 @@ from warp._src.codegen import WarpCodegenIndexError as WarpCodegenIndexError
 from warp._src.codegen import WarpCodegenKeyError as WarpCodegenKeyError
 from warp._src.codegen import WarpCodegenTypeError as WarpCodegenTypeError
 from warp._src.codegen import WarpCodegenValueError as WarpCodegenValueError
+from warp._src.deterministic import WarpDeterminismError as WarpDeterminismError
 from warp._src.context import func as func
 from warp._src.context import func_grad as func_grad
 from warp._src.context import func_replay as func_replay
@@ -448,6 +451,7 @@ from warp._src.context import capture_end as capture_end
 from warp._src.context import capture_launch as capture_launch
 from warp._src.context import capture_save as capture_save
 from warp._src.context import capture_load as capture_load
+from warp._src.context import capture_load_from_bytes as capture_load_from_bytes
 from warp._src.context import capture_if as capture_if
 from warp._src.context import capture_while as capture_while
 from warp._src.context import capture_debug_dot_print as capture_debug_dot_print

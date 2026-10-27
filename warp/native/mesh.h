@@ -2501,7 +2501,10 @@ CUDA_CALLABLE inline vec3 mesh_get_point(uint64_t id, int index)
 
 #if FP_CHECK
     if (index >= mesh.num_tris * 3) {
-        printf("mesh_get_point (%llu, %d) out of bounds at %s:%d\n", id, index, __FILE__, __LINE__);
+        printf(
+            "mesh_get_point (%llu, %d) out of bounds at %s:%d\n", static_cast<unsigned long long>(id), index, __FILE__,
+            __LINE__
+        );
         assert(0);
     }
 #endif
@@ -2526,7 +2529,10 @@ CUDA_CALLABLE inline vec3 mesh_get_velocity(uint64_t id, int index)
 
 #if FP_CHECK
     if (index >= mesh.num_tris * 3) {
-        printf("mesh_get_velocity (%llu, %d) out of bounds at %s:%d\n", id, index, __FILE__, __LINE__);
+        printf(
+            "mesh_get_velocity (%llu, %d) out of bounds at %s:%d\n", static_cast<unsigned long long>(id), index,
+            __FILE__, __LINE__
+        );
         assert(0);
     }
 #endif
@@ -2555,6 +2561,7 @@ CUDA_CALLABLE inline int mesh_get_index(uint64_t id, int face_vertex_index)
 }
 
 CUDA_CALLABLE bool mesh_get_descriptor(uint64_t id, Mesh& mesh);
+bool mesh_get_descriptor_host(uint64_t id, Mesh& mesh);
 CUDA_CALLABLE bool mesh_set_descriptor(uint64_t id, const Mesh& mesh);
 CUDA_CALLABLE void mesh_add_descriptor(uint64_t id, const Mesh& mesh);
 CUDA_CALLABLE void mesh_rem_descriptor(uint64_t id);

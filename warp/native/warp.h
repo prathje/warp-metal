@@ -568,6 +568,9 @@ WP_API void wp_deterministic_counter_scan_device(
 WP_API void wp_deterministic_counter_writeback_device(
     uint64_t keys, int count, uint64_t counter_totals, uint64_t counters, int counter_size
 );
+WP_API void wp_deterministic_counter_validate_replay_device(
+    uint64_t expected_counts, uint64_t replay_counts, int count, uint64_t error, int debug
+);
 
 WP_API void wp_bsr_matrix_from_triplets_host(
     int block_size,
@@ -719,7 +722,7 @@ WP_API void* wp_cuda_context_get_stream(void* context);
 WP_API void wp_cuda_context_set_stream(void* context, void* stream, int sync);
 
 // ensures all device side operations have completed in the current context
-WP_API void wp_cuda_context_synchronize(void* context);
+WP_API bool wp_cuda_context_synchronize(void* context);
 
 // profiler control for the current CUDA context (equivalent to cuProfilerStart/cuProfilerStop)
 WP_API bool wp_cuda_profiler_start(void* context);
@@ -748,7 +751,7 @@ WP_API int wp_cuda_stream_query(void* stream);
 WP_API void wp_cuda_stream_register(void* context, void* stream);
 WP_API void wp_cuda_stream_unregister(void* context, void* stream);
 WP_API void* wp_cuda_stream_get_current();
-WP_API void wp_cuda_stream_synchronize(void* stream);
+WP_API bool wp_cuda_stream_synchronize(void* stream);
 WP_API void wp_cuda_stream_wait_event(void* stream, void* event, bool external = false);
 WP_API void wp_cuda_stream_wait_stream(void* stream, void* other_stream, void* event, bool external = false);
 WP_API int wp_cuda_stream_is_capturing(void* stream);
@@ -761,7 +764,7 @@ WP_API void* wp_cuda_event_create(void* context, unsigned flags);
 WP_API void wp_cuda_event_destroy(void* event);
 WP_API int wp_cuda_event_query(void* event);
 WP_API void wp_cuda_event_record(void* event, void* stream, bool external = false);
-WP_API void wp_cuda_event_synchronize(void* event);
+WP_API bool wp_cuda_event_synchronize(void* event);
 WP_API float wp_cuda_event_elapsed_time(void* start_event, void* end_event);
 
 WP_API bool wp_cuda_graph_begin_capture(void* context, void* stream, int external, int mode);
