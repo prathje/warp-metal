@@ -620,6 +620,15 @@ def _emit_big_vec_struct(name: str, n: int, msl_scalar: str) -> str:
             body_lines.append(f"    r.c[{i}] = metal::abs(a.c[{i}]);")
         body_lines.append("    return r;")
         body_lines.append("} }")
+        # Element-wise binary ``wp.min(a, b)`` / ``wp.max(a, b)`` lower to
+        # ``metal::min`` / ``metal::max``; per component, as for the native widths.
+        for fn in ("min", "max"):
+            body_lines.append(f"namespace metal {{ inline {name} {fn}({name} a, {name} b) {{")
+            body_lines.append(f"    {name} r;")
+            for i in range(n):
+                body_lines.append(f"    r.c[{i}] = metal::{fn}(a.c[{i}], b.c[{i}]);")
+            body_lines.append("    return r;")
+            body_lines.append("} }")
     # Compound assignment. Defining ``operator+`` does NOT give C++ (or
     # MSL) ``operator+=``, and the generic reverse-mode templates in
     # ``_ADJ_HELPERS`` accumulate with ``+=`` / ``-=`` on whatever type

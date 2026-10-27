@@ -391,6 +391,37 @@ class TestMetalR3Locals(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet, timeout=120)
 
+    def test_big_vector_elementwise_min_max(self):
+        # Elementwise ``wp.min``/``wp.max`` of two vectors wider than 4 (warp.fem
+        # integrands over vec12 yield parameters in Newton's implicit MPM).
+        snippet = _snippet(
+            """
+            vec12 = wp.types.vector(length=12, dtype=float)
+
+            @wp.kernel
+            def k(a: wp.array[vec12], b: wp.array[vec12], lo: wp.array[vec12], hi: wp.array[vec12]):
+                i = wp.tid()
+                lo[i] = wp.min(a[i], b[i])
+                hi[i] = wp.max(a[i] * 2.0, vec12(0.25))
+
+            rng = np.random.default_rng(4)
+            A = rng.normal(size=(5, 12)).astype(np.float32)
+            B = rng.normal(size=(5, 12)).astype(np.float32)
+
+            def run(dev):
+                a = wp.array(A, dtype=vec12, device=dev)
+                b = wp.array(B, dtype=vec12, device=dev)
+                lo = wp.zeros(5, dtype=vec12, device=dev)
+                hi = wp.zeros(5, dtype=vec12, device=dev)
+                wp.launch(k, 5, [a, b, lo, hi], device=dev)
+                return lo.numpy(), hi.numpy()
+
+            res = compare(run)
+            np.testing.assert_array_equal(res["cpu"][0], np.minimum(A, B))
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
     def test_fixed_array_adjoint(self):
         # The dual of a fixed array is a second fixed array that the
         # element adjoints accumulate into, as on CPU.
