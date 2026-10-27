@@ -252,6 +252,51 @@ class TestMetalUpstream119(unittest.TestCase):
         )
         _run_with_metal_native(self, snippet, timeout=600)
 
+    def test_handle_mesh_ids_match_cpu(self):
+        # GH-2114: ``wp.handle`` is the uint64 object-id type APIC remaps. Mesh
+        # ids in handle arrays, handle params, and handle struct fields
+        # (also inside struct arrays) work as on the CPU.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            @wp.struct
+            class MS:
+                mesh: wp.handle
+                scale: float
+
+            @wp.kernel
+            def k(ids: wp.array(dtype=wp.handle), h: wp.handle, s: MS, sa: wp.array(dtype=MS),
+                  p: wp.array(dtype=wp.vec3), o: wp.array(dtype=float), oid: wp.array(dtype=wp.handle)):
+                i = wp.tid()
+                q0 = wp.mesh_query_point_no_sign(ids[0], p[i], 10.0)
+                q1 = wp.mesh_query_point_no_sign(h, p[i], 10.0)
+                q2 = wp.mesh_query_point_no_sign(s.mesh, p[i], 10.0)
+                q3 = wp.mesh_query_point_no_sign(sa[0].mesh, p[i], 10.0)
+                o[i] = float(q0.face) + 10.0 * q1.u + 100.0 * q2.v * s.scale + 1000.0 * float(q3.result) * sa[0].scale
+                oid[i] = ids[0]
+
+            res = {}
+            for d in ("cpu", "metal:0"):
+                pts = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0]], np.float32)
+                m = wp.Mesh(points=wp.array(pts, dtype=wp.vec3, device=d),
+                            indices=wp.array([0, 1, 2, 1, 3, 2], dtype=int, device=d))
+                s = MS()
+                s.mesh = m.id
+                s.scale = 2.0
+                sa = wp.array([s], dtype=MS, device=d)
+                p = wp.array(np.random.default_rng(0).uniform(-1, 2, (16, 3)).astype(np.float32), dtype=wp.vec3,
+                             device=d)
+                o = wp.zeros(16, dtype=float, device=d)
+                oid = wp.zeros(16, dtype=wp.handle, device=d)
+                wp.launch(k, 16, [wp.array([m.id], dtype=wp.handle, device=d), m.id, s, sa, p, o, oid], device=d)
+                res[d] = o.numpy()
+                assert (oid.numpy() == m.id).all()
+            np.testing.assert_allclose(res["metal:0"], res["cpu"], rtol=1e-6, atol=1e-5)
+            """
+        )
+        _run_with_metal_native(self, snippet, timeout=240)
+
     def test_unported_tile_reductions_raise(self):
         # Metal has no lowering for these yet. 1.19 changed their CPU/CUDA
         # results (GH-2000 tile_sum axis gradients, GH-2003/GH-1781 scan

@@ -235,6 +235,9 @@ _SCALAR_CTYPE_TO_MSL: dict[str, str] = _ScalarMslMap(
         "wp::uint32": "uint",
         "wp::int64": "long",
         "wp::uint64": "ulong",
+        # ``wp.handle`` (GH-2114): a ``uint64`` object id that APIC remaps;
+        # on Metal ids are descriptor GPU addresses, so it is a plain ``ulong``.
+        "wp::handle": "ulong",
         "wp::int8": "char",
         "wp::uint8": "uchar",
         "wp::int16": "short",
@@ -22972,6 +22975,7 @@ def _wp_dtype_to_mx_dtype(wp_dtype):
         wpt.uint16: mx.uint16,
         wpt.int64: mx.int64,
         wpt.uint64: mx.uint64,
+        wpt.handle: mx.uint64,
         wpt.bool: mx.bool_,
     }
     if wp_dtype is wpt.float64:
