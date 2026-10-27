@@ -2072,6 +2072,18 @@ template <typename T> inline void wp_adj_min(T a, T b, thread T& aa, thread T& a
 template <typename T> inline void wp_adj_max(T a, T b, thread T& aa, thread T& ab, T r) {
     if (a > b) aa += r; else ab += r;
 }
+// Elementwise ``wp.min``/``wp.max`` of two vectors: per-component select, as
+// the ``adj_min``/``adj_max`` vec_t overloads of ``warp/native/vec.h``.
+template <typename T, int N>
+inline void wp_adj_min(metal::vec<T, N> a, metal::vec<T, N> b, thread metal::vec<T, N>& aa,
+                       thread metal::vec<T, N>& ab, metal::vec<T, N> r) {
+    for (int i = 0; i < N; ++i) { if (a[i] < b[i]) aa[i] += r[i]; else ab[i] += r[i]; }
+}
+template <typename T, int N>
+inline void wp_adj_max(metal::vec<T, N> a, metal::vec<T, N> b, thread metal::vec<T, N>& aa,
+                       thread metal::vec<T, N>& ab, metal::vec<T, N> r) {
+    for (int i = 0; i < N; ++i) { if (a[i] > b[i]) aa[i] += r[i]; else ab[i] += r[i]; }
+}
 template <typename T> inline void wp_adj_clamp(T x, T a, T b, thread T& ax, thread T& aa, thread T& ab, T r) {
     if (x < a) aa += r; else if (x > b) ab += r; else ax += r;
 }

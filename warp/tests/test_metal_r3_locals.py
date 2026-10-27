@@ -358,6 +358,39 @@ class TestMetalR3Locals(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet, timeout=120)
 
+    def test_vector_min_max_adjoint(self):
+        # Reverse mode of elementwise ``wp.min``/``wp.max`` of two vectors (Newton's
+        # create_soft_contacts heightfield bounds, upstream 2026-10).
+        snippet = _snippet(
+            """
+            @wp.kernel
+            def k(a: wp.array[wp.vec3], b: wp.array[wp.vec3], out: wp.array[float]):
+                i = wp.tid()
+                lo = wp.min(wp.min(a[i], b[i]), a[i] * 0.5)
+                hi = wp.max(a[i], b[i])
+                out[i] = wp.dot(lo, wp.vec3(1.0, 2.0, 3.0)) + wp.dot(hi, wp.vec3(-1.0, 0.5, 4.0))
+
+            rng = np.random.default_rng(3)
+            A = rng.normal(size=(8, 3)).astype(np.float32)
+            B = rng.normal(size=(8, 3)).astype(np.float32)
+
+            def run(dev):
+                a = wp.array(A, dtype=wp.vec3, device=dev, requires_grad=True)
+                b = wp.array(B, dtype=wp.vec3, device=dev, requires_grad=True)
+                out = wp.zeros(8, dtype=float, device=dev, requires_grad=True)
+                tape = wp.Tape()
+                with tape:
+                    wp.launch(k, 8, [a, b, out], device=dev)
+                out.grad.fill_(1.0)
+                tape.backward()
+                return out.numpy(), a.grad.numpy(), b.grad.numpy()
+
+            res = compare(run)
+            assert np.abs(res["cpu"][1]).sum() > 0 and np.abs(res["cpu"][2]).sum() > 0
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
     def test_fixed_array_adjoint(self):
         # The dual of a fixed array is a second fixed array that the
         # element adjoints accumulate into, as on CPU.
