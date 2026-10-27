@@ -2984,6 +2984,38 @@ def _wide_atomic_array_names(arg_vars) -> tuple[set[str], set[str], set[str]]:
     return i64, u64, f16
 
 
+_GRAD_ATOMIC_MSL_TYPES = {"float32": "atomic_float", "int32": "atomic_int", "uint32": "atomic_uint"}
+
+
+def _cast_grad_buffer_atomics(text: str, grad_types: dict[str, str]) -> str:
+    """Cast ``atomic_fetch_{add,sub}_explicit(&adj_x[...], ...)`` targets to
+    ``device atomic_<T>*``.
+
+    Gradient buffers stay plain ``device T*`` (the reverse pass also reads and
+    zeroes them), and the automatic adjoint accumulates through
+    ``wp_adj_accum``. A ``@wp.func_grad`` body writes ``wp.adjoint[x][i] +=
+    v`` itself, which lowers to a plain array atomic on the gradient buffer;
+    without the cast MSL finds no ``atomic_fetch_add_explicit`` overload.
+    """
+    for needle in ("atomic_fetch_add_explicit(&", "atomic_fetch_sub_explicit(&"):
+        out: list[str] = []
+        pos = 0
+        while True:
+            hit = text.find(needle, pos)
+            if hit == -1:
+                break
+            name_start = hit + len(needle)
+            bracket = text.find("[", name_start)
+            name = text[name_start:bracket].strip() if bracket != -1 else ""
+            out.append(text[pos : name_start - 1])
+            msl = grad_types.get(name)
+            out.append(f"(device {msl}*)&" if msl else "&")
+            pos = name_start
+        out.append(text[pos:])
+        text = "".join(out)
+    return text
+
+
 def _rewrite_wide_atomics(text: str, i64: set[str], u64: set[str], f16: set[str]) -> str:
     """Route atomics on 64-bit integer and float16 array elements to the
     ``wp_a64_<op>`` / ``wp_a16_<op>`` helpers.
@@ -19490,6 +19522,15 @@ def _generate_msl_kernel_uncached(
                 _reject_f64_atomics(translated, f64_arr_names | f64_emu_arr_names, adj.fun_name)
         if any(wide_atomic_arr_names):
             translated = _rewrite_wide_atomics(translated, *wide_atomic_arr_names)
+        if grad_array_vars:
+            _grad_atomic_types = {
+                v.label: _GRAD_ATOMIC_MSL_TYPES[t]
+                for v in grad_array_vars
+                # scalar element types only (a vec element is not one atomic)
+                if (t := getattr(getattr(v.type, "dtype", None), "__name__", None)) in _GRAD_ATOMIC_MSL_TYPES
+            }
+            if _grad_atomic_types:
+                translated = _cast_grad_buffer_atomics(translated, _grad_atomic_types)
         _check_no_unsupported_intrinsics(translated)
         return translated
 

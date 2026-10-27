@@ -585,6 +585,61 @@ class TestMetalR9Fixes(unittest.TestCase):
         )
         _run_with_metal_native(self, snippet, timeout=240)
 
+    def test_custom_func_grad_early_return_matches_cpu(self):
+        # Newton's featherstone dense_solve gradient starts with
+        # ``if not tmp or not wp.adjoint[x]: return``. The custom-grad inliner
+        # raised for any return in the gradient body; a return ends the
+        # adjoint (native returns from adj_<func>), including one nested in a
+        # loop.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            @wp.func
+            def acc(n: int, x: wp.array(dtype=float), tmp: wp.array(dtype=float), i: int) -> float:
+                s = float(0.0)
+                for k in range(n):
+                    s += x[i] * float(k + 1)
+                return s
+
+            @wp.func
+            def bump(g: wp.array(dtype=float), i: int, v: float):
+                g[i] = g[i] + v
+
+            @wp.func_grad(acc)
+            def adj_acc(n: int, x: wp.array(dtype=float), tmp: wp.array(dtype=float), i: int, adj_ret: float):
+                if not tmp or not wp.adjoint[x]:
+                    return
+                for k in range(n):
+                    if k >= 2 and x[i] < 0.0:
+                        return
+                    wp.adjoint[x][i] += adj_ret * float(k + 1)
+                    tmp[i] += 1.0
+                # the gradient buffer passed on to another function
+                bump(wp.adjoint[x], i, 1000.0)
+
+            @wp.kernel(module="unique")
+            def k(n: int, x: wp.array(dtype=float), tmp: wp.array(dtype=float), y: wp.array(dtype=float)):
+                i = wp.tid()
+                y[i] = acc(n, x, tmp, i)
+
+            r = {}
+            for d in ("cpu", "metal:0"):
+                x = wp.array(np.linspace(-2, 2, 8).astype(np.float32), dtype=float, device=d, requires_grad=True)
+                tmp = wp.zeros(8, dtype=float, device=d)
+                y = wp.zeros(8, dtype=float, device=d, requires_grad=True)
+                t = wp.Tape()
+                with t:
+                    wp.launch(k, dim=8, inputs=[4, x, tmp, y], device=d)
+                t.backward(grads={y: wp.ones(8, dtype=float, device=d)})
+                r[d] = (y.numpy(), x.grad.numpy(), tmp.numpy())
+            assert np.any(r["cpu"][1] > 500.0) and np.any(r["cpu"][1] < 500.0), r["cpu"][1]
+            for a, b in zip(r["cpu"], r["metal:0"]):
+                np.testing.assert_array_equal(b, a)
+            """
+        )
+        _run_with_metal_native(self, snippet, timeout=240)
+
     def test_numpy_integer_launch_dims(self):
         # CPU/CUDA canonicalize dim with operator.index(); Metal raised a
         # TypeError for dim=np.int64(n) (and numpy entries in a sequence).

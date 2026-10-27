@@ -2781,10 +2781,19 @@ def _inline_custom_grad_call(
         )
     inline_id = _next_inline_id()
     subs: dict[str, str] = {}
+    from warp._src.types import is_array as _is_array  # noqa: PLC0415
+
     for i, pname in enumerate(gparams):
         if i < n_params:
             subs[f"var_{pname}"] = fwd_args[i]
-            subs[f"adj_{pname}"] = adj_args[i]
+            adj_arg = adj_args[i]
+            # ``wp.adjoint[arr]`` is the gradient buffer the reverse kernel
+            # binds as ``adj_<arg>``. Spell it ``var_adj_<arg>`` so the array
+            # passes (address/load/store/atomic folding, len, shape) treat it
+            # like any other array argument; the final rename strips ``var_``.
+            if _is_array(gadj.args[i].type) and re.fullmatch(r"adj_\w+", adj_arg):
+                adj_arg = f"var_{adj_arg}"
+            subs[f"adj_{pname}"] = adj_arg
         else:
             subs[f"var_{pname}"] = adj_rets[i - n_params]
     param_set = set(gparams)
@@ -2795,9 +2804,15 @@ def _inline_custom_grad_call(
         subs[f"var_{var.label}"] = f"var_{inline_id}__{var.label}"
     for tmp in set(_SYNTH_TMP_PAT.findall("\n".join(body))):
         subs[f"var_{tmp}"] = f"var_{inline_id}__{tmp}"
-    if any(re.search(r"\breturn\b|\bgoto\b", ln) for ln in body if not ln.lstrip().startswith("//")):
+    # Loop gotos (start_/end_ labels) are folded into structured loops by
+    # ``parse``; any other goto is unexpected in a forward body.
+    if any(
+        re.search(r"\bgoto\b", ln) and not re.search(r"\bgoto (?:start|end)_\w+;", ln)
+        for ln in body
+        if not ln.lstrip().startswith("//")
+    ):
         raise MetalCodegenError(
-            f"custom adjoint of {fn_overload.key!r}: early returns in a @wp.func_grad body are not supported on Metal"
+            f"custom adjoint of {fn_overload.key!r}: unexpected goto in a @wp.func_grad body on Metal"
         )
     body = [_substitute_var_refs(line, subs) for line in body]
     query_iters = query_iterator_vars(gadj, subs)
@@ -2837,6 +2852,15 @@ def _inline_custom_grad_call(
             if isinstance(var.constant, int) and not isinstance(var.constant, bool):
                 const_ints_out[f"{inline_id}__{var.label}"] = var.constant
     nodes = _inline_walk(nodes, fn_map, depth + 1, max_depth, const_ints_out, struct_locals_out, var_types)
+    # A gradient function returns nothing; an early ``return;`` ends the
+    # adjoint (native: returns from adj_<func>). Same do-while-0 rewrite as
+    # the forward inliner, with a flag for returns nested in loops.
+    if _has_return(nodes):
+        ret_flag = None
+        if _has_loop_nested_return(nodes):
+            ret_flag = f"var_{inline_id}__ret_flag"
+            decls.append(_RawLine(raw=f"    bool {ret_flag} = false;"))
+        nodes = [_DoWhileZero(raw="", body=tuple(_rewrite_returns_to_breaks(nodes, None, ret_flag)))]
     return [*decls, *nodes]
 
 
