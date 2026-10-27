@@ -739,6 +739,56 @@ class TestMetalR9Fixes(unittest.TestCase):
         )
         _run_with_metal_native(self, snippet, timeout=240)
 
+    def test_big_matrix_product_adjoints_match_cpu(self):
+        # Matrices larger than 4x4 (wp.spatial_matrix, mat63) had no Metal
+        # adjoint for mat*vec, vec*mat, mat*scalar, transpose (MSL "no
+        # matching function for call to wp_adj_mul / wp_adj_transpose"):
+        # featherstone's eval_rigid_id backward. Square mat*mat would have
+        # matched the generic wp_adj_mul<T> template, whose aa += b * r is
+        # not the matrix-product adjoint.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            mat63 = wp.types.matrix(shape=(6, 3), dtype=float)
+
+            @wp.kernel(module="unique")
+            def k(A: wp.array(dtype=wp.spatial_matrix), B: wp.array(dtype=wp.spatial_matrix),
+                  v: wp.array(dtype=wp.spatial_vector), C: wp.array(dtype=mat63), u: wp.array(dtype=wp.vec3),
+                  s: wp.array(dtype=float), y: wp.array(dtype=float)):
+                i = wp.tid()
+                a = A[i]
+                b = B[i]
+                m = (a * b) * s[i] + s[i] * wp.transpose(b)
+                w = m * v[i]
+                w2 = v[i] * a
+                w3 = C[i] * u[i]
+                w4 = w3 * C[i] + wp.transpose(C[i]) * w3
+                y[i] = wp.dot(w, w2) + wp.dot(w3, w3) + wp.dot(w4, u[i])
+
+            rng = np.random.default_rng(0)
+            n = 4
+            data = dict(A=rng.standard_normal((n, 6, 6)), B=rng.standard_normal((n, 6, 6)),
+                        v=rng.standard_normal((n, 6)), C=rng.standard_normal((n, 6, 3)),
+                        u=rng.standard_normal((n, 3)), s=rng.standard_normal(n))
+            types = dict(A=wp.spatial_matrix, B=wp.spatial_matrix, v=wp.spatial_vector, C=mat63, u=wp.vec3, s=float)
+            names = ("A", "B", "v", "C", "u", "s")
+            r = {}
+            for d in ("cpu", "metal:0"):
+                arrs = {kk: wp.array(data[kk].astype(np.float32), dtype=types[kk], device=d, requires_grad=True)
+                        for kk in names}
+                y = wp.zeros(n, dtype=float, device=d, requires_grad=True)
+                t = wp.Tape()
+                with t:
+                    wp.launch(k, dim=n, inputs=[arrs[kk] for kk in names] + [y], device=d)
+                t.backward(grads={y: wp.ones(n, dtype=float, device=d)})
+                r[d] = [y.numpy()] + [arrs[kk].grad.numpy() for kk in names]
+            for a, b in zip(r["cpu"], r["metal:0"]):
+                np.testing.assert_allclose(b, a, rtol=2e-5, atol=2e-4)
+            """
+        )
+        _run_with_metal_native(self, snippet, timeout=240)
+
     def test_numpy_integer_launch_dims(self):
         # CPU/CUDA canonicalize dim with operator.index(); Metal raised a
         # TypeError for dim=np.int64(n) (and numpy entries in a sequence).

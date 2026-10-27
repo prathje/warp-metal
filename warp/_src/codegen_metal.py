@@ -1229,6 +1229,55 @@ def _emit_big_mat_struct(name: str, rows: int, cols: int, msl_scalar: str) -> st
         body.append("    }")
         body.append("    return r;")
         body.append("}")
+    # Reverse mode of the products above (``warp/native/mat.h`` adj_mul),
+    # row-major ``c[i * cols + j]``. Without these, a big-matrix product had
+    # no adjoint candidate (MSL compile error), and square mat * mat fell
+    # through to the generic ``wp_adj_mul<T>`` template, whose
+    # ``aa += b * r`` is not the matrix-product adjoint.
+    zero = _sc_zero(msl_scalar)
+    cv = col_at.format(k="k")
+    rv = row_at.format(k="i")
+    body.append(
+        f"inline void wp_adj_mul({name} a, {col_vec_ty} b, thread {name}& aa, thread {col_vec_ty}& ab, "
+        f"{row_vec_ty} r) {{"
+    )
+    body.append(f"    for (int i = 0; i < {rows}; ++i) for (int k = 0; k < {cols}; ++k) {{")
+    body.append(f"        aa.c[i * {cols} + k] += r{rv} * b{cv};")
+    body.append(f"        ab{cv} += a.c[i * {cols} + k] * r{rv};")
+    body.append("    }")
+    body.append("}")
+    body.append(
+        f"inline void wp_adj_mul({row_vec_ty} b, {name} a, thread {row_vec_ty}& ab, thread {name}& aa, "
+        f"{col_vec_ty} r) {{"
+    )
+    body.append(f"    for (int i = 0; i < {rows}; ++i) for (int k = 0; k < {cols}; ++k) {{")
+    body.append(f"        aa.c[i * {cols} + k] += b{rv} * r{cv};")
+    body.append(f"        ab{rv} += a.c[i * {cols} + k] * r{cv};")
+    body.append("    }")
+    body.append("}")
+    for lhs, rhs, adj_l, adj_r, s_name, m_name in (
+        (f"{name} a", f"{msl_scalar} s", f"thread {name}& aa", f"thread {msl_scalar}& as", "s", "a"),
+        (f"{msl_scalar} s", f"{name} a", f"thread {msl_scalar}& as", f"thread {name}& aa", "s", "a"),
+    ):
+        body.append(f"inline void wp_adj_mul({lhs}, {rhs}, {adj_l}, {adj_r}, {name} r) {{")
+        body.append(f"    {msl_scalar} d = {zero};")
+        body.append(f"    for (int i = 0; i < {n}; ++i) {{ aa.c[i] += r.c[i] * {s_name}; d += {m_name}.c[i] * r.c[i]; }}")
+        body.append("    as += d;")
+        body.append("}")
+    if rows == cols:
+        body.append(f"inline void wp_adj_mul({name} a, {name} b, thread {name}& aa, thread {name}& ab, {name} r) {{")
+        body.append(f"    for (int i = 0; i < {rows}; ++i)")
+        body.append(f"    for (int k = 0; k < {cols}; ++k) {{")
+        body.append(f"        {msl_scalar} sa = {zero};")
+        body.append(f"        {msl_scalar} sb = {zero};")
+        body.append(f"        for (int j = 0; j < {cols}; ++j) {{")
+        body.append(f"            sa += r.c[i * {cols} + j] * b.c[k * {cols} + j];")
+        body.append(f"            sb += a.c[j * {cols} + i] * r.c[j * {cols} + k];")
+        body.append("        }")
+        body.append(f"        aa.c[i * {cols} + k] += sa;")
+        body.append(f"        ab.c[i * {cols} + k] += sb;")
+        body.append("    }")
+        body.append("}")
     return "\n".join(body)
 
 
@@ -1314,6 +1363,12 @@ def _emit_big_mat_cross_overloads(
             body.append(f"    for (int r = 0; r < {cols}; ++r)")
             body.append(f"    for (int c = 0; c < {rows}; ++c) t.c[r * {rows} + c] = m.c[c * {cols} + r];")
         body.append("    return t;")
+        body.append("}")
+        # Reverse: element (i, j) of ``m`` receives element (j, i) of ``r``.
+        r_elem = "r[i][j]" if _is_native_mat_shape((cols, rows, scalar)) else f"r.c[j * {rows} + i]"
+        body.append(f"inline void wp_adj_transpose({name} m, thread {name}& am, {t_name} r) {{")
+        body.append(f"    for (int i = 0; i < {rows}; ++i)")
+        body.append(f"    for (int j = 0; j < {cols}; ++j) am.c[i * {cols} + j] += {r_elem};")
         body.append("}")
         # matrix_from_cols / matrix_from_rows for the non-square shapes
         # (the square native sizes are covered by ``_MISC_MATH_HELPERS``).
