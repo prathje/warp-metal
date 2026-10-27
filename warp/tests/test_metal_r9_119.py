@@ -297,6 +297,39 @@ class TestMetalUpstream119(unittest.TestCase):
         )
         _run_with_metal_native(self, snippet, timeout=240)
 
+    def test_apic_graph_load_on_metal_raises(self):
+        # GH-1724 adds capture_load_from_bytes(). APIC graphs are CPU/CUDA
+        # only (capture_begin(apic=True) already raises on Metal); loading
+        # one onto a Metal device must say so instead of failing inside the
+        # native loader as a "CUDA graph".
+        snippet = textwrap.dedent(
+            """
+            import os
+            import tempfile
+
+            @wp.kernel
+            def k(a: wp.array(dtype=float)):
+                i = wp.tid()
+                a[i] = a[i] + 1.0
+
+            a = wp.zeros(4, dtype=float, device="cpu")
+            wp.load_module(device="cpu")
+            with wp.ScopedCapture(device="cpu", apic=True) as cap:
+                wp.launch(k, 4, [a], device="cpu")
+            path = os.path.join(tempfile.mkdtemp(), "g.wrp")
+            wp.capture_save(cap.graph, path)
+            for load in (lambda: wp.capture_load(path, device="metal:0"),
+                         lambda: wp.capture_load_from_bytes(open(path, "rb").read(), device="metal:0")):
+                try:
+                    load()
+                except RuntimeError as e:
+                    assert "Metal" in str(e), e
+                else:
+                    raise AssertionError("APIC graph loaded onto a Metal device")
+            """
+        )
+        _run_with_metal_native(self, snippet, timeout=240)
+
     def test_unported_tile_reductions_raise(self):
         # Metal has no lowering for these yet. 1.19 changed their CPU/CUDA
         # results (GH-2000 tile_sum axis gradients, GH-2003/GH-1781 scan

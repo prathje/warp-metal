@@ -15722,6 +15722,10 @@ def capture_load(path: str, device: DeviceLike = None) -> Graph:
         A :class:`Graph` object that can be launched with :func:`capture_launch`.
     """
     device = get_device(device)
+    if device.is_metal:
+        raise RuntimeError(
+            "APIC graphs (capture_save) cannot be loaded on Metal devices; load onto a CPU or CUDA device"
+        )
     wrp_path = path if path.endswith(".wrp") else path + ".wrp"
 
     device_type = 1 if device.is_cpu else 0
@@ -15804,6 +15808,10 @@ def capture_load_from_bytes(
     from warp._src.apic.types import APICModuleBytes  # noqa: PLC0415
 
     device = get_device(device)
+    if device.is_metal:
+        raise RuntimeError(
+            "APIC graphs (capture_save) cannot be loaded on Metal devices; load onto a CPU or CUDA device"
+        )
 
     if modules is None:
         modules = {}
