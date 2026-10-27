@@ -2469,6 +2469,49 @@ class TestMetalLaunch(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet)
 
+    def test_tile_sort_mid_size_float_keys_match_cpu(self):
+        # Float key tiles of 33..64 elements: the inlined insertion sort was
+        # miscompiled by the Metal compiler (one sorted key slot read back
+        # 0.0, values were right). The lowering now calls a noinline helper.
+        snippet = textwrap.dedent(
+            """
+            import warp as wp
+            import numpy as np
+
+            def make(n):
+                @wp.kernel(module="unique")
+                def k(keys_in: wp.array(dtype=float), vals_in: wp.array(dtype=int),
+                      keys_out: wp.array(dtype=float), vals_out: wp.array(dtype=int)):
+                    keys = wp.tile_load(keys_in, shape=n)
+                    vals = wp.tile_load(vals_in, shape=n)
+                    wp.tile_sort(keys, vals)
+                    wp.tile_store(keys_out, keys)
+                    wp.tile_store(vals_out, vals)
+                return k
+
+            for n in (33, 40, 48, 64):
+                k = make(n)
+                for seed in range(6):
+                    rng = np.random.default_rng(seed)
+                    keys_np = rng.permutation(n).astype(np.float32)
+                    vals_np = np.arange(n, dtype=np.int32)
+                    order = np.argsort(keys_np, kind='stable')
+                    for dev in ('cpu', 'metal:0'):
+                        for bd in (1, 32):
+                            ki = wp.array(keys_np, dtype=wp.float32, device=dev)
+                            vi = wp.array(vals_np, dtype=wp.int32, device=dev)
+                            ko = wp.zeros(n, dtype=wp.float32, device=dev)
+                            vo = wp.zeros(n, dtype=wp.int32, device=dev)
+                            wp.launch_tiled(k, dim=1, inputs=[ki, vi], outputs=[ko, vo],
+                                            block_dim=bd, device=dev)
+                            np.testing.assert_array_equal(ko.numpy(), keys_np[order],
+                                err_msg=f'keys mismatch on {dev} n={n} seed={seed} bd={bd}')
+                            np.testing.assert_array_equal(vo.numpy(), vals_np[order],
+                                err_msg=f'values mismatch on {dev} n={n} seed={seed} bd={bd}')
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=240)
+
     def test_generic_kernel_dtype_any_matches_cpu(self):
         # Kernels declared with ``dtype=Any`` are specialised at launch
         # time. The CUDA/CPU launch path resolves the overload via

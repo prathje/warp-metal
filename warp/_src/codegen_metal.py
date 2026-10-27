@@ -10038,6 +10038,8 @@ def _build_kernel_header(source: str) -> str:
         parts.append(_BVH_HELPERS)
     if "wp_hash_grid_" in source:
         parts.append(_HASHGRID_HELPERS)
+    if "wp_tile_sort_kv(" in source:
+        parts.append(_TILE_SORT_HELPER)
     if "wp_volume_" in source or "wp_adj_volume_" in source:
         parts.append(_volume_helpers())
     misc_math = _emit_misc_math_helpers(source)
@@ -12000,6 +12002,23 @@ _ADJ_TILE_INPLACE_PAT = re.compile(r"\bwp::adj_tile_(add|sub)_inplace\s*\(([^)]*
 # ``block_dim=1`` the cooperative version reduces to a single-thread
 # insertion sort over the tile elements.
 _TILE_SORT_PAT = re.compile(r"\bwp::tile_sort\s*\(\s*var_(\w+)\s*,\s*var_(\w+)\s*\)")
+# Stable key/value insertion sort used by the ``wp::tile_sort`` lowering.
+# Kept out of line on purpose: inlined into a kernel, the Metal compiler
+# miscompiled the same loop for float key tiles of 33..64 elements (one
+# slot of the sorted keys came back 0.0). Pointer types are template
+# parameters so thread- and threadgroup-resident tiles both bind.
+_TILE_SORT_HELPER = """\
+template <typename KP, typename VP>
+__attribute__((noinline)) void wp_tile_sort_kv(KP k, VP v, int n) {
+    for (int i = 1; i < n; ++i) {
+        for (int j = i; j > 0; --j) {
+            if (!(k[j - 1] > k[j])) break;
+            auto tk = k[j - 1]; k[j - 1] = k[j]; k[j] = tk;
+            auto tv = v[j - 1]; v[j - 1] = v[j]; v[j] = tv;
+        }
+    }
+}
+"""
 # ``var_X = wp::tile_diag_add(M_tile, diag_vec, out_tile)`` — adds
 # ``diag_vec`` to the diagonal of ``M_tile``, returning the result.
 # The mujoco_warp dense-Euler kernel uses this for ``qM + dt*damping``.
@@ -14196,20 +14215,10 @@ def _translate_tile_intrinsics(
         n = rows * cols
         if n <= 1:
             return "/* tile_sort: trivial */ (void)0"
-        return (
-            f"{{ for (int _ts_i = 1; _ts_i < {n}; ++_ts_i) {{ "
-            f"auto _ts_k = var_{keys_label}.c[_ts_i]; "
-            f"auto _ts_v = var_{vals_label}.c[_ts_i]; "
-            f"int _ts_j = _ts_i - 1; "
-            f"while (_ts_j >= 0 && var_{keys_label}.c[_ts_j] > _ts_k) {{ "
-            f"var_{keys_label}.c[_ts_j + 1] = var_{keys_label}.c[_ts_j]; "
-            f"var_{vals_label}.c[_ts_j + 1] = var_{vals_label}.c[_ts_j]; "
-            f"--_ts_j; "
-            f"}} "
-            f"var_{keys_label}.c[_ts_j + 1] = _ts_k; "
-            f"var_{vals_label}.c[_ts_j + 1] = _ts_v; "
-            f"}} }}"
-        )
+        # Stable insertion sort in a noinline helper (``_TILE_SORT_HELPER``):
+        # inlined into the kernel body, the Metal compiler miscompiles it
+        # for float key tiles of 33..64 elements (one slot came back 0.0).
+        return f"wp_tile_sort_kv(var_{keys_label}.c, var_{vals_label}.c, {n})"
 
     line = _TILE_SORT_PAT.sub(_repl_tile_sort, line)
 
