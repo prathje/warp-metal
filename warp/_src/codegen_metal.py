@@ -15885,6 +15885,10 @@ class MetalKernelArtifact:
     # ``i, j = wp.tid()``), e.g. ``tile_scatter_masked(t, j, v, m)``: folding
     # the lane dim would run lane 0 only, so such launches raise instead.
     lane_tile_index: bool = False
+    # Serial-model kernel calling ``wp.tile_from_thread``: every thread is its
+    # own block, so a broadcast from another lane cannot be honoured; the
+    # launcher refuses ``block_dim > 1`` (see ``_lane_broadcast_launch_error``).
+    lane_broadcast: bool = False
     # ``True`` when the kernel calls a ``@wp.func_native`` snippet that uses
     # CUDA intra-block primitives (shuffles, barriers, ...). Those only have
     # a faithful lowering in the serial (folded) and distributed-tile models;
@@ -21479,6 +21483,7 @@ def _generate_msl_kernel_uncached(
         # ``wp.block_dim()`` buried in a non-inlined wp.func would be
         # missed, but tile/block kernels call it at kernel scope.
         lane_tile_index=coop_block_n == 0 and _lane_indexes_tile_op(forward_lines) and not _lane_unfold,
+        lane_broadcast=coop_block_n == 0 and any("wp::tile_from_thread" in _ln for _ln in forward_lines),
         tile_block_fold=not _lane_unfold
         and (
             "builtin_block_dim" in "\n".join(adj.blocks[0].body_forward)
@@ -24920,6 +24925,15 @@ def _lane_tile_launch_error(kernel, block_dim: int) -> str:
     )
 
 
+def _lane_broadcast_launch_error(kernel, block_dim: int) -> str:
+    return (
+        f"Kernel '{kernel.key}' calls wp.tile_from_thread(), which broadcasts one lane's value to the whole "
+        f"block. Metal runs this kernel one thread per block, so with block_dim={block_dim} the other lanes' "
+        "values are not available; launch it with block_dim=1 (or restructure the kernel so its tile ops have "
+        "per-lane lowerings at block_dim=32)."
+    )
+
+
 def _fold_tiled_block_dim(artifact, dims: tuple, block_dim: int) -> tuple:
     """Drop the trailing lane dim of a 4-D+ ``wp.launch_tiled`` launch.
 
@@ -25767,6 +25781,8 @@ def launch_metal_kernel_native(
             grid = (dims[0], coop_block_n, 1)
             tg = (1, coop_block_n, 1)
     else:
+        if getattr(artifact, "lane_broadcast", False) and block_dim > 1:
+            raise RuntimeError(_lane_broadcast_launch_error(kernel, block_dim))
         if getattr(artifact, "tile_block_fold", True) and len(dims) > 1 and dims[-1] == block_dim and block_dim > 1:
             if getattr(artifact, "lane_tile_index", False):
                 raise RuntimeError(_lane_tile_launch_error(kernel, block_dim))
@@ -26567,6 +26583,8 @@ def _launch_metal_kernel(
             )
         else:
             dims = (dims[0], coop_block_n)
+    elif getattr(artifact, "lane_broadcast", False) and block_dim > 1:
+        raise RuntimeError(_lane_broadcast_launch_error(kernel, block_dim))
     elif getattr(artifact, "tile_block_fold", True) and len(dims) > 1 and dims[-1] == block_dim and block_dim > 1:
         if getattr(artifact, "lane_tile_index", False):
             raise RuntimeError(_lane_tile_launch_error(kernel, block_dim))

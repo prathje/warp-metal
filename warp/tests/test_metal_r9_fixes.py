@@ -470,6 +470,39 @@ class TestMetalR9Fixes(unittest.TestCase):
         )
         _run_with_metal_native(self, snippet, timeout=240)
 
+    def test_tile_from_thread_with_lanes_raises(self):
+        # Serial-model kernels run one thread per block on Metal, so
+        # tile_from_thread() cannot read another lane's value; block_dim > 1
+        # used to return each thread's own value (CUDA / CPU with
+        # enable_cpu_blocks broadcast the source lane). Now loud; block_dim=1
+        # (the only lane is the source) still runs.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            @wp.kernel(module="unique")
+            def k(output: wp.array(dtype=int)):
+                idx = wp.tid()
+                t = wp.tile_from_thread(shape=(1,), value=idx * 10, thread_idx=wp.block_dim() - 1, storage="shared")
+                output[idx] = wp.tile_extract(t, 0) + idx
+
+            out = wp.zeros(16, dtype=int, device="metal:0")
+            try:
+                wp.launch(k, dim=[16], inputs=[out], block_dim=16, device="metal:0")
+            except RuntimeError as e:
+                assert "tile_from_thread" in str(e), e
+            else:
+                raise AssertionError("tile_from_thread with block_dim=16 did not raise on Metal")
+            res = {}
+            for dev in ("cpu", "metal:0"):
+                o = wp.zeros(16, dtype=int, device=dev)
+                wp.launch(k, dim=[16], inputs=[o], block_dim=1, device=dev)
+                res[dev] = o.numpy()
+            np.testing.assert_array_equal(res["metal:0"], res["cpu"])
+            """
+        )
+        _run_with_metal_native(self, snippet, timeout=240)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
