@@ -18785,6 +18785,13 @@ def _generate_msl_kernel_uncached(
             # Pointer to a struct-array element left over from slot lowering
             # (``arr[i].field = x``): never referenced after the rewrite.
             continue
+        if ctype in ("wp::shape_t", "wp::shape_t*") and not any(
+            re.search(rf"\bvar_{var.label}\b", ln) for ln in forward_lines
+        ):
+            # ``arr.shape`` pointer/value whose statements were folded away
+            # (e.g. a branch of an unrolled loop that is dead for a constant
+            # induction value); live ones alias ``<arr>_shape`` above.
+            continue
         msl_type = _msl_var_type(ctype)
         if var.constant is None:
             # Reverse mode reads primal locals the forward pass only wrote

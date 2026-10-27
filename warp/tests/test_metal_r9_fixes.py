@@ -671,6 +671,38 @@ class TestMetalR9Fixes(unittest.TestCase):
         )
         _run_with_metal_native(self, snippet, timeout=240)
 
+    def test_array_shape_in_unrolled_loop_branch_matches_cpu(self):
+        # Newton's raycast kernel: ``g = a[t] if i == 0 else roots.shape[0] - 1``
+        # inside ``for i in range(2)``. Unrolled, the shape read is dead for
+        # i == 0 and its statements fold away, but the wp::shape_t locals were
+        # still declared: MetalCodegenError "unsupported scalar ctype".
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            @wp.kernel(module="unique")
+            def k(a: wp.array(dtype=int), roots: wp.array(dtype=int), out: wp.array(dtype=int)):
+                t = wp.tid()
+                s = int(0)
+                for i in range(2):
+                    g = a[t] if i == 0 else roots.shape[0] - 1
+                    if roots[g % 4] < 0:
+                        continue
+                    s += g
+                out[t] = s
+
+            r = {}
+            for d in ("cpu", "metal:0"):
+                a = wp.array([5, 6, 7], dtype=int, device=d)
+                roots = wp.zeros(4, dtype=int, device=d)
+                o = wp.zeros(3, dtype=int, device=d)
+                wp.launch(k, dim=3, inputs=[a, roots, o], device=d)
+                r[d] = o.numpy()
+            np.testing.assert_array_equal(r["metal:0"], r["cpu"])
+            """
+        )
+        _run_with_metal_native(self, snippet, timeout=240)
+
     def test_numpy_integer_launch_dims(self):
         # CPU/CUDA canonicalize dim with operator.index(); Metal raised a
         # TypeError for dim=np.int64(n) (and numpy entries in a sequence).
