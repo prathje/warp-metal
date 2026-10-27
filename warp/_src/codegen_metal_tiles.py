@@ -406,6 +406,11 @@ class TileExt:
                 last = off + (vshape[i] - 1) * step
                 if not (0 <= off < pshape_full[d] and 0 <= last < pshape_full[d]):
                     return None
+            elif (vshape[i] - 1) * abs(step) >= pshape_full[d]:
+                # Whatever the runtime origin, the view's extent along this
+                # dim must fit in the parent's (``t[:, j]``: a 16-stride
+                # walk of 8 elements cannot lie in a 16-wide row).
+                return None
             return step
 
         sols: list[list[tuple[int, int]]] = []

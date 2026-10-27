@@ -291,6 +291,25 @@ class TestMetalR9Fixes(unittest.TestCase):
                     res[dev] = (dst.numpy().copy(), src.grad.numpy().copy())
                 np.testing.assert_array_equal(res["metal:0"][0], res["cpu"][0], err_msg=k.key)
                 np.testing.assert_array_equal(res["metal:0"][1], res["cpu"][1], err_msg=k.key + " grad")
+
+            # A runtime column index: the view's extent rules out the
+            # column-stride mapping onto the row dim whatever the origin.
+            @wp.kernel(module="unique")
+            def k_runtime_col(src: wp.array2d[float], j: int, dst: wp.array1d[float]):
+                t = wp.tile_load(src, shape=(M, N))
+                wp.tile_store(dst, t[:, j])
+
+            res = {}
+            for dev in ("cpu", "metal:0"):
+                src = wp.array(src_np, dtype=float, requires_grad=True, device=dev)
+                dst = wp.zeros(M, dtype=float, requires_grad=True, device=dev)
+                with wp.Tape() as tape:
+                    wp.launch_tiled(k_runtime_col, dim=[1], inputs=[src, 5, dst], block_dim=32, device=dev)
+                dst.grad = wp.array(np.arange(1, M + 1, dtype=np.float32), dtype=float, device=dev)
+                tape.backward()
+                res[dev] = (dst.numpy().copy(), src.grad.numpy().copy())
+            np.testing.assert_array_equal(res["metal:0"][0], res["cpu"][0])
+            np.testing.assert_array_equal(res["metal:0"][1], res["cpu"][1])
             """
         )
         _run_with_metal_native(self, snippet, timeout=240)
