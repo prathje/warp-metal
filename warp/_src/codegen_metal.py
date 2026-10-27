@@ -24702,7 +24702,7 @@ def _lane_indexes_tile_op(lines: list[str]) -> bool:
     return m is not None and any(lm.group(1) == m.group(1) for lm in _TILE_LANE_OP_PAT.finditer(text))
 
 
-_TID2D_PAT = re.compile(r"\bbuiltin_tid2d\s*\(\s*var_\w+\s*,\s*var_\w+\s*\)")
+_TID2D_PAT = re.compile(r"\bbuiltin_tid[23]d\s*\(")
 _TILE_SUM_RESULT_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_sum\s*\(")
 _TILE_ATOMIC_ADD_ARGS_PAT = re.compile(r"\bwp::(adj_)?tile_atomic_add\s*(?:<[^()]*>)?\s*\(([^()]*)\)")
 

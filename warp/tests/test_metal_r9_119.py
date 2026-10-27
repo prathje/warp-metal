@@ -564,9 +564,10 @@ class TestMetalUpstream119(unittest.TestCase):
     def test_lane_sum_unfold_covers_adjoint_and_any_value(self):
         # The sum-only pattern must run every lane in the reverse pass too
         # (the adjoint's index wrapping once hid the lane from the detection,
-        # so x.grad got lane 0 of each block only), and whatever the value
-        # depends on: a lane-uniform value, or one that depends on the lane
-        # only through a loop bound, also summed one lane per block.
+        # so x.grad got lane 0 of each block only), whatever the value depends
+        # on (a lane-uniform value, or one that depends on the lane only
+        # through a loop bound, also summed one lane per block), and for a
+        # 3-D wp.tid() (i, j, lane) as well.
         snippet = textwrap.dedent(
             """
             import numpy as np
@@ -596,6 +597,12 @@ class TestMetalUpstream119(unittest.TestCase):
                     v += 1.0
                 wp.tile_atomic_add(out, wp.tile_sum(wp.tile(v)))
 
+            @wp.kernel(module="unique")
+            def sum3d(x: wp.array(dtype=float), out: wp.array(dtype=float)):
+                i, j, lane = wp.tid()
+                v = x[(i * 3 + j) * TS + lane]
+                wp.tile_atomic_add(out, wp.tile_sum(wp.tile(v)))
+
             xs = np.random.default_rng(3).random(3 * TS).astype(np.float32)
             res = {}
             for d in ("cpu", "metal:0"):
@@ -606,9 +613,9 @@ class TestMetalUpstream119(unittest.TestCase):
                     wp.launch(sq_sum, dim=(3, TS), block_dim=TS, inputs=[x, out], device=d)
                 tape.backward(grads={out: wp.ones(1, dtype=float, device=d)})
                 vals = [out.numpy()[0]]
-                for k, args in ((uniform_sum, []), (loop_sum, [x])):
+                for k, dim, args in ((uniform_sum, (3, TS), []), (loop_sum, (3, TS), [x]), (sum3d, (1, 3, TS), [x])):
                     o = wp.zeros(1, dtype=float, device=d)
-                    wp.launch(k, dim=(3, TS), block_dim=TS, inputs=[*args, o], device=d)
+                    wp.launch(k, dim=dim, block_dim=TS, inputs=[*args, o], device=d)
                     vals.append(o.numpy()[0])
                 res[d] = (np.array(vals), x.grad.numpy())
             np.testing.assert_allclose(res["metal:0"][0], res["cpu"][0], rtol=1e-5)
