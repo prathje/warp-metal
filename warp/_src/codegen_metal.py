@@ -17835,6 +17835,9 @@ def _generate_msl_kernel_uncached(
     # lower to nothing at all rather than branching at runtime.
     grad_array_vars: list = []
     grad_arg_of: dict[str, str] = {}
+    # Grad buffers a store adjoint must not zero (``_KEEP_GRAD_SUFFIX``).
+    keep_grad_of: set[str] = {g[: -len(_KEEP_GRAD_SUFFIX)] for g in grad_args if g.endswith(_KEEP_GRAD_SUFFIX)}
+    grad_args = tuple(g[: -len(_KEEP_GRAD_SUFFIX)] if g.endswith(_KEEP_GRAD_SUFFIX) else g for g in grad_args)
     if adjoint:
         from warp._src.codegen import Var as _WpVar  # noqa: PLC0415
 
@@ -19645,7 +19648,7 @@ def _generate_msl_kernel_uncached(
                     body_lines.append(_finalize(f"{indent}{val} -= {tgt};"))
                 else:
                     body_lines.append(_finalize(f"{indent}{val} += {tgt};"))
-                if slot_op == "store":  # an overwrite consumes the incoming gradient
+                if slot_op == "store" and arr not in keep_grad_of:  # an overwrite consumes the incoming gradient
                     body_lines.append(_finalize(f"{indent}{tgt} = 0.0f;"))
                 continue
             m_adj_arr = _ADJ_ARRAY_PAT.match(raw)
@@ -19718,7 +19721,8 @@ def _generate_msl_kernel_uncached(
                         body_lines.append(_finalize(f"{indent}{adj_val}{comp} -= {tgt};"))
                     else:  # array_store consumes the incoming gradient
                         body_lines.append(_finalize(f"{indent}{adj_val}{comp} += {tgt};"))
-                        body_lines.append(_finalize(f"{indent}{tgt} = 0.0f;"))
+                        if arr not in keep_grad_of:
+                            body_lines.append(_finalize(f"{indent}{tgt} = 0.0f;"))
                 continue
 
             m_adj_tile = _ADJ_TILE_ARRAY_PAT.match(raw)
@@ -23580,6 +23584,34 @@ def _struct_array_elem_field_value(arr, struct_type, k: int, fpath: tuple[str, .
     return wp.array(ptr=data, shape=shape, strides=strides, dtype=field_type.dtype, device=arr.device)
 
 
+# Marks a ``grad_args`` entry whose gradient buffer the store adjoints
+# (``adj_array_store`` / ``adj_array_store_slot``) must read without zeroing:
+# warp/native/array.h zeroes it only when it is the forward array's own
+# ``.grad`` and the array does not have ``retain_grad`` set. Part of the
+# backward-artifact cache key like the rest of ``grad_args``.
+_KEEP_GRAD_SUFFIX = "~keep"
+
+
+def _metal_grad_sink(fwd_value, grad_value):
+    """``(grad_array, keep)`` for one array argument of a backward launch.
+
+    Mirrors warp/native/array.h: an explicit adjoint buffer wins; without one
+    the forward array's own ``.grad`` is the sink (``buf.grad`` fallback).
+    ``keep`` is True when a store adjoint must leave the buffer as is (an
+    external buffer, or ``retain_grad`` on the forward array).
+    """
+    import warp  # noqa: PLC0415
+
+    fwd_grad = getattr(fwd_value, "grad", None) if isinstance(fwd_value, warp.array) else None
+    retain = bool(getattr(fwd_value, "_retain_grad", False)) if fwd_grad is not None else False
+    if grad_value is None:
+        if fwd_grad is None or fwd_grad.ptr is None or not fwd_grad.device.is_metal:
+            return None, False
+        return fwd_grad, retain
+    owns = fwd_grad is not None and getattr(grad_value, "ptr", None) == fwd_grad.ptr
+    return grad_value, retain or not owns
+
+
 def _iter_struct_array_grads(struct_type, adj_instance, _path: tuple[str, ...] = ()):
     """Yield ``(field_path, grad_array)`` for a tape-built adjoint struct.
 
@@ -24993,7 +25025,17 @@ def launch_metal_kernel_native(
         # has arguments (or none at all), in which case the missing ones
         # simply have no gradient sink — same tolerance as the CPU/CUDA
         # ``pack_args`` path.
-        for arg, gval in zip(kernel.adj.args, adj_values, strict=False):
+        fwd_values = list(inputs) + list(outputs)
+        for i_arg, arg in enumerate(kernel.adj.args):
+            gval = adj_values[i_arg] if i_arg < len(adj_values) else None
+            fval = fwd_values[i_arg] if i_arg < len(fwd_values) else None
+            if _is_array_arg(arg) and not isinstance(arg.type, Struct):
+                # warp/native/array.h: without an adjoint buffer the array's
+                # own ``.grad`` is the sink; ``keep`` skips the store-adjoint
+                # zeroing (``retain_grad`` or a caller-owned buffer).
+                gval, keep = _metal_grad_sink(fval, gval)
+            else:
+                keep = False
             if gval is None:
                 continue
             if isinstance(arg.type, Struct):
@@ -25009,7 +25051,11 @@ def launch_metal_kernel_native(
                             f"field {'.'.join(fpath)!r} must live on a Metal device; "
                             f"got {getattr(garr, 'device', '?')}"
                         )
-                    names.append(syn)
+                    ffield = fval
+                    for _fname in fpath:
+                        ffield = getattr(ffield, _fname, None)
+                    _sink, fkeep = _metal_grad_sink(ffield, garr)
+                    names.append(syn + _KEEP_GRAD_SUFFIX if fkeep else syn)
                     grad_value_of[f"adj_{syn}"] = garr
                 continue
             if not _is_array_arg(arg):
@@ -25019,7 +25065,7 @@ def launch_metal_kernel_native(
                     f"Kernel '{kernel.key}': gradient array for {arg.label!r} must live on a "
                     f"Metal device; got {getattr(gval, 'device', '?')}"
                 )
-            names.append(arg.label)
+            names.append(arg.label + _KEEP_GRAD_SUFFIX if keep else arg.label)
             grad_value_of[f"adj_{arg.label}"] = gval
         grad_args = tuple(names)
 

@@ -138,6 +138,100 @@ class TestMetalR9Fixes(unittest.TestCase):
         )
         _run_with_metal_native(self, snippet, timeout=240)
 
+    def test_store_adjoint_grad_zeroing_matches_cpu(self):
+        # warp/native/array.h adj_array_store zeroes the gradient it consumes
+        # only when it is the forward array's own .grad and retain_grad is
+        # off; without an adjoint buffer it falls back to the array's .grad.
+        # Metal zeroed every buffer (retain_grad, caller-owned adj_inputs)
+        # and dropped the fallback.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            @wp.kernel(module="unique")
+            def mul2(x: wp.array(dtype=float), y: wp.array(dtype=float)):
+                i = wp.tid()
+                y[i] = 2.0 * x[i]
+
+            @wp.kernel(module="unique")
+            def mul3(x: wp.array(dtype=float), y: wp.array(dtype=float)):
+                i = wp.tid()
+                y[i] = 3.0 * x[i]
+
+            @wp.kernel(module="unique")
+            def store_vec(x: wp.array(dtype=float), y: wp.array(dtype=wp.vec3)):
+                i = wp.tid()
+                y[i] = wp.vec3(x[i], 2.0 * x[i], 3.0 * x[i])
+
+            @wp.kernel(module="unique")
+            def store_comp(x: wp.array(dtype=float), y: wp.array(dtype=wp.vec3)):
+                i = wp.tid()
+                y[i][1] = 5.0 * x[i]
+
+            @wp.struct
+            class S:
+                a: wp.array(dtype=float)
+
+            @wp.kernel(module="unique")
+            def store_struct(x: wp.array(dtype=float), s: S):
+                i = wp.tid()
+                s.a[i] = 4.0 * x[i]
+
+            def run(dev):
+                N = 6
+                r = {}
+                # retain_grad: two writers
+                xa = wp.ones(N, dtype=float, requires_grad=True, device=dev)
+                xb = wp.ones(N, dtype=float, requires_grad=True, device=dev)
+                y = wp.zeros(N, dtype=float, requires_grad=True, retain_grad=True, device=dev)
+                with wp.Tape() as tape:
+                    wp.launch(mul2, dim=N, inputs=[xa, y], device=dev)
+                    wp.launch(mul3, dim=N, inputs=[xb, y], device=dev)
+                tape.backward(grads={y: wp.ones_like(y)})
+                r["retain"] = [xa.grad.numpy(), xb.grad.numpy(), y.grad.numpy()]
+                # vec / component stores
+                for k in (store_vec, store_comp):
+                    for retain in (False, True):
+                        x = wp.ones(N, dtype=float, requires_grad=True, device=dev)
+                        yv = wp.zeros(N, dtype=wp.vec3, requires_grad=True, retain_grad=retain, device=dev)
+                        with wp.Tape() as tape:
+                            wp.launch(k, dim=N, inputs=[x, yv], device=dev)
+                        yv.grad.fill_(wp.vec3(1.0, 1.0, 1.0))
+                        tape.backward()
+                        r[f"{k.key}{retain}"] = [x.grad.numpy(), yv.grad.numpy()]
+                # struct field
+                for retain in (False, True):
+                    x = wp.ones(N, dtype=float, requires_grad=True, device=dev)
+                    s = S()
+                    s.a = wp.zeros(N, dtype=float, requires_grad=True, retain_grad=retain, device=dev)
+                    with wp.Tape() as tape:
+                        wp.launch(store_struct, dim=N, inputs=[x, s], device=dev)
+                    s.a.grad.fill_(1.0)
+                    tape.backward()
+                    r[f"struct{retain}"] = [x.grad.numpy(), s.a.grad.numpy()]
+                # external adjoint buffer: caller-owned, not zeroed
+                x = wp.ones(N, dtype=float, requires_grad=True, device=dev)
+                y = wp.zeros(N, dtype=float, requires_grad=True, device=dev)
+                adj_x = wp.zeros(N, dtype=float, device=dev)
+                adj_y = wp.full(N, 1.0, dtype=float, device=dev)
+                wp.launch(mul2, dim=N, inputs=[x, y], adj_inputs=[adj_x, adj_y], adjoint=True, device=dev)
+                r["external"] = [adj_x.numpy(), adj_y.numpy()]
+                # no adjoint buffers: fall back to .grad
+                x = wp.ones(N, dtype=float, requires_grad=True, device=dev)
+                y = wp.zeros(N, dtype=float, requires_grad=True, device=dev)
+                y.grad.fill_(1.0)
+                wp.launch(mul2, dim=N, inputs=[x, y], adj_inputs=[None, None], adjoint=True, device=dev)
+                r["fallback"] = [x.grad.numpy(), y.grad.numpy()]
+                return r
+
+            c = run("cpu"); m = run("metal:0")
+            for k in c:
+                for a, b in zip(c[k], m[k]):
+                    np.testing.assert_allclose(b, a, err_msg=k)
+            """
+        )
+        _run_with_metal_native(self, snippet, timeout=240)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
