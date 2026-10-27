@@ -623,6 +623,15 @@ def _emit_big_vec_struct(name: str, n: int, msl_scalar: str) -> str:
             body_lines.append(f"    r.c[{i}] = metal::abs(a.c[{i}]);")
         body_lines.append("    return r;")
         body_lines.append("} }")
+        # Element-wise binary ``wp.min(a, b)`` / ``wp.max(a, b)`` lower to
+        # ``metal::min`` / ``metal::max``; per component, as for the native widths.
+        for fn in ("min", "max"):
+            body_lines.append(f"namespace metal {{ inline {name} {fn}({name} a, {name} b) {{")
+            body_lines.append(f"    {name} r;")
+            for i in range(n):
+                body_lines.append(f"    r.c[{i}] = metal::{fn}(a.c[{i}], b.c[{i}]);")
+            body_lines.append("    return r;")
+            body_lines.append("} }")
     # Compound assignment. Defining ``operator+`` does NOT give C++ (or
     # MSL) ``operator+=``, and the generic reverse-mode templates in
     # ``_ADJ_HELPERS`` accumulate with ``+=`` / ``-=`` on whatever type
@@ -2086,6 +2095,18 @@ template <typename T> inline void wp_adj_min(T a, T b, thread T& aa, thread T& a
 }
 template <typename T> inline void wp_adj_max(T a, T b, thread T& aa, thread T& ab, T r) {
     if (a > b) aa += r; else ab += r;
+}
+// Elementwise ``wp.min``/``wp.max`` of two vectors: per-component select, as
+// the ``adj_min``/``adj_max`` vec_t overloads of ``warp/native/vec.h``.
+template <typename T, int N>
+inline void wp_adj_min(metal::vec<T, N> a, metal::vec<T, N> b, thread metal::vec<T, N>& aa,
+                       thread metal::vec<T, N>& ab, metal::vec<T, N> r) {
+    for (int i = 0; i < N; ++i) { if (a[i] < b[i]) aa[i] += r[i]; else ab[i] += r[i]; }
+}
+template <typename T, int N>
+inline void wp_adj_max(metal::vec<T, N> a, metal::vec<T, N> b, thread metal::vec<T, N>& aa,
+                       thread metal::vec<T, N>& ab, metal::vec<T, N> r) {
+    for (int i = 0; i < N; ++i) { if (a[i] > b[i]) aa[i] += r[i]; else ab[i] += r[i]; }
 }
 template <typename T> inline void wp_adj_clamp(T x, T a, T b, thread T& ax, thread T& aa, thread T& ab, T r) {
     if (x < a) aa += r; else if (x > b) ab += r; else ax += r;
@@ -7334,6 +7355,31 @@ _MISC_MATH_HELPERS: dict[str, str] = {
         "        d[jj++] = wp_mat_extract(m, row, j);\n"
         "}"
     ),
+    # Matrix slice store (see the 4-arg ``wp::assign_inplace<...>`` rule);
+    # mirrors the slice ``assign_inplace`` overloads of ``warp/native/mat.h``.
+    "wp_mat_slice_store": (
+        "template <typename M, typename V>\n"
+        "inline void wp_mat_slice_store(thread M& m, wp_slice_t rs, wp_slice_t cs, V v) {\n"
+        "    int ii = 0;\n"
+        "    for (int i = rs.start; (rs.step > 0) ? (i < rs.stop) : (i > rs.stop); i += rs.step, ++ii) {\n"
+        "        int jj = 0;\n"
+        "        for (int j = cs.start; (cs.step > 0) ? (j < cs.stop) : (j > cs.stop); j += cs.step, ++jj)\n"
+        "            wp_mat_elem_store(m, i, j, wp_mat_extract(v, ii, jj));\n"
+        "    }\n"
+        "}\n"
+        "template <typename M, typename V>\n"
+        "inline void wp_mat_slice_store(thread M& m, wp_slice_t rs, int col, V v) {\n"
+        "    int ii = 0;\n"
+        "    for (int i = rs.start; (rs.step > 0) ? (i < rs.stop) : (i > rs.stop); i += rs.step)\n"
+        "        wp_mat_elem_store(m, i, col, v[ii++]);\n"
+        "}\n"
+        "template <typename M, typename V>\n"
+        "inline void wp_mat_slice_store(thread M& m, int row, wp_slice_t cs, V v) {\n"
+        "    int jj = 0;\n"
+        "    for (int j = cs.start; (cs.step > 0) ? (j < cs.stop) : (j > cs.stop); j += cs.step)\n"
+        "        wp_mat_elem_store(m, row, j, v[jj++]);\n"
+        "}"
+    ),
     "wp_argmin": (
         "template <typename V, int N>\n"
         "inline uint wp_argmin_impl(V v) {\n"
@@ -8635,6 +8681,7 @@ def _emit_tile_matmul(r: int, k: int, n: int, msl_scalar: str, trans_a: bool = F
     (see ``_fold_tile_transpose_views``). The arithmetic and summation order
     are the same as for the plain helper on a materialised transpose.
     """
+
     # A 1x1 tile is a plain scalar local (see ``_msl_var_type``).
     def _ty(a: int, b: int) -> str:
         return msl_scalar if a == 1 and b == 1 else f"wp_tile_{a}x{b}_{msl_scalar}"
@@ -8974,11 +9021,7 @@ _NATIVE_BLOCK_SYNC_PAT = re.compile(r"__syncthreads\s*\(\s*\)")
 
 def _wide_block_dim(block_dim: int | None) -> bool:
     """A block width the wide-block model can run (a multiple of the SIMD width above it)."""
-    return (
-        block_dim is not None
-        and _COOP_BLOCK_DIM < block_dim <= _WIDE_BLOCK_MAX
-        and block_dim % _COOP_BLOCK_DIM == 0
-    )
+    return block_dim is not None and _COOP_BLOCK_DIM < block_dim <= _WIDE_BLOCK_MAX and block_dim % _COOP_BLOCK_DIM == 0
 
 
 def _wide_block_eligible(adj) -> bool:
@@ -9282,6 +9325,7 @@ def _coop_collectives_uniform(
     def block_index(rhs: str) -> bool:
         m_div = _COOP_BLOCK_INDEX_PAT.match(rhs)
         return bool(m_div) and m_div.group(1) in tid1d_labels and m_div.group(2) in bd_labels
+
     # Enclosing loops (innermost last) and the loops a lane-dependent
     # ``break`` / ``continue`` (``goto end_X`` / ``goto start_X``) has made
     # divergent: the rest of such a loop runs with a subset of the lanes, and
@@ -11318,6 +11362,16 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
             r"\s*\(\s*([^,()]+?)\s*,\s*([^,()]+?)\s*,\s*([^,()]+?)\s*\)"
         ),
         r"wp_mat_slice_assign(var_\1, \2, \3, \4)",
+    ),
+    # ``wp::assign_inplace<...>(m, r, c, x)`` — matrix slice store
+    # ``m[a:b, c] = x`` / ``m[r, a:b] = x`` / ``m[a:b, c:d] = x`` (the
+    # ``assign_inplace`` slice overloads of ``warp/native/mat.h``).
+    (
+        re.compile(
+            r"\bwp::assign_inplace\s*<[^<>()]*>\s*\(\s*([^,()]+?)\s*,\s*([^,()]+?)\s*,"
+            r"\s*([^,()]+?)\s*,\s*([^,()]+?)\s*\)"
+        ),
+        r"wp_mat_slice_store(\1, \2, \3, \4)",
     ),
     # ``wp::assign_inplace<N>(v, s, x)`` — vector slice store ``v[a:b] = x``.
     (
@@ -13708,7 +13762,9 @@ def _translate_tile_intrinsics(
         if any(lb in smem_tiles or lb in coldist_tiles or lb in distributed_tiles for lb in labels) or any(
             tile_var_vec_n.get(lb, 0) for lb in labels
         ):
-            raise MetalCodegenError(f"MSL codegen: reverse of tile_matmul on these tiles is not supported ({m.group(0)!r})")
+            raise MetalCodegenError(
+                f"MSL codegen: reverse of tile_matmul on these tiles is not supported ({m.group(0)!r})"
+            )
         if any(d[2] == _F64_EMU_MSL for d in dims):
             raise MetalCodegenError(
                 f"MSL codegen: reverse of tile_matmul on emulated float64 tiles is not supported ({m.group(0)!r})"
@@ -13815,9 +13871,7 @@ def _translate_tile_intrinsics(
             )
         if in_n == 1:
             return f"{{ for (int _ab_i = 0; _ab_i < {l_n}; ++_ab_i) {adj_src} += {el(adj_tile, l_n, '_ab_i')}; }}"
-        loop = (
-            f"for (int _ab_r = 0; _ab_r < {l_rows}; ++_ab_r) for (int _ab_c = 0; _ab_c < {l_cols}; ++_ab_c) "
-        )
+        loop = f"for (int _ab_r = 0; _ab_r < {l_rows}; ++_ab_r) for (int _ab_c = 0; _ab_c < {l_cols}; ++_ab_c) "
         tgt = el(adj_tile, l_n, f"_ab_r * {l_cols} + _ab_c")
         src_2d = s_label in tile_2d_labels
         if src_2d and in_cols == 1 and in_rows == l_rows:
@@ -17109,8 +17163,11 @@ def _ensure_adj_built(kernel, block_dim: int | None = None, enable_backward: boo
             if _wide_block_eligible(adj):
                 adj._metal_coop_block_n = block_dim
                 adj._metal_coop_plan = _CoopPlan(
-                    coldist={}, full=set(), tid1d="builtin_tid1d(" in "\n".join(adj.blocks[0].body_forward),
-                    reverse_ok=False, singleton=frozenset(),
+                    coldist={},
+                    full=set(),
+                    tid1d="builtin_tid1d(" in "\n".join(adj.blocks[0].body_forward),
+                    reverse_ok=False,
+                    singleton=frozenset(),
                 )
             else:
                 _build(1, _has_reverse())
@@ -17973,7 +18030,13 @@ def _generate_msl_kernel_uncached(
     # that looks like a write the classifier did not attribute to an array
     # argument (e.g. a store through an array constructed from a pointer
     # inside the kernel) must keep failing loudly instead.
-    _unattributed_write = any(("store" in ln or "atomic" in ln or "array_t<" in ln) for ln in forward_lines)
+    # String literals (``wp.printf`` formats such as "... stored contacts")
+    # are blanked first so their words are not mistaken for writes.
+    _str_lit_pat = re.compile(r'"(?:[^"\\]|\\.)*"')
+    _unattributed_write = any(
+        ("store" in ln or "atomic" in ln or "array_t<" in ln)
+        for ln in (_str_lit_pat.sub('""', raw_ln) for raw_ln in forward_lines)
+    )
     if (
         not output_args
         and not any("volume_store" in ln for ln in forward_lines)
@@ -19448,6 +19511,10 @@ def _generate_msl_kernel_uncached(
         r"^(?P<indent>\s*)if\s*\(\s*(?P<neg>!?)\s*(?:\(\s*var_(?P<n1>\w+)\s*\)|var_(?P<n2>\w+))\s*\)\s*\{\s*$"
     )
     array_arg_labels_local = {a.label for a in adj.args if _is_array_arg(a)}
+    # ``wp.array`` fields of struct args bind as synthetic array args with
+    # their own packed shape (zeroed for a ``None`` field), so they take the
+    # same truth test; the view fold names them in place of the field load.
+    array_arg_labels_local |= {v.label for v in struct_field_array_vars}
     array_truth_unot_pat = re.compile(r"wp::unot\(\s*var_(?P<name>\w+)\s*\)")
     array_truth_adj_where_pat = re.compile(r"wp::adj_where\(\s*var_(?P<name>\w+)\s*,")
     array_truth_where_pat = re.compile(
@@ -25040,8 +25107,14 @@ def _array_params_aliasing(inputs: list, outputs: list):
 _ALIAS_VARIANT_CACHE_MAX = 64
 
 
-def _alias_variant_pso(kernel, artifact, topology: tuple[tuple[str, str, int], ...], offsets: tuple[int, ...],
-                       adjoint: bool, grad_args: tuple[str, ...]):
+def _alias_variant_pso(
+    kernel,
+    artifact,
+    topology: tuple[tuple[str, str, int], ...],
+    offsets: tuple[int, ...],
+    adjoint: bool,
+    grad_args: tuple[str, ...],
+):
     """``(pso, offsets binding or None)`` for a launch that binds overlapping
     memory to several array params.
 

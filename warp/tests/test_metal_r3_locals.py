@@ -174,6 +174,254 @@ class TestMetalR3Locals(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet, timeout=120)
 
+    def test_fixed_array_views_selected_by_branch(self):
+        # Newton's multicontact (2026-10) picks the vertex/face polygons out of
+        # views of one thread-local buffer in an if/else; Warp merges the array
+        # locals with ``wp::where``. The views differ in offset and in shape.
+        snippet = _snippet(
+            """
+            @wp.func
+            def fill(buf: wp.array[wp.vec2], n: int, base: float):
+                for i in range(n):
+                    buf[i] = wp.vec2(base + float(i), float(i * i))
+
+            @wp.func
+            def weigh(poly: wp.array[wp.vec2], other: wp.array[wp.vec2]) -> float:
+                s = float(0.0)
+                for i in range(poly.shape[0]):
+                    s += poly[i][0] * float(i + 1)
+                for i in range(other.shape[0]):
+                    s += 1000.0 * other[i][1]
+                return s + 1.0e5 * float(poly.shape[0]) + 1.0e6 * float(other.shape[0])
+
+            @wp.func
+            def pick(flag: int, b_buffer: wp.array[wp.vec2], a_buffer: wp.array[wp.vec2]) -> float:
+                poly = a_buffer
+                other = b_buffer
+                if flag == 1:
+                    poly = wp.array(ptr=b_buffer.ptr, shape=(5,), dtype=wp.vec2)
+                    other = a_buffer
+                elif flag == 2:
+                    poly = b_buffer
+                    other = wp.array(ptr=b_buffer.ptr + wp.uint64(2 * 8), shape=(3,), dtype=wp.vec2)
+                poly[0] = poly[0] + wp.vec2(0.5, 0.0)
+                return weigh(poly, other)
+
+            @wp.kernel
+            def k(flags: wp.array[int], out: wp.array[float], first: wp.array[wp.vec2]):
+                tid = wp.tid()
+                b_buffer = wp.zeros(shape=(10,), dtype=wp.vec2f)
+                a_buffer = wp.array(ptr=b_buffer.ptr + wp.uint64(5 * 8), shape=(5,), dtype=wp.vec2f)
+                fill(b_buffer, 5, float(tid))
+                fill(a_buffer, 5, 100.0 + float(tid))
+                out[tid] = pick(flags[tid], b_buffer, a_buffer)
+                first[tid] = b_buffer[0] + a_buffer[0]
+
+            def run(dev):
+                flags = wp.array([0, 1, 2, 1, 0, 2], dtype=int, device=dev)
+                o = wp.zeros(6, dtype=float, device=dev)
+                f = wp.zeros(6, dtype=wp.vec2, device=dev)
+                wp.launch(k, 6, [flags, o, f], device=dev)
+                return o.numpy(), f.numpy()
+
+            res = compare(run)
+            assert len(set(res["cpu"][0].tolist())) == 6
+
+            # Views of different thread-local allocations cannot be merged.
+            @wp.kernel
+            def k_bad(flags: wp.array[int], out: wp.array[float]):
+                tid = wp.tid()
+                x = wp.zeros(shape=(4,), dtype=float)
+                y = wp.zeros(shape=(4,), dtype=float)
+                y[1] = 2.0
+                sel = x
+                if flags[tid] != 0:
+                    sel = y
+                out[tid] = sel[1]
+
+            from warp._src.codegen_metal import MetalCodegenError
+
+            try:
+                wp.launch(k_bad, 2, [wp.array([0, 1], dtype=int, device="metal:0"), wp.zeros(2, dtype=float, device="metal:0")], device="metal:0")
+            except MetalCodegenError as e:
+                assert "different storage" in str(e), e
+            else:
+                raise AssertionError("expected a MetalCodegenError")
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=180)
+
+    def test_struct_arg_array_field_truthiness(self):
+        # Newton's VBD soft-contact filter (``if not data.features: return True``
+        # inside an inlined function) tests a ``wp.array`` field of a struct
+        # kernel arg for ``None``; ``if``, ``not`` and the phi select must all
+        # test the field's packed shape on Metal.
+        snippet = _snippet(
+            """
+            @wp.struct
+            class S:
+                features: wp.array[wp.vec3i]
+                count: wp.array[wp.int32]
+                n: int
+
+            @wp.func
+            def enabled(i: int, s: S) -> bool:
+                if not s.features:
+                    return True
+                if i >= wp.min(s.count[0], s.n):
+                    return False
+                return s.features[i][0] >= 0
+
+            @wp.func
+            def has(s: S) -> int:
+                r = 5
+                if s.features:
+                    r = 9
+                return r
+
+            @wp.kernel
+            def k(s: S, out: wp.array[int]):
+                i = wp.tid()
+                v = wp.where(enabled(i, s), 1, 0) + 10 * has(s)
+                if s.count:
+                    v += 100
+                if not s.features:
+                    v += 1000
+                out[i] = v
+
+            def run(dev):
+                res = []
+                for empty in (False, True):
+                    s = S()
+                    if not empty:
+                        s.features = wp.array([[1, 0, 0], [-1, 0, 0], [2, 0, 0], [3, 0, 0]], dtype=wp.vec3i, device=dev)
+                    s.count = wp.array([3], dtype=wp.int32, device=dev)
+                    s.n = 4
+                    out = wp.zeros(4, dtype=int, device=dev)
+                    wp.launch(k, 4, [s, out], device=dev)
+                    res.append(out.numpy())
+                return res
+
+            res = compare(run)
+            assert res["cpu"][0].tolist() == [191, 190, 191, 190], res["cpu"]
+            assert res["cpu"][1].tolist() == [1151] * 4, res["cpu"]
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=180)
+
+    def test_printf_only_kernel_with_write_words(self):
+        # A diagnostic kernel that only prints is a no-op under native dispatch.
+        # Words like "stored" or "atomic" inside the printf format must not be
+        # read as unattributed writes (Newton's VBD check_contact_overflow).
+        snippet = _snippet(
+            """
+            @wp.kernel
+            def check(overflow: wp.array[wp.int32], cap: int):
+                if overflow[0] > cap:
+                    wp.printf("Warning: overflowed %d > %d; scanning all stored contacts (atomic).\\n", overflow[0], cap)
+
+            a = wp.array([5], dtype=wp.int32, device="metal:0")
+            wp.launch(check, 1, [a, 3], device="metal:0")
+            wp.synchronize_device("metal:0")
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
+    def test_matrix_slice_stores(self):
+        # ``m[a:b, c] = v``, ``m[r, a:b] = v`` and ``m[a:b, c:d] = n`` lower to
+        # templated 4-argument ``wp::assign_inplace`` (Newton's implicit MPM
+        # strain-mode kernels, upstream 2026-10).
+        snippet = _snippet(
+            """
+            @wp.kernel
+            def k(out: wp.array[wp.mat44], out3: wp.array[wp.mat33]):
+                i = wp.tid()
+                m = wp.mat44(0.0)
+                m[1:3, 2] = wp.vec2(1.0 + float(i), 2.0)
+                m[0, 1:4] = wp.vec3(3.0, 4.0, 5.0 * float(i))
+                m[2:4, 0:2] = wp.mat22(6.0, 7.0, 8.0, 9.0 + float(i))
+                m[3, ::-2] = wp.vec2(-1.0, -2.0)
+                out[i] = m
+                a = wp.mat33(0.0)
+                a[0:2, 1] = wp.vec2(1.0, 2.0 * float(i))
+                out3[i] = a
+
+            def run(dev):
+                o = wp.zeros(3, dtype=wp.mat44, device=dev)
+                o3 = wp.zeros(3, dtype=wp.mat33, device=dev)
+                wp.launch(k, 3, [o, o3], device=dev)
+                return o.numpy(), o3.numpy()
+
+            res = compare(run)
+            assert np.abs(res["cpu"][0]).sum() > 0
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
+    def test_vector_min_max_adjoint(self):
+        # Reverse mode of elementwise ``wp.min``/``wp.max`` of two vectors (Newton's
+        # create_soft_contacts heightfield bounds, upstream 2026-10).
+        snippet = _snippet(
+            """
+            @wp.kernel
+            def k(a: wp.array[wp.vec3], b: wp.array[wp.vec3], out: wp.array[float]):
+                i = wp.tid()
+                lo = wp.min(wp.min(a[i], b[i]), a[i] * 0.5)
+                hi = wp.max(a[i], b[i])
+                out[i] = wp.dot(lo, wp.vec3(1.0, 2.0, 3.0)) + wp.dot(hi, wp.vec3(-1.0, 0.5, 4.0))
+
+            rng = np.random.default_rng(3)
+            A = rng.normal(size=(8, 3)).astype(np.float32)
+            B = rng.normal(size=(8, 3)).astype(np.float32)
+
+            def run(dev):
+                a = wp.array(A, dtype=wp.vec3, device=dev, requires_grad=True)
+                b = wp.array(B, dtype=wp.vec3, device=dev, requires_grad=True)
+                out = wp.zeros(8, dtype=float, device=dev, requires_grad=True)
+                tape = wp.Tape()
+                with tape:
+                    wp.launch(k, 8, [a, b, out], device=dev)
+                out.grad.fill_(1.0)
+                tape.backward()
+                return out.numpy(), a.grad.numpy(), b.grad.numpy()
+
+            res = compare(run)
+            assert np.abs(res["cpu"][1]).sum() > 0 and np.abs(res["cpu"][2]).sum() > 0
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
+    def test_big_vector_elementwise_min_max(self):
+        # Elementwise ``wp.min``/``wp.max`` of two vectors wider than 4 (warp.fem
+        # integrands over vec12 yield parameters in Newton's implicit MPM).
+        snippet = _snippet(
+            """
+            vec12 = wp.types.vector(length=12, dtype=float)
+
+            @wp.kernel
+            def k(a: wp.array[vec12], b: wp.array[vec12], lo: wp.array[vec12], hi: wp.array[vec12]):
+                i = wp.tid()
+                lo[i] = wp.min(a[i], b[i])
+                hi[i] = wp.max(a[i] * 2.0, vec12(0.25))
+
+            rng = np.random.default_rng(4)
+            A = rng.normal(size=(5, 12)).astype(np.float32)
+            B = rng.normal(size=(5, 12)).astype(np.float32)
+
+            def run(dev):
+                a = wp.array(A, dtype=vec12, device=dev)
+                b = wp.array(B, dtype=vec12, device=dev)
+                lo = wp.zeros(5, dtype=vec12, device=dev)
+                hi = wp.zeros(5, dtype=vec12, device=dev)
+                wp.launch(k, 5, [a, b, lo, hi], device=dev)
+                return lo.numpy(), hi.numpy()
+
+            res = compare(run)
+            np.testing.assert_array_equal(res["cpu"][0], np.minimum(A, B))
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
     def test_fixed_array_adjoint(self):
         # The dual of a fixed array is a second fixed array that the
         # element adjoints accumulate into, as on CPU.
