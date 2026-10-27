@@ -405,6 +405,39 @@ class TestMetalUpstream119(unittest.TestCase):
         )
         _run_with_metal_native(self, snippet, timeout=240)
 
+    def test_bsr_transpose_under_tape_matches_cpu(self):
+        # 1.19's BSR expression evaluation builds the transposed topology
+        # through bsr_set_from_triplets under an active wp.Tape. The Metal
+        # triplet builder's integer dispatches must stay off the tape (their
+        # adjoints have no outputs), as the native CPU/CUDA builder does.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+            import warp.sparse as sp
+
+            res = {}
+            for d in ("cpu", "metal:0"):
+                rows = wp.array([0, 1, 2, 3, 2, 1], dtype=int, device=d)
+                cols = wp.array([1, 4, 1, 3, 0, 2], dtype=int, device=d)
+                vals_np = np.random.default_rng(123).random(size=(6, 1, 3)).astype(np.float32)
+                vals = wp.array(vals_np, dtype=wp.types.matrix(shape=(1, 3), dtype=float), device=d)
+                A = sp.bsr_zeros(65, 67, wp.types.matrix(shape=(1, 3), dtype=float), device=d)
+                sp.bsr_set_from_triplets(A, rows, cols, vals)
+                A.values.requires_grad = True
+                with wp.Tape() as tape:
+                    T = (2.0 * A).transpose().eval()
+                seed = wp.array(np.ones_like(T.values.numpy()), dtype=T.values.dtype, device=d)
+                tape.backward(grads={T.values: seed})
+                T.nnz_sync()
+                n = int(T.offsets.numpy()[T.nrow])
+                res[d] = (T.offsets.numpy(), T.columns.numpy()[:n], T.values.numpy()[:n], A.values.grad.numpy())
+            for c, m in zip(res["cpu"], res["metal:0"]):
+                np.testing.assert_allclose(m, c, rtol=1e-6)
+            np.testing.assert_allclose(res["metal:0"][3], 2.0)
+            """
+        )
+        _run_with_metal_native(self, snippet, timeout=240)
+
     def test_unported_tile_reductions_raise(self):
         # Metal has no lowering for these yet. 1.19 changed their CPU/CUDA
         # results (GH-2000 tile_sum axis gradients, GH-2003/GH-1781 scan

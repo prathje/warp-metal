@@ -1258,10 +1258,13 @@ def _bsr_set_from_triplets_metal(
         else wp.empty((0, 1, 1), dtype=dest.scalar_type, device=device)
     )
     count_arr = count if count is not None else wp.empty(1, dtype=int, device=device)
+    # Topology-only integer dispatches: never recorded on a wp.Tape (their
+    # adjoints have no outputs), as the CPU/CUDA native builder is not.
     wp.launch(
         _bsr_triplet_keys_metal,
         dim=nnz,
         device=device,
+        record_tape=False,
         inputs=[
             nnz,
             count_arr,
@@ -1279,7 +1282,9 @@ def _bsr_set_from_triplets_metal(
     )
     _mu.radix_sort_pairs(keys, indices, nnz, 0, end_bit)
     heads = wp.empty(nnz, dtype=int, device=device)
-    wp.launch(_bsr_triplet_heads_metal, dim=nnz, device=device, inputs=[nnz, sentinel, keys, heads])
+    wp.launch(
+        _bsr_triplet_heads_metal, dim=nnz, device=device, inputs=[nnz, sentinel, keys, heads], record_tape=False
+    )
     _mu.array_scan(heads, heads, True)
     row_ends = wp.full(dest.nrow, -1, dtype=int, device=device)
     has_summed = summed_offsets is not None
@@ -1288,6 +1293,7 @@ def _bsr_set_from_triplets_metal(
         _bsr_triplet_emit_metal,
         dim=nnz,
         device=device,
+        record_tape=False,
         inputs=[
             nnz,
             dest.ncol,
@@ -1302,7 +1308,13 @@ def _bsr_set_from_triplets_metal(
             dest_columns,
         ],
     )
-    wp.launch(_bsr_triplet_offsets_metal, dim=dest.nrow, device=device, inputs=[dest.nrow, row_ends, dest_offsets])
+    wp.launch(
+        _bsr_triplet_offsets_metal,
+        dim=dest.nrow,
+        device=device,
+        inputs=[dest.nrow, row_ends, dest_offsets],
+        record_tape=False,
+    )
     if device.is_capturing:
         graph = wp._src.context.runtime._metal_capture_graph
         graph._metal_retain.extend((keys, indices, heads, row_ends, dummy, values_3d, count_arr))
