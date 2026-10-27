@@ -17801,7 +17801,13 @@ def _generate_msl_kernel_uncached(
     # that looks like a write the classifier did not attribute to an array
     # argument (e.g. a store through an array constructed from a pointer
     # inside the kernel) must keep failing loudly instead.
-    _unattributed_write = any(("store" in ln or "atomic" in ln or "array_t<" in ln) for ln in forward_lines)
+    # String literals (``wp.printf`` formats such as "... stored contacts")
+    # are blanked first so their words are not mistaken for writes.
+    _str_lit_pat = re.compile(r'"(?:[^"\\]|\\.)*"')
+    _unattributed_write = any(
+        ("store" in ln or "atomic" in ln or "array_t<" in ln)
+        for ln in (_str_lit_pat.sub('""', raw_ln) for raw_ln in forward_lines)
+    )
     if (
         not output_args
         and not any("volume_store" in ln for ln in forward_lines)

@@ -309,6 +309,24 @@ class TestMetalR3Locals(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet, timeout=180)
 
+    def test_printf_only_kernel_with_write_words(self):
+        # A diagnostic kernel that only prints is a no-op under native dispatch.
+        # Words like "stored" or "atomic" inside the printf format must not be
+        # read as unattributed writes (Newton's VBD check_contact_overflow).
+        snippet = _snippet(
+            """
+            @wp.kernel
+            def check(overflow: wp.array[wp.int32], cap: int):
+                if overflow[0] > cap:
+                    wp.printf("Warning: overflowed %d > %d; scanning all stored contacts (atomic).\\n", overflow[0], cap)
+
+            a = wp.array([5], dtype=wp.int32, device="metal:0")
+            wp.launch(check, 1, [a, 3], device="metal:0")
+            wp.synchronize_device("metal:0")
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=120)
+
     def test_fixed_array_adjoint(self):
         # The dual of a fixed array is a second fixed array that the
         # element adjoints accumulate into, as on CPU.
