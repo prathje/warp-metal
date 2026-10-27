@@ -358,6 +358,53 @@ class TestMetalUpstream119(unittest.TestCase):
         )
         _run_with_metal_native(self, snippet, timeout=240)
 
+    def test_range_with_runtime_step_matches_cpu(self):
+        # ``range(start, stop, step)`` with a step known only at run time:
+        # the MSL loop used ``i < stop`` whatever the sign, so a negative
+        # step ran no iterations and a zero step never terminated
+        # (upstream test_codegen test_range_dynamic_reverse*). Covers the
+        # kernel body, an inlined @wp.func and a loop variable read after
+        # the loop.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            @wp.func
+            def count(start: int, stop: int, step: int):
+                n = int(0)
+                for _i in range(start, stop, step):
+                    n += 1
+                return n
+
+            @wp.kernel
+            def k(start: int, stop: int, step: int, out: wp.array(dtype=int), n: wp.array(dtype=int)):
+                c = int(0)
+                last = int(-99)
+                for i in range(start, stop, step):
+                    if c < 8:
+                        out[c] = i
+                    c += 1
+                    last = i
+                n[0] = c
+                n[1] = count(start, stop, step)
+                n[2] = last
+
+            cases = [(0, 4, 1), (4, 0, -1), (8, 0, -2), (0, 8, 3), (3, 3, -1), (0, 5, 0), (5, 0, 0), (-3, -10, -3)]
+            for args in cases:
+                res = {}
+                for d in ("cpu", "metal:0"):
+                    out = wp.full(8, -1, dtype=int, device=d)
+                    n = wp.zeros(3, dtype=int, device=d)
+                    wp.launch(k, 1, [*args, out, n], device=d)
+                    res[d] = (out.numpy(), n.numpy())
+                for c, m in zip(res["cpu"], res["metal:0"]):
+                    np.testing.assert_array_equal(m, c, err_msg=str(args))
+                expected = list(range(*args)) if args[2] != 0 else []
+                assert res["cpu"][1][0] == len(expected), (args, res["cpu"])
+            """
+        )
+        _run_with_metal_native(self, snippet, timeout=240)
+
     def test_unported_tile_reductions_raise(self):
         # Metal has no lowering for these yet. 1.19 changed their CPU/CUDA
         # results (GH-2000 tile_sum axis gradients, GH-2003/GH-1781 scan

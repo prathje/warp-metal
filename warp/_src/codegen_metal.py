@@ -15903,6 +15903,33 @@ _CONST_INT_DECL_PAT = re.compile(r"^\s*const int var_(\w+) = (-?\d+);\s*$")
 _VAR_REF_PAT = re.compile(r"\bvar_(\w+)")
 
 
+def _for_loop_const_ints(lines: list[str], adj=None, extra_const_ints: dict[str, int] | None = None) -> dict[str, int]:
+    """Compile-time int locals for resolving a ``for`` header's step."""
+    const_ints: dict[str, int] = {}
+    if adj is not None:
+        for v in adj.variables:
+            val = getattr(v, "constant", None)
+            if isinstance(val, int) and not isinstance(val, bool):
+                const_ints[str(v.label)] = val
+    if extra_const_ints:
+        const_ints.update(extra_const_ints)
+    for raw in lines:
+        m = _CONST_INT_DECL_PAT.match(raw)
+        if m is not None:
+            const_ints[m.group(1)] = int(m.group(2))
+    return const_ints
+
+
+def _for_loop_static_step(step_expr: str, const_ints: dict[str, int]) -> int | None:
+    s = step_expr.strip()
+    if s.startswith("var_"):
+        return const_ints.get(s[len("var_") :])
+    try:
+        return int(s)
+    except ValueError:
+        return None
+
+
 def _fix_negative_step_for_loops(
     lines: list[str], adj=None, extra_const_ints: dict[str, int] | None = None
 ) -> list[str]:
@@ -15921,32 +15948,11 @@ def _fix_negative_step_for_loops(
     carry their value on the Var) plus the inliner's surfaced constants
     for loops spliced in from ``@wp.func`` helpers; a ``const int var_X
     = N;`` line scan remains as a fallback for pre-declared lines.
-    Non-integer or non-constant steps stay positive by convention —
-    covers ``range(0, n, BLOCK_DIM)`` etc.
+    Steps that are not compile-time constants keep ``<`` here; the header
+    shape must stay as is for ``_materialize_for_loop_vars``, and
+    ``_fix_dynamic_step_for_loops`` gives them a runtime direction test.
     """
-    const_ints: dict[str, int] = {}
-    if adj is not None:
-        for v in adj.variables:
-            val = getattr(v, "constant", None)
-            if isinstance(val, int) and not isinstance(val, bool):
-                const_ints[str(v.label)] = val
-    if extra_const_ints:
-        const_ints.update(extra_const_ints)
-    for raw in lines:
-        m = _CONST_INT_DECL_PAT.match(raw)
-        if m is not None:
-            const_ints[m.group(1)] = int(m.group(2))
-
-    def _step_is_negative(step_expr: str) -> bool:
-        s = step_expr.strip()
-        if s.startswith("var_"):
-            v = const_ints.get(s[len("var_") :])
-            return v is not None and v < 0
-        try:
-            return int(s) < 0
-        except ValueError:
-            return False
-
+    const_ints = _for_loop_const_ints(lines, adj, extra_const_ints)
     out: list[str] = []
     for raw in lines:
         m = _FOR_LOOP_LINE_PAT.match(raw)
@@ -15954,7 +15960,8 @@ def _fix_negative_step_for_loops(
             out.append(raw)
             continue
         step = m.group("step")  # ``None`` for the ``++var_X`` form
-        if step is None or not _step_is_negative(step):
+        k = None if step is None else _for_loop_static_step(step, const_ints)
+        if k is None or k >= 0:
             out.append(raw)
             continue
         indent = m.group("indent")
@@ -15963,6 +15970,50 @@ def _fix_negative_step_for_loops(
         stop = m.group("stop")
         inc = m.group("inc")
         out.append(f"{indent}for (var_{iv} = {start}; var_{iv} > {stop}; {inc}) {{")
+    return out
+
+
+# A ``for`` header after ``_materialize_for_loop_vars``: the induction
+# variable is either the ``var_X`` local or a fresh ``int wp_for_itN``.
+_FOR_HEADER_STEP_PAT = re.compile(
+    r"^(?P<indent>\s*)for \((?P<decl>int )?(?P<iv>var_\w+|wp_for_it\d+) = (?P<start>[^;]+); "
+    r"(?P=iv) < (?P<stop>[^;]+); (?P=iv) \+= (?P<step>[^)]+)\) \{$"
+)
+
+
+def _fix_dynamic_step_for_loops(
+    lines: list[str], adj=None, extra_const_ints: dict[str, int] | None = None
+) -> list[str]:
+    """Give ``range(start, stop, step)`` loops a runtime direction test.
+
+    ``wp::iter_cmp`` (warp/native/range.h) runs ``i < stop`` for a positive
+    step, ``i > stop`` for a negative one and nothing for a zero step. A
+    step that is not a compile-time constant (``range(a, b, s)`` with a
+    kernel argument ``s``) only knows its sign at run time; ``<`` alone
+    silently ran no iterations for a negative step and never terminated
+    for a zero step. Runs after ``_materialize_for_loop_vars`` so the
+    header keeps the shape that pass matches.
+    """
+    const_ints = _for_loop_const_ints(lines, adj, extra_const_ints)
+    out: list[str] = []
+    for raw in lines:
+        m = _FOR_HEADER_STEP_PAT.match(raw) if "for (" in raw else None
+        if m is None:
+            out.append(raw)
+            continue
+        step = m.group("step").strip()
+        k = _for_loop_static_step(step, const_ints)
+        if k is not None and k > 0:
+            out.append(raw)
+            continue
+        iv, stop = m.group("iv"), m.group("stop")
+        if k == 0:
+            cond = "false"
+        else:
+            cond = f"(({step}) > 0 ? ({iv} < {stop}) : (({step}) < 0 && {iv} > {stop}))"
+        out.append(
+            f"{m.group('indent')}for ({m.group('decl') or ''}{iv} = {m.group('start')}; {cond}; {iv} += {step}) {{"
+        )
     return out
 
 
@@ -17563,6 +17614,7 @@ def _generate_msl_kernel_uncached(
     forward_lines = _fix_negative_step_for_loops(forward_lines, adj=adj, extra_const_ints=_inlined_const_ints)
     # A loop variable read after its loop keeps its last iteration value.
     forward_lines = _materialize_for_loop_vars(forward_lines)
+    forward_lines = _fix_dynamic_step_for_loops(forward_lines, adj=adj, extra_const_ints=_inlined_const_ints)
     # ``t.width`` etc. on texture values.
     forward_lines = _mtex.fold_field_reads(
         forward_lines,
