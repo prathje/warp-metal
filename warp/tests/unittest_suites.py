@@ -268,6 +268,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
         TestMetalR8InternalLaunchesOffTape,
         TestMetalR8TileAdjointEdge,
     )
+    from warp.tests.test_metal_r9_119 import TestMetalUpstream119
     from warp.tests.test_metal_runtime import TestMetalRuntime, TestMetalRuntimeSubprocess
     from warp.tests.test_metal_tiles_ext import (
         TestMetalMeshWinding,
@@ -511,6 +512,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
         TestMetalLoopIRDevice,
         TestMetalLoopIRFixtures,
         TestMetalUpstreamBuiltins,
+        TestMetalUpstream119,
         TestMetalR8BsrTranspose,
         TestMetalR8InternalLaunchesOffTape,
         TestMetalR8TileAdjointEdge,
