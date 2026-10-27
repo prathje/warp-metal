@@ -18626,6 +18626,14 @@ def _generate_msl_kernel_uncached(
             layout = struct_local_layouts[var.label]
             for field_path, _off, field_info in _iter_scalar_leaves(layout):
                 local_name = _per_field_local(var.label, field_path)
+                if var.constant is not None:
+                    # A struct constant (``wp.static(make_struct(...))``): its
+                    # leaves start at the constant's values, not zero.
+                    body_lines.append(
+                        f"    {_struct_leaf_local_msl(field_info)} {local_name} = "
+                        f"{_struct_constant_leaf(adj, var, field_path, field_info)};"
+                    )
+                    continue
                 # MSL ``T()`` zero-constructs scalar / vec / mat values.
                 # Zero-init form differs by type:
                 #   - Native MSL types (``float``, ``float3``, ``float3x3``,
@@ -23037,6 +23045,22 @@ def _struct_leaf_local_msl(finfo: _StructFieldInfo) -> str:
     field stores convert through ``wp_f64_to_f32`` / ``wp_f32_to_f64``
     (``f64_scalar_alias``)."""
     return "ulong" if _is_demoted_f64_leaf(finfo) else finfo.msl_type
+
+
+def _struct_constant_leaf(adj, var, field_path: str, finfo: _StructFieldInfo) -> str:
+    """MSL literal of leaf ``field_path`` (``__``-joined) of struct constant ``var``."""
+    value = var.constant
+    try:
+        for name in field_path.split("__"):
+            value = getattr(value, name)
+    except AttributeError:
+        value = None
+    if value is None or finfo is _ARRAY_RECORD_WORD or _is_demoted_f64_leaf(finfo):
+        raise MetalCodegenError(
+            f"Kernel {adj.fun_name!r}: struct constant field {field_path.replace('__', '.')!r} of "
+            f"'var_{var.label}' cannot be initialized on Metal"
+        )
+    return _msl_constant_str(value, _struct_leaf_local_msl(finfo))
 
 
 def _struct_leaf_zero(msl: str) -> str:

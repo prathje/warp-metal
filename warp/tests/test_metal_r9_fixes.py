@@ -421,6 +421,55 @@ class TestMetalR9Fixes(unittest.TestCase):
         )
         _run_with_metal_native(self, snippet, timeout=240)
 
+    def test_static_struct_constant_matches_cpu(self):
+        # A struct value built by wp.static() is a struct constant; Metal
+        # declared its per-field locals zero-initialized and ignored the value.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            @wp.struct
+            class Inner:
+                mat: wp.mat33
+                vec: wp.vec3
+                i: int
+
+            @wp.struct
+            class Outer:
+                s: Inner
+                tf: wp.transform
+                q: wp.quat
+
+            @wp.func
+            def make(mat: wp.mat33, vec: wp.vec3, i: int, tf: wp.transform, q: wp.quat):
+                o = Outer()
+                o.s.mat = mat
+                o.s.vec = vec
+                o.s.i = i
+                o.tf = tf
+                o.q = q
+                return o
+
+            @wp.kernel(module="unique")
+            def k(res: wp.array(dtype=Outer), out: wp.array(dtype=float)):
+                c = wp.static(make(wp.mat33(1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0), wp.vec3(1.0, 2.0, 3.0), 7,
+                                   wp.transform(wp.vec3(1.0, 2.0, 3.0), wp.quat_from_axis_angle(wp.vec3(0.0, 1.0, 0.0), 0.5)),
+                                   wp.quat(0.1, 0.2, 0.3, 0.9)))
+                res[0] = c
+                out[0] = c.s.vec[1] + c.s.mat[2, 1] + float(c.s.i) + c.tf.p[2] + c.q[3]
+
+            r = {}
+            for dev in ("cpu", "metal:0"):
+                res = wp.zeros(1, dtype=Outer, device=dev)
+                out = wp.zeros(1, dtype=float, device=dev)
+                wp.launch(k, dim=1, inputs=[res, out], device=dev)
+                r[dev] = (res.numpy(), out.numpy())
+            assert r["cpu"][0].tobytes() == r["metal:0"][0].tobytes(), r
+            np.testing.assert_array_equal(r["metal:0"][1], r["cpu"][1])
+            """
+        )
+        _run_with_metal_native(self, snippet, timeout=240)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
