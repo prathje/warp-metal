@@ -291,6 +291,25 @@ class TestMetalR9Fixes(unittest.TestCase):
                     res[dev] = (dst.numpy().copy(), src.grad.numpy().copy())
                 np.testing.assert_array_equal(res["metal:0"][0], res["cpu"][0], err_msg=k.key)
                 np.testing.assert_array_equal(res["metal:0"][1], res["cpu"][1], err_msg=k.key + " grad")
+
+            # A runtime column index: the view's extent rules out the
+            # column-stride mapping onto the row dim whatever the origin.
+            @wp.kernel(module="unique")
+            def k_runtime_col(src: wp.array2d[float], j: int, dst: wp.array1d[float]):
+                t = wp.tile_load(src, shape=(M, N))
+                wp.tile_store(dst, t[:, j])
+
+            res = {}
+            for dev in ("cpu", "metal:0"):
+                src = wp.array(src_np, dtype=float, requires_grad=True, device=dev)
+                dst = wp.zeros(M, dtype=float, requires_grad=True, device=dev)
+                with wp.Tape() as tape:
+                    wp.launch_tiled(k_runtime_col, dim=[1], inputs=[src, 5, dst], block_dim=32, device=dev)
+                dst.grad = wp.array(np.arange(1, M + 1, dtype=np.float32), dtype=float, device=dev)
+                tape.backward()
+                res[dev] = (dst.numpy().copy(), src.grad.numpy().copy())
+            np.testing.assert_array_equal(res["metal:0"][0], res["cpu"][0])
+            np.testing.assert_array_equal(res["metal:0"][1], res["cpu"][1])
             """
         )
         _run_with_metal_native(self, snippet, timeout=240)
@@ -381,6 +400,36 @@ class TestMetalR9Fixes(unittest.TestCase):
                 pass
             else:
                 raise AssertionError("float64 field arithmetic on Metal did not raise in 'error' mode")
+
+            # Only float32 / float16 casts are exact on the value Metal reads:
+            # an integer cast or a predicate on it is not (int32(2.9999999999)
+            # was 3 on Metal, 2 on the CPU; isfinite(1e300) was false).
+            @wp.kernel(module="unique")
+            def k_field_int(p: P, out: wp.array(dtype=int)):
+                out[0] = wp.int32(p.nu)
+
+            @wp.kernel(module="unique")
+            def k_field_isfinite(p: P, out: wp.array(dtype=int)):
+                out[0] = wp.where(wp.isfinite(p.nu), 1, 0)
+
+            @wp.kernel(module="unique")
+            def k_field_float(p: P, out: wp.array(dtype=float)):
+                out[0] = float(p.nu)
+
+            pv.nu = wp.float64(2.9999999999)
+            for k in (k_field_int, k_field_isfinite):
+                try:
+                    wp.launch(k, dim=1, inputs=[pv, wp.zeros(1, dtype=int, device="metal:0")], device="metal:0")
+                except MetalCodegenError:
+                    pass
+                else:
+                    raise AssertionError(f"{k.key}: non-exact use of a float64 field did not raise")
+            res = {}
+            for dev in ("cpu", "metal:0"):
+                o = wp.zeros(1, dtype=float, device=dev)
+                wp.launch(k_field_float, dim=1, inputs=[pv, o], device=dev)
+                res[dev] = o.numpy()[0]
+            assert res["cpu"] == res["metal:0"], res
             """
         )
         _run_with_metal_native(self, snippet, timeout=240)
