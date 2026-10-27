@@ -640,6 +640,37 @@ class TestMetalR9Fixes(unittest.TestCase):
         )
         _run_with_metal_native(self, snippet, timeout=240)
 
+    def test_skew_adjoint_matches_cpu(self):
+        # wp::adj_skew had no Metal lowering (featherstone's eval_rigid_id
+        # adjoint): a MetalCodegenError naming the intrinsic.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            @wp.kernel(module="unique")
+            def k(x: wp.array(dtype=wp.vec3), w: wp.array(dtype=wp.mat33), y: wp.array(dtype=float)):
+                i = wp.tid()
+                y[i] = wp.ddot(wp.skew(x[i]), w[i])
+
+            rng = np.random.default_rng(0)
+            xs = rng.standard_normal((5, 3)).astype(np.float32)
+            ws = rng.standard_normal((5, 3, 3)).astype(np.float32)
+            r = {}
+            for d in ("cpu", "metal:0"):
+                x = wp.array(xs, dtype=wp.vec3, device=d, requires_grad=True)
+                w = wp.array(ws, dtype=wp.mat33, device=d, requires_grad=True)
+                y = wp.zeros(5, dtype=float, device=d, requires_grad=True)
+                t = wp.Tape()
+                with t:
+                    wp.launch(k, dim=5, inputs=[x, w, y], device=d)
+                t.backward(grads={y: wp.ones(5, dtype=float, device=d)})
+                r[d] = (y.numpy(), x.grad.numpy(), w.grad.numpy())
+            for a, b in zip(r["cpu"], r["metal:0"]):
+                np.testing.assert_allclose(b, a, rtol=1e-6, atol=1e-6)
+            """
+        )
+        _run_with_metal_native(self, snippet, timeout=240)
+
     def test_numpy_integer_launch_dims(self):
         # CPU/CUDA canonicalize dim with operator.index(); Metal raised a
         # TypeError for dim=np.int64(n) (and numpy entries in a sequence).

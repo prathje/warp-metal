@@ -2400,6 +2400,15 @@ inline void wp_adj_cross(float3 a, float3 b, thread float3& aa, thread float3& a
 }
 """
 
+# mat.h ``adj_skew``; MSL matrices are column-major (``r[col][row]``).
+_ADJ_SKEW = """\
+inline void wp_adj_skew(float3 a, thread float3& aa, float3x3 r) {
+    aa.x += r[1][2] - r[2][1];
+    aa.y += r[2][0] - r[0][2];
+    aa.z += r[0][1] - r[1][0];
+}
+"""
+
 # ``wp::adj_<name>`` -> ``wp_adj_<name>`` for everything the helper block
 # above defines. Anything absent stays as ``wp::adj_*`` and trips
 # ``_check_no_unsupported_intrinsics``, which is the intended failure mode:
@@ -2429,6 +2438,7 @@ _ADJ_SUPPORTED = frozenset(
         "length_sq",
         "normalize",
         "cross",
+        "skew",
         "extract",
         "clamp",
         "mod",
@@ -10087,6 +10097,8 @@ def _build_kernel_header(source: str) -> str:
                 parts.append(_adj_mat_helpers(_n))
         if "wp_adj_cross" in source:
             parts.append(_ADJ_VEC3_EXTRA)
+        if "wp_adj_skew" in source:
+            parts.append(_ADJ_SKEW)
     # Always emitted: kernels reference ``wp_normalize``/``wp_quat_normalize``
     # directly, and the quat/noise/BVH helper families below call
     # ``wp_normalize`` internally (mirroring native code's guarded
