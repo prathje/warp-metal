@@ -560,6 +560,8 @@ def fold_local_arrays(
                 return []
             if fn == "copy" and len(args) == 1 and (is_local(first) or (first[4:] in ptr_values)):
                 return assign_array(indent, lhs, first[4:], raw)
+            if fn == "where" and len(args) == 3 and (is_local(args[1]) or is_local(args[2])):
+                return select_array(indent, lhs, args, raw)
             if fn == "address" and is_local(first):
                 arr = arrays[first[4:]]
                 declare_ptr(lhs, arr.elem_msl)
@@ -665,6 +667,47 @@ def fold_local_arrays(
             raise fail(f"array local var_{lhs} is bound to different thread-local storage on different paths", raw)
         arrays[lhs] = arr
         skip.add(lhs)
+
+    def select_array(indent: str, lhs: str, args: list[str], raw: str) -> list[str]:
+        """``var_L = wp::where(cond, var_A, var_B)`` over two views of one storage.
+
+        Warp merges an array local assigned in an ``if``/``else`` with
+        ``wp::where`` (natively a copy of the selected ``array_t`` header).
+        Views of the same thread-local storage with the same element type and
+        rank differ only in their element offset and extents, so the result is
+        that storage with a runtime-selected offset and extents, held in
+        ``int`` locals.
+        """
+        cond, a, b = args
+        if not (is_local(a) and is_local(b)):
+            raise fail("selecting between a thread-local array and another array is not supported on Metal", raw)
+        arr_a, arr_b = arrays[a[4:]], arrays[b[4:]]
+        if (arr_a.storage, arr_a.elem_msl, len(arr_a.dims)) != (arr_b.storage, arr_b.elem_msl, len(arr_b.dims)):
+            raise fail(
+                "selecting between thread-local arrays with different storage, element type or rank is not "
+                f"supported on Metal ({arr_a.storage}/{arr_a.elem_msl}/{arr_a.dims} vs "
+                f"{arr_b.storage}/{arr_b.elem_msl}/{arr_b.dims})",
+                raw,
+            )
+        c = subst_reads(cond)
+        out: list[str] = []
+
+        def pick(name: str, x: str, y: str) -> str:
+            if x == y:
+                return x
+            label = f"{lhs}__{name}"
+            if label not in select_locals:
+                select_locals.add(label)
+                decls.append(_RawLine(raw=f"    int var_{label} = 0;"))
+            out.append(f"{indent}var_{label} = ({c}) ? int({x}) : int({y});")
+            return f"var_{label}"
+
+        offset = pick("fa_off", arr_a.offset, arr_b.offset)
+        dims = tuple(pick(f"fa_dim{k}", x, y) for k, (x, y) in enumerate(zip(arr_a.dims, arr_b.dims, strict=True)))
+        bind(lhs, dataclasses.replace(arr_a, offset=offset, dims=dims), raw)
+        return out
+
+    select_locals: set[str] = set()
 
     def assign_array(indent: str, lhs: str, rhs: str, raw: str) -> list[str]:
         if rhs in ptr_values:
@@ -825,9 +868,7 @@ class _SliceView:
         return [k for k, d in enumerate(self.dims) if d[0] == "slice"]
 
 
-def fold_arg_slice_views(
-    nodes: list[Node], adj, const_ints: dict[str, int]
-) -> tuple[list[Node], set[str], set[str]]:
+def fold_arg_slice_views(nodes: list[Node], adj, const_ints: dict[str, int]) -> tuple[list[Node], set[str], set[str]]:
     """Lower range-slice views of kernel array arguments; see above.
 
     Element accesses are all this fold rewrites. A view that also reaches an

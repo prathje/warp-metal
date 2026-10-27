@@ -174,6 +174,83 @@ class TestMetalR3Locals(unittest.TestCase):
         )
         _run_with_metal_enabled(self, snippet, timeout=120)
 
+    def test_fixed_array_views_selected_by_branch(self):
+        # Newton's multicontact (2026-10) picks the vertex/face polygons out of
+        # views of one thread-local buffer in an if/else; Warp merges the array
+        # locals with ``wp::where``. The views differ in offset and in shape.
+        snippet = _snippet(
+            """
+            @wp.func
+            def fill(buf: wp.array[wp.vec2], n: int, base: float):
+                for i in range(n):
+                    buf[i] = wp.vec2(base + float(i), float(i * i))
+
+            @wp.func
+            def weigh(poly: wp.array[wp.vec2], other: wp.array[wp.vec2]) -> float:
+                s = float(0.0)
+                for i in range(poly.shape[0]):
+                    s += poly[i][0] * float(i + 1)
+                for i in range(other.shape[0]):
+                    s += 1000.0 * other[i][1]
+                return s + 1.0e5 * float(poly.shape[0]) + 1.0e6 * float(other.shape[0])
+
+            @wp.func
+            def pick(flag: int, b_buffer: wp.array[wp.vec2], a_buffer: wp.array[wp.vec2]) -> float:
+                poly = a_buffer
+                other = b_buffer
+                if flag == 1:
+                    poly = wp.array(ptr=b_buffer.ptr, shape=(5,), dtype=wp.vec2)
+                    other = a_buffer
+                elif flag == 2:
+                    poly = b_buffer
+                    other = wp.array(ptr=b_buffer.ptr + wp.uint64(2 * 8), shape=(3,), dtype=wp.vec2)
+                poly[0] = poly[0] + wp.vec2(0.5, 0.0)
+                return weigh(poly, other)
+
+            @wp.kernel
+            def k(flags: wp.array[int], out: wp.array[float], first: wp.array[wp.vec2]):
+                tid = wp.tid()
+                b_buffer = wp.zeros(shape=(10,), dtype=wp.vec2f)
+                a_buffer = wp.array(ptr=b_buffer.ptr + wp.uint64(5 * 8), shape=(5,), dtype=wp.vec2f)
+                fill(b_buffer, 5, float(tid))
+                fill(a_buffer, 5, 100.0 + float(tid))
+                out[tid] = pick(flags[tid], b_buffer, a_buffer)
+                first[tid] = b_buffer[0] + a_buffer[0]
+
+            def run(dev):
+                flags = wp.array([0, 1, 2, 1, 0, 2], dtype=int, device=dev)
+                o = wp.zeros(6, dtype=float, device=dev)
+                f = wp.zeros(6, dtype=wp.vec2, device=dev)
+                wp.launch(k, 6, [flags, o, f], device=dev)
+                return o.numpy(), f.numpy()
+
+            res = compare(run)
+            assert len(set(res["cpu"][0].tolist())) == 6
+
+            # Views of different thread-local allocations cannot be merged.
+            @wp.kernel
+            def k_bad(flags: wp.array[int], out: wp.array[float]):
+                tid = wp.tid()
+                x = wp.zeros(shape=(4,), dtype=float)
+                y = wp.zeros(shape=(4,), dtype=float)
+                y[1] = 2.0
+                sel = x
+                if flags[tid] != 0:
+                    sel = y
+                out[tid] = sel[1]
+
+            from warp._src.codegen_metal import MetalCodegenError
+
+            try:
+                wp.launch(k_bad, 2, [wp.array([0, 1], dtype=int, device="metal:0"), wp.zeros(2, dtype=float, device="metal:0")], device="metal:0")
+            except MetalCodegenError as e:
+                assert "different storage" in str(e), e
+            else:
+                raise AssertionError("expected a MetalCodegenError")
+            """
+        )
+        _run_with_metal_enabled(self, snippet, timeout=180)
+
     def test_fixed_array_adjoint(self):
         # The dual of a fixed array is a second fixed array that the
         # element adjoints accumulate into, as on CPU.
