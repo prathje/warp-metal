@@ -703,6 +703,42 @@ class TestMetalR9Fixes(unittest.TestCase):
         )
         _run_with_metal_native(self, snippet, timeout=240)
 
+    def test_emulated_pow_of_two_is_exact(self):
+        # metal_fp64="emulate" evaluated pow in float32, so pow(2.0, n) became
+        # inf for n > 127 and the fixed-point scaling of Newton's deterministic
+        # hydroelastic reduction (shift = 2**(bits - exponent), up to ~2**160)
+        # silently overflowed. Integral powers of two are now built exactly.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            @wp.kernel(module="unique")
+            def k(e: wp.array(dtype=int), x: wp.array(dtype=float), q: wp.array(dtype=wp.int64),
+                  back: wp.array(dtype=float), sh: wp.array(dtype=wp.float64)):
+                i = wp.tid()
+                shift = wp.pow(wp.float64(2.0), wp.float64(e[i]))
+                v = wp.int64(wp.round(wp.float64(x[i]) * shift))
+                q[i] = v
+                sh[i] = shift
+                back[i] = wp.float32(wp.float64(v) / shift)
+
+            wp.set_module_options({"metal_fp64": "emulate"}, k.module)
+            es = np.array([0, 1, -3, 60, 127, 128, 150, 160, 1023, 1024, -1022, -1074, -1080, 100, 55], dtype=np.int32)
+            xs = np.array([1.5, -3.25, 7.0, 3.7e-15, 1.2e-30, 1e-31, 2.3e-34, 1e-40, 0.0, 1e-300, 1e30, 3e38, 1.0,
+                           1.1e-17, -9.5e-12], dtype=np.float32)
+            r = {}
+            for d in ("cpu", "metal:0"):
+                q = wp.zeros(len(es), dtype=wp.int64, device=d)
+                b = wp.zeros(len(es), dtype=float, device=d)
+                sh = wp.zeros(len(es), dtype=wp.float64, device=d)
+                wp.launch(k, dim=len(es), inputs=[wp.array(es, device=d), wp.array(xs, device=d), q, b, sh], device=d)
+                r[d] = (q.numpy(), b.numpy(), sh.numpy())
+            for a, c in zip(r["cpu"], r["metal:0"]):
+                np.testing.assert_array_equal(c, a)
+            """
+        )
+        _run_with_metal_native(self, snippet, timeout=240)
+
     def test_numpy_integer_launch_dims(self):
         # CPU/CUDA canonicalize dim with operator.index(); Metal raised a
         # TypeError for dim=np.int64(n) (and numpy entries in a sequence).

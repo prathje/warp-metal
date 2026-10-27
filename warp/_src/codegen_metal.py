@@ -1805,10 +1805,25 @@ def _f64_emulate_helpers() -> str:
         # acos/asin clamp their domain like ``warp/native/builtin.h``.
         arg = "metal::clamp(float(a), -1.0f, 1.0f)" if fn in ("acos", "asin") else "float(a)"
         L.append(f"inline wp_f64 {fn}(wp_f64 a) {{ return wp_f64_from(metal::precise::{fn}({arg})); }}")
+    # pow(2.0, n) for an integral n is a power of two, which binary64
+    # represents exactly (subnormals included): build its bits, as CPU/CUDA
+    # ``pow`` returns it exactly. Fixed-point scaling (Newton's deterministic
+    # hydroelastic reduction) relies on this beyond the float32 range.
+    L.append("inline bool wp_f64_exp2_exact(wp_f64 a, wp_f64 b, thread wp_f64& r) {")
+    L.append("    if (a.bits != 0x4000000000000000UL || wp_f64_trunc(b) != b) return false;")
+    L.append("    if (!(wp_f64_abs(b) < wp_f64{0x40a0000000000000UL})) return false;  // |b| < 2048")
+    L.append("    int n = int(b);")
+    L.append("    if (n > 1023) r = wp_f64_bits(0x7ff0000000000000UL);")
+    L.append("    else if (n >= -1022) r = wp_f64_bits(ulong(n + 1023) << 52);")
+    L.append("    else if (n >= -1074) r = wp_f64_bits(1UL << (n + 1074));")
+    L.append("    else r = wp_f64_bits(0UL);")
+    L.append("    return true;")
+    L.append("}")
     for fn in _F64_EMU_FP32_BINARY:
+        exact = "wp_f64 r; if (wp_f64_exp2_exact(a, b, r)) return r; " if fn == "pow" else ""
         L.append(
             f"inline wp_f64 {fn}(wp_f64 a, wp_f64 b) "
-            f"{{ return wp_f64_from(metal::precise::{fn}(float(a), float(b))); }}"
+            f"{{ {exact}return wp_f64_from(metal::precise::{fn}(float(a), float(b))); }}"
         )
     # SIMD-group collectives: shuffle the two 32-bit halves. ``simd_sum``
     # runs an xor butterfly (always in range) and then broadcasts lane 0's
@@ -17317,7 +17332,8 @@ def _warn_f64_fp32_transcendentals(kernel, fns: tuple[str, ...]) -> None:
         f"Kernel {getattr(kernel, 'key', kernel)!r}: {names} on float64 values "
         f"{'is' if len(fns) == 1 else 'are'} evaluated in float32 on Metal devices "
         f"(metal_fp64 = 'emulate' computes float64 arithmetic and sqrt exactly, but "
-        f"transcendental functions carry single-precision error).",
+        f"transcendental functions carry single-precision error; pow(2.0, n) with an "
+        f"integral n is exact).",
         category=UserWarning,
     )
 
