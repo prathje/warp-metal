@@ -438,6 +438,67 @@ class TestMetalUpstream119(unittest.TestCase):
         )
         _run_with_metal_native(self, snippet, timeout=240)
 
+    def test_array_args_validated_and_subclasses_bind(self):
+        # GH-1723: array subclasses pass as their parent family. A Metal
+        # launch must also reject what pack_arg rejects on CPU/CUDA (the
+        # binder used to reinterpret an int32 array as float, or read a 2-D
+        # array as 1-D, silently), including on a recorded launch command.
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+
+            class TaggedArray(wp.array):
+                pass
+
+            class TaggedIndexedArray(wp.indexedarray):
+                pass
+
+            @wp.kernel
+            def read_regular(a: wp.array(dtype=float), out: wp.array(dtype=float)):
+                i = wp.tid()
+                out[i] = a[i] * 2.0
+
+            @wp.kernel
+            def read_indexed(a: wp.indexedarray(dtype=float), out: wp.array(dtype=float)):
+                i = wp.tid()
+                out[i] = a[i] * 2.0
+
+            res = {}
+            for d in ("cpu", "metal:0"):
+                out = wp.zeros(3, dtype=float, device=d)
+                a = TaggedArray([1.0, 2.0, 3.0], dtype=float, device=d)
+                wp.launch(read_regular, 3, inputs=[a], outputs=[out], device=d)
+                r1 = out.numpy().copy()
+                idx = TaggedIndexedArray(a, [wp.array([2, 0, 1], dtype=int, device=d)])
+                wp.launch(read_indexed, 3, inputs=[idx], outputs=[out], device=d)
+                res[d] = (r1, out.numpy().copy())
+                bad = [
+                    (wp.zeros(3, dtype=wp.int32, device=d), "dtype"),
+                    (wp.zeros((3, 1), dtype=float, device=d), "dimension"),
+                    (wp.zeros(3, dtype=wp.vec2, device=d), "dtype"),
+                    (idx, "expects an array of type"),
+                ]
+                for value, msg in bad:
+                    try:
+                        wp.launch(read_regular, 3, inputs=[value], outputs=[out], device=d)
+                    except RuntimeError as e:
+                        assert msg in str(e), (d, msg, e)
+                    else:
+                        raise AssertionError(f"{d}: {msg} mismatch not rejected")
+                cmd = wp.launch(read_regular, 3, inputs=[a], outputs=[out], device=d, record_cmd=True)
+                try:
+                    cmd.set_param_at_index(0, wp.zeros(3, dtype=wp.int32, device=d))
+                except RuntimeError as e:
+                    assert "dtype" in str(e), e
+                else:
+                    raise AssertionError(f"{d}: launch command accepted a mismatching array")
+            for c, m in zip(res["cpu"], res["metal:0"]):
+                np.testing.assert_array_equal(m, c)
+            np.testing.assert_array_equal(res["metal:0"][1], [6.0, 2.0, 4.0])
+            """
+        )
+        _run_with_metal_native(self, snippet, timeout=240)
+
     def test_unported_tile_reductions_raise(self):
         # Metal has no lowering for these yet. 1.19 changed their CPU/CUDA
         # results (GH-2000 tile_sum axis gradients, GH-2003/GH-1781 scan

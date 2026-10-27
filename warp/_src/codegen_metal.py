@@ -24677,14 +24677,15 @@ def _native_lane_launch_error(kernel, block_dim: int) -> str:
 
 
 from warp._src.types import array as _WpArrayType  # noqa: E402
+from warp._src.types import indexedarray as _WpIndexedArrayType  # noqa: E402
 
 
 def _maybe_staged_arg(value) -> bool:
-    """Cheap pre-check for ``metal_array_args``: an indexed array, or a
-    ``wp.array`` that is not contiguous."""
+    """Cheap pre-check for ``metal_array_args``: an indexed array (or a
+    subclass of one, GH-1723), or a ``wp.array`` that is not contiguous."""
     if isinstance(value, _WpArrayType):
         return not value.is_contiguous
-    return type(value).__name__ == "indexedarray"
+    return isinstance(value, _WpIndexedArrayType)
 
 
 _TILE_LANE_OP_PAT = re.compile(r"\bwp::tile_scatter_(?:masked|add)\s*(?:<[^()]*>)?\s*\(\s*var_\w+\s*,\s*var_(\w+)\s*,")
@@ -25689,6 +25690,10 @@ class MetalLaunch:
         if adjoint:
             raise RuntimeError("Metal backend does not yet support adjoint launches")
         n = len(self._inputs)
+        # Validate like ``Launch.set_param_at_index`` (``pack_arg``) does.
+        params = [None] * len(self.kernel.adj.args)
+        params[index] = value
+        _validate_metal_array_args(self.kernel, params, ())
         if index < n:
             self._inputs[index] = value
         else:
@@ -25707,6 +25712,51 @@ class MetalLaunch:
         launch_metal_kernel(self.kernel, self.dim, self._inputs, self._outputs, self.device, block_dim=self.block_dim)
 
 
+def _validate_metal_array_args(kernel, inputs, outputs) -> None:
+    """Reject array arguments whose family, dtype or dimensionality do not match.
+
+    The checks ``context.pack_arg`` applies to CPU/CUDA launches (with the
+    same messages). The Metal binder takes the buffer address and the
+    shape, so without them a ``wp.int32`` array passed to a ``float``
+    parameter was silently reinterpreted, and a 2-D array read as 1-D.
+    Non-Warp objects (external interfaces) and ``array_t`` descriptors are
+    left to the binder, which rejects what it cannot bind.
+    """
+    from warp._src import types as wpt  # noqa: PLC0415
+
+    for arg, value in zip(kernel.adj.args, (*inputs, *outputs)):
+        arg_type = arg.type
+        if value is None or not wpt.is_array(arg_type) or isinstance(value, wpt.array_t):
+            continue
+        expected = wpt.concrete_array_type(arg_type)
+        if type(value) is expected:
+            family = expected
+            if value.dtype is arg_type.dtype and value.ndim == arg_type.ndim:
+                continue
+        else:
+            try:
+                family = wpt._resolve_array_family(value)
+            except TypeError as e:
+                raise RuntimeError(f"Error launching kernel '{kernel.key}', argument '{arg.label}': {e}") from e
+            if family is None:
+                continue
+        if family is not expected:
+            raise RuntimeError(
+                f"Error launching kernel '{kernel.key}', argument '{arg.label}' expects an array of type "
+                f"{wpt.type_repr(arg_type)}, but passed value has type {type(value).__name__}."
+            )
+        if not wpt.types_equal(value.dtype, arg_type.dtype):
+            raise RuntimeError(
+                f"Error launching kernel '{kernel.key}', argument '{arg.label}' expects an array with "
+                f"dtype={arg_type.dtype} but passed array has dtype={value.dtype}."
+            )
+        if value.ndim != arg_type.ndim:
+            raise RuntimeError(
+                f"Error launching kernel '{kernel.key}', argument '{arg.label}' expects an array with "
+                f"{arg_type.ndim} dimension(s) but the passed array has {value.ndim} dimension(s)."
+            )
+
+
 def launch_metal_kernel(
     kernel,
     dim,
@@ -25719,6 +25769,7 @@ def launch_metal_kernel(
     adj_outputs=(),
 ):
     """Dispatch a Warp kernel on a Metal device (see ``_launch_metal_kernel``)."""
+    _validate_metal_array_args(kernel, inputs, outputs)
     with _kernel_fp64_mode(kernel):
         return _launch_metal_kernel(
             kernel,
