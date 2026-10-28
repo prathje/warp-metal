@@ -12815,8 +12815,9 @@ def _tile_mention_roles(line: str, label: str) -> list[str]:
         return ["r"]
     if re.search(rf"(?:[.\[&*]\s*{tok}\b|\b{tok}\s*(?:\.|\[|->|=(?!=)))", line):
         return ["w"] * n
-    if re.match(r"^\s*wp::adj_\w+\s*(?:<[^()]*>)?\s*\(", line):
-        # Reverse-mode statement: reads primal values, writes ``adj_*`` duals.
+    if re.match(r"^\s*wp::adj_\w+\s*(?:<[^()]*>)?\s*\(", line) or _ADJ_TILE_LOWER_SOLVE_PAT.match(line.strip()):
+        # Reverse-mode statement: reads primal values, writes ``adj_*`` duals
+        # (``adj_tile_lower_solve`` is emitted without the namespace).
         return ["r"] * n
     for args in _ir_call_args(line, _TILE_MATMUL_ACC_PAT) + _ir_call_args(line, _TILE_MATMUL_ASSIGN_PAT):
         if len(args) == 8:

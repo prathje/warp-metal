@@ -270,6 +270,46 @@ class TestMetalR10TileChol(unittest.TestCase):
         )
         _run_with_metal_native(self, snippet, timeout=600)
 
+    def test_tile_lower_solve_transposed_factor_reverse_matches_cpu(self):
+        # The factor is a ``tile_transpose`` copy and its source is stored
+        # after the solve: the bare ``adj_tile_lower_solve`` reverse statement
+        # only reads the copy, so the transpose-copy check must not reject it
+        # (it raised "the copy would go stale").
+        snippet = _COMMON + textwrap.dedent(
+            """
+            n = 6
+
+            @wp.kernel(module="unique")
+            def k(a: wp.array3d(dtype=float), y: wp.array3d(dtype=float), z: wp.array3d(dtype=float)):
+                i = wp.tid()
+                u = wp.tile_load(a[i], shape=(n, n))
+                z_t = wp.tile_lower_solve(wp.tile_transpose(u), wp.tile_load(y[i], shape=(n, 2)))
+                wp.tile_store(z[i], z_t)
+                wp.tile_store(a[i], wp.tile_map(wp.mul, u, u))
+
+            rng = np.random.default_rng(8)
+            u0 = np.stack([np.linalg.cholesky(s).T for s in spd(rng, 2, n).astype(np.float64)]).astype(np.float32)
+            y0 = rng.standard_normal((2, n, 2)).astype(np.float32)
+            w0 = rng.standard_normal((2, n, 2)).astype(np.float32)
+            res = {}
+            for dev in ("cpu", "metal:0"):
+                a = wp.array(u0, device=dev, requires_grad=True)
+                y = wp.array(y0, device=dev, requires_grad=True)
+                z = wp.zeros((2, n, 2), dtype=float, device=dev, requires_grad=True)
+                loss = wp.zeros(1, dtype=float, device=dev, requires_grad=True)
+                tape = wp.Tape()
+                with tape:
+                    wp.launch_tiled(k, dim=2, inputs=[a, y], outputs=[z], device=dev, block_dim=64)
+                    wp.launch(wloss3, dim=(2, n, 2), inputs=[z, wp.array(w0, device=dev)], outputs=[loss], device=dev)
+                tape.backward(loss)
+                res[dev] = (z.numpy(), a.numpy(), y.grad.numpy(), a.grad.numpy())
+            for q, what in enumerate(("z", "a", "dy", "da")):
+                close(res["metal:0"][q], res["cpu"][q], what, rtol=2e-4)
+            assert np.abs(res["cpu"][2]).max() > 1e-2
+            """
+        )
+        _run_with_metal_native(self, snippet, timeout=300)
+
     def test_featherstone_fused_gemm_cholesky_adjoint_matches_cpu(self):
         # The shape of Newton's ``eval_dense_gemm_and_cholesky_tile``: H = sum
         # J_b^T M_b J_b accumulated with ``tile_matmul``, stored into ``H[idx]``,
