@@ -8645,8 +8645,9 @@ def _emit_tile_cholesky(n: int, msl_scalar: str) -> str:
 
     Crout's algorithm, fully unrolled for compile-time ``n``. ``precise::sqrt``
     is used because MSL defaults to ``-ffast-math`` which would otherwise
-    reassociate accumulations and erode stability. ``max(diag, 1e-30)``
-    guards against denormal-flush turning a tiny pivot into hard zero.
+    reassociate accumulations and erode stability. The pivot is not
+    clamped, as in native ``scalar_cholesky_impl``: a negative pivot gives
+    NaN and a zero pivot inf/NaN, exactly as on CPU/CUDA.
     """
     name = f"wp_tile_{n}x{n}_{msl_scalar}"
     parts: list[str] = []
@@ -8667,13 +8668,12 @@ def _emit_tile_cholesky(n: int, msl_scalar: str) -> str:
     # mul+sub to use the fused-multiply-add path with one rounding
     # instead of two. With Apple-default ``-ffast-math`` the compiler
     # is allowed to re-associate the sequence, which on G1's H matrix
-    # (freejoint root + tightly-coupled hinge dofs) accumulates enough
-    # round-off to drive the diagonal pivot below the
-    # ``max(d, 1e-30)`` clamp, then ``inv = 1/sqrt(1e-30) ≈ 1e15``
-    # blows up the rest of the factorization to NaN.
+    # (freejoint root + tightly-coupled hinge dofs) accumulated enough
+    # round-off to drive the diagonal pivot to (or below) zero and blow
+    # up the rest of the factorization to NaN. No pivot clamp (native
+    # has none; a clamp would turn CPU's NaN into finite garbage).
     parts.append("            d = metal::fma(-ljk, ljk, d);")
     parts.append("        }")
-    parts.append(f"        d = metal::max(d, {_sc_lit(msl_scalar, 1e-30)});")
     parts.append(f"        {msl_scalar} ljj = metal::precise::sqrt(d);")
     parts.append(f"        L.c[j*{n} + j] = ljj;")
     parts.append(f"        {msl_scalar} inv = {_sc_lit(msl_scalar, 1.0)} / ljj;")
@@ -8831,7 +8831,6 @@ def _emit_tile_cholesky_coop(n: int, msl_scalar: str) -> str:
     # Explicit fma — see ``_emit_tile_cholesky_inplace`` for rationale.
     parts.append("                d = metal::fma(-ljk, ljk, d);")
     parts.append("            }")
-    parts.append(f"            d = metal::max(d, {_sc_lit(msl_scalar, 1e-30)});")
     parts.append(f"            smem[j*{n} + j] = metal::precise::sqrt(d);")
     parts.append("        }")
     parts.append("        threadgroup_barrier(metal::mem_flags::mem_threadgroup);")
@@ -8887,13 +8886,12 @@ def _emit_tile_cholesky_inplace(n: int, msl_scalar: str) -> str:
     # mul+sub to use the fused-multiply-add path with one rounding
     # instead of two. With Apple-default ``-ffast-math`` the compiler
     # is allowed to re-associate the sequence, which on G1's H matrix
-    # (freejoint root + tightly-coupled hinge dofs) accumulates enough
-    # round-off to drive the diagonal pivot below the
-    # ``max(d, 1e-30)`` clamp, then ``inv = 1/sqrt(1e-30) ≈ 1e15``
-    # blows up the rest of the factorization to NaN.
+    # (freejoint root + tightly-coupled hinge dofs) accumulated enough
+    # round-off to drive the diagonal pivot to (or below) zero and blow
+    # up the rest of the factorization to NaN. No pivot clamp (native
+    # has none; a clamp would turn CPU's NaN into finite garbage).
     parts.append("            d = metal::fma(-ljk, ljk, d);")
     parts.append("        }")
-    parts.append(f"        d = metal::max(d, {_sc_lit(msl_scalar, 1e-30)});")
     parts.append(f"        {msl_scalar} ljj = metal::precise::sqrt(d);")
     parts.append(f"        L.c[j*{n} + j] = ljj;")
     parts.append(f"        {msl_scalar} inv = {_sc_lit(msl_scalar, 1.0)} / ljj;")
@@ -9427,7 +9425,7 @@ def _emit_tile_cholesky_solve_coop(n: int, msl_scalar: str) -> str:
 # the factorization runs in place, and ``tile_store`` / the solve read
 # smem. Measured 23x faster at 128+ worlds with bit-identical results
 # (the arithmetic below is deliberately identical to the by-value coop
-# variants — same fma order, same clamp, same precise::sqrt).
+# variants — same fma order, same unclamped precise::sqrt).
 #
 # NB: an earlier attempt at cooperative load/store (commits 02bfba9e,
 # 38f74e5d — see the note above ``_emit_tile_load_coop``) was reverted
@@ -9447,8 +9445,8 @@ def _smem_cholesky_body(n: int, msl_scalar: str, at, scale: str) -> list[str]:
 
     Every element sees exactly the operations of the left-looking (dot
     product) form, in the same order: ``a(i, k) = fma(-l(i, c), l(k, c),
-    a(i, k))`` for ``c = 0, 1, ...``, then the ``1e-30`` clamp,
-    ``precise::sqrt`` and the scale. So the factor is bitwise the same, but
+    a(i, k))`` for ``c = 0, 1, ...``, then ``precise::sqrt`` (no pivot
+    clamp, as native) and the scale. So the factor is bitwise the same, but
     the work per column is independent element updates rather than a serial
     dot-product chain, and the inner loop issues its loads four at a time
     (2x lower latency and throughput at N=35 than the dot-product form).
@@ -9456,12 +9454,11 @@ def _smem_cholesky_body(n: int, msl_scalar: str, at, scale: str) -> list[str]:
     a column, so a lane only reads rows other lanes wrote across a barrier.
     """
     one = _sc_lit(msl_scalar, 1.0)
-    clamp = _sc_lit(msl_scalar, 1e-30)
     lines = [
         "    threadgroup_barrier(metal::mem_flags::mem_threadgroup);",
         "    #pragma clang loop unroll(disable)",
         f"    for (int j = 0; j < {n}; ++j) {{",
-        f"        const {msl_scalar} ljj = metal::precise::sqrt(metal::max({at('j', 'j')}, {clamp}));",
+        f"        const {msl_scalar} ljj = metal::precise::sqrt({at('j', 'j')});",
     ]
     if scale == "mul":
         lines.append(f"        const {msl_scalar} inv = {one} / ljj;")
@@ -9582,7 +9579,7 @@ def _emit_tile_cholesky_inplace_smem(n: int, msl_scalar: str, upper: bool = Fals
 
     Same per-element arithmetic as :func:`_emit_tile_cholesky_inplace` (the
     serial helper every lane otherwise runs redundantly on its own private
-    copy): ``fma`` order, ``1e-30`` clamp, ``precise::sqrt`` and the
+    copy): ``fma`` order, unclamped ``precise::sqrt`` and the
     multiply by ``1 / ljj``, so the factor is bit-identical to that path
     (schedule: :func:`_smem_cholesky_body`).
 
@@ -14381,10 +14378,9 @@ def _translate_tile_intrinsics(
         if rows != cols:
             return m.group(0)
         # Shape (1,1) collapses to a scalar local: the factor is just
-        # sqrt(max(a, eps)). The clamp matches the wp_tile_NxN cholesky
-        # helper's near-singular guard.
+        # sqrt(a) (no clamp, as native: a < 0 gives NaN).
         if rows == 1:
-            return f"var_{lhs} = metal::precise::sqrt(metal::max({in_arg}, {_sc_lit(msl_scalar, 1e-30)}))"
+            return f"var_{lhs} = metal::precise::sqrt({in_arg})"
         # Above the cooperative threshold (and within Apple Silicon's
         # threadgroup-memory cap), route through the SIMD-cooperative
         # variant: 32 lanes share one ``wp_tile_chol_smem`` scratch
@@ -15550,7 +15546,7 @@ def _translate_tile_intrinsics(
         if rows != cols:
             return m.group(0)
         if rows == 1:
-            return f"{tile_arg} = metal::precise::sqrt(metal::max({tile_arg}, {_sc_lit(scalar, 1e-30)}))"
+            return f"{tile_arg} = metal::precise::sqrt({tile_arg})"
         if tile_label in smem_tiles:
             # Threadgroup-resident (see ``_plan_smem_alias_groups``): factor
             # the arena slot in place, all 32 lanes cooperating.
