@@ -5427,17 +5427,26 @@ _ADJ_ARRAY_VIEW_OPS = (
 #   adj_atomic_add:  arr, i.., value, adj_arr, adj_i.., adj_value, adj_ret -> (1, 2)
 #
 # Needed only to splice a sliced view's leading indices in at the right offset.
-# The tile trio (``adj_tile_load`` / ``adj_tile_store`` / ``adj_tile_atomic_add``)
-# mirrors this layout with ``dest, off.., t`` in place of ``arr, i.., value``, but
-# is deliberately ABSENT: no test or example reaches a tile op on a *sliced* view
-# in reverse mode, so there is nothing to validate a splice against. Leaving them
-# out keeps them on the zero-lead path and raising, rather than silently emitting
-# an index list nothing has checked.
+# The tile trio mirrors this layout with ``dest, off.., t`` in place of
+# ``arr, i.., value`` (``warp/native/tile.h``):
+#
+#   adj_tile_load:       src,  off..,    adj_src,  adj_off.., adj_ret        -> (0, 1)
+#   adj_tile_store:      dest, off.., t, adj_dest, adj_off.., adj_t          -> (1, 1)
+#   adj_tile_atomic_add: dest, off.., t, adj_dest, adj_off.., adj_t, adj_ret -> (1, 2)
+#
+# The views folded here are integer-indexed only (``arr[i]``, see
+# ``_collect_view_aliases``): the leading indices select a sub-array and the tile
+# offsets address its trailing dims, exactly as the forward ``tile_load`` /
+# ``tile_store`` rewrite in ``_apply_view_rewrites`` does (featherstone's
+# ``wp.tile_store(H[idx], t)`` / ``wp.tile_load(J[idx], ...)`` under a tape).
 _ADJ_ARRAY_VIEW_EXTRAS = {
     "adj_address": (0, 1),
     "adj_array_store": (1, 1),
     "adj_atomic_add": (1, 2),
     "adj_atomic_sub": (1, 2),
+    "adj_tile_load": (0, 1),
+    "adj_tile_store": (1, 1),
+    "adj_tile_atomic_add": (1, 2),
 }
 _ATOMIC_TO_MSL = {
     "atomic_add": "atomic_fetch_add_explicit",
