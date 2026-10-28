@@ -4457,19 +4457,38 @@ inline float3 wp_curlnoise(uint state, float4 xyzt, uint octaves, float lacunari
 
 
 # Segment/triangle intersection queries — ports of warp/native/intersect.h.
-# ``wp_closest_point_edge_edge`` transcribes the reference Warp source that
-# generated the native IR (Ericson 5.1.9); ``wp_intersect_tri_tri``
-# transcribes Möller's NoDivTriTriIsect (warp/native/intersect_tri.h) with
-# the C macros unrolled into functions. Dot/cross are written out
-# component-wise in the macro's evaluation order rather than using
-# ``metal::dot``/``cross`` so boundary sign tests match the CPU bit pattern
-# as closely as fast-math contraction allows.
+# ``wp_closest_point_edge_edge`` (+ adjoint) transcribes the native C++ of
+# Warp 1.19 (Ericson 5.1.9 with Kahan-compensated denominators);
+# ``wp_intersect_tri_tri`` transcribes Möller's NoDivTriTriIsect
+# (warp/native/intersect_tri.h) with the C macros unrolled into functions.
+# Dot/cross are written out component-wise in the macro's evaluation order
+# rather than using ``metal::dot``/``cross``, with FP contraction off as in
+# the CPU build, so boundary sign tests match the CPU bit pattern.
 _INTERSECT_HELPERS = """\
-inline float wp_tt_dot(float3 a, float3 b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+inline float wp_tt_dot(float3 a, float3 b) {
+#pragma clang fp contract(off)
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
 inline float3 wp_tt_cross(float3 a, float3 b) {
+#pragma clang fp contract(off)
     return float3(a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]);
 }
+// closest_point_edge_edge / adj_closest_point_edge_edge of warp/native/intersect.h
+// (Warp >= 1.19: Kahan-compensated denom / num, clamped degenerate branches).
+// Native CPU code is not FP-contracted, so neither are these.
+inline float wp_eee_clamp01(float x) { return metal::fmin(metal::fmax(0.0f, x), 1.0f); }
+inline float wp_eee_diff_product(float a, float b, float c, float d) {
+    float cd = c * d;
+    float diff = metal::fma(a, b, -cd);
+    float error = metal::fma(-c, d, cd);
+    return diff + error;
+}
+inline float wp_eee_length(float3 v) {
+#pragma clang fp contract(off)
+    return metal::precise::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+}
 inline float3 wp_closest_point_edge_edge(float3 p1, float3 q1, float3 p2, float3 q2, float epsilon) {
+#pragma clang fp contract(off)
     float3 d1 = q1 - p1;
     float3 d2 = q2 - p2;
     float3 r = p1 - p2;
@@ -4478,36 +4497,166 @@ inline float3 wp_closest_point_edge_edge(float3 p1, float3 q1, float3 p2, float3
     float f = wp_tt_dot(d2, r);
     float s = 0.0f;
     float t = 0.0f;
-    float dist = metal::length(p2 - p1);
-    if (a <= epsilon && e <= epsilon) {
-        return float3(s, t, dist);
-    }
-    if (a <= epsilon) {
-        s = 0.0f;
-        t = f / e;
+    bool degen1 = (a <= epsilon);
+    bool degen2 = (e <= epsilon);
+    if (degen1 && degen2) {
+    } else if (degen1) {
+        t = wp_eee_clamp01(f / e);
+    } else if (degen2) {
+        s = wp_eee_clamp01(-wp_tt_dot(d1, r) / a);
     } else {
         float c = wp_tt_dot(d1, r);
-        if (e <= epsilon) {
-            s = metal::clamp(-c / a, 0.0f, 1.0f);
-            t = 0.0f;
+        float b = wp_tt_dot(d1, d2);
+        float denom = wp_eee_diff_product(a, e, b, b);
+        float s_init;
+        if (denom > 0.0f) {
+            float num = wp_eee_diff_product(b, f, c, e);
+            s_init = wp_eee_clamp01(num / denom);
         } else {
-            float b = wp_tt_dot(d1, d2);
-            float denom = a * e - b * b;
-            if (denom != 0.0f) { s = metal::clamp((b * f - c * e) / denom, 0.0f, 1.0f); } else { s = 0.0f; }
-            t = (b * s + f) / e;
-            if (t < 0.0f) {
-                t = 0.0f;
-                s = metal::clamp(-c / a, 0.0f, 1.0f);
-            } else if (t > 1.0f) {
-                t = 1.0f;
-                s = metal::clamp((b - c) / a, 0.0f, 1.0f);
-            }
+            s_init = 0.0f;
+        }
+        float t_init = (b * s_init + f) / e;
+        if (t_init < 0.0f) {
+            s = wp_eee_clamp01(-c / a);
+        } else if (t_init > 1.0f) {
+            s = wp_eee_clamp01((b - c) / a);
+            t = 1.0f;
+        } else {
+            s = s_init;
+            t = t_init;
         }
     }
-    float3 c1 = p1 + (q1 - p1) * s;
-    float3 c2 = p2 + (q2 - p2) * t;
-    dist = metal::length(c2 - c1);
-    return float3(s, t, dist);
+    float3 c1 = p1 + s * d1;
+    float3 c2 = p2 + t * d2;
+    return float3(s, t, wp_eee_length(c2 - c1));
+}
+// adj_clamp(x, 0, 1, ...) routing: the gradient reaches x iff 0 <= x < 1.
+inline float wp_eee_adj_clamp01(float x, float adj_ret) { return (x >= 0.0f && x < 1.0f) ? adj_ret : 0.0f; }
+inline void wp_adj_closest_point_edge_edge(
+    float3 p1, float3 q1, float3 p2, float3 q2, float epsilon,
+    thread float3& adj_p1, thread float3& adj_q1, thread float3& adj_p2, thread float3& adj_q2,
+    thread float& adj_epsilon, float3 adj_ret)
+{
+#pragma clang fp contract(off)
+    float3 d1 = q1 - p1;
+    float3 d2 = q2 - p2;
+    float3 r = p1 - p2;
+    float a = wp_tt_dot(d1, d1);
+    float e = wp_tt_dot(d2, d2);
+    float f = wp_tt_dot(d2, r);
+    bool degen1 = (a <= epsilon);
+    bool degen2 = (e <= epsilon);
+    float s = 0.0f;
+    float t = 0.0f;
+    float c = 0.0f;
+    float b = 0.0f;
+    float denom = 0.0f;
+    float s_uc = 0.0f;
+    float t_uc = 0.0f;
+    // 0 A, 1 B, 2 C, 3 D, 4 D_DEGEN, 5 E, 6 F (native branch enum)
+    int branch;
+    if (degen1 && degen2) {
+        branch = 0;
+    } else if (degen1) {
+        branch = 1;
+        t_uc = f / e;
+        t = wp_eee_clamp01(t_uc);
+    } else if (degen2) {
+        branch = 2;
+        c = wp_tt_dot(d1, r);
+        s_uc = -c / a;
+        s = wp_eee_clamp01(s_uc);
+    } else {
+        c = wp_tt_dot(d1, r);
+        b = wp_tt_dot(d1, d2);
+        denom = wp_eee_diff_product(a, e, b, b);
+        bool denom_positive = (denom > 0.0f);
+        bool denom_stable = denom_positive && (denom > 1.0e-6f * a * e);
+        float s_init;
+        if (denom_positive) {
+            float num = wp_eee_diff_product(b, f, c, e);
+            s_uc = num / denom;
+            s_init = wp_eee_clamp01(s_uc);
+        } else {
+            s_init = 0.0f;
+        }
+        float t_init = (b * s_init + f) / e;
+        if (t_init < 0.0f) {
+            branch = 5;
+            s_uc = -c / a;
+            s = wp_eee_clamp01(s_uc);
+            t = 0.0f;
+        } else if (t_init > 1.0f) {
+            branch = 6;
+            s_uc = (b - c) / a;
+            s = wp_eee_clamp01(s_uc);
+            t = 1.0f;
+        } else {
+            branch = denom_stable ? 3 : 4;
+            s = s_init;
+            t = t_init;
+        }
+    }
+    float3 c1 = p1 + s * d1;
+    float3 c2 = p2 + t * d2;
+    float3 diff = c2 - c1;
+    float dist = wp_eee_length(diff);
+    float3 adj_diff = float3(0.0f);
+    if (dist > 0.0f) { adj_diff = (adj_ret[2] / dist) * diff; }
+    float3 adj_c1 = -adj_diff;
+    float3 adj_c2 = adj_diff;
+    float3 adj_d1 = float3(0.0f);
+    float3 adj_d2 = float3(0.0f);
+    float3 adj_r = float3(0.0f);
+    adj_p1 += adj_c1;
+    adj_d1 += s * adj_c1;
+    float adj_s = wp_tt_dot(d1, adj_c1) + adj_ret[0];
+    adj_p2 += adj_c2;
+    adj_d2 += t * adj_c2;
+    float adj_t = wp_tt_dot(d2, adj_c2) + adj_ret[1];
+    float adj_a = 0.0f, adj_e = 0.0f, adj_b = 0.0f, adj_c = 0.0f, adj_f = 0.0f;
+    if (branch == 1) {
+        float adj_t_uc = wp_eee_adj_clamp01(t_uc, adj_t);
+        adj_f += adj_t_uc / e;
+        adj_e += -adj_t_uc * t_uc / e;
+    } else if (branch == 2 || branch == 5) {
+        float adj_s_uc = wp_eee_adj_clamp01(s_uc, adj_s);
+        adj_c += -adj_s_uc / a;
+        adj_a += -adj_s_uc * s_uc / a;
+    } else if (branch == 6) {
+        float adj_s_uc = wp_eee_adj_clamp01(s_uc, adj_s);
+        adj_b += adj_s_uc / a;
+        adj_c += -adj_s_uc / a;
+        adj_a += -adj_s_uc * s_uc / a;
+    } else if (branch == 3) {
+        adj_b += adj_t * s / e;
+        adj_s += adj_t * b / e;
+        adj_f += adj_t / e;
+        adj_e += -adj_t * t / e;
+        float adj_s_uc = wp_eee_adj_clamp01(s_uc, adj_s);
+        float adj_num = adj_s_uc / denom;
+        float adj_denom = -adj_s_uc * s_uc / denom;
+        adj_b += adj_num * f;
+        adj_f += adj_num * b;
+        adj_c -= adj_num * e;
+        adj_e -= adj_num * c;
+        adj_a += adj_denom * e;
+        adj_e += adj_denom * a;
+        adj_b -= 2.0f * adj_denom * b;
+    } else if (branch == 4) {
+        adj_b += adj_t * s / e;
+        adj_f += adj_t / e;
+        adj_e += -adj_t * t / e;
+    }
+    adj_d1 += 2.0f * adj_a * d1 + adj_b * d2 + adj_c * r;
+    adj_d2 += 2.0f * adj_e * d2 + adj_b * d1 + adj_f * r;
+    adj_r += adj_c * d1 + adj_f * d2;
+    adj_q1 += adj_d1;
+    adj_p1 -= adj_d1;
+    adj_q2 += adj_d2;
+    adj_p2 -= adj_d2;
+    adj_p1 += adj_r;
+    adj_p2 -= adj_r;
 }
 inline bool wp_tt_edge_edge(float3 V0, float3 U0, float3 U1, int i0, int i1, float Ax, float Ay) {
     float Bx = U0[i0] - U1[i0];
@@ -10278,7 +10427,11 @@ def _build_kernel_header(source: str) -> str:
         parts.append(_NOISE_HELPERS)
     if "wp_svd" in source or "wp_qr3" in source or "wp_eig3" in source:
         parts.append(_SVD_HELPERS)
-    if "wp_closest_point_edge_edge" in source or "wp_intersect_tri_tri" in source:
+    if (
+        "wp_closest_point_edge_edge" in source
+        or "wp_adj_closest_point_edge_edge" in source
+        or "wp_intersect_tri_tri" in source
+    ):
         parts.append(_INTERSECT_HELPERS)
     if "wp_bvh_" in source or "wp_mesh_" in source:
         parts.append(_BVH_HELPERS)
@@ -11840,6 +11993,7 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     # Intersection queries — ports of warp/native/intersect.h (see
     # ``_INTERSECT_HELPERS``).
     (re.compile(r"\bwp::closest_point_edge_edge\b"), "wp_closest_point_edge_edge"),
+    (re.compile(r"\bwp::adj_closest_point_edge_edge\b"), "wp_adj_closest_point_edge_edge"),
     (re.compile(r"\bwp::intersect_tri_tri\b"), "wp_intersect_tri_tri"),
     # BVH / mesh queries — descriptor-buffer ports of warp/native/bvh.h and
     # mesh.h (see ``_BVH_HELPERS``). Ids are ``gpuAddress``es of descriptor
