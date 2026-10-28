@@ -12920,14 +12920,14 @@ class TestMetalAdjoint(unittest.TestCase):
         )
         _run_with_metal_native(self, snippet)
 
-    def test_unsupported_tile_adjoint_raises(self):
-        """An unimplemented tile adjoint must name the gap, not emit bad MSL.
+    def test_tile_cholesky_adjoint_matches_cpu(self):
+        """Reverse mode through ``wp.tile_cholesky`` matches the CPU adjoint.
 
-        Two spellings reach the check: adjoints that keep their ``wp::``
-        prefix (caught by the generic remaining-intrinsic check) and adjoints
-        the tile translator strips the prefix from, which would otherwise
-        reach the Metal compiler as undeclared identifiers. ``tile_cholesky``
-        is the first kind; either way the message has to name the operation.
+        This used to pin a loud "remaining Warp intrinsic" error for the
+        missing adjoint; the Metal reverse now exists (see
+        ``test_metal_r10_tilechol`` for the full coverage, and
+        ``test_tile_cholesky_upper_reverse_is_loud`` there for the variant
+        that still raises).
         """
         snippet = textwrap.dedent(
             """
@@ -12940,22 +12940,19 @@ class TestMetalAdjoint(unittest.TestCase):
                 a = wp.tile_load(x, shape=(TILE, TILE))
                 wp.tile_store(y, wp.tile_cholesky(a))
 
-            dev = 'metal:0'
-            spd = (np.eye(TILE, dtype=np.float32) * 4.0)
-            x = wp.array(spd, dtype=wp.float32, device=dev, requires_grad=True)
-            y = wp.zeros((TILE, TILE), dtype=wp.float32, device=dev, requires_grad=True)
-            tape = wp.Tape()
-            with tape:
-                wp.launch_tiled(k, dim=[1], inputs=[x], outputs=[y], block_dim=1, device=dev)
-            y.grad.assign(np.ones((TILE, TILE), np.float32))
-            try:
+            spd = np.eye(TILE, dtype=np.float32) * 4.0 + 0.5
+            grads = {}
+            for dev in ('cpu', 'metal:0'):
+                x = wp.array(spd, dtype=wp.float32, device=dev, requires_grad=True)
+                y = wp.zeros((TILE, TILE), dtype=wp.float32, device=dev, requires_grad=True)
+                tape = wp.Tape()
+                with tape:
+                    wp.launch_tiled(k, dim=[1], inputs=[x], outputs=[y], block_dim=1, device=dev)
+                y.grad.assign(np.arange(TILE * TILE, dtype=np.float32).reshape(TILE, TILE))
                 tape.backward()
-            except Exception as e:
-                msg = str(e)
-                assert 'tile_cholesky' in msg, msg
-                assert ('not supported' in msg or 'does not yet support' in msg), msg
-            else:
-                raise AssertionError('adjoint of tile_cholesky should have raised')
+                grads[dev] = x.grad.numpy()
+            assert np.abs(grads['cpu']).max() > 0.1
+            np.testing.assert_allclose(grads['metal:0'], grads['cpu'], rtol=1e-5, atol=1e-5)
             """
         )
         _run_with_metal_native(self, snippet)
