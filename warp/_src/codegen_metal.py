@@ -9059,7 +9059,7 @@ def _emit_tile_cholesky_smem(n: int, msl_scalar: str) -> str:
     return "\n".join(parts)
 
 
-def _emit_tile_cholesky_solve_smem_1(n: int, msl_scalar: str) -> str:
+def _emit_tile_cholesky_solve_smem_1(n: int, msl_scalar: str, upper: bool = False) -> str:
     """Emit ``wp_tile_NxN_<scalar>_cholesky_solve_smem_1`` — vector-RHS
     solve reading ``L`` from a threadgroup-resident tile.
 
@@ -9068,33 +9068,115 @@ def _emit_tile_cholesky_solve_smem_1(n: int, msl_scalar: str) -> str:
     32 lanes share one copy of the factor instead of holding 32. ``x``
     stays private and redundant per lane (it is only N floats, and
     ``metal::simd_sum`` keeps every lane's copy identical).
+
+    ``upper`` emits ``..._cholesky_solve_smem_upper_1`` for a factor stored
+    in ``fill_mode="upper"`` form (``U`` with ``A = U^T U``): it reads
+    ``L[i][k]`` as ``U[k][i]``, which is exactly what the private path does
+    by transposing a copy of ``U`` before the coop solve, so the arithmetic
+    (and the result) is the same.
     """
     B_name = f"wp_tile_{n}x1_{msl_scalar}"
     L_name = f"wp_tile_{n}x{n}_{msl_scalar}"
+
+    def at(r: str, c: str) -> str:
+        return f"L[{c}*{n} + {r}]" if upper else f"L[{r}*{n} + {c}]"
+
+    suffix = "_upper" if upper else ""
     parts: list[str] = []
     parts.append(
-        f"inline {B_name} {L_name}_cholesky_solve_smem_1(threadgroup const {msl_scalar}* L, {B_name} b, uint lane) {{"
+        f"inline {B_name} {L_name}_cholesky_solve_smem{suffix}_1(threadgroup const {msl_scalar}* L, {B_name} b, uint lane) {{"
     )
     parts.append(f"    {B_name} x = b;")
     parts.append("    #pragma clang loop unroll(disable)")
     parts.append(f"    for (int i = 0; i < {n}; ++i) {{")
     parts.append(f"        {msl_scalar} s = {_sc_zero(msl_scalar)};")
-    parts.append(f"        for (int kk = (int)lane; kk < i; kk += 32) s = metal::fma(-L[i*{n} + kk], x.c[kk], s);")
+    parts.append(f"        for (int kk = (int)lane; kk < i; kk += 32) s = metal::fma(-{at('i', 'kk')}, x.c[kk], s);")
     parts.append("        s = metal::simd_sum(s);")
-    parts.append(f"        x.c[i] = (x.c[i] + s) / L[i*{n} + i];")
+    parts.append(f"        x.c[i] = (x.c[i] + s) / {at('i', 'i')};")
     parts.append("    }")
     parts.append("    #pragma clang loop unroll(disable)")
     parts.append(f"    for (int i = {n} - 1; i >= 0; --i) {{")
     parts.append(f"        {msl_scalar} s = {_sc_zero(msl_scalar)};")
     parts.append(
-        f"        for (int kk = i + 1 + (int)lane; kk < {n}; kk += 32) s = metal::fma(-L[kk*{n} + i], x.c[kk], s);"
+        f"        for (int kk = i + 1 + (int)lane; kk < {n}; kk += 32) s = metal::fma(-{at('kk', 'i')}, x.c[kk], s);"
     )
     parts.append("        s = metal::simd_sum(s);")
-    parts.append(f"        x.c[i] = (x.c[i] + s) / L[i*{n} + i];")
+    parts.append(f"        x.c[i] = (x.c[i] + s) / {at('i', 'i')};")
     parts.append("    }")
     parts.append("    return x;")
     parts.append("}")
     return "\n".join(parts)
+
+
+def _emit_tile_cholesky_inplace_smem(n: int, msl_scalar: str, upper: bool = False) -> str:
+    """Emit ``wp_tile_NxN_<scalar>_cholesky_inplace_smem[_upper]`` — the
+    cooperative, threadgroup-resident form of ``tile_cholesky_inplace``.
+
+    Same per-element arithmetic as :func:`_emit_tile_cholesky_inplace` (the
+    serial helper every lane otherwise runs redundantly on its own private
+    copy): ``fma`` order, ``1e-30`` clamp, ``precise::sqrt`` and the
+    multiply by ``1 / ljj``, so the factor is bit-identical to that path.
+    Lane ``j & 31`` computes pivot ``j``; the rows below it are split across
+    the 32 lanes (each row reads only finished columns ``k < j``).
+
+    ``upper`` factors a tile holding ``A`` in its upper triangle into
+    ``U = L^T`` (``fill_mode="upper"``), reading element ``(r, c)`` of the
+    lower-mode algorithm at ``A[c][r]``; that is what the private path does
+    with a transpose before and after the serial helper. The strictly
+    lower (upper mode) / upper (lower mode) triangle is zeroed at the end,
+    as the serial helper does.
+    """
+    name = f"wp_tile_{n}x{n}_{msl_scalar}"
+    nn = n * n
+
+    def at(r: str, c: str) -> str:
+        return f"smem[({c})*{n} + ({r})]" if upper else f"smem[({r})*{n} + ({c})]"
+
+    suffix = "_upper" if upper else ""
+    parts: list[str] = []
+    parts.append(f"inline void {name}_cholesky_inplace_smem{suffix}(threadgroup {msl_scalar}* smem, uint lane) {{")
+    parts.append("    threadgroup_barrier(metal::mem_flags::mem_threadgroup);")
+    parts.append("    #pragma clang loop unroll(disable)")
+    parts.append(f"    for (int j = 0; j < {n}; ++j) {{")
+    parts.append("        if ((int)lane == (j & 31)) {")
+    parts.append(f"            {msl_scalar} d = {at('j', 'j')};")
+    parts.append("            for (int k = 0; k < j; ++k) {")
+    parts.append(f"                {msl_scalar} ljk = {at('j', 'k')};")
+    parts.append("                d = metal::fma(-ljk, ljk, d);")
+    parts.append("            }")
+    parts.append(f"            d = metal::max(d, {_sc_lit(msl_scalar, 1e-30)});")
+    parts.append(f"            {at('j', 'j')} = metal::precise::sqrt(d);")
+    parts.append("        }")
+    parts.append("        threadgroup_barrier(metal::mem_flags::mem_threadgroup);")
+    parts.append(f"        {msl_scalar} inv = {_sc_lit(msl_scalar, 1.0)} / {at('j', 'j')};")
+    parts.append(f"        for (int i = j + 1 + (int)lane; i < {n}; i += 32) {{")
+    parts.append(f"            {msl_scalar} s = {at('i', 'j')};")
+    parts.append(f"            for (int k = 0; k < j; ++k) s = metal::fma(-{at('i', 'k')}, {at('j', 'k')}, s);")
+    parts.append(f"            {at('i', 'j')} = s * inv;")
+    parts.append("        }")
+    parts.append("        threadgroup_barrier(metal::mem_flags::mem_threadgroup);")
+    parts.append("    }")
+    parts.append(f"    for (uint e = lane; e < {nn}u; e += 32u) {{")
+    parts.append(f"        uint i = e / {n}u;")
+    parts.append(f"        uint j = e - i * {n}u;")
+    parts.append(f"        if ({'j < i' if upper else 'j > i'}) smem[e] = {_sc_zero(msl_scalar)};")
+    parts.append("    }")
+    parts.append("    threadgroup_barrier(metal::mem_flags::mem_threadgroup);")
+    parts.append("}")
+    return "\n".join(parts)
+
+
+def _smem_slot(entry: tuple[int, int, int, str]) -> str:
+    """Pointer expression for a threadgroup-resident tile's slot in the arena.
+
+    The arena is ``threadgroup float``; a 32-bit integer tile sharing it
+    (an index tile, see ``_plan_smem_alias_groups``) is addressed through a
+    reinterpreting pointer so its values are stored, not converted.
+    """
+    off, _rows, _cols, scalar = entry
+    if scalar == "float":
+        return f"({_SMEM_ARENA_NAME} + {off})"
+    return f"((threadgroup {scalar}*)({_SMEM_ARENA_NAME} + {off}))"
 
 
 # Apple Silicon caps threadgroup memory at 32 KB per threadgroup.
@@ -10011,6 +10093,197 @@ def _plan_smem_tiles(
     return plan, offset
 
 
+_SMEM_RESHAPE_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_reshape\s*<(.*)>\s*\(\s*var_(\w+)\s*\)\s*;")
+_SMEM_LOAD_INDEXED_PAT = re.compile(r"\bvar_(\w+)\s*=\s*wp::tile_load_indexed\s*(?:<[^()]*>)?\s*\(([^;]*?)\)(?=\s*;)")
+_SMEM_CHOL_INPLACE_PAT = re.compile(r"\bwp::tile_cholesky_inplace\s*<[^()]*>\s*\(([^)]*)\)")
+
+
+def _plan_smem_alias_groups(
+    forward_lines: list[str],
+    tile_var_dims: dict[str, tuple[int, int, str]],
+    tile_var_vec_n: dict[str, int],
+    reserved_floats: int = 0,
+    exclude: set[str] | frozenset = frozenset(),
+) -> tuple[dict[str, tuple[int, int, int, str]], int]:
+    """Threadgroup-resident tiles for the ``tile_reshape`` / ``tile_load_indexed``
+    / ``tile_cholesky_inplace`` idiom (mujoco_warp's dense-block Cholesky).
+
+    Extends :func:`_plan_smem_tiles` to *alias groups*: tiles joined by a
+    ``tile_reshape`` to a ``tile_shared_t`` (a view of the same storage on
+    CPU/CUDA, which the private model emulates with copies and write-backs)
+    all share one arena slot. A group is promoted when
+
+    - every member is a non-vec ``float`` tile with the same element count;
+    - exactly one statement produces the storage (``tile_load`` or a 1-D
+      ``tile_load_indexed`` into a member), and no member appears before it;
+    - every appearance of a member is a supported position: produced as above,
+      either side of a reshape, ``tile_cholesky_inplace``'s tile (lower or
+      upper), ``tile_cholesky_solve``'s factor (vector right-hand side), or
+      ``tile_store``'s source;
+    - some member is a square tile in the cooperative Cholesky range used by
+      ``tile_cholesky_inplace`` or ``tile_cholesky_solve``.
+
+    The index tile of the producing ``tile_load_indexed`` also joins the slot
+    when it is a 1-D 32-bit integer tile of the same length, produced by one
+    ``tile_load`` and used by nothing but the indexed load: lane ``k`` reads
+    index ``k`` and then writes element ``k`` of the same slot, so the two
+    never race.
+
+    Returns ``(plan, floats_used)`` in :func:`_plan_smem_tiles`'s format, with
+    each label's own ``(rows, cols, scalar)``. Anything not matching keeps the
+    private representation.
+    """
+
+    def _label_of(arg: str) -> str:
+        arg = arg.strip()
+        return arg[len("var_") :] if arg.startswith("var_") else arg
+
+    parent: dict[str, str] = {}
+
+    def find(x: str) -> str:
+        while parent.get(x, x) != x:
+            x = parent[x]
+        return x
+
+    reshape_lines: dict[int, tuple[str, str]] = {}
+    indexed_lines: dict[int, tuple[str, str]] = {}  # line -> (dst, index tile)
+    bad: set[str] = set()
+    for idx, raw in enumerate(forward_lines):
+        m = _SMEM_RESHAPE_PAT.search(raw)
+        if m is not None:
+            dst, src = m.group(1), m.group(3)
+            if "tile_shared_t" not in m.group(2):
+                bad.update((dst, src))
+            reshape_lines[idx] = (dst, src)
+            parent.setdefault(dst, dst)
+            parent.setdefault(src, src)
+            ra, rb = find(dst), find(src)
+            if ra != rb:
+                parent[ra] = rb
+        m = _SMEM_LOAD_INDEXED_PAT.search(raw)
+        if m is not None:
+            args = _mtiles._split_top(m.group(2))
+            dst = m.group(1)
+            d = tile_var_dims.get(dst)
+            # 1-D only: ``(arr, lead..., indices, axis, offset)``.
+            if d is None or d[1] != 1 or len(args) < 4:
+                bad.add(dst)
+                continue
+            parent.setdefault(dst, dst)
+            indexed_lines[idx] = (dst, _label_of(args[-3]))
+
+    groups: dict[str, list[str]] = {}
+    for label in parent:
+        groups.setdefault(find(label), []).append(label)
+
+    occ_cache: dict[str, list[tuple[int, int]]] = {}
+
+    def occurrences(label: str) -> list[tuple[int, int]]:
+        hit = occ_cache.get(label)
+        if hit is None:
+            pat = re.compile(r"\bvar_" + re.escape(label) + r"\b")
+            hit = [(i, n) for i, raw in enumerate(forward_lines) if (n := len(pat.findall(raw)))]
+            occ_cache[label] = hit
+        return hit
+
+    def in_coop_range(label: str) -> bool:
+        r, c, _sc = tile_var_dims[label]
+        return r == c and _COOP_CHOL_MIN_N <= r <= _COOP_CHOL_MAX_N
+
+    plan: dict[str, tuple[int, int, int, str]] = {}
+    offset = 0
+    for members in groups.values():
+        if any(
+            lb in bad
+            or lb in exclude
+            or lb not in tile_var_dims
+            or tile_var_dims[lb][2] != "float"
+            or tile_var_vec_n.get(lb)
+            for lb in members
+        ):
+            continue
+        sizes = {tile_var_dims[lb][0] * tile_var_dims[lb][1] for lb in members}
+        if len(sizes) != 1:
+            continue
+        size = sizes.pop()
+        mset = set(members)
+        expected: dict[tuple[str, int], int] = {}
+        producers: list[int] = []
+        heavy = False
+        idx_member = None
+
+        def acc(label: str, line: int, _expected=expected) -> None:
+            _expected[(label, line)] = _expected.get((label, line), 0) + 1
+
+        for i, raw in enumerate(forward_lines):
+            if not any(f"var_{lb}" in raw for lb in members):
+                continue
+            if i in reshape_lines:
+                dst, src = reshape_lines[i]
+                acc(dst, i)
+                acc(src, i)
+            if i in indexed_lines and indexed_lines[i][0] in mset:
+                acc(indexed_lines[i][0], i)
+                producers.append(i)
+                idx_member = (indexed_lines[i][1], i)
+            m = _SMEM_LOAD_PAT.search(raw)
+            if m is not None and m.group(1) in mset:
+                acc(m.group(1), i)
+                producers.append(i)
+            m = _SMEM_CHOL_INPLACE_PAT.search(raw)
+            if m is not None:
+                args = [a.strip() for a in m.group(1).split(",")]
+                lb = _label_of(args[1]) if len(args) == 2 else ""
+                if lb in mset:
+                    acc(lb, i)
+                    heavy = heavy or in_coop_range(lb)
+            m = _SMEM_SOLVE_PAT.search(raw)
+            if m is not None:
+                args = [a.strip() for a in m.group(2).split(",")]
+                if len(args) == 4:
+                    lb = _label_of(args[1])
+                    b_dims = tile_var_dims.get(_label_of(args[2]))
+                    if lb in mset and b_dims is not None and b_dims[1] == 1 and in_coop_range(lb):
+                        acc(lb, i)
+                        heavy = True
+            m = _SMEM_STORE_PAT.search(raw)
+            if m is not None:
+                args = [a.strip() for a in m.group(1).split(",")]
+                if args and _label_of(args[-1]) in mset:
+                    acc(_label_of(args[-1]), i)
+        if not heavy or len(producers) != 1:
+            continue
+        prod = producers[0]
+        if any(expected.get((lb, i), 0) != n or i < prod for lb in members for i, n in occurrences(lb)):
+            continue
+        entries = {lb: tile_var_dims[lb] for lb in members}
+        if idx_member is not None:
+            il, iline = idx_member
+            d = tile_var_dims.get(il)
+            loads = [
+                i for i, raw in enumerate(forward_lines) if (mm := _SMEM_LOAD_PAT.search(raw)) and mm.group(1) == il
+            ]
+            if (
+                d is not None
+                and il not in mset
+                and il not in exclude
+                and d[2] in ("int", "uint")
+                and d[1] == 1
+                and d[0] == size
+                and not tile_var_vec_n.get(il)
+                and len(loads) == 1
+                and loads[0] < iline
+                and all(i in (loads[0], iline) and n == 1 for i, n in occurrences(il))
+            ):
+                entries[il] = d
+        if reserved_floats + offset + size > _SMEM_ARENA_MAX_FLOATS:
+            continue
+        for lb, (r, c, sc) in entries.items():
+            plan[lb] = (offset, r, c, sc)
+        offset += size
+    return plan, offset
+
+
 def _msl_vec_name(n: int, msl_scalar: str) -> str:
     """MSL type name for ``vec_t<N, T>`` — native ``floatN`` or our struct."""
     return f"{msl_scalar}{n}" if _vec_native(n, msl_scalar) else f"wp_vec{n}_{msl_scalar}"
@@ -10437,6 +10710,29 @@ def _build_kernel_header(source: str) -> str:
             seen_smem_solve.add((rows, m.group(3)))
     for n, scalar in sorted(seen_smem_solve):
         parts.append(_emit_tile_cholesky_solve_smem_1(n, scalar))
+    # Resident ``tile_cholesky_inplace`` / ``fill_mode="upper"`` variants
+    # (see ``_plan_smem_alias_groups``).
+    for pat, emit in (
+        (
+            r"\bwp_tile_(\d+)x(\d+)_(\w+)_cholesky_inplace_smem\b",
+            lambda n_, sc_: _emit_tile_cholesky_inplace_smem(n_, sc_),
+        ),
+        (
+            r"\bwp_tile_(\d+)x(\d+)_(\w+)_cholesky_inplace_smem_upper\b",
+            lambda n_, sc_: _emit_tile_cholesky_inplace_smem(n_, sc_, upper=True),
+        ),
+        (
+            r"\bwp_tile_(\d+)x(\d+)_(\w+)_cholesky_solve_smem_upper_1\b",
+            lambda n_, sc_: _emit_tile_cholesky_solve_smem_1(n_, sc_, upper=True),
+        ),
+    ):
+        seen_ext: set[tuple[int, str]] = set()
+        for m in re.finditer(pat, source):
+            rows, cols = int(m.group(1)), int(m.group(2))
+            if rows == cols:
+                seen_ext.add((rows, m.group(3)))
+        for n, scalar in sorted(seen_ext):
+            parts.append(emit(n, scalar))
     # mujoco_warp ``@wp.func`` helpers referenced by ``tile_map``.
     user_func_defs = _emit_referenced_user_funcs(source)
     if user_func_defs:
@@ -13197,7 +13493,7 @@ def _translate_tile_intrinsics(
         if lhs in smem_tiles:
             off, srows, scols, _sc = smem_tiles[lhs]
             n = srows * scols
-            slot = f"({_SMEM_ARENA_NAME} + {off})"
+            slot = _smem_slot(smem_tiles[lhs])
             elem = f"{arr}[{base_expr} + (({row_off}) + (int)_tl_i) * ({row_stride}) + (({col_off}) + (int)_tl_j)]"
             if shaped:
                 elem = (
@@ -13411,7 +13707,7 @@ def _translate_tile_intrinsics(
         if tile_label in smem_tiles:
             off, srows, scols, _sc = smem_tiles[tile_label]
             n = srows * scols
-            slot = f"({_SMEM_ARENA_NAME} + {off})"
+            slot = _smem_slot(smem_tiles[tile_label])
             target = f"{arr}[{base_expr} + (({row_off}) + (int)_ts_i) * ({row_stride}) + (({col_off}) + (int)_ts_j)]"
             write = (
                 f"atomic_store_explicit(&{target}, {slot}[_ts_e], memory_order_relaxed);"
@@ -14642,6 +14938,14 @@ def _translate_tile_intrinsics(
             return m.group(0)
         if rows == 1:
             return f"{tile_arg} = metal::precise::sqrt(metal::max({tile_arg}, {_sc_lit(scalar, 1e-30)}))"
+        if tile_label in smem_tiles:
+            # Threadgroup-resident (see ``_plan_smem_alias_groups``): factor
+            # the arena slot in place, all 32 lanes cooperating.
+            suffix = "_upper" if _cholesky_tpl_upper(m.group(0)) else ""
+            return (
+                f"wp_tile_{rows}x{cols}_{scalar}_cholesky_inplace_smem{suffix}"
+                f"({_smem_slot(smem_tiles[tile_label])}, _coop_lane)"
+            )
         helper = f"wp_tile_{rows}x{cols}_{scalar}_cholesky_inplace"
         if _cholesky_tpl_upper(m.group(0)):
             # ``fill_mode="upper"``: A = U^T U with U upper-triangular (lower
@@ -14996,7 +15300,7 @@ def _translate_tile_intrinsics(
 
         def _elem(label: str, var: str, i: str) -> str:
             if label in smem_tiles:
-                return f"({_SMEM_ARENA_NAME} + {smem_tiles[label][0]})[{i}]"
+                return f"{_smem_slot(smem_tiles[label])}[{i}]"
             return f"{var}.c[{i}]" if n > 1 else var
 
         target = f"{arr}[_tsi_ix]"
@@ -15060,9 +15364,24 @@ def _translate_tile_intrinsics(
         )
         return f"{{ auto var_{tmp_label} = {u_arg}; {tr} {lowered}; }}"
 
+    def _upper_solve_smem(m: re.Match[str]) -> str | None:
+        """``fill_mode="upper"`` vector solve against a threadgroup-resident
+        factor: read ``U`` transposed in place (no private copy)."""
+        args = [a.strip() for a in m.group(2).split(",")]
+        if len(args) != 4:
+            return None
+        u_label = args[1][len("var_") :] if args[1].startswith("var_") else args[1]
+        b_label = args[2][len("var_") :] if args[2].startswith("var_") else args[2]
+        dims = tile_var_dims.get(u_label)
+        b_dims = tile_var_dims.get(b_label) or tile_var_dims.get(m.group(1))
+        if u_label not in smem_tiles or dims is None or b_dims is None or dims[0] != dims[1] or b_dims[1] != 1:
+            return None
+        helper = f"wp_tile_{dims[0]}x{dims[0]}_{dims[2]}_cholesky_solve_smem_upper_1"
+        return f"var_{m.group(1)} = {helper}({_smem_slot(smem_tiles[u_label])}, {args[2]}, _coop_lane)"
+
     line = _TILE_CHOLESKY_SOLVE_PAT.sub(
         lambda m: (
-            _upper_solve_via_lower(m, _TILE_CHOLESKY_SOLVE_PAT, repl_cholesky_solve, 1)
+            (_upper_solve_smem(m) or _upper_solve_via_lower(m, _TILE_CHOLESKY_SOLVE_PAT, repl_cholesky_solve, 1))
             if _cholesky_tpl_upper(m.group(0))
             else repl_cholesky_solve(m)
         ),
@@ -19297,6 +19616,20 @@ def _generate_msl_kernel_uncached(
             reserved_floats=pre_coop_chol_n * pre_coop_chol_n,
             exclude=set(transpose_views.values()),
         )
+        if not adjoint:
+            # Reshape / indexed-load / in-place Cholesky groups (one slot per
+            # group, after the chains above).
+            alias_plan, alias_floats = _plan_smem_alias_groups(
+                forward_lines,
+                tile_var_dims,
+                tile_var_vec_n,
+                reserved_floats=pre_coop_chol_n * pre_coop_chol_n + smem_arena_floats,
+                exclude=set(transpose_views.values()) | set(smem_tiles),
+            )
+            for _lb, (_off, _r, _c, _sc) in alias_plan.items():
+                smem_tiles[_lb] = (smem_arena_floats + _off, _r, _c, _sc)
+            smem_arena_floats += alias_floats
+    tile_ext.smem = smem_tiles
 
     # ---- Quaternion-typed locals --------------------------------------
     # Quats are stored as ``vec_t<4>``/``float4``, but ``wp::mul`` on two

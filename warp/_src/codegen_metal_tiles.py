@@ -266,6 +266,10 @@ class TileExt:
         const_ints: dict[str, int] | None = None,
     ):
         self.const_ints = const_ints or {}
+        # Threadgroup-resident tiles (label -> (arena offset, rows, cols,
+        # scalar)), set by the core translator after planning. Views among
+        # them share their parent's slot, so they need no copies.
+        self.smem: dict[str, tuple[int, int, int, str]] = {}
         self._axis_maps: dict[str, list[tuple[int, int]]] = {}
         self.dims = tile_var_dims
         self.vec_n = tile_var_vec_n
@@ -334,6 +338,10 @@ class TileExt:
 
     def _elem(self, var: str, label: str, flat: str, comp: int | None = None) -> str:
         """Scalar slot ``flat`` (element index) of a tile local."""
+        if label in self.smem:
+            from warp._src.codegen_metal import _smem_slot  # noqa: PLC0415
+
+            return f"{_smem_slot(self.smem[label])}[{flat}]"
         vn = self.vec_n.get(label, 0)
         if self._n(label) == 1:
             base = var
@@ -633,6 +641,10 @@ class TileExt:
             return line
         m = _VIEW_DEF_PAT.search(line)
         if m is not None and m.group(1) in self.views:
+            if m.group(1) in self.smem:
+                # A reshape inside a threadgroup-resident alias group: the
+                # view is the parent's arena slot, nothing to copy.
+                return line[: len(line) - len(line.lstrip())] + f"// var_{m.group(1)}: resident view"
             return self._lower_view_def(line, m)
         pre = ""
         post = ""
@@ -643,7 +655,7 @@ class TileExt:
             return self._lower_ops(line)
         if self.views:
             referenced = {mm.group(1) for mm in self._label_pat.finditer(line) if mm.group(0).startswith("var_")}
-            views_here = [v for v in referenced if v in self.views]
+            views_here = [v for v in referenced if v in self.views and v not in self.smem]
             if views_here:
                 pre = " ".join(self._refresh_chain(v) for v in views_here if self._view_chain_volatile(v))
                 written = _mutated_labels(line)
@@ -806,6 +818,23 @@ class TileExt:
         def idx_at(c: str) -> str:
             return self._elem(idx_t, idx_label, c)
 
+        if lhs in self.smem:
+            # Threadgroup-resident destination: lane-strided, between
+            # barriers. Lane ``k`` reads index ``k`` before writing element
+            # ``k`` (the index tile may share the slot, see
+            # ``_plan_smem_alias_groups``), so no element is read after
+            # another lane wrote it.
+            if nd != 1:
+                raise MetalCodegenError(
+                    f"MSL codegen: threadgroup-resident tile_load_indexed must be 1-D ({m.group(0)!r})"
+                )
+            r = f"(({offs[0]}) + (({axis}) == 0 ? (int)({idx_at('_li_k')}) : _li_k))"
+            return (
+                "do { threadgroup_barrier(metal::mem_flags::mem_threadgroup); "
+                f"for (int _li_k = (int)_coop_lane; _li_k < {n}; _li_k += 32) {{ const int _li_r = {r}; "
+                f"{dst} = (_li_r >= 0 && _li_r < (int){arr_name}_shape[{nl}]) ? {arr}[{base} + _li_r] : {zero}; }} "
+                "threadgroup_barrier(metal::mem_flags::mem_threadgroup); } while (0)"
+            )
         if nd == 1:
             r = f"(({offs[0]}) + (({axis}) == 0 ? (int)({idx_at('_li_k')}) : _li_k))"
             return (
