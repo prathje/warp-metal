@@ -10,6 +10,9 @@
   must give the same NaN / inf pattern, in values and in gradients.
 * ``warp.config.metal_tid_order`` is part of the in-process content-artifact
   key, so toggling it is honoured for kernels with identical content.
+* ``MetalDispatcher.add_sync_callback``: host callbacks after every completed
+  sync (eager, graph replay, atexit drain), used by Newton to report device-side
+  overflow flags that CUDA kernels would ``printf``.
 """
 
 import textwrap
@@ -176,6 +179,110 @@ class TestMetalR10TidOrderContentKey(unittest.TestCase):
             """
         )
         _run_with_metal_native(self, snippet, timeout=300)
+
+
+@unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
+@unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
+class TestMetalR10SyncCallbacks(unittest.TestCase):
+    def test_sync_callback_sees_finished_launches(self):
+        snippet = textwrap.dedent(
+            """
+            import ctypes, warnings
+            import numpy as np
+            from warp._src.metal_dispatch import get_dispatcher
+
+            @wp.kernel
+            def bump(flag: wp.array[wp.int64], v: wp.int64):
+                flag[0] = flag[0] + v
+
+            disp = get_dispatcher()
+            flag = wp.zeros(1, dtype=wp.int64, device="metal:0")
+            seen = []
+            nested = []
+
+            def peek():
+                return ctypes.c_int64.from_address(flag.ptr).value
+
+            stop = []
+
+            def cb():
+                seen.append(peek())
+                # a nested sync must not re-enter the callbacks
+                nested.append(int(flag.numpy()[0]))
+                return not stop
+
+            disp.add_sync_callback(cb)
+            wp.launch(bump, dim=1, inputs=[flag, 5], device="metal:0")
+            wp.synchronize_device("metal:0")
+            assert seen == [5] and nested == [5], (seen, nested)
+            # graph replay, read back through .numpy()
+            with wp.ScopedCapture(device="metal:0") as cap:
+                wp.launch(bump, dim=1, inputs=[flag, 2], device="metal:0")
+            n = len(seen)
+            wp.capture_launch(cap.graph)
+            wp.capture_launch(cap.graph)
+            assert flag.numpy()[0] == 9
+            assert len(seen) > n and seen[-1] == 9 and nested[-1] == 9, seen
+            assert len(seen) == len(nested), (seen, nested)
+            stop.append(1)
+            wp.synchronize()  # returns False -> removed
+            n = len(seen)
+            wp.synchronize()
+            assert len(seen) == n and cb not in disp._sync_callbacks, seen
+
+            def bad():
+                raise ValueError("boom")
+
+            disp.add_sync_callback(bad)
+            with warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter("always")
+                wp.synchronize()
+                wp.synchronize()
+            msgs = [str(x.message) for x in w if "sync callback" in str(x.message)]
+            assert len(msgs) == 1 and "boom" in msgs[0], msgs
+            assert bad not in disp._sync_callbacks
+            disp.remove_sync_callback(bad)  # absent: no-op
+            print("OK")
+            """
+        )
+        _run_with_metal_native(self, snippet, timeout=300)
+
+    def test_sync_callback_runs_at_exit(self):
+        # A flag set by the last launch of a script, with no sync before exit,
+        # is seen by the callback from the atexit drain.
+        import os  # noqa: PLC0415
+        import subprocess  # noqa: PLC0415
+        import sys  # noqa: PLC0415
+        import tempfile  # noqa: PLC0415
+
+        code = textwrap.dedent(
+            """
+            import ctypes
+            import warp as wp
+            wp.config.enable_metal = True
+            wp.config.metal_native_dispatch = True
+            wp.init()
+            from warp._src.metal_dispatch import get_dispatcher
+
+            @wp.kernel
+            def setflag(flag: wp.array[wp.int64]):
+                flag[0] = wp.int64(42)
+
+            flag = wp.zeros(1, dtype=wp.int64, device="metal:0")
+            wp.synchronize_device("metal:0")
+            get_dispatcher().add_sync_callback(
+                lambda: print("FLAG", ctypes.c_int64.from_address(flag.ptr).value, flush=True))
+            wp.launch(setflag, dim=1, inputs=[flag], device="metal:0")
+            """
+        )
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, prefix="warp_metal_exit_") as f:
+            f.write(code)
+        try:
+            r = subprocess.run([sys.executable, f.name], capture_output=True, text=True, timeout=300, check=False)
+        finally:
+            os.unlink(f.name)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("FLAG 42", r.stdout, r.stdout + r.stderr)
 
 
 if __name__ == "__main__":

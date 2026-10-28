@@ -720,6 +720,10 @@ class MetalDispatcher:
         # Loop-overflow words of replayed graphs, checked at the next sync
         # (``addr -> (buf, addr, max_iters)``).
         self._armed_loop_checks: dict = {}
+        # Host callbacks run after every completed :meth:`sync` (see
+        # :meth:`add_sync_callback`), and the re-entrancy guard for them.
+        self._sync_callbacks: list = []
+        self._in_sync_callbacks = False
         # Cached descriptor used to allocate new ICBs. We reuse it
         # across captures (mutating the slot count per call) to avoid
         # the PyObjC alloc/init overhead on every record session.
@@ -1825,10 +1829,51 @@ class MetalDispatcher:
             # would otherwise silently discard all of their results.
             self._armed_loop_checks.clear()
             raise MetalDispatchError(f"Metal command buffer failed on the GPU: {failed.error()}")
+        if self._sync_callbacks and not self._in_sync_callbacks:
+            self._run_sync_callbacks()
         if self._armed_loop_checks:
             armed = list(self._armed_loop_checks.values())
             self._armed_loop_checks.clear()
             self._check_loop_overflow(armed)
+
+    def add_sync_callback(self, fn) -> None:
+        """Call ``fn()`` on the host after every completed :meth:`sync`.
+
+        :meth:`sync` is the point where every launch committed so far has
+        finished, so ``fn`` can read results of earlier launches from
+        unified memory without waiting (e.g. device-side error flags that a
+        CUDA kernel would have reported with ``printf``). It runs at every
+        host read (``.numpy()``, ``wp.synchronize*``, copies to the host),
+        after graph replays as well as eager launches, and once more from
+        the ``atexit`` drain, so a flag set by the last launch of a script
+        is still seen. ``fn`` must not launch or sync (a nested sync skips
+        the callbacks); it unregisters itself by returning ``False``. An
+        exception from ``fn`` is reported as a warning and unregisters it.
+        """
+        self._sync_callbacks.append(fn)
+
+    def remove_sync_callback(self, fn) -> None:
+        """Unregister a callback added with :meth:`add_sync_callback` (no-op if absent)."""
+        try:
+            self._sync_callbacks.remove(fn)
+        except ValueError:
+            pass
+
+    def _run_sync_callbacks(self) -> None:
+        self._in_sync_callbacks = True
+        try:
+            for fn in list(self._sync_callbacks):
+                try:
+                    keep = fn()
+                except Exception as exc:
+                    import warnings  # noqa: PLC0415
+
+                    warnings.warn(f"Metal sync callback {fn!r} raised {exc!r}; removed", stacklevel=3)
+                    keep = False
+                if keep is False:
+                    self.remove_sync_callback(fn)
+        finally:
+            self._in_sync_callbacks = False
 
     def _drain_at_exit(self) -> None:
         """``atexit`` hook: block until outstanding GPU work finishes.
