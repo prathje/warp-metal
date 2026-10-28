@@ -426,6 +426,140 @@ class TestMetalR10SoftMesh(unittest.TestCase):
         )
         _run_with_metal_native(self, snippet, timeout=300)
 
+    def test_native_snippet_cross_and_woop_normal_match_cpu_bitwise(self):
+        # wp::cross and the normal output of wp::intersect_ray_tri_woop are
+        # computed unfused, as native vec.h cross() on CPU (metal::cross fuses).
+        snippet = _COMMON + textwrap.dedent(
+            """
+            @wp.func_native(\"\"\"
+            float t, u, v, sign;
+            wp::vec3 n;
+            if (!wp::intersect_ray_tri_woop(p, d, a, b, c, t, u, v, sign, &n))
+                return wp::vec3(0.0f, 0.0f, 0.0f);
+            return n;
+            \"\"\")
+            def woop_normal(p: wp.vec3, d: wp.vec3, a: wp.vec3, b: wp.vec3, c: wp.vec3) -> wp.vec3: ...
+
+            @wp.func_native(\"\"\"
+            return wp::cross(a, b);
+            \"\"\")
+            def native_cross(a: wp.vec3, b: wp.vec3) -> wp.vec3: ...
+
+            @wp.kernel(module="unique")
+            def k(p: wp.array[wp.vec3], d: wp.array[wp.vec3], a: wp.array[wp.vec3], b: wp.array[wp.vec3],
+                  c: wp.array[wp.vec3], out: wp.array2d[wp.vec3]):
+                t = wp.tid()
+                out[t, 0] = woop_normal(p[t], d[t], a[t], b[t], c[t])
+                out[t, 1] = native_cross(a[t], b[t])
+
+            rng = np.random.default_rng(29)
+            n = 100000
+            P, A, B, C = (rng.uniform(-1, 1, (n, 3)).astype(np.float32) for _ in range(4))
+            W = rng.dirichlet([1, 1, 1], n).astype(np.float32)
+            D = (W[:, :1] * A + W[:, 1:2] * B + W[:, 2:] * C - P).astype(np.float32)
+
+            def go(dev):
+                arrs = [wp.array(x, dtype=wp.vec3, device=dev) for x in (P, D, A, B, C)]
+                out = wp.zeros((n, 2), dtype=wp.vec3, device=dev)
+                wp.launch(k, n, [*arrs, out], device=dev)
+                return out.numpy()
+
+            res = run_both(go)
+            c, m = res["cpu"], res["metal:0"]
+            assert np.any(c[:, 0] != 0.0)
+            bad = np.any(c.view(np.int32) != m.view(np.int32), axis=2)
+            assert not bad.any(), (bad.sum(axis=0), c[bad.any(1)][:3], m[bad.any(1)][:3])
+            """
+        )
+        _run_with_metal_native(self, snippet, timeout=300)
+
+    def test_mesh_parity_sign_and_ray_on_surface_match_cpu(self):
+        # Points exactly on a watertight mesh (faces, edges, vertices) and ray
+        # casts through its edges / vertices: the ray / triangle test must not
+        # FP-contract and must refine exact-zero edge functions in binary64 like
+        # native intersect_ray_tri_woop, or the parity sign of on-surface points
+        # (Newton's full-surface soft contacts on watertight meshes) flips.
+        snippet = _COMMON + textwrap.dedent(
+            """
+            @wp.kernel(module="unique")
+            def k_sign(mesh: wp.uint64, pts: wp.array[wp.vec3], out: wp.array[wp.vec4]):
+                t = wp.tid()
+                q = wp.mesh_query_point_sign_parity(mesh, pts[t], 10.0)
+                out[t] = wp.vec4(wp.where(q.result, 1.0, 0.0), q.sign, float(q.face), q.u + 2.0 * q.v)
+
+            @wp.kernel(module="unique")
+            def k_ray(mesh: wp.uint64, starts: wp.array[wp.vec3], dirs: wp.array[wp.vec3],
+                      out: wp.array2d[wp.vec4]):
+                t = wp.tid()
+                q = wp.mesh_query_ray(mesh, starts[t], dirs[t], 100.0)
+                out[t, 0] = wp.vec4(wp.where(q.result, 1.0, 0.0), q.t, q.u, q.v)
+                out[t, 1] = wp.vec4(q.sign, q.normal[0], q.normal[1], q.normal[2])
+
+            def cube(m):
+                verts, tris = [], []
+                lin = np.linspace(-0.5, 0.5, m + 1)
+                for axis in range(3):
+                    for side in (-0.5, 0.5):
+                        base = len(verts)
+                        for a in lin:
+                            for b in lin:
+                                p = [0.0, 0.0, 0.0]
+                                p[axis] = side
+                                p[(axis + 1) % 3] = a
+                                p[(axis + 2) % 3] = b
+                                verts.append(p)
+                        for i in range(m):
+                            for j in range(m):
+                                v0 = base + i * (m + 1) + j
+                                v1, v2, v3 = v0 + (m + 1), v0 + (m + 1) + 1, v0 + 1
+                                tris += [v0, v1, v2, v0, v2, v3] if side > 0 else [v0, v2, v1, v0, v3, v2]
+                return np.array(verts, np.float32), np.array(tris, np.int32)
+
+            verts, tris = cube(4)
+            rng = np.random.default_rng(31)
+            grid = np.linspace(-0.75, 0.75, 13).astype(np.float32)
+            pts = np.stack(np.meshgrid(grid, grid, grid, indexing="ij"), -1).reshape(-1, 3)
+            face = rng.uniform(-0.45, 0.45, (4000, 3)).astype(np.float32)
+            face[:, 2] = 0.5
+            pts = np.concatenate([pts, face]).astype(np.float32)
+            g = lambda n: (rng.integers(-4, 5, (n, 3)) * 0.25).astype(np.float32)
+            # starts outside the cube; targets on its face / edge / vertex lattice
+            starts = g(20000) * np.float32(2.0)
+            starts[:, 0] = np.where(np.abs(starts[:, 0]) < 1.0, np.float32(2.0), starts[:, 0])
+            dirs = g(20000) - starts
+            dirs[np.all(dirs == 0, axis=1)] = 1.0
+
+            def go(dev):
+                mesh = wp.Mesh(wp.array(verts, dtype=wp.vec3, device=dev), wp.array(tris, dtype=int, device=dev))
+                out = wp.zeros(len(pts), dtype=wp.vec4, device=dev)
+                wp.launch(k_sign, len(pts), [mesh.id, wp.array(pts, dtype=wp.vec3, device=dev), out], device=dev)
+                ray = wp.zeros((len(starts), 2), dtype=wp.vec4, device=dev)
+                wp.launch(k_ray, len(starts), [mesh.id, wp.array(starts, dtype=wp.vec3, device=dev),
+                                               wp.array(dirs, dtype=wp.vec3, device=dev), ray], device=dev)
+                return out.numpy(), ray.numpy()
+
+            res = run_both(go)
+            c, m = res["cpu"][0], res["metal:0"][0]
+            flips = np.sign(c[:, 1]) != np.sign(m[:, 1])
+            assert not flips.any(), (flips.sum(), pts[flips][:4])
+            assert (c[:, 1] < 0).any() and (c[:, 1] > 0).any()
+            cr, mr = res["cpu"][1], res["metal:0"][1]
+            assert cr[:, 0, 0].sum() > 1000
+            # Hit / miss everywhere; every output where the hit is unique (interior of a face).
+            # Hits on shared edges / vertices pick their face (and its ulp-different t) by
+            # traversal order, which differs between the native (near-child-first) and the
+            # Metal BVH walk.
+            assert np.array_equal(cr[:, 0, 0], mr[:, 0, 0])
+            np.testing.assert_allclose(mr[:, 0, 1], cr[:, 0, 1], rtol=1e-6, atol=0.0)
+            u, v = cr[:, 0, 2], cr[:, 0, 3]
+            unique = (cr[:, 0, 0] > 0) & (u > 0) & (v > 0) & (1.0 - u - v > 1e-6)
+            assert unique.sum() > 500
+            bad = unique & np.any(cr.view(np.int32) != mr.view(np.int32), axis=(1, 2))
+            assert not bad.any(), (bad.sum(), starts[bad][:3], dirs[bad][:3], cr[bad][:2], mr[bad][:2])
+            """
+        )
+        _run_with_metal_native(self, snippet, timeout=300)
+
     def test_native_snippet_unknown_wp_api_fails_loudly(self):
         # Native members without a Metal counterpart (here the mesh's points
         # array) must fail to compile, not read something else.

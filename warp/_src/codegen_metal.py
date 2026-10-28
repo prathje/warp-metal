@@ -5106,10 +5106,25 @@ inline float wp_bvh_diff_product(float a, float b, float c, float d) {
     float error = metal::fma(-c, d, cd);
     return diff + error;
 }
+#if defined(WP_METAL_SOFTFLOAT64)
+// a*b - c*d as native intersect_ray_tri_woop refines it in double: exact
+// float products, one binary64 rounding, then one binary32 rounding.
+inline float wp_bvh_f64_diff_product(float a, float b, float c, float d) {
+    ulong ab = __softfloat64_fmul(__softfloat64_cvt_f32_to_f64(as_type<uint>(a)),
+                                  __softfloat64_cvt_f32_to_f64(as_type<uint>(b)), 0u);
+    ulong cd = __softfloat64_fmul(__softfloat64_cvt_f32_to_f64(as_type<uint>(c)),
+                                  __softfloat64_cvt_f32_to_f64(as_type<uint>(d)), 0u);
+    return as_type<float>(__softfloat64_cvt_f64_to_f32(__softfloat64_fsub(ab, cd, 0u), 0u));
+}
+#endif
+// Native CPU code is not FP-contracted; MSL would fuse e.g. ``A[kx] - Sx * A[kz]``
+// and ``U * Az + V * Bz + W * Cz``, which flips the sign of near-zero edge
+// functions / T (e.g. parity sign queries for points on the surface).
 inline bool wp_bvh_intersect_ray_tri_woop(
     float3 p, float3 dir, float3 a, float3 b, float3 c,
     thread float& t, thread float& u, thread float& v, thread float& sign_out, thread float3& normal)
 {
+#pragma clang fp contract(off)
     int kz = wp_bvh_ray_max_dim(dir);
     int kx = kz + 1;
     if (kx == 3) { kx = 0; }
@@ -5135,8 +5150,16 @@ inline bool wp_bvh_intersect_ray_tri_woop(
     float U = wp_bvh_diff_product(Cx, By, Cy, Bx);
     float V = wp_bvh_diff_product(Ax, Cy, Ay, Cx);
     float W = wp_bvh_diff_product(Bx, Ay, By, Ax);
-    // The native version refines exact-zero U/V/W in double precision; MSL
-    // has no double, so edge-grazing rays keep the fma-compensated values.
+    // The native version refines exact-zero U/V/W in double precision. MSL has
+    // no double: kernels calling a ray / parity query get the softfloat64
+    // routines (see ``_WOOP_CALLER_PAT``) and the same refinement.
+#if defined(WP_METAL_SOFTFLOAT64)
+    if (U == 0.0f || V == 0.0f || W == 0.0f) {
+        U = wp_bvh_f64_diff_product(Cx, By, Cy, Bx);
+        V = wp_bvh_f64_diff_product(Ax, Cy, Ay, Cx);
+        W = wp_bvh_f64_diff_product(Bx, Ay, By, Ax);
+    }
+#endif
     if ((U < 0.0f || V < 0.0f || W < 0.0f) && (U > 0.0f || V > 0.0f || W > 0.0f)) { return false; }
     float det = U + V + W;
     if (det == 0.0f) { return false; }
@@ -5153,7 +5176,7 @@ inline bool wp_bvh_intersect_ray_tri_woop(
     sign_out = det;
     float3 ab = b - a;
     float3 ac = c - a;
-    normal = metal::cross(ab, ac);
+    normal = float3(ab.y * ac.z - ab.z * ac.y, ab.z * ac.x - ab.x * ac.z, ab.x * ac.y - ab.y * ac.x);
     return true;
 }
 inline bool wp_mesh_query_ray(
@@ -10804,8 +10827,10 @@ def _build_kernel_header(source: str) -> str:
     if native_wp_compat:
         source = source + "\n" + _NATIVE_WP_COMPAT_MSL
     # Emulated doubles first: every struct below may carry ``wp_f64`` members.
-    if _F64_EMU_MSL in source or native_wp_compat:
+    # Ray / parity mesh queries use them for the woop edge refinement.
+    if _F64_EMU_MSL in source or native_wp_compat or _WOOP_CALLER_PAT.search(source):
         parts.append(_f64_emulate_helpers())
+        parts.append("#define WP_METAL_SOFTFLOAT64 1")
     for n, scalar in sorted(seen_vec):
         parts.append(_emit_big_vec_struct(f"wp_vec{n}_{scalar}", n, scalar))
     # ``wp.vec1d(v_f32)`` / ``wp.vec1f(v_f64)`` between two big-vec structs
@@ -16155,7 +16180,11 @@ inline float dot(float3 a, float3 b) {
 #pragma clang fp contract(off)
     return a.x * b.x + a.y * b.y + a.z * b.z;
 }
-inline float3 cross(float3 a, float3 b) { return metal::cross(a, b); }
+// Component-wise as native vec.h cross(); metal::cross fuses into fma.
+inline float3 cross(float3 a, float3 b) {
+#pragma clang fp contract(off)
+    return float3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x);
+}
 // BVHPackedNodeHalf: same 16-byte layout as wp_bvh_node_t (bits = i:31 | b:1).
 struct BVHPackedNodeHalf {
     float x;
@@ -16271,13 +16300,20 @@ inline bool intersect_ray_tri_woop(
     v = V * rcp_det;
     t = T * rcp_det;
     sign = det;
-    if (normal) { *normal = metal::cross(b - a, c - a); }
+    if (normal) { *normal = wp::cross(b - a, c - a); }
     return true;
 }
 }  // namespace wp
 #endif
 """
 _NATIVE_WP_NAME_PAT = re.compile(r"\bwp::")
+# MSL helpers reaching ``wp_bvh_intersect_ray_tri_woop`` (ray casts, ray
+# parity / ray-tracing sign queries): their kernels get the softfloat64
+# routines for its binary64 edge refinement.
+_WOOP_CALLER_PAT = re.compile(
+    r"\bwp_(?:bvh_intersect_ray_tri_woop|mesh_query_ray\w*|mesh_query_inside_\w+|mesh_query_point"
+    r"|mesh_query_point_sign_parity|mesh_query_point_sign_winding_number)\s*\("
+)
 
 
 def _native_snippets_need_wp_compat(source: str) -> bool:
