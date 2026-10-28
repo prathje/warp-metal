@@ -1846,8 +1846,10 @@ class MetalDispatcher:
         host read (``.numpy()``, ``wp.synchronize*``, copies to the host),
         after graph replays as well as eager launches, and once more from
         the ``atexit`` drain, so a flag set by the last launch of a script
-        is still seen. ``fn`` must not launch or sync (a nested sync skips
-        the callbacks); it unregisters itself by returning ``False``. An
+        is still seen. ``fn`` should not launch or sync: a nested sync skips
+        the callbacks, and work ``fn`` launches is completed before the outer
+        sync returns. It unregisters itself by returning ``False``; a callback
+        removed by an earlier one in the same round is not called. An
         exception from ``fn`` is reported as a warning and unregisters it.
         """
         self._sync_callbacks.append(fn)
@@ -1863,6 +1865,8 @@ class MetalDispatcher:
         self._in_sync_callbacks = True
         try:
             for fn in list(self._sync_callbacks):
+                if fn not in self._sync_callbacks:
+                    continue  # removed by an earlier callback of this round
                 try:
                     keep = fn()
                 except Exception as exc:
@@ -1872,6 +1876,10 @@ class MetalDispatcher:
                     keep = False
                 if keep is False:
                     self.remove_sync_callback(fn)
+            if self._cmd_buf is not None or self._pending_commits:
+                # A callback launched work: finish it too (callbacks skipped), so
+                # the caller's host read after sync() still sees everything done.
+                self.sync(torch=False)
         finally:
             self._in_sync_callbacks = False
 

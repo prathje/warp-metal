@@ -247,6 +247,51 @@ class TestMetalR10SyncCallbacks(unittest.TestCase):
         )
         _run_with_metal_native(self, snippet, timeout=300)
 
+    def test_sync_callback_removal_and_launch_in_a_round(self):
+        # A callback removed by an earlier one in the same round is not called, and
+        # work a callback launches is finished before sync() returns.
+        snippet = textwrap.dedent(
+            """
+            import ctypes
+            from warp._src.metal_dispatch import get_dispatcher
+
+            @wp.kernel
+            def bump(flag: wp.array[wp.int64], v: wp.int64):
+                flag[0] = flag[0] + v
+
+            disp = get_dispatcher()
+            flag = wp.zeros(1, dtype=wp.int64, device="metal:0")
+            wp.synchronize_device("metal:0")
+            log = []
+
+            def b():
+                log.append("b")
+                return True
+
+            def a():
+                log.append("a")
+                disp.remove_sync_callback(b)
+                return False
+
+            disp.add_sync_callback(a)
+            disp.add_sync_callback(b)
+            wp.synchronize_device("metal:0")
+            assert log == ["a"], log
+            assert disp._sync_callbacks == [], disp._sync_callbacks
+
+            def launcher():
+                wp.launch(bump, dim=1, inputs=[flag, 7], device="metal:0")
+                return False
+
+            disp.add_sync_callback(launcher)
+            wp.synchronize_device("metal:0")
+            assert not disp.has_pending_work()
+            assert ctypes.c_int64.from_address(flag.ptr).value == 7
+            print("OK")
+            """
+        )
+        _run_with_metal_native(self, snippet, timeout=300)
+
     def test_sync_callback_runs_at_exit(self):
         # A flag set by the last launch of a script, with no sync before exit,
         # is seen by the callback from the atexit drain.
