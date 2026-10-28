@@ -24954,8 +24954,7 @@ def _get_or_build_metal_kernel_native(
             return hit
         artifact = generate_msl_kernel(kernel, block_dim=block_dim, adjoint=True, grad_args=grad_args)
         wrapped = _wrap_msl_for_native_dispatch(artifact)
-        pso = get_dispatcher().compile(wrapped, f"custom_kernel_{artifact.name}")
-        _note_native_pso(pso, wrapped)
+        pso = _compile_native(artifact, wrapped)
         cache[(model_key, grad_args)] = (artifact, pso)
         return artifact, pso
 
@@ -24981,8 +24980,7 @@ def _get_or_build_metal_kernel_native(
         wrapped = _wrap_msl_for_native_dispatch(artifact)
         kernel._metal_native_wrapped_source = wrapped
         try:
-            pso = get_dispatcher().compile(wrapped, f"custom_kernel_{artifact.name}")
-            _note_native_pso(pso, wrapped)
+            pso = _compile_native(artifact, wrapped)
         except Exception:
             if os.environ.get("WARP_METAL_DUMP_ON_FAIL"):
                 import tempfile
@@ -25379,6 +25377,78 @@ def _note_native_pso(pso, wrapped: str) -> None:
     entry = _PSO_GRID_ONLY.get(id(pso))
     if entry is None or entry[0] is not pso:
         _PSO_GRID_ONLY[id(pso)] = (pso, _grid_only_source(wrapped))
+
+
+# PSO id -> ``(pso, arity)``: the PSO was built from source whose ``wp.tid()``
+# axes are reversed (see ``_reverse_tid_axes``); ``arity`` is 2 or 3.
+_PSO_TID_REVERSED: dict[int, tuple] = {}
+_TID_LINE_PAT = re.compile(r"^(?P<indent>[ \t]*)var_(?P<v>\w+) = \(int\)thread_position_in_grid\.(?P<ax>[xyz]);[ \t]*$", re.M)
+
+
+def _reverse_tid_axes(artifact, wrapped: str) -> tuple[str, int]:
+    """Reverse the grid axes a native kernel's ``wp.tid()`` reads (see
+    :data:`warp.config.metal_tid_order`).
+
+    Returns ``(source, arity)``; ``arity`` is 0 (source unchanged) unless the
+    kernel is a plain 2-D / 3-D ``wp.tid()`` kernel whose body cannot depend on
+    the threadgroup shape (:func:`_grid_only_source`) and reads
+    ``thread_position_in_grid`` only in its tid lines. Then index ``k`` of
+    ``wp.tid()`` comes from grid axis ``arity - 1 - k`` and the launcher
+    dispatches the reversed grid, so the last tid index walks the threadgroup's
+    x axis, which Metal fills SIMD groups along.
+    """
+    import warp.config  # noqa: PLC0415
+
+    if not getattr(warp.config, "metal_tid_order", True):
+        return wrapped, 0
+    if (
+        getattr(artifact, "coop_chol_n", 0)
+        or getattr(artifact, "coop_block_n", 0)
+        or getattr(artifact, "needs_init_barrier", False)
+        or getattr(artifact, "tile_block_fold", False)
+        or getattr(artifact, "tid4", False)
+        or getattr(artifact, "lane_broadcast", False)
+        or getattr(artifact, "lane_tile_index", False)
+        or getattr(artifact, "native_lane_dependent", False)
+    ):
+        return wrapped, 0
+    start = wrapped.find("[[kernel]]")
+    open_at = wrapped.find(") {", start) if start >= 0 else -1
+    if open_at < 0 or "thread_position_in_grid" in wrapped[:start]:
+        return wrapped, 0
+    body = wrapped[open_at:]
+    lines = list(_TID_LINE_PAT.finditer(body))
+    axes = [m.group("ax") for m in lines]
+    if sorted(axes) not in (["x", "y"], ["x", "y", "z"]):
+        return wrapped, 0
+    if body.count("thread_position_in_grid") != len(lines) or "threads_per_grid" in body:
+        return wrapped, 0
+    if not _grid_only_source(wrapped):
+        return wrapped, 0
+    arity = len(axes)
+    flip = {"x": "y", "y": "x"} if arity == 2 else {"x": "z", "y": "y", "z": "x"}
+
+    def repl(m: re.Match[str]) -> str:
+        return f"{m.group('indent')}var_{m.group('v')} = (int)thread_position_in_grid.{flip[m.group('ax')]};"
+
+    return wrapped[:open_at] + _TID_LINE_PAT.sub(repl, body), arity
+
+
+def _pso_tid_reversed(pso) -> int:
+    entry = _PSO_TID_REVERSED.get(id(pso))
+    return entry[1] if entry is not None and entry[0] is pso else 0
+
+
+def _compile_native(artifact, wrapped: str):
+    """Compile a wrapped native kernel (tid axes reversed when eligible) and record its launch facts."""
+    from warp._src.metal_dispatch import get_dispatcher  # noqa: PLC0415
+
+    wrapped, arity = _reverse_tid_axes(artifact, wrapped)
+    pso = get_dispatcher().compile(wrapped, f"custom_kernel_{artifact.name}")
+    _note_native_pso(pso, wrapped)
+    if pso is not None:
+        _PSO_TID_REVERSED[id(pso)] = (pso, arity)
+    return pso
 
 
 def _pso_max_threads(pso) -> int:
@@ -26381,6 +26451,18 @@ def launch_metal_kernel_native(
             if grid_y * grid_z <= 1024:
                 tg = (1, grid_y, grid_z)
             # else: keep default tg and accept potential race (matches MLX path's behaviour).
+        arity = _pso_tid_reversed(pso)
+        if arity:
+            # Built with reversed tid axes (``_reverse_tid_axes``): reverse the
+            # grid so the last tid index runs along x, and fill threadgroups
+            # x-first. The body is threadgroup-shape independent.
+            g = list(grid)
+            g[:arity] = g[:arity][::-1]
+            cap = min(256, max_threads)
+            tx = min(g[0], cap)
+            ty = min(g[1], max(1, cap // tx))
+            tz = min(g[2], max(1, cap // (tx * ty)))
+            grid, tg = (g[0], g[1], g[2]), (tx, ty, tz)
     if tg[0] * tg[1] * tg[2] > _pso_max_threads(pso):
         # Metal leaves an oversized threadgroup undefined; this shape is
         # part of the kernel's semantics (barriers, SIMD groups, lanes).

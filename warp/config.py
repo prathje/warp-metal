@@ -487,6 +487,21 @@ loop's results are those after ``max_iters`` iterations (a fixed-iteration
 solver).
 """
 
+metal_tid_order: bool = _os.environ.get("WARP_METAL_TID_ORDER", "").strip().lower() not in ("0", "false", "off")
+"""Launch multi-dimensional Metal kernels with the last ``wp.tid()`` index fastest.
+
+Defaults to ``True``; set the ``WARP_METAL_TID_ORDER`` environment variable to
+``0`` to disable (an A/B kill switch, read when a kernel's pipeline is built).
+
+CUDA runs a ``dim=(a, b)`` launch with consecutive threads walking ``b``, so a
+warp reads consecutive elements of ``x[i, j]``. Metal forms SIMD groups along
+the grid's x axis, which held ``a``: 32 lanes read 32 different rows, one cache
+line each. With this on, native-dispatch kernels whose results cannot depend on
+the threadgroup shape (no threadgroup memory, barriers, SIMD functions or lock
+loops) and that read the grid position only through ``wp.tid()`` are built with
+the tid axes reversed and launched on the reversed grid. Results are unchanged.
+"""
+
 metal_threadgroup_tiles: bool = _os.environ.get("WARP_METAL_THREADGROUP_TILES", "").strip().lower() not in (
     "0",
     "false",
