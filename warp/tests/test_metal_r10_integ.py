@@ -8,6 +8,8 @@
   pivot gives NaN and a zero pivot inf/NaN on CPU and CUDA; every Metal
   forward (serial, by-value cooperative, threadgroup-resident, in-place, 1x1)
   must give the same NaN / inf pattern, in values and in gradients.
+* ``warp.config.metal_tid_order`` is part of the in-process content-artifact
+  key, so toggling it is honoured for kernels with identical content.
 """
 
 import textwrap
@@ -142,6 +144,38 @@ class TestMetalR10CholeskyPivot(unittest.TestCase):
             """
         )
         _run_with_metal_native(self, snippet, timeout=600)
+
+
+@unittest.skipUnless(_is_apple_silicon(), "Metal backend requires macOS / Apple Silicon")
+@unittest.skipUnless(_has_mlx(), "MLX is not installed (required for Metal backend)")
+class TestMetalR10TidOrderContentKey(unittest.TestCase):
+    def test_tid_order_toggle_not_bypassed_by_content_cache(self):
+        snippet = textwrap.dedent(
+            """
+            import numpy as np
+            from warp._src.codegen_metal import _pso_tid_reversed
+
+            def make(tag):
+                @wp.kernel(module=f"tidkey_{tag}")
+                def k(a: wp.array2d[float], b: wp.array2d[float]):
+                    i, j = wp.tid()
+                    b[i, j] = a[i, j] + float(10 * i + j)
+                return k
+
+            x = np.arange(3 * 35, dtype=np.float32).reshape(3, 35)
+            ref = x + 10 * np.arange(3)[:, None] + np.arange(35)[None, :]
+            for tag, flag, expect in (("on", True, 2), ("off", False, 0), ("on2", True, 2)):
+                wp.config.metal_tid_order = flag
+                k = make(tag)
+                b = wp.zeros((3, 35), dtype=float, device="metal:0")
+                wp.launch(k, dim=(3, 35), inputs=[wp.array(x, device="metal:0")], outputs=[b], device="metal:0")
+                np.testing.assert_array_equal(b.numpy(), ref)
+                got = _pso_tid_reversed(k._metal_native_pso)
+                assert got == expect, (tag, flag, got)
+            wp.config.metal_tid_order = True
+            """
+        )
+        _run_with_metal_native(self, snippet, timeout=300)
 
 
 if __name__ == "__main__":

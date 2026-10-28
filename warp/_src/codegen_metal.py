@@ -25930,6 +25930,9 @@ def _content_artifact_key(kernel, block_dim: int | None) -> str | None:
         f"coop={_coop_tiles_enabled()}",
         f"print={getattr(warp.config, 'metal_print', 'warn')}",
         f"outline={_moutline.mode() != 'off'}",
+        # The cached PSO was compiled from tid-reversed source when this was
+        # on (``_compile_native``); a hit across a toggle would bypass the switch.
+        f"tidorder={bool(getattr(warp.config, 'metal_tid_order', True))}",
     ):
         h.update(part.encode("utf-8"))
         h.update(b"\x00")
