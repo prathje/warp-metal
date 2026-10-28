@@ -9009,14 +9009,73 @@ def _emit_tile_cholesky_solve_coop(n: int, msl_scalar: str) -> str:
 # nothing. The win requires eliminating the private struct end-to-end.
 
 
+def _smem_cholesky_body(n: int, msl_scalar: str, at, scale: str) -> list[str]:
+    """Right-looking cooperative Cholesky over a threadgroup-resident tile.
+
+    ``at(r, c)`` addresses element ``(r, c)`` of the matrix being factored
+    (lower mode); ``scale`` is ``"mul"`` (``l = a * (1 / ljj)``, the serial
+    ``cholesky_inplace`` helper's form) or ``"div"`` (``l = a / ljj``, the
+    by-value coop helper's form).
+
+    Every element sees exactly the operations of the left-looking (dot
+    product) form, in the same order: ``a(i, k) = fma(-l(i, c), l(k, c),
+    a(i, k))`` for ``c = 0, 1, ...``, then the ``1e-30`` clamp,
+    ``precise::sqrt`` and the scale. So the factor is bitwise the same, but
+    the work per column is independent element updates rather than a serial
+    dot-product chain, and the inner loop issues its loads four at a time
+    (2x lower latency and throughput at N=35 than the dot-product form).
+    Rows are owned by lanes ``i = c + 1 + lane (+32 ...)`` in both phases of
+    a column, so a lane only reads rows other lanes wrote across a barrier.
+    """
+    one = _sc_lit(msl_scalar, 1.0)
+    clamp = _sc_lit(msl_scalar, 1e-30)
+    lines = [
+        "    threadgroup_barrier(metal::mem_flags::mem_threadgroup);",
+        "    #pragma clang loop unroll(disable)",
+        f"    for (int j = 0; j < {n}; ++j) {{",
+        f"        const {msl_scalar} ljj = metal::precise::sqrt(metal::max({at('j', 'j')}, {clamp}));",
+    ]
+    if scale == "mul":
+        lines.append(f"        const {msl_scalar} inv = {one} / ljj;")
+        scaled = f"{at('i', 'j')} * inv"
+    else:
+        scaled = f"{at('i', 'j')} / ljj"
+    lines += [
+        f"        for (int i = j + 1 + (int)lane; i < {n}; i += 32) {at('i', 'j')} = {scaled};",
+        "        threadgroup_barrier(metal::mem_flags::mem_threadgroup);",
+        # Nothing reads the pivot slot in this phase.
+        f"        if (lane == 0u) {at('j', 'j')} = ljj;",
+        f"        for (int i = j + 1 + (int)lane; i < {n}; i += 32) {{",
+        f"            const {msl_scalar} lij = {at('i', 'j')};",
+        "            int k = j + 1;",
+        "            for (; k + 3 <= i; k += 4) {",
+        f"                const {msl_scalar} c0 = {at('k', 'j')}, c1 = {at('k + 1', 'j')}, "
+        f"c2 = {at('k + 2', 'j')}, c3 = {at('k + 3', 'j')};",
+        f"                const {msl_scalar} a0 = {at('i', 'k')}, a1 = {at('i', 'k + 1')}, "
+        f"a2 = {at('i', 'k + 2')}, a3 = {at('i', 'k + 3')};",
+        f"                {at('i', 'k')} = metal::fma(-lij, c0, a0);",
+        f"                {at('i', 'k + 1')} = metal::fma(-lij, c1, a1);",
+        f"                {at('i', 'k + 2')} = metal::fma(-lij, c2, a2);",
+        f"                {at('i', 'k + 3')} = metal::fma(-lij, c3, a3);",
+        "            }",
+        f"            for (; k <= i; ++k) {at('i', 'k')} = metal::fma(-lij, {at('k', 'j')}, {at('i', 'k')});",
+        "        }",
+        "        threadgroup_barrier(metal::mem_flags::mem_threadgroup);",
+        "    }",
+    ]
+    return lines
+
+
 def _emit_tile_cholesky_smem(n: int, msl_scalar: str) -> str:
     """Emit ``wp_tile_NxN_<scalar>_cholesky_smem`` — in-place cooperative
     Cholesky on a threadgroup-resident tile.
 
-    Same algorithm as :func:`_emit_tile_cholesky_coop` with the leading
-    private->smem stage and the trailing smem->private readback removed:
-    the tile is already in ``smem`` and stays there. Called by all 32
-    lanes of the SIMD group; ``lane`` is ``thread_position_in_threadgroup.x``.
+    Same arithmetic as :func:`_emit_tile_cholesky_coop` (``a / pivot``) with
+    the private->smem stage and the smem->private readback removed: the tile
+    is already in ``smem`` and stays there. Called by all 32 lanes of the
+    SIMD group; ``lane`` is ``thread_position_in_threadgroup.x``. See
+    :func:`_smem_cholesky_body` for the (bitwise equivalent) right-looking
+    schedule.
 
     The strict upper triangle is zeroed at the end because the by-value
     variant did that during its readback, and consumers (``tile_store``)
@@ -9024,31 +9083,12 @@ def _emit_tile_cholesky_smem(n: int, msl_scalar: str) -> str:
     """
     name = f"wp_tile_{n}x{n}_{msl_scalar}"
     nn = n * n
-    parts: list[str] = []
-    parts.append(f"inline void {name}_cholesky_smem(threadgroup {msl_scalar}* smem, uint lane) {{")
-    # A previous cooperative op may still be reading smem.
-    parts.append("    threadgroup_barrier(metal::mem_flags::mem_threadgroup);")
-    parts.append(f"    for (int j = 0; j < {n}; ++j) {{")
-    parts.append("        if ((int)lane == (j & 31)) {")
-    parts.append(f"            {msl_scalar} d = smem[j*{n} + j];")
-    parts.append("            for (int k = 0; k < j; ++k) {")
-    parts.append(f"                {msl_scalar} ljk = smem[j*{n} + k];")
-    parts.append("                d = metal::fma(-ljk, ljk, d);")
-    parts.append("            }")
-    parts.append(f"            d = metal::max(d, {_sc_lit(msl_scalar, 1e-30)});")
-    parts.append(f"            smem[j*{n} + j] = metal::precise::sqrt(d);")
-    parts.append("        }")
-    parts.append("        threadgroup_barrier(metal::mem_flags::mem_threadgroup);")
-    parts.append(f"        {msl_scalar} pivot = smem[j*{n} + j];")
-    parts.append(f"        for (int i = (int)lane; i < {n}; i += 32) {{")
-    parts.append("            if (i > j) {")
-    parts.append(f"                {msl_scalar} s = smem[i*{n} + j];")
-    parts.append(f"                for (int k = 0; k < j; ++k) s = metal::fma(-smem[i*{n} + k], smem[j*{n} + k], s);")
-    parts.append(f"                smem[i*{n} + j] = s / pivot;")
-    parts.append("            }")
-    parts.append("        }")
-    parts.append("        threadgroup_barrier(metal::mem_flags::mem_threadgroup);")
-    parts.append("    }")
+
+    def at(r: str, c: str) -> str:
+        return f"smem[({r})*{n} + ({c})]"
+
+    parts: list[str] = [f"inline void {name}_cholesky_smem(threadgroup {msl_scalar}* smem, uint lane) {{"]
+    parts += _smem_cholesky_body(n, msl_scalar, at, "div")
     parts.append(f"    for (uint e = lane; e < {nn}u; e += 32u) {{")
     parts.append(f"        uint i = e / {n}u;")
     parts.append(f"        uint j = e - i * {n}u;")
@@ -9115,9 +9155,8 @@ def _emit_tile_cholesky_inplace_smem(n: int, msl_scalar: str, upper: bool = Fals
     Same per-element arithmetic as :func:`_emit_tile_cholesky_inplace` (the
     serial helper every lane otherwise runs redundantly on its own private
     copy): ``fma`` order, ``1e-30`` clamp, ``precise::sqrt`` and the
-    multiply by ``1 / ljj``, so the factor is bit-identical to that path.
-    Lane ``j & 31`` computes pivot ``j``; the rows below it are split across
-    the 32 lanes (each row reads only finished columns ``k < j``).
+    multiply by ``1 / ljj``, so the factor is bit-identical to that path
+    (schedule: :func:`_smem_cholesky_body`).
 
     ``upper`` factors a tile holding ``A`` in its upper triangle into
     ``U = L^T`` (``fill_mode="upper"``), reading element ``(r, c)`` of the
@@ -9135,27 +9174,7 @@ def _emit_tile_cholesky_inplace_smem(n: int, msl_scalar: str, upper: bool = Fals
     suffix = "_upper" if upper else ""
     parts: list[str] = []
     parts.append(f"inline void {name}_cholesky_inplace_smem{suffix}(threadgroup {msl_scalar}* smem, uint lane) {{")
-    parts.append("    threadgroup_barrier(metal::mem_flags::mem_threadgroup);")
-    parts.append("    #pragma clang loop unroll(disable)")
-    parts.append(f"    for (int j = 0; j < {n}; ++j) {{")
-    parts.append("        if ((int)lane == (j & 31)) {")
-    parts.append(f"            {msl_scalar} d = {at('j', 'j')};")
-    parts.append("            for (int k = 0; k < j; ++k) {")
-    parts.append(f"                {msl_scalar} ljk = {at('j', 'k')};")
-    parts.append("                d = metal::fma(-ljk, ljk, d);")
-    parts.append("            }")
-    parts.append(f"            d = metal::max(d, {_sc_lit(msl_scalar, 1e-30)});")
-    parts.append(f"            {at('j', 'j')} = metal::precise::sqrt(d);")
-    parts.append("        }")
-    parts.append("        threadgroup_barrier(metal::mem_flags::mem_threadgroup);")
-    parts.append(f"        {msl_scalar} inv = {_sc_lit(msl_scalar, 1.0)} / {at('j', 'j')};")
-    parts.append(f"        for (int i = j + 1 + (int)lane; i < {n}; i += 32) {{")
-    parts.append(f"            {msl_scalar} s = {at('i', 'j')};")
-    parts.append(f"            for (int k = 0; k < j; ++k) s = metal::fma(-{at('i', 'k')}, {at('j', 'k')}, s);")
-    parts.append(f"            {at('i', 'j')} = s * inv;")
-    parts.append("        }")
-    parts.append("        threadgroup_barrier(metal::mem_flags::mem_threadgroup);")
-    parts.append("    }")
+    parts += _smem_cholesky_body(n, msl_scalar, at, "mul")
     parts.append(f"    for (uint e = lane; e < {nn}u; e += 32u) {{")
     parts.append(f"        uint i = e / {n}u;")
     parts.append(f"        uint j = e - i * {n}u;")
