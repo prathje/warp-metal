@@ -10167,8 +10167,13 @@ def _build_kernel_header(source: str) -> str:
             if not _vec_native(n, scalar):
                 seen_vec.add((n, scalar))
     parts: list[str] = []
+    # The native ``wp::`` compat block (emitted last, with the snippets) uses
+    # the BVH / mesh helpers and the binary64 softfloat routines.
+    native_wp_compat = _native_snippets_need_wp_compat(source)
+    if native_wp_compat:
+        source = source + "\n" + _NATIVE_WP_COMPAT_MSL
     # Emulated doubles first: every struct below may carry ``wp_f64`` members.
-    if _F64_EMU_MSL in source:
+    if _F64_EMU_MSL in source or native_wp_compat:
         parts.append(_f64_emulate_helpers())
     for n, scalar in sorted(seen_vec):
         parts.append(_emit_big_vec_struct(f"wp_vec{n}_{scalar}", n, scalar))
@@ -15263,6 +15268,168 @@ _NATIVE_SNIPPET_SHIMS = """\
 #define __syncwarp(...) WP_NATIVE_WARP_SYNC()
 #endif
 """
+# Native C++ API (``namespace wp``) for ``@wp.func_native`` snippets that read
+# Warp's mesh / BVH internals or call native geometry routines (e.g. Newton's
+# full-surface mesh soft contacts). Each entry mirrors its warp/native
+# counterpart (bvh.h, mesh.h, intersect.h) over the Metal descriptor buffers
+# of ``metal_bvh.py``. Only the names below exist; any other ``wp::`` name in
+# a snippet stays an MSL compile error. Emitted only for kernels calling a
+# snippet that names ``wp::`` (such snippets never compiled on Metal before).
+_NATIVE_WP_COMPAT_MSL = """\
+#ifndef WP_METAL_NATIVE_WP_COMPAT
+#define WP_METAL_NATIVE_WP_COMPAT
+// a*b - c*d evaluated as native intersect_ray_tri_woop does in double:
+// exact float products, one binary64 rounding, then one binary32 rounding.
+inline float wp_compat_f64_diff_product(float a, float b, float c, float d) {
+    ulong ab = __softfloat64_fmul(__softfloat64_cvt_f32_to_f64(as_type<uint>(a)),
+                                  __softfloat64_cvt_f32_to_f64(as_type<uint>(b)), 0u);
+    ulong cd = __softfloat64_fmul(__softfloat64_cvt_f32_to_f64(as_type<uint>(c)),
+                                  __softfloat64_cvt_f32_to_f64(as_type<uint>(d)), 0u);
+    return as_type<float>(__softfloat64_cvt_f64_to_f32(__softfloat64_fsub(ab, cd, 0u), 0u));
+}
+namespace wp {
+typedef float2 vec2;
+typedef float3 vec3;
+typedef float4 vec4;
+// Native CPU code is compiled without FP contraction; MSL contracts within an
+// expression by default, so every helper below that could fuse opts out.
+inline float dot(float3 a, float3 b) {
+#pragma clang fp contract(off)
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+inline float3 cross(float3 a, float3 b) { return metal::cross(a, b); }
+// BVHPackedNodeHalf: same 16-byte layout as wp_bvh_node_t (bits = i:31 | b:1).
+struct BVHPackedNodeHalf {
+    float x;
+    float y;
+    float z;
+    uint i : 31;
+    uint b : 1;
+};
+struct BVH {
+    const device BVHPackedNodeHalf* node_lowers;
+    const device BVHPackedNodeHalf* node_uppers;
+    const device int* node_parents;
+    const device int* primitive_indices;
+    const device int* root;
+    const device packed_float3* item_lowers;
+    const device packed_float3* item_uppers;
+    const device int* item_groups;
+    int num_nodes;
+    int num_leaf_nodes;
+    int num_items;
+    int leaf_size;
+};
+struct Mesh {
+    BVH bvh;
+    int num_points;
+    int num_tris;
+    float average_edge_length;
+};
+inline BVH bvh_get(ulong id) {
+    const device wp_bvh_desc_t* d = reinterpret_cast<const device wp_bvh_desc_t*>(id);
+    BVH bvh;
+    bvh.node_lowers = reinterpret_cast<const device BVHPackedNodeHalf*>(d->node_lowers);
+    bvh.node_uppers = reinterpret_cast<const device BVHPackedNodeHalf*>(d->node_uppers);
+    bvh.node_parents = reinterpret_cast<const device int*>(d->node_parents);
+    bvh.primitive_indices = reinterpret_cast<const device int*>(d->primitive_indices);
+    bvh.root = &d->root;
+    bvh.item_lowers = reinterpret_cast<const device packed_float3*>(d->item_lowers);
+    bvh.item_uppers = reinterpret_cast<const device packed_float3*>(d->item_uppers);
+    bvh.item_groups = reinterpret_cast<const device int*>(d->item_groups);
+    bvh.num_nodes = d->num_nodes;
+    bvh.num_leaf_nodes = d->num_leaf_nodes;
+    bvh.num_items = d->num_items;
+    bvh.leaf_size = d->leaf_size;
+    return bvh;
+}
+inline Mesh mesh_get(ulong id) {
+    const device wp_mesh_desc_t* d = reinterpret_cast<const device wp_mesh_desc_t*>(id);
+    Mesh mesh;
+    mesh.bvh = bvh_get(id);
+    mesh.num_points = d->num_points;
+    mesh.num_tris = d->num_tris;
+    mesh.average_edge_length = d->average_edge_length;
+    return mesh;
+}
+inline ulong mesh_get_bvh(ulong id) { return id; }
+inline BVHPackedNodeHalf bvh_load_node(const device BVHPackedNodeHalf* nodes, int index) { return nodes[index]; }
+inline wp_mesh_query_point_t mesh_query_point_sign_parity(
+    ulong id, float3 point, float max_dist, int n_sample = 1, float perturbation_scale = 0.1f) {
+    return ::wp_mesh_query_point_sign_parity(id, point, max_dist, n_sample, perturbation_scale);
+}
+inline wp_mesh_query_point_t mesh_query_point_sign_normal(ulong id, float3 point, float max_dist, float epsilon = 1e-3f) {
+    return ::wp_mesh_query_point_sign_normal(id, point, max_dist, epsilon);
+}
+// intersect_ray_tri_woop (warp/native/intersect.h) including its binary64
+// refinement of exactly-zero edge functions, so edge / vertex hits report
+// the same exact-zero weights as on CPU and CUDA.
+inline bool intersect_ray_tri_woop(
+    float3 p, float3 dir, float3 a, float3 b, float3 c,
+    thread float& t, thread float& u, thread float& v, thread float& sign, thread float3* normal)
+{
+#pragma clang fp contract(off)
+    int kz = wp_bvh_ray_max_dim(dir);
+    int kx = kz + 1;
+    if (kx == 3) { kx = 0; }
+    int ky = kx + 1;
+    if (ky == 3) { ky = 0; }
+    if (dir[kz] < 0.0f) {
+        int tmp = kx;
+        kx = ky;
+        ky = tmp;
+    }
+    float Sx = dir[kx] / dir[kz];
+    float Sy = dir[ky] / dir[kz];
+    float Sz = 1.0f / dir[kz];
+    float3 A = a - p;
+    float3 B = b - p;
+    float3 C = c - p;
+    float Ax = A[kx] - Sx * A[kz];
+    float Ay = A[ky] - Sy * A[kz];
+    float Bx = B[kx] - Sx * B[kz];
+    float By = B[ky] - Sy * B[kz];
+    float Cx = C[kx] - Sx * C[kz];
+    float Cy = C[ky] - Sy * C[kz];
+    float U = wp_bvh_diff_product(Cx, By, Cy, Bx);
+    float V = wp_bvh_diff_product(Ax, Cy, Ay, Cx);
+    float W = wp_bvh_diff_product(Bx, Ay, By, Ax);
+    if (U == 0.0f || V == 0.0f || W == 0.0f) {
+        U = wp_compat_f64_diff_product(Cx, By, Cy, Bx);
+        V = wp_compat_f64_diff_product(Ax, Cy, Ay, Cx);
+        W = wp_compat_f64_diff_product(Bx, Ay, By, Ax);
+    }
+    if ((U < 0.0f || V < 0.0f || W < 0.0f) && (U > 0.0f || V > 0.0f || W > 0.0f)) { return false; }
+    float det = U + V + W;
+    if (det == 0.0f) { return false; }
+    float Az = Sz * A[kz];
+    float Bz = Sz * B[kz];
+    float Cz = Sz * C[kz];
+    float T = U * Az + V * Bz + W * Cz;
+    int det_sign = as_type<int>(det) & int(0x80000000u);
+    if (as_type<float>(as_type<int>(T) ^ det_sign) < 0.0f) { return false; }
+    float rcp_det = 1.0f / det;
+    u = U * rcp_det;
+    v = V * rcp_det;
+    t = T * rcp_det;
+    sign = det;
+    if (normal) { *normal = metal::cross(b - a, c - a); }
+    return true;
+}
+}  // namespace wp
+#endif
+"""
+_NATIVE_WP_NAME_PAT = re.compile(r"\bwp::")
+
+
+def _native_snippets_need_wp_compat(source: str) -> bool:
+    """Whether a kernel calls a native snippet that names the ``wp::`` C++ API."""
+    return any(
+        _NATIVE_WP_NAME_PAT.search(_NATIVE_SNIPPET_DEFS.get(m.group(1), ""))
+        for m in _NATIVE_SNIPPET_REF_PAT.finditer(source)
+    )
+
+
 # Block / warp barriers in snippets: real barriers in a kernel whose lanes
 # cooperate (distributed tiles, one threadgroup per block), no-ops in the
 # serial one-thread-per-block model. Prepended to the header per kernel.
@@ -15462,6 +15629,10 @@ def _native_snippet_call(fn_overload, caller_args, return_value_dst):
         body = _NATIVE_PTR_DECL_PAT.sub(r"device \1* ", body)
     body = _NATIVE_REINTERPRET_REF_PAT.sub(r"as_type<\1>(\2)", body)
     body = _NATIVE_GUARDED_SYNC_PAT.sub(lambda m: m.group("body"), body)
+    if _NATIVE_WP_NAME_PAT.search(body):
+        # Snippets on the native ``wp::`` API (see ``_NATIVE_WP_COMPAT_MSL``)
+        # keep CPU's unfused float arithmetic.
+        body = "#pragma clang fp contract(off)\n" + body
     _NATIVE_SNIPPET_DEFS[name] = f"inline {ret_msl} {name}({', '.join(params)}) {{\n{body}\n}}"
     call = f"{name}({', '.join(caller_args)})"
     if return_value_dst is not None:
@@ -15487,6 +15658,8 @@ def _emit_referenced_user_funcs(source: str) -> str:
     parts = [_USER_FUNC_MSL_DEFS[n] for n in sorted(seen)]
     if native:
         parts.append(_NATIVE_SNIPPET_SHIMS)
+        if any(_NATIVE_WP_NAME_PAT.search(_NATIVE_SNIPPET_DEFS[n]) for n in native):
+            parts.append(_NATIVE_WP_COMPAT_MSL)
         parts.append(_NATIVE_ARRAY_VIEW_MSL)
         parts.extend(_NATIVE_SNIPPET_DEFS[n] for n in native)
     return "\n".join(parts) + "\n"
