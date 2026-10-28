@@ -12924,6 +12924,12 @@ def _tile_lead_guard(arr_name: str, lead_idx_args: list[str]) -> str:
     return " && ".join(f"({ix}) >= 0 && ({ix}) < (int){arr_name}_shape[{d}]" for d, ix in enumerate(lead_idx_args))
 
 
+# Reverse ``tile_load`` / ``tile_store`` scatters on a scalar register tile with
+# at least this many elements are emitted as one loop instead of one statement
+# per element (compile time; the arithmetic is the same).
+_TILE_GRAD_ROLL_MIN = 256
+
+
 def _tile_grad_slots(
     arr_name: str,
     lead_idx_args: list[str],
@@ -12932,8 +12938,14 @@ def _tile_grad_slots(
     cols: int,
     vec_n: int,
     two_d: bool | None = None,
+    rolled: bool = False,
 ) -> list[tuple[str, str, str]]:
     """``[(array_flat_index, tile_element_accessor, in_bounds)]`` for a tile/array pairing.
+
+    ``rolled=True`` (scalar-element tiles only) returns one slot written in
+    terms of the loop variables ``_ag_e`` / ``_ag_i`` / ``_ag_j`` (flat
+    element, row, column) for the caller to wrap in a loop over the tile
+    (see ``_TILE_GRAD_ROLL_MIN``).
 
     Mirrors the index arithmetic of the forward ``tile_store`` /
     ``tile_atomic_add`` lowering so the reverse pass touches exactly the
@@ -12964,6 +12976,14 @@ def _tile_grad_slots(
         row_off, col_off = offsets[0], "0"
     n_elem = rows * cols
     slots: list[tuple[str, str, str]] = []
+    if rolled:
+        if vec_n or n_elem == 1:
+            raise MetalCodegenError("MSL codegen: rolled tile gradient slots need a scalar-element register tile")
+        flat = f"{base_expr} + (({row_off}) + _ag_i) * ({row_stride}) + (({col_off}) + _ag_j)"
+        guard = f"({lead_ok}) && (({row_off}) + _ag_i) >= 0 && (({row_off}) + _ag_i) < {row_dim}"
+        if col_dim is not None:
+            guard += f" && (({col_off}) + _ag_j) >= 0 && (({col_off}) + _ag_j) < {col_dim}"
+        return [(f"({flat})", ".c[_ag_e]", guard)]
     for i in range(rows):
         for j in range(cols):
             flat = f"{base_expr} + (({row_off}) + {i}) * ({row_stride}) + (({col_off}) + {j})"
@@ -20126,6 +20146,9 @@ def _generate_msl_kernel_uncached(
                         )
                     )
                     continue
+                # Large scalar tiles scatter in a loop: one unrolled statement per
+                # element made the Apple compiler take minutes on a 48x48 tile.
+                rolled = rows * cols >= _TILE_GRAD_ROLL_MIN and not tile_var_vec_n.get(tile_label, 0)
                 slots = _tile_grad_slots(
                     arr_name,
                     index_args[: ndim - n_off],
@@ -20134,6 +20157,7 @@ def _generate_msl_kernel_uncached(
                     cols,
                     tile_var_vec_n.get(tile_label, 0),
                     two_d,
+                    rolled=rolled,
                 )
                 for idx_expr, cell, in_bounds in slots:
                     tgt = f"{grad_name}[{idx_expr}]"
@@ -20142,17 +20166,19 @@ def _generate_msl_kernel_uncached(
                     if op == "tile_load":
                         # The tile was READ from the array, so its dual
                         # scatters back into the array's gradient.
-                        body_lines.append(
-                            _finalize(f"{indent}if ({in_bounds}) wp_adj_accum(&{tgt}, {adj_tile}{cell});")
-                        )
+                        stmt = f"if ({in_bounds}) wp_adj_accum(&{tgt}, {adj_tile}{cell});"
                     elif op == "tile_store":
                         # ``grad_zero_global``: a plain store consumes
                         # the gradient, an atomic accumulate does not.
-                        body_lines.append(
-                            _finalize(f"{indent}if ({in_bounds}) {{ {adj_tile}{cell} += {tgt}; {tgt} = 0.0f; }}")
-                        )
+                        stmt = f"if ({in_bounds}) {{ {adj_tile}{cell} += {tgt}; {tgt} = 0.0f; }}"
                     else:
-                        body_lines.append(_finalize(f"{indent}if ({in_bounds}) {adj_tile}{cell} += {tgt};"))
+                        stmt = f"if ({in_bounds}) {adj_tile}{cell} += {tgt};"
+                    if rolled:
+                        stmt = (
+                            f"for (int _ag_e = 0; _ag_e < {rows * cols}; ++_ag_e) {{ "
+                            f"const int _ag_i = _ag_e / {cols}; const int _ag_j = _ag_e - _ag_i * {cols}; {stmt} }}"
+                        )
+                    body_lines.append(_finalize(f"{indent}{stmt}"))
                 continue
         # Address lines have been folded into ``subscript_map`` (or, for
         # struct-element pointers, ``struct_refs``). An address whose base

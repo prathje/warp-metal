@@ -123,6 +123,52 @@ class TestMetalR10TileChol(unittest.TestCase):
         )
         _run_with_metal_native(self, snippet, timeout=300)
 
+    def test_large_tile_reverse_scatter_matches_cpu(self):
+        # Reverse tile_load / tile_store / tile_atomic_add on scalar tiles of
+        # >= 256 elements scatter in a loop instead of one statement per
+        # element (a 48x48 cholesky backward took ~2 min to compile). Partial
+        # edge tiles (offsets past the array end) and a 1-D tile.
+        snippet = _COMMON + textwrap.dedent(
+            """
+            @wp.kernel(module="unique")
+            def k(a: wp.array3d(dtype=float), v: wp.array2d(dtype=float), h: wp.array3d(dtype=float),
+                  g: wp.array3d(dtype=float), u: wp.array2d(dtype=float)):
+                i = wp.tid()
+                t = wp.tile_load(a[i], shape=(24, 20), offset=(5, 3))
+                wp.tile_store(h[i], wp.tile_map(wp.mul, t, t), offset=(4, 4))
+                wp.tile_atomic_add(g[i], wp.tile_map(wp.sin, t), offset=(1, 1))
+                s = wp.tile_load(v[i], shape=(300,), offset=(7,))
+                wp.tile_store(u[i], wp.tile_map(wp.mul, s, s), offset=(2,))
+
+            rng = np.random.default_rng(7)
+            a0 = rng.standard_normal((2, 26, 21)).astype(np.float32)
+            v0 = rng.standard_normal((2, 290)).astype(np.float32)
+            wh = rng.standard_normal((2, 26, 21)).astype(np.float32)
+            wu = rng.standard_normal((2, 290, 1)).astype(np.float32)
+            res = {}
+            for dev in ("cpu", "metal:0"):
+                a = wp.array(a0, device=dev, requires_grad=True)
+                v = wp.array(v0, device=dev, requires_grad=True)
+                h = wp.zeros((2, 26, 21), dtype=float, device=dev, requires_grad=True)
+                g = wp.zeros((2, 26, 21), dtype=float, device=dev, requires_grad=True)
+                u = wp.zeros((2, 290), dtype=float, device=dev, requires_grad=True)
+                loss = wp.zeros(1, dtype=float, device=dev, requires_grad=True)
+                tape = wp.Tape()
+                with tape:
+                    wp.launch_tiled(k, dim=2, inputs=[a, v], outputs=[h, g, u], device=dev, block_dim=64)
+                    wp.launch(wloss3, dim=(2, 26, 21), inputs=[h, wp.array(wh, device=dev)], outputs=[loss], device=dev)
+                    wp.launch(wloss3, dim=(2, 26, 21), inputs=[g, wp.array(-wh, device=dev)], outputs=[loss], device=dev)
+                    wp.launch(wloss3, dim=(2, 290, 1), inputs=[u.reshape((2, 290, 1)), wp.array(wu, device=dev)],
+                              outputs=[loss], device=dev)
+                tape.backward(loss)
+                res[dev] = (h.numpy(), g.numpy(), u.numpy(), a.grad.numpy(), v.grad.numpy())
+            for q, what in enumerate(("h", "g", "u", "a.grad", "v.grad")):
+                close(res["metal:0"][q], res["cpu"][q], what, rtol=1e-5)
+            assert np.abs(res["cpu"][3]).max() > 0.1 and np.abs(res["cpu"][4]).max() > 0.1
+            """
+        )
+        _run_with_metal_native(self, snippet, timeout=300)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
