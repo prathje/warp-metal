@@ -4752,6 +4752,9 @@ inline int wp_bvh_get_group_root(ulong id, int group_id) {
     wp_bvh_desc_t bvh = wp_bvh_get_desc(id);
     return wp_bvh_group_root_impl(bvh, group_id);
 }
+// The BVH descriptor sits at offset 0 of the mesh descriptor (metal_bvh.py),
+// so a mesh id is also the id of its triangle BVH.
+inline ulong wp_mesh_get_bvh(ulong id) { return id; }
 inline int wp_mesh_get_group_root(ulong id, int group_id) {
     wp_mesh_desc_t mesh = wp_mesh_get_desc(id);
     return wp_bvh_group_root_impl(mesh.bvh, group_id);
@@ -4788,20 +4791,73 @@ struct wp_bvh_query_t {
     float3 input_lower;
     float3 input_upper;
     int bounds_nr;
-    bool is_ray;
+    // Query kind (native ``BvhQueryKind``): one MSL iterator serves every
+    // kind, so the kind is a runtime field, as in ``bvh_query_next_dynamic``.
+    int kind;
+    float radius;
+    float radius_sq;
 };
-inline bool wp_bvh_query_intersection_test(
-    const thread wp_bvh_query_t& query, float3 node_lower, float3 node_upper, thread float& t)
+#define WP_BVH_QUERY_AABB 0
+#define WP_BVH_QUERY_RAY 1
+#define WP_BVH_QUERY_CAPSULE 2
+#define WP_BVH_QUERY_SPHERE 3
+// intersect_ray_aabb_robust / intersect_sphere_aabb (warp/native/intersect.h).
+inline bool wp_bvh_intersect_ray_aabb_robust(
+    float3 pos, float3 dir, float3 rcp_dir, float3 lower, float3 upper, thread float& t)
 {
-    if (query.is_ray) {
-        return wp_bvh_intersect_ray_aabb(query.input_lower, query.input_upper, node_lower, node_upper, t);
+    float lmin = -FLT_MAX;
+    float lmax = FLT_MAX;
+    for (int i = 0; i < 3; ++i) {
+        if (dir[i] == 0.0f) {
+            if (pos[i] < lower[i] || pos[i] > upper[i]) { return false; }
+        } else {
+            float l1 = (lower[i] - pos[i]) * rcp_dir[i];
+            float l2 = (upper[i] - pos[i]) * rcp_dir[i];
+            lmin = wp_bvh_maxf(wp_bvh_minf(l1, l2), lmin);
+            lmax = wp_bvh_minf(wp_bvh_maxf(l1, l2), lmax);
+        }
+    }
+    bool hit = (lmax >= 0.0f) && (lmax >= lmin);
+    if (hit) { t = lmin; }
+    return hit;
+}
+inline bool wp_bvh_intersect_sphere_aabb(float3 center, float radius_sq, float3 lower, float3 upper) {
+#pragma clang fp contract(off)
+    float dx = wp_bvh_maxf(wp_bvh_maxf(lower.x - center.x, center.x - upper.x), 0.0f);
+    float dy = wp_bvh_maxf(wp_bvh_maxf(lower.y - center.y, center.y - upper.y), 0.0f);
+    float dz = wp_bvh_maxf(wp_bvh_maxf(lower.z - center.z, center.z - upper.z), 0.0f);
+    return dx * dx + dy * dy + dz * dz <= radius_sq;
+}
+// Node / item overlap test of ``bvh_query_test<KIND>`` (warp/native/bvh.h),
+// including each kind's ``max_dist`` predicate: half-open for rays, closed
+// for capsules, none for AABB and sphere queries.
+inline bool wp_bvh_query_intersection_test(
+    const thread wp_bvh_query_t& query, float3 node_lower, float3 node_upper, float max_dist)
+{
+    if (query.kind == WP_BVH_QUERY_SPHERE) {
+        return wp_bvh_intersect_sphere_aabb(query.input_lower, query.radius_sq, node_lower, node_upper);
+    }
+    if (query.kind == WP_BVH_QUERY_CAPSULE) {
+        float t = FLT_MAX;
+        float3 inv = float3(1.0f / query.input_upper.x, 1.0f / query.input_upper.y, 1.0f / query.input_upper.z);
+        bool hit = wp_bvh_intersect_ray_aabb_robust(
+            query.input_lower, inv, query.input_upper, node_lower - float3(query.radius),
+            node_upper + float3(query.radius), t);
+        return hit && !(t > max_dist);
+    }
+    if (query.kind == WP_BVH_QUERY_RAY) {
+        float t = FLT_MAX;
+        bool hit = wp_bvh_intersect_ray_aabb(query.input_lower, query.input_upper, node_lower, node_upper, t);
+        return hit && !(t >= max_dist);
     }
     return wp_bvh_intersect_aabb_aabb(query.input_lower, query.input_upper, node_lower, node_upper);
 }
-inline wp_bvh_query_t wp_bvh_query_init(ulong id, bool is_ray, float3 lower, float3 upper, int root) {
+inline wp_bvh_query_t wp_bvh_query_init(ulong id, int kind, float3 lower, float3 upper, int root) {
     wp_bvh_query_t query;
     query.bvh = wp_bvh_get_desc(id);
-    query.is_ray = is_ray;
+    query.kind = kind;
+    query.radius = 0.0f;
+    query.radius_sq = 0.0f;
     query.stack[0] = root == -1 ? query.bvh.root : root;
     query.count = 1;
     query.primitive_counter = 0;
@@ -4811,10 +4867,22 @@ inline wp_bvh_query_t wp_bvh_query_init(ulong id, bool is_ray, float3 lower, flo
     return query;
 }
 inline wp_bvh_query_t wp_bvh_query_aabb(ulong id, float3 lower, float3 upper, int root) {
-    return wp_bvh_query_init(id, false, lower, upper, root);
+    return wp_bvh_query_init(id, WP_BVH_QUERY_AABB, lower, upper, root);
 }
 inline wp_bvh_query_t wp_bvh_query_ray(ulong id, float3 start, float3 dir, int root) {
-    return wp_bvh_query_init(id, true, start, 1.0f / dir, root);
+    return wp_bvh_query_init(id, WP_BVH_QUERY_RAY, start, 1.0f / dir, root);
+}
+inline wp_bvh_query_t wp_bvh_query_capsule(ulong id, float3 start, float3 dir, float radius, int root) {
+    wp_bvh_query_t query = wp_bvh_query_init(id, WP_BVH_QUERY_CAPSULE, start, 1.0f / dir, root);
+    query.radius = wp_bvh_maxf(radius, 0.0f);
+    query.radius_sq = query.radius * query.radius;
+    return query;
+}
+inline wp_bvh_query_t wp_bvh_query_sphere(ulong id, float3 center, float radius, int root) {
+    wp_bvh_query_t query = wp_bvh_query_init(id, WP_BVH_QUERY_SPHERE, center, center, root);
+    query.radius = wp_bvh_maxf(radius, 0.0f);
+    query.radius_sq = query.radius * query.radius;
+    return query;
 }
 inline bool wp_bvh_query_next(thread wp_bvh_query_t& query, thread int& index, float max_dist) {
     const device wp_bvh_node_t* lowers = wp_bvh_node_ptr(query.bvh.node_lowers);
@@ -4825,11 +4893,10 @@ inline bool wp_bvh_query_next(thread wp_bvh_query_t& query, thread int& index, f
         wp_bvh_node_t node_lower = lowers[node_index];
         wp_bvh_node_t node_upper = uppers[node_index];
         if (query.primitive_counter == 0) {
-            float t = FLT_MAX;
             bool hit = wp_bvh_query_intersection_test(
                 query, float3(node_lower.x, node_lower.y, node_lower.z),
-                float3(node_upper.x, node_upper.y, node_upper.z), t);
-            if (!hit || (query.is_ray && t >= max_dist)) { continue; }
+                float3(node_upper.x, node_upper.y, node_upper.z), max_dist);
+            if (!hit) { continue; }
         }
         const int left_index = int(node_lower.bits & 0x7fffffffu);
         const int right_index = int(node_upper.bits & 0x7fffffffu);
@@ -4848,11 +4915,10 @@ inline bool wp_bvh_query_next(thread wp_bvh_query_t& query, thread int& index, f
                 } else {
                     query.stack[query.count++] = node_index;
                 }
-                float t = FLT_MAX;
                 bool hit = wp_bvh_query_intersection_test(
                     query, wp_bvh_load_v3(query.bvh.item_lowers, primitive_index),
-                    wp_bvh_load_v3(query.bvh.item_uppers, primitive_index), t);
-                if (!hit || (query.is_ray && t >= max_dist)) { continue; }
+                    wp_bvh_load_v3(query.bvh.item_uppers, primitive_index), max_dist);
+                if (!hit) { continue; }
                 index = primitive_index;
                 query.bounds_nr = primitive_index;
                 return true;
@@ -6299,7 +6365,7 @@ inline void wp_adj_mesh_query_point_sign_winding_number(ulong id, float3 point, 
 // bounds in that descriptor are the per-triangle AABBs, matching the
 // native mesh_query_aabb_next primitive test exactly.
 inline wp_bvh_query_t wp_mesh_query_aabb(ulong id, float3 lower, float3 upper) {
-    return wp_bvh_query_init(id, false, lower, upper, -1);
+    return wp_bvh_query_init(id, WP_BVH_QUERY_AABB, lower, upper, -1);
 }
 inline bool wp_mesh_query_aabb_next(thread wp_bvh_query_t& query, thread int& index) {
     return wp_bvh_query_next(query, index, FLT_MAX);
@@ -11778,11 +11844,15 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bwp::bvh_query_ray\b"), "wp_bvh_query_ray"),
     (re.compile(r"\bwp::bvh_query_next\b"), "wp_bvh_query_next"),
     # Warp >= 1.18 types BVH queries by kind and emits a per-kind iterator;
-    # the MSL query keeps its kind (``is_ray``) at runtime, so the ray and
-    # kind-erased iterators share ``wp_bvh_query_next``. Capsule and sphere
-    # queries have no MSL port and fall through to the unsupported guard.
+    # the MSL query keeps its kind at runtime, so every per-kind iterator and
+    # the kind-erased one share ``wp_bvh_query_next``.
+    (re.compile(r"\bwp::bvh_query_capsule\b"), "wp_bvh_query_capsule"),
+    (re.compile(r"\bwp::bvh_query_sphere\b"), "wp_bvh_query_sphere"),
     (re.compile(r"\bwp::bvh_query_ray_next\b"), "wp_bvh_query_next"),
+    (re.compile(r"\bwp::bvh_query_capsule_next\b"), "wp_bvh_query_next"),
+    (re.compile(r"\bwp::bvh_query_sphere_next\b"), "wp_bvh_query_next"),
     (re.compile(r"\bwp::bvh_query_next_dynamic\b"), "wp_bvh_query_next"),
+    (re.compile(r"\bwp::mesh_get_bvh\b"), "wp_mesh_get_bvh"),
     (re.compile(r"\bwp::bvh_get_group_root\b"), "wp_bvh_get_group_root"),
     (re.compile(r"\bwp::mesh_query_ray_anyhit\b"), "wp_mesh_query_ray_anyhit"),
     # Reverse mode for the ray query: differentiates the hit distance and
