@@ -4457,19 +4457,38 @@ inline float3 wp_curlnoise(uint state, float4 xyzt, uint octaves, float lacunari
 
 
 # Segment/triangle intersection queries — ports of warp/native/intersect.h.
-# ``wp_closest_point_edge_edge`` transcribes the reference Warp source that
-# generated the native IR (Ericson 5.1.9); ``wp_intersect_tri_tri``
-# transcribes Möller's NoDivTriTriIsect (warp/native/intersect_tri.h) with
-# the C macros unrolled into functions. Dot/cross are written out
-# component-wise in the macro's evaluation order rather than using
-# ``metal::dot``/``cross`` so boundary sign tests match the CPU bit pattern
-# as closely as fast-math contraction allows.
+# ``wp_closest_point_edge_edge`` (+ adjoint) transcribes the native C++ of
+# Warp 1.19 (Ericson 5.1.9 with Kahan-compensated denominators);
+# ``wp_intersect_tri_tri`` transcribes Möller's NoDivTriTriIsect
+# (warp/native/intersect_tri.h) with the C macros unrolled into functions.
+# Dot/cross are written out component-wise in the macro's evaluation order
+# rather than using ``metal::dot``/``cross``, with FP contraction off as in
+# the CPU build, so boundary sign tests match the CPU bit pattern.
 _INTERSECT_HELPERS = """\
-inline float wp_tt_dot(float3 a, float3 b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+inline float wp_tt_dot(float3 a, float3 b) {
+#pragma clang fp contract(off)
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
 inline float3 wp_tt_cross(float3 a, float3 b) {
+#pragma clang fp contract(off)
     return float3(a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]);
 }
+// closest_point_edge_edge / adj_closest_point_edge_edge of warp/native/intersect.h
+// (Warp >= 1.19: Kahan-compensated denom / num, clamped degenerate branches).
+// Native CPU code is not FP-contracted, so neither are these.
+inline float wp_eee_clamp01(float x) { return metal::fmin(metal::fmax(0.0f, x), 1.0f); }
+inline float wp_eee_diff_product(float a, float b, float c, float d) {
+    float cd = c * d;
+    float diff = metal::fma(a, b, -cd);
+    float error = metal::fma(-c, d, cd);
+    return diff + error;
+}
+inline float wp_eee_length(float3 v) {
+#pragma clang fp contract(off)
+    return metal::precise::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+}
 inline float3 wp_closest_point_edge_edge(float3 p1, float3 q1, float3 p2, float3 q2, float epsilon) {
+#pragma clang fp contract(off)
     float3 d1 = q1 - p1;
     float3 d2 = q2 - p2;
     float3 r = p1 - p2;
@@ -4478,36 +4497,166 @@ inline float3 wp_closest_point_edge_edge(float3 p1, float3 q1, float3 p2, float3
     float f = wp_tt_dot(d2, r);
     float s = 0.0f;
     float t = 0.0f;
-    float dist = metal::length(p2 - p1);
-    if (a <= epsilon && e <= epsilon) {
-        return float3(s, t, dist);
-    }
-    if (a <= epsilon) {
-        s = 0.0f;
-        t = f / e;
+    bool degen1 = (a <= epsilon);
+    bool degen2 = (e <= epsilon);
+    if (degen1 && degen2) {
+    } else if (degen1) {
+        t = wp_eee_clamp01(f / e);
+    } else if (degen2) {
+        s = wp_eee_clamp01(-wp_tt_dot(d1, r) / a);
     } else {
         float c = wp_tt_dot(d1, r);
-        if (e <= epsilon) {
-            s = metal::clamp(-c / a, 0.0f, 1.0f);
-            t = 0.0f;
+        float b = wp_tt_dot(d1, d2);
+        float denom = wp_eee_diff_product(a, e, b, b);
+        float s_init;
+        if (denom > 0.0f) {
+            float num = wp_eee_diff_product(b, f, c, e);
+            s_init = wp_eee_clamp01(num / denom);
         } else {
-            float b = wp_tt_dot(d1, d2);
-            float denom = a * e - b * b;
-            if (denom != 0.0f) { s = metal::clamp((b * f - c * e) / denom, 0.0f, 1.0f); } else { s = 0.0f; }
-            t = (b * s + f) / e;
-            if (t < 0.0f) {
-                t = 0.0f;
-                s = metal::clamp(-c / a, 0.0f, 1.0f);
-            } else if (t > 1.0f) {
-                t = 1.0f;
-                s = metal::clamp((b - c) / a, 0.0f, 1.0f);
-            }
+            s_init = 0.0f;
+        }
+        float t_init = (b * s_init + f) / e;
+        if (t_init < 0.0f) {
+            s = wp_eee_clamp01(-c / a);
+        } else if (t_init > 1.0f) {
+            s = wp_eee_clamp01((b - c) / a);
+            t = 1.0f;
+        } else {
+            s = s_init;
+            t = t_init;
         }
     }
-    float3 c1 = p1 + (q1 - p1) * s;
-    float3 c2 = p2 + (q2 - p2) * t;
-    dist = metal::length(c2 - c1);
-    return float3(s, t, dist);
+    float3 c1 = p1 + s * d1;
+    float3 c2 = p2 + t * d2;
+    return float3(s, t, wp_eee_length(c2 - c1));
+}
+// adj_clamp(x, 0, 1, ...) routing: the gradient reaches x iff 0 <= x < 1.
+inline float wp_eee_adj_clamp01(float x, float adj_ret) { return (x >= 0.0f && x < 1.0f) ? adj_ret : 0.0f; }
+inline void wp_adj_closest_point_edge_edge(
+    float3 p1, float3 q1, float3 p2, float3 q2, float epsilon,
+    thread float3& adj_p1, thread float3& adj_q1, thread float3& adj_p2, thread float3& adj_q2,
+    thread float& adj_epsilon, float3 adj_ret)
+{
+#pragma clang fp contract(off)
+    float3 d1 = q1 - p1;
+    float3 d2 = q2 - p2;
+    float3 r = p1 - p2;
+    float a = wp_tt_dot(d1, d1);
+    float e = wp_tt_dot(d2, d2);
+    float f = wp_tt_dot(d2, r);
+    bool degen1 = (a <= epsilon);
+    bool degen2 = (e <= epsilon);
+    float s = 0.0f;
+    float t = 0.0f;
+    float c = 0.0f;
+    float b = 0.0f;
+    float denom = 0.0f;
+    float s_uc = 0.0f;
+    float t_uc = 0.0f;
+    // 0 A, 1 B, 2 C, 3 D, 4 D_DEGEN, 5 E, 6 F (native branch enum)
+    int branch;
+    if (degen1 && degen2) {
+        branch = 0;
+    } else if (degen1) {
+        branch = 1;
+        t_uc = f / e;
+        t = wp_eee_clamp01(t_uc);
+    } else if (degen2) {
+        branch = 2;
+        c = wp_tt_dot(d1, r);
+        s_uc = -c / a;
+        s = wp_eee_clamp01(s_uc);
+    } else {
+        c = wp_tt_dot(d1, r);
+        b = wp_tt_dot(d1, d2);
+        denom = wp_eee_diff_product(a, e, b, b);
+        bool denom_positive = (denom > 0.0f);
+        bool denom_stable = denom_positive && (denom > 1.0e-6f * a * e);
+        float s_init;
+        if (denom_positive) {
+            float num = wp_eee_diff_product(b, f, c, e);
+            s_uc = num / denom;
+            s_init = wp_eee_clamp01(s_uc);
+        } else {
+            s_init = 0.0f;
+        }
+        float t_init = (b * s_init + f) / e;
+        if (t_init < 0.0f) {
+            branch = 5;
+            s_uc = -c / a;
+            s = wp_eee_clamp01(s_uc);
+            t = 0.0f;
+        } else if (t_init > 1.0f) {
+            branch = 6;
+            s_uc = (b - c) / a;
+            s = wp_eee_clamp01(s_uc);
+            t = 1.0f;
+        } else {
+            branch = denom_stable ? 3 : 4;
+            s = s_init;
+            t = t_init;
+        }
+    }
+    float3 c1 = p1 + s * d1;
+    float3 c2 = p2 + t * d2;
+    float3 diff = c2 - c1;
+    float dist = wp_eee_length(diff);
+    float3 adj_diff = float3(0.0f);
+    if (dist > 0.0f) { adj_diff = (adj_ret[2] / dist) * diff; }
+    float3 adj_c1 = -adj_diff;
+    float3 adj_c2 = adj_diff;
+    float3 adj_d1 = float3(0.0f);
+    float3 adj_d2 = float3(0.0f);
+    float3 adj_r = float3(0.0f);
+    adj_p1 += adj_c1;
+    adj_d1 += s * adj_c1;
+    float adj_s = wp_tt_dot(d1, adj_c1) + adj_ret[0];
+    adj_p2 += adj_c2;
+    adj_d2 += t * adj_c2;
+    float adj_t = wp_tt_dot(d2, adj_c2) + adj_ret[1];
+    float adj_a = 0.0f, adj_e = 0.0f, adj_b = 0.0f, adj_c = 0.0f, adj_f = 0.0f;
+    if (branch == 1) {
+        float adj_t_uc = wp_eee_adj_clamp01(t_uc, adj_t);
+        adj_f += adj_t_uc / e;
+        adj_e += -adj_t_uc * t_uc / e;
+    } else if (branch == 2 || branch == 5) {
+        float adj_s_uc = wp_eee_adj_clamp01(s_uc, adj_s);
+        adj_c += -adj_s_uc / a;
+        adj_a += -adj_s_uc * s_uc / a;
+    } else if (branch == 6) {
+        float adj_s_uc = wp_eee_adj_clamp01(s_uc, adj_s);
+        adj_b += adj_s_uc / a;
+        adj_c += -adj_s_uc / a;
+        adj_a += -adj_s_uc * s_uc / a;
+    } else if (branch == 3) {
+        adj_b += adj_t * s / e;
+        adj_s += adj_t * b / e;
+        adj_f += adj_t / e;
+        adj_e += -adj_t * t / e;
+        float adj_s_uc = wp_eee_adj_clamp01(s_uc, adj_s);
+        float adj_num = adj_s_uc / denom;
+        float adj_denom = -adj_s_uc * s_uc / denom;
+        adj_b += adj_num * f;
+        adj_f += adj_num * b;
+        adj_c -= adj_num * e;
+        adj_e -= adj_num * c;
+        adj_a += adj_denom * e;
+        adj_e += adj_denom * a;
+        adj_b -= 2.0f * adj_denom * b;
+    } else if (branch == 4) {
+        adj_b += adj_t * s / e;
+        adj_f += adj_t / e;
+        adj_e += -adj_t * t / e;
+    }
+    adj_d1 += 2.0f * adj_a * d1 + adj_b * d2 + adj_c * r;
+    adj_d2 += 2.0f * adj_e * d2 + adj_b * d1 + adj_f * r;
+    adj_r += adj_c * d1 + adj_f * d2;
+    adj_q1 += adj_d1;
+    adj_p1 -= adj_d1;
+    adj_q2 += adj_d2;
+    adj_p2 -= adj_d2;
+    adj_p1 += adj_r;
+    adj_p2 -= adj_r;
 }
 inline bool wp_tt_edge_edge(float3 V0, float3 U0, float3 U1, int i0, int i1, float Ax, float Ay) {
     float Bx = U0[i0] - U1[i0];
@@ -4752,6 +4901,9 @@ inline int wp_bvh_get_group_root(ulong id, int group_id) {
     wp_bvh_desc_t bvh = wp_bvh_get_desc(id);
     return wp_bvh_group_root_impl(bvh, group_id);
 }
+// The BVH descriptor sits at offset 0 of the mesh descriptor (metal_bvh.py),
+// so a mesh id is also the id of its triangle BVH.
+inline ulong wp_mesh_get_bvh(ulong id) { return id; }
 inline int wp_mesh_get_group_root(ulong id, int group_id) {
     wp_mesh_desc_t mesh = wp_mesh_get_desc(id);
     return wp_bvh_group_root_impl(mesh.bvh, group_id);
@@ -4788,20 +4940,73 @@ struct wp_bvh_query_t {
     float3 input_lower;
     float3 input_upper;
     int bounds_nr;
-    bool is_ray;
+    // Query kind (native ``BvhQueryKind``): one MSL iterator serves every
+    // kind, so the kind is a runtime field, as in ``bvh_query_next_dynamic``.
+    int kind;
+    float radius;
+    float radius_sq;
 };
-inline bool wp_bvh_query_intersection_test(
-    const thread wp_bvh_query_t& query, float3 node_lower, float3 node_upper, thread float& t)
+#define WP_BVH_QUERY_AABB 0
+#define WP_BVH_QUERY_RAY 1
+#define WP_BVH_QUERY_CAPSULE 2
+#define WP_BVH_QUERY_SPHERE 3
+// intersect_ray_aabb_robust / intersect_sphere_aabb (warp/native/intersect.h).
+inline bool wp_bvh_intersect_ray_aabb_robust(
+    float3 pos, float3 dir, float3 rcp_dir, float3 lower, float3 upper, thread float& t)
 {
-    if (query.is_ray) {
-        return wp_bvh_intersect_ray_aabb(query.input_lower, query.input_upper, node_lower, node_upper, t);
+    float lmin = -FLT_MAX;
+    float lmax = FLT_MAX;
+    for (int i = 0; i < 3; ++i) {
+        if (dir[i] == 0.0f) {
+            if (pos[i] < lower[i] || pos[i] > upper[i]) { return false; }
+        } else {
+            float l1 = (lower[i] - pos[i]) * rcp_dir[i];
+            float l2 = (upper[i] - pos[i]) * rcp_dir[i];
+            lmin = wp_bvh_maxf(wp_bvh_minf(l1, l2), lmin);
+            lmax = wp_bvh_minf(wp_bvh_maxf(l1, l2), lmax);
+        }
+    }
+    bool hit = (lmax >= 0.0f) && (lmax >= lmin);
+    if (hit) { t = lmin; }
+    return hit;
+}
+inline bool wp_bvh_intersect_sphere_aabb(float3 center, float radius_sq, float3 lower, float3 upper) {
+#pragma clang fp contract(off)
+    float dx = wp_bvh_maxf(wp_bvh_maxf(lower.x - center.x, center.x - upper.x), 0.0f);
+    float dy = wp_bvh_maxf(wp_bvh_maxf(lower.y - center.y, center.y - upper.y), 0.0f);
+    float dz = wp_bvh_maxf(wp_bvh_maxf(lower.z - center.z, center.z - upper.z), 0.0f);
+    return dx * dx + dy * dy + dz * dz <= radius_sq;
+}
+// Node / item overlap test of ``bvh_query_test<KIND>`` (warp/native/bvh.h),
+// including each kind's ``max_dist`` predicate: half-open for rays, closed
+// for capsules, none for AABB and sphere queries.
+inline bool wp_bvh_query_intersection_test(
+    const thread wp_bvh_query_t& query, float3 node_lower, float3 node_upper, float max_dist)
+{
+    if (query.kind == WP_BVH_QUERY_SPHERE) {
+        return wp_bvh_intersect_sphere_aabb(query.input_lower, query.radius_sq, node_lower, node_upper);
+    }
+    if (query.kind == WP_BVH_QUERY_CAPSULE) {
+        float t = FLT_MAX;
+        float3 inv = float3(1.0f / query.input_upper.x, 1.0f / query.input_upper.y, 1.0f / query.input_upper.z);
+        bool hit = wp_bvh_intersect_ray_aabb_robust(
+            query.input_lower, inv, query.input_upper, node_lower - float3(query.radius),
+            node_upper + float3(query.radius), t);
+        return hit && !(t > max_dist);
+    }
+    if (query.kind == WP_BVH_QUERY_RAY) {
+        float t = FLT_MAX;
+        bool hit = wp_bvh_intersect_ray_aabb(query.input_lower, query.input_upper, node_lower, node_upper, t);
+        return hit && !(t >= max_dist);
     }
     return wp_bvh_intersect_aabb_aabb(query.input_lower, query.input_upper, node_lower, node_upper);
 }
-inline wp_bvh_query_t wp_bvh_query_init(ulong id, bool is_ray, float3 lower, float3 upper, int root) {
+inline wp_bvh_query_t wp_bvh_query_init(ulong id, int kind, float3 lower, float3 upper, int root) {
     wp_bvh_query_t query;
     query.bvh = wp_bvh_get_desc(id);
-    query.is_ray = is_ray;
+    query.kind = kind;
+    query.radius = 0.0f;
+    query.radius_sq = 0.0f;
     query.stack[0] = root == -1 ? query.bvh.root : root;
     query.count = 1;
     query.primitive_counter = 0;
@@ -4811,10 +5016,22 @@ inline wp_bvh_query_t wp_bvh_query_init(ulong id, bool is_ray, float3 lower, flo
     return query;
 }
 inline wp_bvh_query_t wp_bvh_query_aabb(ulong id, float3 lower, float3 upper, int root) {
-    return wp_bvh_query_init(id, false, lower, upper, root);
+    return wp_bvh_query_init(id, WP_BVH_QUERY_AABB, lower, upper, root);
 }
 inline wp_bvh_query_t wp_bvh_query_ray(ulong id, float3 start, float3 dir, int root) {
-    return wp_bvh_query_init(id, true, start, 1.0f / dir, root);
+    return wp_bvh_query_init(id, WP_BVH_QUERY_RAY, start, 1.0f / dir, root);
+}
+inline wp_bvh_query_t wp_bvh_query_capsule(ulong id, float3 start, float3 dir, float radius, int root) {
+    wp_bvh_query_t query = wp_bvh_query_init(id, WP_BVH_QUERY_CAPSULE, start, 1.0f / dir, root);
+    query.radius = wp_bvh_maxf(radius, 0.0f);
+    query.radius_sq = query.radius * query.radius;
+    return query;
+}
+inline wp_bvh_query_t wp_bvh_query_sphere(ulong id, float3 center, float radius, int root) {
+    wp_bvh_query_t query = wp_bvh_query_init(id, WP_BVH_QUERY_SPHERE, center, center, root);
+    query.radius = wp_bvh_maxf(radius, 0.0f);
+    query.radius_sq = query.radius * query.radius;
+    return query;
 }
 inline bool wp_bvh_query_next(thread wp_bvh_query_t& query, thread int& index, float max_dist) {
     const device wp_bvh_node_t* lowers = wp_bvh_node_ptr(query.bvh.node_lowers);
@@ -4825,11 +5042,10 @@ inline bool wp_bvh_query_next(thread wp_bvh_query_t& query, thread int& index, f
         wp_bvh_node_t node_lower = lowers[node_index];
         wp_bvh_node_t node_upper = uppers[node_index];
         if (query.primitive_counter == 0) {
-            float t = FLT_MAX;
             bool hit = wp_bvh_query_intersection_test(
                 query, float3(node_lower.x, node_lower.y, node_lower.z),
-                float3(node_upper.x, node_upper.y, node_upper.z), t);
-            if (!hit || (query.is_ray && t >= max_dist)) { continue; }
+                float3(node_upper.x, node_upper.y, node_upper.z), max_dist);
+            if (!hit) { continue; }
         }
         const int left_index = int(node_lower.bits & 0x7fffffffu);
         const int right_index = int(node_upper.bits & 0x7fffffffu);
@@ -4848,11 +5064,10 @@ inline bool wp_bvh_query_next(thread wp_bvh_query_t& query, thread int& index, f
                 } else {
                     query.stack[query.count++] = node_index;
                 }
-                float t = FLT_MAX;
                 bool hit = wp_bvh_query_intersection_test(
                     query, wp_bvh_load_v3(query.bvh.item_lowers, primitive_index),
-                    wp_bvh_load_v3(query.bvh.item_uppers, primitive_index), t);
-                if (!hit || (query.is_ray && t >= max_dist)) { continue; }
+                    wp_bvh_load_v3(query.bvh.item_uppers, primitive_index), max_dist);
+                if (!hit) { continue; }
                 index = primitive_index;
                 query.bounds_nr = primitive_index;
                 return true;
@@ -6299,7 +6514,7 @@ inline void wp_adj_mesh_query_point_sign_winding_number(ulong id, float3 point, 
 // bounds in that descriptor are the per-triangle AABBs, matching the
 // native mesh_query_aabb_next primitive test exactly.
 inline wp_bvh_query_t wp_mesh_query_aabb(ulong id, float3 lower, float3 upper) {
-    return wp_bvh_query_init(id, false, lower, upper, -1);
+    return wp_bvh_query_init(id, WP_BVH_QUERY_AABB, lower, upper, -1);
 }
 inline bool wp_mesh_query_aabb_next(thread wp_bvh_query_t& query, thread int& index) {
     return wp_bvh_query_next(query, index, FLT_MAX);
@@ -10583,8 +10798,13 @@ def _build_kernel_header(source: str) -> str:
             if not _vec_native(n, scalar):
                 seen_vec.add((n, scalar))
     parts: list[str] = []
+    # The native ``wp::`` compat block (emitted last, with the snippets) uses
+    # the BVH / mesh helpers and the binary64 softfloat routines.
+    native_wp_compat = _native_snippets_need_wp_compat(source)
+    if native_wp_compat:
+        source = source + "\n" + _NATIVE_WP_COMPAT_MSL
     # Emulated doubles first: every struct below may carry ``wp_f64`` members.
-    if _F64_EMU_MSL in source:
+    if _F64_EMU_MSL in source or native_wp_compat:
         parts.append(_f64_emulate_helpers())
     for n, scalar in sorted(seen_vec):
         parts.append(_emit_big_vec_struct(f"wp_vec{n}_{scalar}", n, scalar))
@@ -10689,7 +10909,11 @@ def _build_kernel_header(source: str) -> str:
         parts.append(_NOISE_HELPERS)
     if "wp_svd" in source or "wp_qr3" in source or "wp_eig3" in source:
         parts.append(_SVD_HELPERS)
-    if "wp_closest_point_edge_edge" in source or "wp_intersect_tri_tri" in source:
+    if (
+        "wp_closest_point_edge_edge" in source
+        or "wp_adj_closest_point_edge_edge" in source
+        or "wp_intersect_tri_tri" in source
+    ):
         parts.append(_INTERSECT_HELPERS)
     if "wp_bvh_" in source or "wp_mesh_" in source:
         parts.append(_BVH_HELPERS)
@@ -12291,6 +12515,7 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     # Intersection queries — ports of warp/native/intersect.h (see
     # ``_INTERSECT_HELPERS``).
     (re.compile(r"\bwp::closest_point_edge_edge\b"), "wp_closest_point_edge_edge"),
+    (re.compile(r"\bwp::adj_closest_point_edge_edge\b"), "wp_adj_closest_point_edge_edge"),
     (re.compile(r"\bwp::intersect_tri_tri\b"), "wp_intersect_tri_tri"),
     # BVH / mesh queries — descriptor-buffer ports of warp/native/bvh.h and
     # mesh.h (see ``_BVH_HELPERS``). Ids are ``gpuAddress``es of descriptor
@@ -12300,11 +12525,15 @@ _INTRINSIC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bwp::bvh_query_ray\b"), "wp_bvh_query_ray"),
     (re.compile(r"\bwp::bvh_query_next\b"), "wp_bvh_query_next"),
     # Warp >= 1.18 types BVH queries by kind and emits a per-kind iterator;
-    # the MSL query keeps its kind (``is_ray``) at runtime, so the ray and
-    # kind-erased iterators share ``wp_bvh_query_next``. Capsule and sphere
-    # queries have no MSL port and fall through to the unsupported guard.
+    # the MSL query keeps its kind at runtime, so every per-kind iterator and
+    # the kind-erased one share ``wp_bvh_query_next``.
+    (re.compile(r"\bwp::bvh_query_capsule\b"), "wp_bvh_query_capsule"),
+    (re.compile(r"\bwp::bvh_query_sphere\b"), "wp_bvh_query_sphere"),
     (re.compile(r"\bwp::bvh_query_ray_next\b"), "wp_bvh_query_next"),
+    (re.compile(r"\bwp::bvh_query_capsule_next\b"), "wp_bvh_query_next"),
+    (re.compile(r"\bwp::bvh_query_sphere_next\b"), "wp_bvh_query_next"),
     (re.compile(r"\bwp::bvh_query_next_dynamic\b"), "wp_bvh_query_next"),
+    (re.compile(r"\bwp::mesh_get_bvh\b"), "wp_mesh_get_bvh"),
     (re.compile(r"\bwp::bvh_get_group_root\b"), "wp_bvh_get_group_root"),
     (re.compile(r"\bwp::mesh_query_ray_anyhit\b"), "wp_mesh_query_ray_anyhit"),
     # Reverse mode for the ray query: differentiates the hit distance and
@@ -15897,6 +16126,168 @@ _NATIVE_SNIPPET_SHIMS = """\
 #define __syncwarp(...) WP_NATIVE_WARP_SYNC()
 #endif
 """
+# Native C++ API (``namespace wp``) for ``@wp.func_native`` snippets that read
+# Warp's mesh / BVH internals or call native geometry routines (e.g. Newton's
+# full-surface mesh soft contacts). Each entry mirrors its warp/native
+# counterpart (bvh.h, mesh.h, intersect.h) over the Metal descriptor buffers
+# of ``metal_bvh.py``. Only the names below exist; any other ``wp::`` name in
+# a snippet stays an MSL compile error. Emitted only for kernels calling a
+# snippet that names ``wp::`` (such snippets never compiled on Metal before).
+_NATIVE_WP_COMPAT_MSL = """\
+#ifndef WP_METAL_NATIVE_WP_COMPAT
+#define WP_METAL_NATIVE_WP_COMPAT
+// a*b - c*d evaluated as native intersect_ray_tri_woop does in double:
+// exact float products, one binary64 rounding, then one binary32 rounding.
+inline float wp_compat_f64_diff_product(float a, float b, float c, float d) {
+    ulong ab = __softfloat64_fmul(__softfloat64_cvt_f32_to_f64(as_type<uint>(a)),
+                                  __softfloat64_cvt_f32_to_f64(as_type<uint>(b)), 0u);
+    ulong cd = __softfloat64_fmul(__softfloat64_cvt_f32_to_f64(as_type<uint>(c)),
+                                  __softfloat64_cvt_f32_to_f64(as_type<uint>(d)), 0u);
+    return as_type<float>(__softfloat64_cvt_f64_to_f32(__softfloat64_fsub(ab, cd, 0u), 0u));
+}
+namespace wp {
+typedef float2 vec2;
+typedef float3 vec3;
+typedef float4 vec4;
+// Native CPU code is compiled without FP contraction; MSL contracts within an
+// expression by default, so every helper below that could fuse opts out.
+inline float dot(float3 a, float3 b) {
+#pragma clang fp contract(off)
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+inline float3 cross(float3 a, float3 b) { return metal::cross(a, b); }
+// BVHPackedNodeHalf: same 16-byte layout as wp_bvh_node_t (bits = i:31 | b:1).
+struct BVHPackedNodeHalf {
+    float x;
+    float y;
+    float z;
+    uint i : 31;
+    uint b : 1;
+};
+struct BVH {
+    const device BVHPackedNodeHalf* node_lowers;
+    const device BVHPackedNodeHalf* node_uppers;
+    const device int* node_parents;
+    const device int* primitive_indices;
+    const device int* root;
+    const device packed_float3* item_lowers;
+    const device packed_float3* item_uppers;
+    const device int* item_groups;
+    int num_nodes;
+    int num_leaf_nodes;
+    int num_items;
+    int leaf_size;
+};
+struct Mesh {
+    BVH bvh;
+    int num_points;
+    int num_tris;
+    float average_edge_length;
+};
+inline BVH bvh_get(ulong id) {
+    const device wp_bvh_desc_t* d = reinterpret_cast<const device wp_bvh_desc_t*>(id);
+    BVH bvh;
+    bvh.node_lowers = reinterpret_cast<const device BVHPackedNodeHalf*>(d->node_lowers);
+    bvh.node_uppers = reinterpret_cast<const device BVHPackedNodeHalf*>(d->node_uppers);
+    bvh.node_parents = reinterpret_cast<const device int*>(d->node_parents);
+    bvh.primitive_indices = reinterpret_cast<const device int*>(d->primitive_indices);
+    bvh.root = &d->root;
+    bvh.item_lowers = reinterpret_cast<const device packed_float3*>(d->item_lowers);
+    bvh.item_uppers = reinterpret_cast<const device packed_float3*>(d->item_uppers);
+    bvh.item_groups = reinterpret_cast<const device int*>(d->item_groups);
+    bvh.num_nodes = d->num_nodes;
+    bvh.num_leaf_nodes = d->num_leaf_nodes;
+    bvh.num_items = d->num_items;
+    bvh.leaf_size = d->leaf_size;
+    return bvh;
+}
+inline Mesh mesh_get(ulong id) {
+    const device wp_mesh_desc_t* d = reinterpret_cast<const device wp_mesh_desc_t*>(id);
+    Mesh mesh;
+    mesh.bvh = bvh_get(id);
+    mesh.num_points = d->num_points;
+    mesh.num_tris = d->num_tris;
+    mesh.average_edge_length = d->average_edge_length;
+    return mesh;
+}
+inline ulong mesh_get_bvh(ulong id) { return id; }
+inline BVHPackedNodeHalf bvh_load_node(const device BVHPackedNodeHalf* nodes, int index) { return nodes[index]; }
+inline wp_mesh_query_point_t mesh_query_point_sign_parity(
+    ulong id, float3 point, float max_dist, int n_sample = 1, float perturbation_scale = 0.1f) {
+    return ::wp_mesh_query_point_sign_parity(id, point, max_dist, n_sample, perturbation_scale);
+}
+inline wp_mesh_query_point_t mesh_query_point_sign_normal(ulong id, float3 point, float max_dist, float epsilon = 1e-3f) {
+    return ::wp_mesh_query_point_sign_normal(id, point, max_dist, epsilon);
+}
+// intersect_ray_tri_woop (warp/native/intersect.h) including its binary64
+// refinement of exactly-zero edge functions, so edge / vertex hits report
+// the same exact-zero weights as on CPU and CUDA.
+inline bool intersect_ray_tri_woop(
+    float3 p, float3 dir, float3 a, float3 b, float3 c,
+    thread float& t, thread float& u, thread float& v, thread float& sign, thread float3* normal)
+{
+#pragma clang fp contract(off)
+    int kz = wp_bvh_ray_max_dim(dir);
+    int kx = kz + 1;
+    if (kx == 3) { kx = 0; }
+    int ky = kx + 1;
+    if (ky == 3) { ky = 0; }
+    if (dir[kz] < 0.0f) {
+        int tmp = kx;
+        kx = ky;
+        ky = tmp;
+    }
+    float Sx = dir[kx] / dir[kz];
+    float Sy = dir[ky] / dir[kz];
+    float Sz = 1.0f / dir[kz];
+    float3 A = a - p;
+    float3 B = b - p;
+    float3 C = c - p;
+    float Ax = A[kx] - Sx * A[kz];
+    float Ay = A[ky] - Sy * A[kz];
+    float Bx = B[kx] - Sx * B[kz];
+    float By = B[ky] - Sy * B[kz];
+    float Cx = C[kx] - Sx * C[kz];
+    float Cy = C[ky] - Sy * C[kz];
+    float U = wp_bvh_diff_product(Cx, By, Cy, Bx);
+    float V = wp_bvh_diff_product(Ax, Cy, Ay, Cx);
+    float W = wp_bvh_diff_product(Bx, Ay, By, Ax);
+    if (U == 0.0f || V == 0.0f || W == 0.0f) {
+        U = wp_compat_f64_diff_product(Cx, By, Cy, Bx);
+        V = wp_compat_f64_diff_product(Ax, Cy, Ay, Cx);
+        W = wp_compat_f64_diff_product(Bx, Ay, By, Ax);
+    }
+    if ((U < 0.0f || V < 0.0f || W < 0.0f) && (U > 0.0f || V > 0.0f || W > 0.0f)) { return false; }
+    float det = U + V + W;
+    if (det == 0.0f) { return false; }
+    float Az = Sz * A[kz];
+    float Bz = Sz * B[kz];
+    float Cz = Sz * C[kz];
+    float T = U * Az + V * Bz + W * Cz;
+    int det_sign = as_type<int>(det) & int(0x80000000u);
+    if (as_type<float>(as_type<int>(T) ^ det_sign) < 0.0f) { return false; }
+    float rcp_det = 1.0f / det;
+    u = U * rcp_det;
+    v = V * rcp_det;
+    t = T * rcp_det;
+    sign = det;
+    if (normal) { *normal = metal::cross(b - a, c - a); }
+    return true;
+}
+}  // namespace wp
+#endif
+"""
+_NATIVE_WP_NAME_PAT = re.compile(r"\bwp::")
+
+
+def _native_snippets_need_wp_compat(source: str) -> bool:
+    """Whether a kernel calls a native snippet that names the ``wp::`` C++ API."""
+    return any(
+        _NATIVE_WP_NAME_PAT.search(_NATIVE_SNIPPET_DEFS.get(m.group(1), ""))
+        for m in _NATIVE_SNIPPET_REF_PAT.finditer(source)
+    )
+
+
 # Block / warp barriers in snippets: real barriers in a kernel whose lanes
 # cooperate (distributed tiles, one threadgroup per block), no-ops in the
 # serial one-thread-per-block model. Prepended to the header per kernel.
@@ -16096,6 +16487,10 @@ def _native_snippet_call(fn_overload, caller_args, return_value_dst):
         body = _NATIVE_PTR_DECL_PAT.sub(r"device \1* ", body)
     body = _NATIVE_REINTERPRET_REF_PAT.sub(r"as_type<\1>(\2)", body)
     body = _NATIVE_GUARDED_SYNC_PAT.sub(lambda m: m.group("body"), body)
+    if _NATIVE_WP_NAME_PAT.search(body):
+        # Snippets on the native ``wp::`` API (see ``_NATIVE_WP_COMPAT_MSL``)
+        # keep CPU's unfused float arithmetic.
+        body = "#pragma clang fp contract(off)\n" + body
     _NATIVE_SNIPPET_DEFS[name] = f"inline {ret_msl} {name}({', '.join(params)}) {{\n{body}\n}}"
     call = f"{name}({', '.join(caller_args)})"
     if return_value_dst is not None:
@@ -16121,6 +16516,8 @@ def _emit_referenced_user_funcs(source: str) -> str:
     parts = [_USER_FUNC_MSL_DEFS[n] for n in sorted(seen)]
     if native:
         parts.append(_NATIVE_SNIPPET_SHIMS)
+        if any(_NATIVE_WP_NAME_PAT.search(_NATIVE_SNIPPET_DEFS[n]) for n in native):
+            parts.append(_NATIVE_WP_COMPAT_MSL)
         parts.append(_NATIVE_ARRAY_VIEW_MSL)
         parts.extend(_NATIVE_SNIPPET_DEFS[n] for n in native)
     return "\n".join(parts) + "\n"
