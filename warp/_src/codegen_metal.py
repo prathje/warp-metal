@@ -8942,6 +8942,196 @@ def _emit_tile_cholesky_solve(n: int, k: int, msl_scalar: str) -> str:
     return "\n".join(parts)
 
 
+def _tile_type_name(rows: int, cols: int, msl_scalar: str) -> str:
+    """MSL type of a ``rows x cols`` private tile (a 1x1 tile is a scalar)."""
+    return msl_scalar if rows == 1 and cols == 1 else f"wp_tile_{rows}x{cols}_{msl_scalar}"
+
+
+def _emit_tile_adj_cholesky(n: int, msl_scalar: str) -> str:
+    """Emit ``wp_tile_adjchol_<N>_<scalar>(L, adj_L, adj_A)``: the reverse of
+    the lower ``tile_cholesky`` (``L = chol(A)``) in the serial tile model.
+
+    Same six phases and the same operation order as
+    ``partitioned_gemm::cooperative_scalar_cholesky_adj<false>`` in
+    ``warp/native/tile_cholesky.h`` (Murray 2016), run by the one thread
+    that owns the block's tiles:
+
+      1. ``W1 = L^T adj_L``
+      2. ``W2 = W1`` with its lower triangle mirrored into the upper one
+      3. ``L^T X = W2``, in place in ``W2``
+      4. ``W1 = W2^T``
+      5. ``L^T B = W1``, in place in ``W1``
+      6. ``adj_A[r, c] += B[r, c]`` on the lower triangle, diagonal halved
+
+    A zero pivot leaves the row undivided, as the native solve does. The
+    loops are kept rolled (``unroll(disable)``) for the same Apple-compiler
+    reason as the forward helpers: fully unrolled tile bodies have dropped
+    writes at N >= 8.
+    """
+    T = _tile_type_name(n, n, msl_scalar)
+    s = msl_scalar
+    zero = _sc_zero(s)
+    name = f"wp_tile_adjchol_{n}_{s}"
+    p: list[str] = [
+        f"__attribute__((noinline)) void {name}(const thread {T}& L, const thread {T}& adjL, thread {T}& adjA) {{",
+        f"    {s} W1[{n * n}];",
+        f"    {s} W2[{n * n}];",
+        "    #pragma clang loop unroll(disable)",
+        f"    for (int ij = 0; ij < {n * n}; ++ij) {{",
+        f"        const int i = ij / {n}; const int j = ij - i * {n};",
+        f"        {s} acc = {zero};",
+        f"        for (int k = 0; k < {n}; ++k) acc += L.c[k * {n} + i] * adjL.c[k * {n} + j];",
+        "        W1[ij] = acc;",
+        "    }",
+        "    #pragma clang loop unroll(disable)",
+        f"    for (int ij = 0; ij < {n * n}; ++ij) {{",
+        f"        const int r = ij / {n}; const int c = ij - r * {n};",
+        f"        W2[ij] = (r < c) ? W1[c * {n} + r] : W1[ij];",
+        "    }",
+        "    #pragma clang loop unroll(disable)",
+        f"    for (int k = 0; k < {n}; ++k) {{",
+        f"        for (int i = {n - 1}; i >= 0; --i) {{",
+        f"            {s} acc = W2[i * {n} + k];",
+        f"            for (int j = i + 1; j < {n}; ++j) acc -= L.c[j * {n} + i] * W2[j * {n} + k];",
+        f"            const {s} d = L.c[i * {n} + i];",
+        f"            W2[i * {n} + k] = (d != {zero}) ? acc / d : acc;",
+        "        }",
+        "    }",
+        "    #pragma clang loop unroll(disable)",
+        f"    for (int ij = 0; ij < {n * n}; ++ij) {{",
+        f"        const int r = ij / {n}; const int c = ij - r * {n};",
+        f"        W1[ij] = W2[c * {n} + r];",
+        "    }",
+        "    #pragma clang loop unroll(disable)",
+        f"    for (int k = 0; k < {n}; ++k) {{",
+        f"        for (int i = {n - 1}; i >= 0; --i) {{",
+        f"            {s} acc = W1[i * {n} + k];",
+        f"            for (int j = i + 1; j < {n}; ++j) acc -= L.c[j * {n} + i] * W1[j * {n} + k];",
+        f"            const {s} d = L.c[i * {n} + i];",
+        f"            W1[i * {n} + k] = (d != {zero}) ? acc / d : acc;",
+        "        }",
+        "    }",
+        "    #pragma clang loop unroll(disable)",
+        f"    for (int ij = 0; ij < {n * n}; ++ij) {{",
+        f"        const int r = ij / {n}; const int c = ij - r * {n};",
+        "        if (r > c) adjA.c[ij] += W1[ij];",
+        f"        else if (r == c) adjA.c[ij] += {_sc_lit(s, 0.5)} * W1[ij];",
+        "    }",
+        "}",
+    ]
+    return "\n".join(p)
+
+
+def _emit_tile_lower_solve_out(n: int, k: int, msl_scalar: str) -> str:
+    """Emit ``wp_tile_lsolve_<N>x<K>_<scalar>(L, y)``: out-of-place
+    ``tile_lower_solve`` (``L z = y`` by forward substitution) returning ``z``.
+
+    Mirrors ``scalar_cholesky_forward_substitution<false>`` in
+    ``warp/native/tile_solve.h``, including its zero-pivot rule (the row is
+    left undivided). ``y`` / ``z`` are ``N x K`` (``K = 1`` for a 1-D tile).
+    """
+    LT = _tile_type_name(n, n, msl_scalar)
+    YT = _tile_type_name(n, k, msl_scalar)
+    s = msl_scalar
+    zero = _sc_zero(s)
+    name = f"wp_tile_lsolve_{n}x{k}_{s}"
+    return "\n".join(
+        [
+            f"__attribute__((noinline)) {YT} {name}(const thread {LT}& L, const thread {YT}& y) {{",
+            f"    {YT} z;",
+            "    #pragma clang loop unroll(disable)",
+            f"    for (int col = 0; col < {k}; ++col) {{",
+            f"        for (int i = 0; i < {n}; ++i) {{",
+            f"            {s} acc = y.c[i * {k} + col];",
+            f"            for (int j = 0; j < i; ++j) acc -= L.c[i * {n} + j] * z.c[j * {k} + col];",
+            f"            const {s} d = L.c[i * {n} + i];",
+            f"            z.c[i * {k} + col] = (d != {zero}) ? acc / d : acc;",
+            "        }",
+            "    }",
+            "    return z;",
+            "}",
+        ]
+    )
+
+
+def _emit_tile_upper_solve_out(n: int, k: int, msl_scalar: str) -> str:
+    """Emit ``wp_tile_usolve_<N>x<K>_<scalar>(U, z)``: out-of-place
+    ``tile_upper_solve`` (``U x = z`` by back substitution) returning ``x``.
+
+    Mirrors ``tile_upper_solve`` in ``warp/native/tile_solve.h`` (back
+    substitution on ``transpose(U)`` read as lower), including the
+    zero-pivot rule.
+    """
+    UT = _tile_type_name(n, n, msl_scalar)
+    ZT = _tile_type_name(n, k, msl_scalar)
+    s = msl_scalar
+    zero = _sc_zero(s)
+    name = f"wp_tile_usolve_{n}x{k}_{s}"
+    return "\n".join(
+        [
+            f"__attribute__((noinline)) {ZT} {name}(const thread {UT}& U, const thread {ZT}& z) {{",
+            f"    {ZT} x = z;",
+            "    #pragma clang loop unroll(disable)",
+            f"    for (int col = 0; col < {k}; ++col) {{",
+            f"        for (int i = {n - 1}; i >= 0; --i) {{",
+            f"            {s} acc = x.c[i * {k} + col];",
+            f"            for (int j = i + 1; j < {n}; ++j) acc -= U.c[i * {n} + j] * x.c[j * {k} + col];",
+            f"            const {s} d = U.c[i * {n} + i];",
+            f"            x.c[i * {k} + col] = (d != {zero}) ? acc / d : acc;",
+            "        }",
+            "    }",
+            "    return x;",
+            "}",
+        ]
+    )
+
+
+def _emit_tile_adj_lower_solve(n: int, k: int, msl_scalar: str) -> str:
+    """Emit ``wp_tile_adjlsolve_<N>x<K>_<scalar>(L, z, adj_z, adj_y, adj_L)``:
+    the reverse of ``z = tile_lower_solve(L, y)`` in the serial tile model.
+
+    As ``adj_tile_lower_solve`` in ``warp/native/tile_solve.h``:
+    ``W = L^{-T} adj_z`` (back substitution, zero-pivot rule), then
+    ``adj_y += W`` and ``adj_L[r, c] -= sum_k W[r, k] z[c, k]`` on the lower
+    triangle (``r >= c``); the strict upper triangle gets nothing.
+    """
+    LT = _tile_type_name(n, n, msl_scalar)
+    ZT = _tile_type_name(n, k, msl_scalar)
+    s = msl_scalar
+    zero = _sc_zero(s)
+    name = f"wp_tile_adjlsolve_{n}x{k}_{s}"
+    return "\n".join(
+        [
+            f"__attribute__((noinline)) void {name}(const thread {LT}& L, const thread {ZT}& z, "
+            f"const thread {ZT}& adjz, thread {ZT}& adjy, thread {LT}& adjL) {{",
+            f"    {s} W[{n * k}];",
+            "    #pragma clang loop unroll(disable)",
+            f"    for (int e = 0; e < {n * k}; ++e) W[e] = adjz.c[e];",
+            "    #pragma clang loop unroll(disable)",
+            f"    for (int col = 0; col < {k}; ++col) {{",
+            f"        for (int i = {n - 1}; i >= 0; --i) {{",
+            f"            {s} acc = W[i * {k} + col];",
+            f"            for (int j = i + 1; j < {n}; ++j) acc -= L.c[j * {n} + i] * W[j * {k} + col];",
+            f"            const {s} d = L.c[i * {n} + i];",
+            f"            W[i * {k} + col] = (d != {zero}) ? acc / d : acc;",
+            "        }",
+            "    }",
+            "    #pragma clang loop unroll(disable)",
+            f"    for (int e = 0; e < {n * k}; ++e) adjy.c[e] += W[e];",
+            "    #pragma clang loop unroll(disable)",
+            f"    for (int rc = 0; rc < {n * n}; ++rc) {{",
+            f"        const int r = rc / {n}; const int c = rc - r * {n};",
+            "        if (r >= c) {",
+            f"            {s} acc = {zero};",
+            f"            for (int q = 0; q < {k}; ++q) acc += W[r * {k} + q] * z.c[c * {k} + q];",
+            "            adjL.c[rc] -= acc;",
+            "        }",
+            "    }",
+            "}",
+        ]
+    )
+
+
 def _emit_tile_cholesky_solve_coop(n: int, msl_scalar: str) -> str:
     """Emit ``wp_tile_NxN_<scalar>_cholesky_solve_coop_1`` — 32-lane
     SIMD-cooperative solve of ``L L^T x = b`` for a vector RHS.
@@ -10680,6 +10870,23 @@ def _build_kernel_header(source: str) -> str:
     }
     for kind_, tr_, n_, k_, sc_ in sorted(solve_lt_seen):
         parts.append(solve_lt_emit[(kind_, tr_)](n_, k_, sc_, l_trans=True))
+    # Out-of-place triangular solves and the reverse-mode helpers of
+    # ``tile_cholesky`` / ``tile_lower_solve`` (serial tile model).
+    linalg_seen: set[tuple[str, int, int, str]] = {
+        (m.group(1), int(m.group(2)), int(m.group(3)), m.group(4))
+        for m in re.finditer(r"\bwp_tile_(lsolve|usolve|adjlsolve)_(\d+)x(\d+)_(\w+)\b", source)
+    }
+    linalg_emit = {
+        "lsolve": _emit_tile_lower_solve_out,
+        "usolve": _emit_tile_upper_solve_out,
+        "adjlsolve": _emit_tile_adj_lower_solve,
+    }
+    for kind_, n_, k_, sc_ in sorted(linalg_seen):
+        parts.append(linalg_emit[kind_](n_, k_, sc_))
+    for n_, sc_ in sorted(
+        {(int(m.group(1)), m.group(2)) for m in re.finditer(r"\bwp_tile_adjchol_(\d+)_(\w+)\b", source)}
+    ):
+        parts.append(_emit_tile_adj_cholesky(n_, sc_))
     cholesky_pat = re.compile(r"\bwp_tile_(\d+)x(\d+)_(\w+)_cholesky\b(?!_solve|_inplace|_coop)")
     cholesky_solve_pat = re.compile(r"\bwp_tile_(\d+)x(\d+)_(\w+)_cholesky_solve_(\d+)\b")
     coop_cholesky_pat = re.compile(r"\bwp_tile_(\d+)x(\d+)_(\w+)_cholesky_coop\b")
@@ -12923,8 +13130,9 @@ def _tile_mention_roles(line: str, label: str) -> list[str]:
         return ["r"]
     if re.search(rf"(?:[.\[&*]\s*{tok}\b|\b{tok}\s*(?:\.|\[|->|=(?!=)))", line):
         return ["w"] * n
-    if re.match(r"^\s*wp::adj_\w+\s*(?:<[^()]*>)?\s*\(", line):
-        # Reverse-mode statement: reads primal values, writes ``adj_*`` duals.
+    if re.match(r"^\s*wp::adj_\w+\s*(?:<[^()]*>)?\s*\(", line) or _ADJ_TILE_LOWER_SOLVE_PAT.match(line.strip()):
+        # Reverse-mode statement: reads primal values, writes ``adj_*`` duals
+        # (``adj_tile_lower_solve`` is emitted without the namespace).
         return ["r"] * n
     for args in _ir_call_args(line, _TILE_MATMUL_ACC_PAT) + _ir_call_args(line, _TILE_MATMUL_ASSIGN_PAT):
         if len(args) == 8:
@@ -12937,6 +13145,14 @@ def _tile_mention_roles(line: str, label: str) -> list[str]:
     for args in _ir_call_args(line, _TILE_STORE_SRC_PAT):
         if args and args[-1] == tok:
             roles.append("fold-r")
+    # Out-of-place solves read the factor and the right-hand side (the
+    # result is a new tile, the statement's left-hand side).
+    for args in _ir_call_args(line, _TILE_LOWER_SOLVE_PAT):
+        if len(args) == 5:
+            roles += ["r"] * args[2:4].count(tok)
+    for args in _ir_call_args(line, _TILE_UPPER_SOLVE_PAT):
+        if len(args) == 4:
+            roles += ["r"] * args[1:3].count(tok)
     for m in _TILE_EXTRACT_SRC_PAT.finditer(line):
         if m.group(1) == label:
             roles.append("extract")
@@ -13115,6 +13331,19 @@ def _check_tile_transpose_copies(lines: list[str], lowered: set[str] | frozenset
 # *without* the ``wp::`` prefix and without ``<...>`` template args
 # (unlike ``tile_cholesky_inplace`` which keeps a ``<upper>`` flag).
 # Match the bare form. Same shape for the upper variant.
+# Out-of-place triangular solves. Like the in-place forms, the no-MathDx
+# dispatch emits them bare (``namespace=""``):
+#   ``var_Z = tile_lower_solve(f_fwd, f_bkwd, var_L, var_y, var_Z)``
+#   ``var_X = tile_upper_solve(f_fwd, var_U, var_z, var_X)``
+_TILE_LOWER_SOLVE_PAT = re.compile(r"(?<![\w:])var_(\w+)\s*=\s*tile_lower_solve\s*\(([^)]*)\)")
+_TILE_UPPER_SOLVE_PAT = re.compile(r"(?<![\w:])var_(\w+)\s*=\s*tile_upper_solve\s*\(([^)]*)\)")
+# Their reverse (``tile_lower_solve`` and ``tile_cholesky`` are the only
+# differentiable tile linear-algebra builtins upstream):
+#   ``adj_tile_lower_solve(f, b, L, y, Z, adj_f, adj_b, adj_L, adj_y, adj_Z, adj_ret)``
+#   ``wp::adj_tile_cholesky<upper>(f, g, t, A, Out, adj_f, adj_g, adj_t, adj_A, adj_Out, adj_ret)``
+_ADJ_TILE_LOWER_SOLVE_PAT = re.compile(r"(?<![\w:])(?:wp::)?adj_tile_lower_solve\s*\(([^)]*)\)")
+_ADJ_TILE_CHOLESKY_PAT = re.compile(r"\bwp::adj_tile_cholesky\s*(<[^()]*>)\s*\(([^)]*)\)")
+_LINALG_REVERSE_PAT = re.compile(r"\badj_tile_(?:cholesky|lower_solve)\s*[<(]")
 _TILE_LOWER_SOLVE_INPLACE_PAT = re.compile(r"\btile_lower_solve_inplace\s*\(([^)]*)\)")
 _TILE_UPPER_SOLVE_INPLACE_PAT = re.compile(r"\btile_upper_solve_inplace\s*\(([^)]*)\)")
 # ``tile_fft(dir, batch, size, var_X)`` / ``tile_ifft(...)`` — the
@@ -13239,6 +13468,12 @@ def _tile_lead_guard(arr_name: str, lead_idx_args: list[str]) -> str:
     return " && ".join(f"({ix}) >= 0 && ({ix}) < (int){arr_name}_shape[{d}]" for d, ix in enumerate(lead_idx_args))
 
 
+# Reverse ``tile_load`` / ``tile_store`` scatters on a scalar register tile with
+# at least this many elements are emitted as one loop instead of one statement
+# per element (compile time; the arithmetic is the same).
+_TILE_GRAD_ROLL_MIN = 256
+
+
 def _tile_grad_slots(
     arr_name: str,
     lead_idx_args: list[str],
@@ -13247,8 +13482,14 @@ def _tile_grad_slots(
     cols: int,
     vec_n: int,
     two_d: bool | None = None,
+    rolled: bool = False,
 ) -> list[tuple[str, str, str]]:
     """``[(array_flat_index, tile_element_accessor, in_bounds)]`` for a tile/array pairing.
+
+    ``rolled=True`` (scalar-element tiles only) returns one slot written in
+    terms of the loop variables ``_ag_e`` / ``_ag_i`` / ``_ag_j`` (flat
+    element, row, column) for the caller to wrap in a loop over the tile
+    (see ``_TILE_GRAD_ROLL_MIN``).
 
     Mirrors the index arithmetic of the forward ``tile_store`` /
     ``tile_atomic_add`` lowering so the reverse pass touches exactly the
@@ -13279,6 +13520,14 @@ def _tile_grad_slots(
         row_off, col_off = offsets[0], "0"
     n_elem = rows * cols
     slots: list[tuple[str, str, str]] = []
+    if rolled:
+        if vec_n or n_elem == 1:
+            raise MetalCodegenError("MSL codegen: rolled tile gradient slots need a scalar-element register tile")
+        flat = f"{base_expr} + (({row_off}) + _ag_i) * ({row_stride}) + (({col_off}) + _ag_j)"
+        guard = f"({lead_ok}) && (({row_off}) + _ag_i) >= 0 && (({row_off}) + _ag_i) < {row_dim}"
+        if col_dim is not None:
+            guard += f" && (({col_off}) + _ag_j) >= 0 && (({col_off}) + _ag_j) < {col_dim}"
+        return [(f"({flat})", ".c[_ag_e]", guard)]
     for i in range(rows):
         for j in range(cols):
             flat = f"{base_expr} + (({row_off}) + {i}) * ({row_stride}) + (({col_off}) + {j})"
@@ -13895,7 +14144,7 @@ def _translate_tile_intrinsics(
             off = smem_tiles[lhs][0]
             helper = f"wp_tile_{rows}x{cols}_{msl_scalar}_cholesky_smem"
             return f"{helper}({_SMEM_ARENA_NAME} + {off}, _coop_lane)"
-        if coop_chol_seen is not None and _COOP_CHOL_MIN_N <= rows <= _COOP_CHOL_MAX_N:
+        if coop_chol_seen is not None and is_coop_kernel and _COOP_CHOL_MIN_N <= rows <= _COOP_CHOL_MAX_N:
             coop_chol_seen.add((rows, msl_scalar))
             helper = f"wp_tile_{rows}x{cols}_{msl_scalar}_cholesky_coop"
             return f"var_{lhs} = {helper}({in_arg}, wp_tile_chol_smem, _coop_lane)"
@@ -13943,7 +14192,7 @@ def _translate_tile_intrinsics(
             off = smem_tiles[L_label][0]
             helper = f"wp_tile_{n}x{n}_{msl_scalar}_cholesky_solve_smem_1"
             return f"var_{lhs} = {helper}({_SMEM_ARENA_NAME} + {off}, {b_arg}, _coop_lane)"
-        if coop_chol_seen is not None and _COOP_CHOL_MIN_N <= n <= _COOP_CHOL_MAX_N and k == 1:
+        if coop_chol_seen is not None and is_coop_kernel and _COOP_CHOL_MIN_N <= n <= _COOP_CHOL_MAX_N and k == 1:
             coop_chol_seen.add((n, msl_scalar))
             helper = f"wp_tile_{n}x{n}_{msl_scalar}_cholesky_solve_coop_1"
             return f"var_{lhs} = {helper}({L_arg}, {b_arg}, _coop_lane)"
@@ -14277,6 +14526,97 @@ def _translate_tile_intrinsics(
         return _serial_adj_tile_matmul(m, args, scale_c=True)
 
     line = _ADJ_TILE_MATMUL_ACC_PAT.sub(repl_adj_tile_matmul_acc, line)
+
+    def _linalg_operands(call: str, what: str, labels: list[str]) -> list[tuple[int, int, str]]:
+        """Shapes of the private (serial-model) tiles a tile linear-algebra
+        op or its reverse reads. Every other tile model (cooperative or
+        threadgroup-resident tiles, vec elements, emulated float64) raises
+        rather than guess."""
+        if is_coop_kernel or coop_block_n > 0:
+            raise MetalCodegenError(
+                f"MSL codegen: {what} is only supported in the serial tile model on Metal "
+                f"(this kernel uses cooperative tiles): {call!r}"
+            )
+        dims = []
+        for lb in labels:
+            d = tile_var_dims.get(lb)
+            if d is None:
+                raise MetalCodegenError(f"MSL codegen: tile shapes of {what} could not be resolved in {call!r}")
+            if lb in smem_tiles or lb in coldist_tiles or lb in distributed_tiles or tile_var_vec_n.get(lb, 0):
+                raise MetalCodegenError(f"MSL codegen: {what} on these tiles is not supported on Metal ({call!r})")
+            if d[2] == _F64_EMU_MSL:
+                raise MetalCodegenError(f"MSL codegen: {what} on emulated float64 tiles is not supported ({call!r})")
+            dims.append(d)
+        if len({d[2] for d in dims}) != 1:
+            raise MetalCodegenError(f"MSL codegen: {what} with mixed operand precisions is not supported ({call!r})")
+        return dims
+
+    def _lbl(v: str) -> str:
+        return v[len("var_") :] if v.startswith("var_") else v
+
+    def repl_adj_tile_cholesky(m: re.Match[str]) -> str:
+        # Reverse of ``Out = tile_cholesky(A)`` (lower), as
+        # ``adj_tile_cholesky`` -> ``cooperative_scalar_cholesky_adj`` in
+        # ``tile_cholesky.h``: only ``adj_Out`` is read, the gradient lands in
+        # ``adj_A``'s lower triangle with the diagonal halved.
+        call = m.group(0)
+        if _cholesky_tpl_upper(call):
+            raise MetalCodegenError(
+                f"MSL codegen: reverse of tile_cholesky(fill_mode='upper') is not supported on Metal ({call!r})"
+            )
+        args = [a.strip() for a in m.group(2).split(",")]
+        if len(args) != 11:
+            raise MetalCodegenError(f"MSL codegen: unexpected adj_tile_cholesky arity in {call!r}")
+        a_arg, out_arg, adj_a, adj_out = args[3], args[4], args[8], args[9]
+        if adj_a == adj_out:
+            raise MetalCodegenError(f"MSL codegen: reverse of tile_cholesky with aliased duals ({call!r})")
+        (n, n2, scalar), (o1, o2, _sc) = _linalg_operands(
+            call, "reverse of tile_cholesky", [_lbl(a_arg), _lbl(out_arg)]
+        )
+        if not (n == n2 == o1 == o2):
+            raise MetalCodegenError(f"MSL codegen: adj_tile_cholesky operand shapes disagree in {call!r}")
+        if n == 1:
+            # L = sqrt(a): every phase collapses to adj_a += 0.5 * adj_L / L.
+            z = _sc_zero(scalar)
+            return (
+                f"{{ {scalar} _ac_w = {out_arg} * {adj_out}; "
+                f"if ({out_arg} != {z}) _ac_w = (_ac_w / {out_arg}) / {out_arg}; "
+                f"{adj_a} += {_sc_lit(scalar, 0.5)} * _ac_w; }}"
+            )
+        return f"wp_tile_adjchol_{n}_{scalar}({out_arg}, {adj_out}, {adj_a})"
+
+    line = _ADJ_TILE_CHOLESKY_PAT.sub(repl_adj_tile_cholesky, line)
+
+    def repl_adj_tile_lower_solve(m: re.Match[str]) -> str:
+        # Reverse of ``Z = tile_lower_solve(L, y)``, as ``adj_tile_lower_solve``
+        # in ``tile_solve.h``: reads ``adj_ret`` (the dual of the returned tile).
+        call = m.group(0)
+        args = [a.strip() for a in m.group(1).split(",")]
+        if len(args) != 11:
+            raise MetalCodegenError(f"MSL codegen: unexpected adj_tile_lower_solve arity in {call!r}")
+        l_arg, z_arg = args[2], args[4]
+        adj_l, adj_y, adj_ret = args[7], args[8], args[10]
+        if len({adj_l, adj_y, adj_ret}) != 3:
+            raise MetalCodegenError(f"MSL codegen: reverse of tile_lower_solve with aliased duals ({call!r})")
+        (n, n2, scalar), (rows, k, _sc) = _linalg_operands(
+            call, "reverse of tile_lower_solve", [_lbl(l_arg), _lbl(args[3]), _lbl(z_arg)]
+        )[0:3:2]
+        if n != n2 or rows != n:
+            raise MetalCodegenError(f"MSL codegen: adj_tile_lower_solve operand shapes disagree in {call!r}")
+        if n == 1:
+            if k != 1:
+                raise MetalCodegenError(
+                    f"MSL codegen: reverse of tile_lower_solve with a 1x1 factor and a (1, {k}) right-hand "
+                    f"side is not supported on Metal ({call!r})"
+                )
+            z = _sc_zero(scalar)
+            return (
+                f"{{ {scalar} _al_w = ({l_arg} != {z}) ? {adj_ret} / {l_arg} : {adj_ret}; "
+                f"{adj_y} += _al_w; {adj_l} -= _al_w * {z_arg}; }}"
+            )
+        return f"wp_tile_adjlsolve_{n}x{k}_{scalar}({l_arg}, {z_arg}, {adj_ret}, {adj_y}, {adj_l})"
+
+    line = _ADJ_TILE_LOWER_SOLVE_PAT.sub(repl_adj_tile_lower_solve, line)
 
     def _serial_adj_tile_broadcast(m: re.Match[str], s_label: str, adj_src: str, adj_tile: str, t_label: str) -> str:
         # Serial-model reverse of ``_repl_tile_broadcast``: each source
@@ -15046,6 +15386,32 @@ def _translate_tile_intrinsics(
 
     line = _TILE_LOWER_SOLVE_INPLACE_PAT.sub(lambda m: _repl_solve_inplace("lower", m), line)
     line = _TILE_UPPER_SOLVE_INPLACE_PAT.sub(lambda m: _repl_solve_inplace("upper", m), line)
+
+    def repl_triangular_solve(kind: str, m: re.Match[str]) -> str:
+        # Lower: (f_fwd, f_bkwd, L, y, Z); upper: (f_fwd, U, z, X).
+        lhs = m.group(1)
+        args = [a.strip() for a in m.group(2).split(",")]
+        n_fixed = 5 if kind == "lower" else 4
+        if len(args) != n_fixed:
+            raise MetalCodegenError(f"MSL codegen: unexpected tile_{kind}_solve arity in {m.group(0)!r}")
+        f_arg, rhs_arg = args[n_fixed - 3], args[n_fixed - 2]
+        (n, n2, scalar), (rows, k, _sc) = _linalg_operands(
+            m.group(0), f"tile_{kind}_solve", [_lbl(f_arg), _lbl(rhs_arg)]
+        )
+        if n != n2 or rows != n:
+            raise MetalCodegenError(f"MSL codegen: tile_{kind}_solve operand shapes disagree in {m.group(0)!r}")
+        if n == 1:
+            if k != 1:
+                raise MetalCodegenError(
+                    f"MSL codegen: tile_{kind}_solve with a 1x1 factor and a (1, {k}) right-hand side "
+                    f"is not supported on Metal ({m.group(0)!r})"
+                )
+            return f"var_{lhs} = ({f_arg} != {_sc_zero(scalar)}) ? {rhs_arg} / {f_arg} : {rhs_arg}"
+        helper = f"wp_tile_{'lsolve' if kind == 'lower' else 'usolve'}_{n}x{k}_{scalar}"
+        return f"var_{lhs} = {helper}({f_arg}, {rhs_arg})"
+
+    line = _TILE_LOWER_SOLVE_PAT.sub(lambda m: repl_triangular_solve("lower", m), line)
+    line = _TILE_UPPER_SOLVE_PAT.sub(lambda m: repl_triangular_solve("upper", m), line)
 
     def _fft_call(direction: int, size: int, t_label: str, tile_expr: str) -> str:
         dims = tile_var_dims.get(t_label)
@@ -19570,7 +19936,15 @@ def _generate_msl_kernel_uncached(
     # incompatible with the coop-Cholesky rewrite below (which redundantly
     # runs all 32 lanes at one worldid). Eligibility already excludes
     # cholesky-bearing kernels from coop-block mode, so just skip the scan.
-    for raw in forward_lines if coop_block_n == 0 else ():
+    #
+    # A backward kernel that differentiates through ``tile_cholesky`` /
+    # ``tile_lower_solve`` stays in the serial model: their reverse helpers
+    # are serial-only (the cooperative variants have none). The replayed
+    # forward then uses the serial factorization, the same algorithm the
+    # forward kernel ran cooperatively. Before the reverse existed such
+    # kernels raised (no adjoint), so no working backward changes model.
+    _serial_reverse = adjoint and any(_LINALG_REVERSE_PAT.search(raw) for raw in forward_lines)
+    for raw in forward_lines if coop_block_n == 0 and not _serial_reverse else ():
         for m in _chol_pat_pre.finditer(raw):
             args = [a.strip() for a in m.group(1).split(",")]
             if len(args) >= 5:
@@ -20478,6 +20852,9 @@ def _generate_msl_kernel_uncached(
                         )
                     )
                     continue
+                # Large scalar tiles scatter in a loop: one unrolled statement per
+                # element made the Apple compiler take minutes on a 48x48 tile.
+                rolled = rows * cols >= _TILE_GRAD_ROLL_MIN and not tile_var_vec_n.get(tile_label, 0)
                 slots = _tile_grad_slots(
                     arr_name,
                     index_args[: ndim - n_off],
@@ -20486,6 +20863,7 @@ def _generate_msl_kernel_uncached(
                     cols,
                     tile_var_vec_n.get(tile_label, 0),
                     two_d,
+                    rolled=rolled,
                 )
                 for idx_expr, cell, in_bounds in slots:
                     tgt = f"{grad_name}[{idx_expr}]"
@@ -20494,17 +20872,19 @@ def _generate_msl_kernel_uncached(
                     if op == "tile_load":
                         # The tile was READ from the array, so its dual
                         # scatters back into the array's gradient.
-                        body_lines.append(
-                            _finalize(f"{indent}if ({in_bounds}) wp_adj_accum(&{tgt}, {adj_tile}{cell});")
-                        )
+                        stmt = f"if ({in_bounds}) wp_adj_accum(&{tgt}, {adj_tile}{cell});"
                     elif op == "tile_store":
                         # ``grad_zero_global``: a plain store consumes
                         # the gradient, an atomic accumulate does not.
-                        body_lines.append(
-                            _finalize(f"{indent}if ({in_bounds}) {{ {adj_tile}{cell} += {tgt}; {tgt} = 0.0f; }}")
-                        )
+                        stmt = f"if ({in_bounds}) {{ {adj_tile}{cell} += {tgt}; {tgt} = 0.0f; }}"
                     else:
-                        body_lines.append(_finalize(f"{indent}if ({in_bounds}) {adj_tile}{cell} += {tgt};"))
+                        stmt = f"if ({in_bounds}) {adj_tile}{cell} += {tgt};"
+                    if rolled:
+                        stmt = (
+                            f"for (int _ag_e = 0; _ag_e < {rows * cols}; ++_ag_e) {{ "
+                            f"const int _ag_i = _ag_e / {cols}; const int _ag_j = _ag_e - _ag_i * {cols}; {stmt} }}"
+                        )
+                    body_lines.append(_finalize(f"{indent}{stmt}"))
                 continue
         # Address lines have been folded into ``subscript_map`` (or, for
         # struct-element pointers, ``struct_refs``). An address whose base
