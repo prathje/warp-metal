@@ -450,6 +450,155 @@ class TestMetalR10TileChol(unittest.TestCase):
         )
         _run_with_metal_native(self, snippet, timeout=300)
 
+    def test_chained_cholesky_solve_matmul_into_duplicate_views_matches_cpu(self):
+        # tile_cholesky -> tile_lower_solve (matrix RHS) -> tile_matmul ->
+        # tile_store into an offset indexed view + tile_atomic_add into views
+        # selected by duplicate indices (several blocks add into one slice).
+        # Serial model only: an out-of-place solve in a cooperative kernel
+        # raises (see test_tile_lower_solve_in_cooperative_kernel_is_loud).
+        snippet = _COMMON + textwrap.dedent(
+            """
+            def make(n, k, m):
+                @wp.kernel(module="unique")
+                def kern(a: wp.array3d(dtype=float), y: wp.array3d(dtype=float), wm: wp.array2d(dtype=float),
+                         idx: wp.array(dtype=int), h: wp.array3d(dtype=float), g: wp.array3d(dtype=float)):
+                    i = wp.tid()
+                    lt = wp.tile_cholesky(wp.tile_load(a[i], shape=(n, n)))
+                    z = wp.tile_lower_solve(lt, wp.tile_load(y[i], shape=(n, k)))
+                    p = wp.tile_zeros(shape=(n, m), dtype=float)
+                    wp.tile_matmul(z, wp.tile_load(wm, shape=(k, m)), p)
+                    wp.tile_store(h[i], p, offset=(1, 0))
+                    wp.tile_atomic_add(g[idx[i]], p, offset=(0, 2))
+                return kern
+
+            for n, k, m in ((7, 3, 4), (17, 2, 3)):
+                rng = np.random.default_rng(n)
+                b = 4
+                a0 = spd(rng, b, n)
+                y0 = rng.standard_normal((b, n, k)).astype(np.float32)
+                w0 = rng.standard_normal((k, m)).astype(np.float32)
+                idx0 = np.array([1, 0, 1, 1], dtype=np.int32)
+                wh = rng.standard_normal((b, n + 3, m + 1)).astype(np.float32)
+                wg = rng.standard_normal((2, n, m + 1)).astype(np.float32)
+                kern = make(n, k, m)
+                res = {}
+                for dev in ("cpu", "metal:0"):
+                    a = wp.array(a0, device=dev, requires_grad=True)
+                    y = wp.array(y0, device=dev, requires_grad=True)
+                    wm = wp.array(w0, device=dev, requires_grad=True)
+                    h = wp.zeros((b, n + 3, m + 1), dtype=float, device=dev, requires_grad=True)
+                    g = wp.zeros((2, n, m + 1), dtype=float, device=dev, requires_grad=True)
+                    loss = wp.zeros(1, dtype=float, device=dev, requires_grad=True)
+                    tape = wp.Tape()
+                    with tape:
+                        wp.launch_tiled(kern, dim=b, inputs=[a, y, wm, wp.array(idx0, device=dev)], outputs=[h, g],
+                                        device=dev, block_dim=64)
+                        wp.launch(wloss3, dim=h.shape, inputs=[h, wp.array(wh, device=dev)], outputs=[loss], device=dev)
+                        wp.launch(wloss3, dim=g.shape, inputs=[g, wp.array(wg, device=dev)], outputs=[loss], device=dev)
+                    tape.backward(loss)
+                    res[dev] = (h.numpy(), g.numpy(), a.grad.numpy(), y.grad.numpy(), wm.grad.numpy())
+                for j, what in enumerate(("h", "g", "a.grad", "y.grad", "wm.grad")):
+                    close(res["metal:0"][j], res["cpu"][j], f"n={n} {what}")
+                assert np.abs(res["cpu"][2]).max() > 0.1
+            """
+        )
+        _run_with_metal_native(self, snippet, timeout=600)
+
+    def test_tile_lower_solve_in_cooperative_kernel_is_loud(self):
+        # A tile_cholesky in the cooperative range (N in [24, 88]) puts the
+        # forward kernel in the cooperative model, which has no out-of-place
+        # triangular solve: it must raise, never compute a wrong value.
+        snippet = _COMMON + textwrap.dedent(
+            """
+            from warp._src.codegen_metal import MetalCodegenError
+
+            @wp.kernel(module="unique")
+            def k(a: wp.array3d(dtype=float), y: wp.array2d(dtype=float), z: wp.array2d(dtype=float)):
+                i = wp.tid()
+                lt = wp.tile_cholesky(wp.tile_load(a[i], shape=(24, 24)))
+                wp.tile_store(z[i], wp.tile_lower_solve(lt, wp.tile_load(y[i], shape=(24,))))
+
+            dev = "metal:0"
+            rng = np.random.default_rng(8)
+            a = wp.array(spd(rng, 2, 24), device=dev)
+            y = wp.array(rng.standard_normal((2, 24)).astype(np.float32), device=dev)
+            z = wp.zeros((2, 24), dtype=float, device=dev)
+            try:
+                wp.launch_tiled(k, dim=2, inputs=[a, y], outputs=[z], device=dev, block_dim=64)
+                wp.synchronize()
+            except MetalCodegenError as e:
+                assert "serial tile model" in str(e), e
+            else:
+                raise AssertionError("tile_lower_solve ran in a cooperative Metal kernel")
+            """
+        )
+        _run_with_metal_native(self, snippet, timeout=300)
+
+    def test_rolled_reverse_scatter_is_bitwise_unrolled(self):
+        # The >= 256-element loop form of the reverse tile_load / tile_store /
+        # tile_atomic_add scatter must produce exactly the gradients of the
+        # per-element form (same slots, same order), incl. two loads from one
+        # slice and duplicate view indices across blocks.
+        snippet = _COMMON + textwrap.dedent(
+            """
+            import os
+            import warp._src.codegen_metal as cm
+
+            os.environ["WARP_METAL_DISABLE_ARTIFACT_CACHE"] = "1"
+
+            def make(tag):
+                # ``tag`` only makes each call a distinct kernel (no cache hit).
+                @wp.kernel(module="unique")
+                def k(a: wp.array3d(dtype=float), idx: wp.array(dtype=int), h: wp.array3d(dtype=float),
+                      g: wp.array3d(dtype=float)):
+                    i = wp.tid() + tag - tag
+                    t = wp.tile_load(a[idx[i]], shape=(20, 16), offset=(3, 5))
+                    t2 = wp.tile_load(a[idx[i]], shape=(20, 16), offset=(4, 5))
+                    s = wp.tile_map(wp.add, wp.tile_map(wp.mul, t, t), t2)
+                    wp.tile_store(h[i], s, offset=(2, 3))
+                    wp.tile_atomic_add(g[idx[i]], s, offset=(1, 6))
+                return k
+
+            rng = np.random.default_rng(0)
+            a0 = rng.standard_normal((3, 22, 23)).astype(np.float32)
+            idx0 = np.array([0, 2, 0, 0, 1], dtype=np.int32)
+            wh = rng.standard_normal((5, 21, 20)).astype(np.float32)
+            wg = rng.standard_normal((3, 22, 23)).astype(np.float32)
+
+            def grads(dev, roll_min):
+                cm._TILE_GRAD_ROLL_MIN = roll_min
+                k = make(0 if roll_min == 256 else 1)
+                a = wp.array(a0, device=dev, requires_grad=True)
+                h = wp.zeros((5, 21, 20), dtype=float, device=dev, requires_grad=True)
+                g = wp.zeros((3, 22, 23), dtype=float, device=dev, requires_grad=True)
+                loss = wp.zeros(1, dtype=float, device=dev, requires_grad=True)
+                tape = wp.Tape()
+                with tape:
+                    wp.launch_tiled(k, dim=5, inputs=[a, wp.array(idx0, device=dev)], outputs=[h, g], device=dev,
+                                    block_dim=64)
+                    wp.launch(wloss3, dim=h.shape, inputs=[h, wp.array(wh, device=dev)], outputs=[loss], device=dev)
+                    wp.launch(wloss3, dim=g.shape, inputs=[g, wp.array(wg, device=dev)], outputs=[loss], device=dev)
+                tape.backward(loss)
+                return a.grad.numpy()
+
+            calls = []
+            orig = cm._tile_grad_slots
+            def spy(*args, **kw):
+                calls.append(bool(kw.get("rolled")))
+                return orig(*args, **kw)
+            cm._tile_grad_slots = spy
+
+            rolled = grads("metal:0", 256)
+            assert calls and all(calls), calls
+            calls.clear()
+            unrolled = grads("metal:0", 10**9)
+            assert calls and not any(calls), calls
+            np.testing.assert_array_equal(rolled, unrolled)
+            close(rolled, grads("cpu", 256), "a.grad", rtol=1e-5)
+            """
+        )
+        _run_with_metal_native(self, snippet, timeout=600)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
