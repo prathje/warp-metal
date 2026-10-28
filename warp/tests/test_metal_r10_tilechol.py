@@ -340,7 +340,7 @@ class TestMetalR10TileChol(unittest.TestCase):
                 return k
 
             rng = np.random.default_rng(4)
-            for nb, nd in ((2, 2), (3, 10)):
+            for nb, nd in ((2, 2), (3, 10), (4, 24)):
                 k = make(nb, nd)
                 b = 3
                 j0 = rng.standard_normal((b, 6 * nb, nd)).astype(np.float32)
@@ -396,7 +396,7 @@ class TestMetalR10TileChol(unittest.TestCase):
                 return ku, kc
 
             rng = np.random.default_rng(5)
-            for n, m in ((1, 1), (6, 2), (9, 1)):
+            for n, m in ((1, 1), (6, 2), (9, 1), (24, 1), (30, 3)):
                 l0 = np.stack([np.linalg.cholesky(s) for s in spd(rng, 2, n).astype(np.float64)]).astype(np.float32)
                 y0 = rng.standard_normal((2, n, m)).astype(np.float32)
                 w0 = rng.standard_normal((2, n, m)).astype(np.float32)
